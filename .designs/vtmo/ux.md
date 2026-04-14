@@ -371,10 +371,10 @@ Error: DiskFull {
 3. **MongoDB Compatibility Matrix**: A table listing every MQL operator with its support status: Supported, Partial (with notes), Not Supported. Updated with every release. This is the trust document for the test-double persona.
 4. **Error Guide**: Every `Error` variant with causes, recovery steps, and example code. This replaces the DBA that embedded database users don't have.
 5. **Concurrency Guide**: Explains the SWMR model, writer contention, busy timeout, and patterns for multi-threaded access. MongoDB developers need this because they've never encountered single-writer semantics.
+6. **Migration Guide from MongoDB Rust Driver**: Side-by-side code comparisons. `mongodb::Client::with_uri_str("mongodb://...")` → `mqlite::Database::open("data.mqlite")`. What transfers, what's different, what's missing. **Note**: The PRD (Business/Adoption constraints) explicitly requires this as a Phase 1 deliverable: "Documentation must include migration guide from MongoDB driver to mqlite."
 
 ### Tier 2: Important for Adoption
 
-6. **Migration Guide from MongoDB Rust Driver**: Side-by-side code comparisons. `mongodb::Client::with_uri_str("mongodb://...")` → `mqlite::Database::open("data.mqlite")`. What transfers, what's different, what's missing.
 7. **Test Double Cookbook**: Patterns for using mqlite in test suites. Fixture loading, parallel test isolation, asserting against query results.
 8. **File Management Guide**: Backup strategies, file copying safety, WAL and auxiliary file explanations, compaction, size monitoring.
 9. **IoT/Embedded Deployment Guide**: Resource configuration, cross-compilation notes, durability modes, disk-full handling.
@@ -385,6 +385,8 @@ Error: DiskFull {
 11. **Wire Protocol Shim Guide**: Setup, `mongosh` connection, limitations, security considerations.
 12. **Performance Tuning**: Buffer pool sizing, checkpoint frequency, durability vs. speed trade-offs.
 13. **File Format Specification**: For advanced users building backup tools, forensic analysis, or third-party readers.
+
+**Note on tier numbering**: Items 1-6 are Tier 1 (mandatory for Phase 1 launch), 7-9 are Tier 2 (important for adoption), 10-13 are Tier 3 (power user / later).
 
 ### Documentation as Implementation Tasks (PRD Phase 1 DoD #10)
 
@@ -400,7 +402,7 @@ Documentation is a Phase 1 deliverable, not an afterthought. The following docum
 | Migration Guide | After API stable | Full API surface finalized | Medium |
 | Wire Protocol Security Advisory | Before wire protocol release | Wire protocol working | Low |
 
-Each Tier 1 doc must be complete before Phase 1 is declared done. Tier 2 docs should be drafted during Phase 1 and finalized shortly after.
+Each Tier 1 doc (including the migration guide, per PRD mandate) must be complete before Phase 1 is declared done. Tier 2 docs should be drafted during Phase 1 and finalized shortly after.
 
 ## Observability UX
 

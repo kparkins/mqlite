@@ -272,6 +272,8 @@ pub struct IndexOptions {
 
 **Unsupported index types**: `createIndex` requests specifying unsupported index options (TTL via `expireAfterSeconds`, text indexes, geospatial indexes via `2dsphere`/`2d`, partial indexes via `partialFilterExpression`, hashed indexes) must return an appropriate error. Use error code 67 (`CannotCreateIndex`) with a message naming the unsupported option and listing supported index types (single-field, compound, unique, sparse, multikey).
 
+**Collation parameter handling (PRD non-goal NG10)**: Collation is explicitly out of scope for Phase 1. When a `collation` option is specified in any command (`find`, `createIndexes`, `update`, `delete`, `findAndModify`, `aggregate`), mqlite must return an error rather than silently ignoring it. Silent ignore would cause correctness issues — queries would return results in byte ordering rather than the locale-aware ordering the caller expects. Use error code 2 (`BadValue`) with message: `"Collation is not supported in mqlite Phase 1. Queries use binary (byte-order) comparison for strings."`
+
 ```rust
 // Example error for unsupported index type
 Error::UnsupportedIndexOption {
@@ -441,6 +443,18 @@ The wire protocol shim runs in a tokio runtime that is internal to the `wire` fe
 | `OpenOptions` | Yes | Yes | Yes | Builder, no interior mutability. |
 
 `Cursor` is not `Sync` because it maintains iteration state. It is `Send` so it can be moved to another thread, but should not be shared. This matches the MongoDB driver's cursor semantics.
+
+## Atomicity Guarantees
+
+mqlite provides **single-document atomicity only** (PRD non-goal NG4: no multi-document transactions). Each individual CRUD operation is atomic:
+
+- `insert_one`: atomic — the document is either fully inserted or not at all.
+- `update_one`, `find_one_and_update`, `find_one_and_delete`, `find_one_and_replace`: atomic read-modify-write on a single document (requires writer lock acquisition, query execution, mutation, and result return within a single lock hold).
+- `delete_one`: atomic — the document is either fully deleted or not at all.
+- `insert_many`: **NOT atomic as a whole**. With `ordered: true` (default), stops at first error — successfully inserted documents are committed; remaining documents are not attempted. With `ordered: false`, attempts all inserts — each individual insert is atomic, but the batch may partially succeed.
+- `update_many`, `delete_many`: each affected document is updated/deleted atomically, but the overall operation is not transactional — a crash mid-operation may leave some documents updated and others not.
+
+There are no multi-document ACID transactions, sessions, or `startTransaction`/`commitTransaction` APIs. The wire protocol omits `logicalSessionTimeoutMinutes` from the hello response and silently ignores `lsid` fields in commands (per integration.md).
 
 ## Constraints Identified
 

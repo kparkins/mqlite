@@ -120,7 +120,11 @@ Phase 1 implementation:
     "minWireVersion": 0,
     "maxWireVersion": 21,               // MongoDB 8.0
     "readOnly": false,
-    "ok": 1
+    "ok": 1,
+    // mqlite-specific (PRD trademark constraint: identify as mqlite, not MongoDB)
+    "mqlite": {
+        "version": "0.1.0"
+    }
 }
 ```
 
@@ -262,6 +266,7 @@ name = "mqlite"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"        # Minimum supported Rust version
+license = "MIT OR Apache-2.0" # PRD constraint: must be Apache 2.0 or MIT
 
 [features]
 default = []
@@ -314,6 +319,15 @@ tracing = { version = "0.1", optional = true }
 | `tracing` | tracing only | Observability | Minimal |
 
 Base crate without features: ~10 transitive dependencies. With `wire`: ~40. This is acceptable for a database crate.
+
+### Pure-Rust Dependency Enforcement (PRD Constraint)
+
+The PRD requires no C/C++ code in mqlite's direct dependency tree. Transitive dependencies that optionally have C backends must use their Rust backend. Enforcement:
+
+1. **Cargo.toml**: Use feature flags to force pure-Rust backends. Example: if `flate2` is ever added (e.g., for OP_COMPRESSED in Phase 1.1), specify `flate2 = { version = "1", default-features = false, features = ["rust_backend"] }`.
+2. **`crc32c` crate**: Verify it uses a pure-Rust implementation. The `crc32c` crate may auto-detect hardware CRC32C instructions via Rust intrinsics (not C FFI) — this is acceptable.
+3. **CI check**: Add a CI job that runs `cargo build` and verifies no `.c`, `.cpp`, or `build.rs` with `cc::Build` compilation appears in the build output. Alternatively, use `cargo tree --edges=normal -f '{p} {l}'` to audit for C dependencies.
+4. **Policy**: Any new dependency that introduces C code must be explicitly approved and documented as an exception, or replaced with a pure-Rust alternative.
 
 ### Cross-Compilation Targets
 
@@ -471,6 +485,14 @@ Each operator must be implemented, tested against MongoDB 8.0 for correctness, a
 | `$all` | Array | Required | Unit + compat | |
 | `$size` | Array | Required | Unit + compat | |
 | `$regex` | Evaluation | Required | Unit + compat | Rust `regex` crate only (no PCRE); document incompatibilities |
+
+**Query operators — Phase 1 out-of-scope (must return error):**
+
+The following query operators are explicitly excluded from Phase 1 (per PRD G2). When encountered in a find filter, they must return error code 9 (`FailedToParse`) with a message naming the unsupported operator and listing what IS supported:
+
+`$expr`, `$jsonSchema`, `$mod`, `$text`, `$where`, `$geoWithin`, `$geoIntersects`, `$near`, `$nearSphere`, `$elemMatch` (projection position), `$slice` (projection), `$meta`, `$comment`, `$rand`, `$natural`.
+
+Of these, `$expr` deserves special attention: it allows aggregation expressions inside find filters. Since the aggregation pipeline is a PRD non-goal, `$expr` must be explicitly rejected — not silently ignored or treated as a passthrough.
 
 ### Update Operators — Phase 1
 
