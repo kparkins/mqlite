@@ -393,21 +393,36 @@ Phase 1 is complete when ALL of the following are true:
 
 **Bottom-up build order** — each layer builds on the one below:
 
-1. **File format and page manager**: Define the `.mqlite` file header (MQLT magic, format version, page sizes, catalog root, free lists, CRC32C). Page allocator with two size classes (4KB, 32KB).
+0. **Project scaffolding and test infrastructure** *(before any implementation)*:
+   - Cargo workspace: `mqlite` crate, feature flags `wire` and `tracing`, `rust-version = "1.70"`, `license = "MIT OR Apache-2.0"`
+   - Module structure per ux.md: `database`, `collection`, `cursor`, `error`, `options`, `index`, `results`, `wire/` (feature-gated)
+   - Clippy: `#![deny(clippy::unwrap_used, clippy::expect_used)]` in library code
+   - CI: cross-compile jobs (x86_64-linux, aarch64-linux, aarch64-darwin), `cargo audit`, pure-Rust dependency enforcement
+   - Dev dependencies: `proptest` (B+ tree property tests), `criterion` (benchmarks), `cargo-fuzz` (fuzz targets)
+   - Fuzz targets scaffolded: BSON parser, OP_MSG frame parser
+   - Error taxonomy implemented from api.md (`src/error.rs`) before any layer is built
+   - Public API types scaffolded as stubs: `Database`, `Collection<T>`, `Cursor<T>`, result types, options types
 
-2. **WAL implementation**: Write-ahead log for crash recovery and SWMR concurrency. Page-level redo log with CRC32C per frame. Three-file model (main + WAL + SHM) collapsing to single file on clean close. Multi-process coordination via POSIX fcntl.
+1. **File format and page manager**: Define the `.mqlite` file header (MQLT magic, format version, page sizes, catalog root, free lists, CRC32C). Page allocator with two size classes (4KB, 32KB). **In-memory mode support**: the page manager must support `PageManagerMode::File(path)` and `PageManagerMode::InMemory` (allocates pages from `Vec<Vec<u8>>`). Set file permissions to 0600 on creation.
 
-3. **B+ tree storage engine**: Variable-page B+ tree with BSON comparison ordering baked into key encoding from day one. Buffer pool with CLOCK-sweep eviction. Overflow pages for large documents. Property-based tests for tree invariants.
+2. **WAL implementation**: Write-ahead log for crash recovery and SWMR concurrency. Page-level redo log with CRC32C per frame. Three-file model (main + WAL + SHM) collapsing to single file on clean close. Multi-process coordination via POSIX fcntl. **In-memory mode**: WAL and SHM are completely bypassed; writes go directly to the in-memory page store. **SHM clarification**: the SHM WAL index is a fixed-size mmap'd memory region, separate from the data buffer pool (which is built in Step 3b).
 
-4. **Collection and index management**: Catalog B+ tree mapping collection names to root pages. Auto `_id` index (clustered — documents stored in `_id` order). Secondary indexes with `_id` appended for uniqueness. Multikey indexes for array fields.
+3a. **BSON key encoding** *(must complete before 3b/3c)*: Implement MongoDB BSON comparison ordering as byte-comparable key encoding for all 14 type categories. Unit tests for every type tag and edge cases (NaN, -0.0, Decimal128, cross-type comparison). Compound index key concatenation with per-field inversion for descending sort. Property test: for any two BSON values where A < B by MongoDB ordering, `encode(A) < encode(B)` by memcmp.
+
+3b. **Buffer pool**: CLOCK-sweep eviction, separate pools for 4KB (internal nodes) and 32KB (leaf/overflow) pages, pin/unpin with dirty tracking. Available to WAL reader path (Step 2) and B+ tree (Step 3c).
+
+3c. **B+ tree storage engine**: Variable-page B+ tree using key encoding from 3a and buffer pool from 3b. Overflow pages for large documents. Property-based tests for all 8 tree invariants from data.md written concurrent with implementation.
+
+4. **Collection and index management**: Catalog B+ tree mapping collection names to root pages. Define catalog schema as a data contract before implementation (collection entry format, index entry format). Auto `_id` index (clustered — documents stored in `_id` order). Secondary indexes with `_id` appended for uniqueness. Multikey indexes for array fields.
 
 5. **Query engine**: MQL operator implementation for the defined Phase 1 operator set. Heuristic planner: select most selective single index for the query shape, fall back to collection scan. Cursor-based iteration with snapshot isolation.
 
-6. **Native Rust API**: `Database::open()`, `Collection<T>` with serde support, all CRUD methods, index management. Sync-first. Error model with MongoDB error code mapping. `Database::open_in_memory()` for testing.
+6. **Native Rust API**: `Database::open()`, `Collection<T>` with serde support, all CRUD methods (including `close()`), index management. Sync-first. Error model with MongoDB error code mapping. `Database::open_in_memory()` for testing. After Step 6: run Phase A native API compatibility tests.
 
-7. **Wire protocol shim** (behind `wire` feature flag): OP_MSG framing, hello/isMaster handshake, 18 Phase 1 commands. Localhost-only binding. Internal tokio runtime via `spawn_blocking` to call sync native API.
+7. **Wire protocol shim** (behind `wire` feature flag): OP_MSG framing, hello/isMaster handshake, 18 Phase 1 commands. Localhost-only binding with startup security warning. Internal tokio runtime via `spawn_blocking` to call sync native API. Silently ignore `lsid`, `readConcern`, `writeConcern` in all commands. After Step 7: run Phase B wire protocol compatibility tests (mongosh, pymongo).
 
 ### Sub-phases (if needed for timeline management)
-- **1a**: Storage engine (layers 1-3) — file format, WAL, B+ tree
-- **1b**: Query + API (layers 4-6) — catalog, query engine, native API
-- **1c**: Wire protocol (layer 7) — OP_MSG, commands, mongosh/pymongo validation
+- **0**: Scaffolding + test infrastructure
+- **1a**: Storage engine (steps 1, 2, 3a, 3b, 3c) — file format, WAL, BSON key encoding, buffer pool, B+ tree
+- **1b**: Query + API (steps 4-6) — catalog, query engine, native API. Phase A compat tests. Begin Tier 1 documentation.
+- **1c**: Wire protocol (step 7) — OP_MSG, commands, mongosh/pymongo validation. Phase B compat tests. Complete Tier 1 documentation.

@@ -379,6 +379,51 @@ MongoDB publishes CRUD spec tests as YAML/JSON files. These define expected beha
 4. Run the same tests against real MongoDB 8.0 as a reference.
 5. Compare results. Any divergence is a compatibility bug.
 
+### Silently Ignored Command Fields
+
+The following fields are sent by pymongo 4.x and the MongoDB Rust driver by default with every
+command. mqlite **silently ignores** them — do NOT return an error when they are present:
+
+| Field | Reason Ignored |
+|-------|---------------|
+| `lsid` | Logical session ID — mqlite has no session support |
+| `readConcern` | mqlite is single-copy; read concerns are meaningless |
+| `writeConcern` | Durability is configured at open time, not per-operation |
+| `$clusterTime` | No cluster; field is ignored |
+| `txnNumber` | No transactions; field is ignored |
+
+All ignored fields are logged at **DEBUG** level:
+```
+mqlite::wire: ignoring lsid field (sessions not supported)
+mqlite::wire: ignoring readConcern/writeConcern (embedded mode)
+```
+
+NOT returning an error for these fields is required for pymongo 4.x compatibility — the driver
+sends `lsid` with every command by default. (Resolved: integration.md OQ#1-2)
+
+### Compatibility Testing Split: Native API vs. Wire Protocol
+
+The compatibility test suite runs in two phases to enable earlier validation:
+
+**Phase A — Native API compat tests** (run after Step 6: Native API complete):
+- BSON round-trip: insert via native API, read back, verify byte-for-byte equality
+- All G2 query operators produce results matching MongoDB 8.0
+- Error code verification: each error condition returns the correct MongoDB error code
+- `insert_many` ordered/unordered semantics (R10)
+- `find_one_and_update` returns pre-modification document by default (ReturnDocument::Before)
+- Upsert semantics for `update_one` with `upsert: true`
+- Compound index prefix queries and sort order
+- Multikey index correctness for `$elemMatch`, `$all`, `$size`
+
+**Phase B — Wire protocol compat tests** (run after Step 7: Wire protocol complete):
+- `mongosh` 2.x connects and runs: `show dbs`, `show collections`, `db.coll.insertOne()`,
+  `db.coll.find()`, `db.coll.updateOne()`, `db.coll.deleteOne()`
+- pymongo 4.x curated test suite passes (insert/find/update/delete with indexes)
+- BSON round-trip across API paths: insert via pymongo, read via native API
+- All 18 Phase 1 commands return MongoDB-format responses
+- Unsupported commands (e.g., `aggregate`) return error code 59 (`CommandNotFound`)
+- `directConnection=true` required for all driver connections (documented)
+
 ### Jepsen-Style Crash Testing
 
 Per Q5, crash testing is required. Implementation:

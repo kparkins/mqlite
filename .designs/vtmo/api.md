@@ -101,6 +101,12 @@ impl Database {
 
     /// Database statistics.
     pub fn stats(&self) -> Result<DatabaseStats>;
+
+    /// Flush WAL, checkpoint, and close. Blocks until complete.
+    /// Use this when you need a guarantee that all committed data is in the main file.
+    /// `Drop` performs a non-blocking close; use `close()` for explicit durability guarantees
+    /// (e.g., before copying the .mqlite file as a backup).
+    pub fn close(self) -> Result<()>;
 }
 
 // Database is Send + Sync (Arc<Inner> internally).
@@ -115,6 +121,8 @@ pub struct OpenOptions {
     buffer_pool_size: Option<usize>,       // Default: 64MB
     durability: Option<DurabilityMode>,     // Default: Interval(100ms)
     wal_auto_checkpoint: Option<u32>,       // Default: 1000 pages
+    wal_max_size: Option<u64>,              // Default: 100MB. Absolute WAL size that forces a checkpoint
+                                            //          regardless of page count threshold.
     busy_timeout: Option<Duration>,         // Default: 5 seconds
     read_only: Option<bool>,               // Default: false (see note below)
     create_if_missing: Option<bool>,       // Default: true
@@ -123,9 +131,10 @@ pub struct OpenOptions {
 
 // Note on read_only mode:
 // When `read_only: true`:
-// - WAL replay is skipped (database state is as of last checkpoint)
+// - WAL replay is SKIPPED (database state is as of last checkpoint)
 // - No writes are attempted, even for recovery
-// - Safe for opening databases on read-only filesystems
+// - SHM file is not created or modified
+// - Safe for opening databases on read-only filesystems (e.g., IoT forensic access after failure)
 // - Useful for forensic access after IoT/edge failures
 // - If WAL exists with uncommitted changes, they are NOT visible
 
@@ -166,11 +175,22 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     pub fn delete_many(&self, filter: Document) -> Result<DeleteResult>;
 
     // --- findAndModify variants ---
+    /// Returns the document as it appeared BEFORE the update (pre-modification document).
+    /// This matches MongoDB's findAndModify default behavior.
+    /// To return the post-modification document, use find_one_and_update_with_options
+    /// with FindOneAndUpdateOptions { return_document: Some(ReturnDocument::After) }.
     pub fn find_one_and_update(&self, filter: Document, update: Document) -> Result<Option<T>>;
+    pub fn find_one_and_update_with_options(&self, filter: Document, update: Document, opts: FindOneAndUpdateOptions) -> Result<Option<T>>;
     pub fn find_one_and_delete(&self, filter: Document) -> Result<Option<T>>;
+    pub fn find_one_and_delete_with_options(&self, filter: Document, opts: FindOneAndDeleteOptions) -> Result<Option<T>>;
     pub fn find_one_and_replace(&self, filter: Document, replacement: &T) -> Result<Option<T>>;
+    pub fn find_one_and_replace_with_options(&self, filter: Document, replacement: &T, opts: FindOneAndReplaceOptions) -> Result<Option<T>>;
 
     // --- Indexes ---
+    /// BLOCKING: Acquires the writer lock and holds it until the index is fully built.
+    /// For large collections (e.g., 100K documents), this may take several seconds.
+    /// No writes can proceed on this collection during index construction.
+    /// Background (non-blocking) index builds are planned for Phase 2.
     pub fn create_index(&self, model: IndexModel) -> Result<String>;
     pub fn drop_index(&self, name: &str) -> Result<()>;
     pub fn list_indexes(&self) -> Result<Vec<IndexModel>>;
@@ -181,6 +201,42 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
 
     // --- Stats ---
     pub fn stats(&self) -> Result<CollectionStats>;
+}
+```
+
+### FindOneAnd* Options
+
+```rust
+/// Which version of the document to return from find_one_and_update / find_one_and_replace.
+pub enum ReturnDocument {
+    /// Return the document as it appeared BEFORE the modification (default, matches MongoDB).
+    Before,
+    /// Return the document as it appears AFTER the modification.
+    After,
+}
+
+pub struct FindOneAndUpdateOptions {
+    /// Default: ReturnDocument::Before (matches MongoDB findAndModify default behavior).
+    pub return_document: Option<ReturnDocument>,
+    /// If true and no document matches the filter, insert a new document from the filter
+    /// plus the update operators. Default: false.
+    pub upsert: Option<bool>,
+    /// Sort order for selecting which document to update when filter matches multiple.
+    pub sort: Option<Document>,
+}
+
+pub struct FindOneAndDeleteOptions {
+    /// Sort order for selecting which document to delete when filter matches multiple.
+    pub sort: Option<Document>,
+}
+
+pub struct FindOneAndReplaceOptions {
+    /// Default: ReturnDocument::Before.
+    pub return_document: Option<ReturnDocument>,
+    /// If true and no document matches, insert the replacement document. Default: false.
+    pub upsert: Option<bool>,
+    /// Sort order for selecting which document to replace when filter matches multiple.
+    pub sort: Option<Document>,
 }
 ```
 
@@ -258,7 +314,15 @@ impl<T> Cursor<T> {
 
 ```rust
 pub struct InsertOneResult { pub inserted_id: Bson }
-pub struct InsertManyResult { pub inserted_ids: HashMap<usize, Bson> }
+
+pub struct InsertManyResult {
+    /// IDs of all successfully inserted documents, keyed by their index in the input array.
+    pub inserted_ids: HashMap<usize, Bson>,
+    /// Errors encountered during the operation. Non-empty only on partial failure.
+    /// Populated in ordered mode (stops at first error) and unordered mode (collects all errors).
+    pub errors: Vec<BulkWriteError>,
+}
+
 pub struct UpdateResult { pub matched_count: u64, pub modified_count: u64, pub upserted_id: Option<Bson> }
 pub struct DeleteResult { pub deleted_count: u64 }
 ```
