@@ -165,30 +165,36 @@ pub struct FindOptions {
 }
 
 impl FindOptions {
+    /// Create default `FindOptions`.
     pub fn new() -> Self {
         FindOptions::default()
     }
 
+    /// Set the sort order for results.
     pub fn sort(mut self, sort: Document) -> Self {
         self.sort = Some(sort);
         self
     }
 
+    /// Maximum number of documents to return.
     pub fn limit(mut self, limit: i64) -> Self {
         self.limit = Some(limit);
         self
     }
 
+    /// Number of documents to skip before returning results.
     pub fn skip(mut self, skip: u64) -> Self {
         self.skip = Some(skip);
         self
     }
 
+    /// Projection document specifying fields to include or exclude.
     pub fn projection(mut self, projection: Document) -> Self {
         self.projection = Some(projection);
         self
     }
 
+    /// Number of documents to fetch per internal batch.
     pub fn batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size);
         self
@@ -203,10 +209,12 @@ pub struct UpdateOptions {
 }
 
 impl UpdateOptions {
+    /// Create default `UpdateOptions`.
     pub fn new() -> Self {
         UpdateOptions::default()
     }
 
+    /// Set whether to upsert (insert if no match).
     pub fn upsert(mut self, upsert: bool) -> Self {
         self.upsert = upsert;
         self
@@ -221,10 +229,12 @@ pub struct InsertManyOptions {
 }
 
 impl InsertManyOptions {
+    /// Create default `InsertManyOptions`.
     pub fn new() -> Self {
         InsertManyOptions { ordered: false }
     }
 
+    /// Set whether inserts should stop on the first error.
     pub fn ordered(mut self, ordered: bool) -> Self {
         self.ordered = ordered;
         self
@@ -243,20 +253,24 @@ pub struct IndexOptions {
 }
 
 impl IndexOptions {
+    /// Create default `IndexOptions`.
     pub fn new() -> Self {
         IndexOptions::default()
     }
 
+    /// Set whether the index enforces a unique constraint.
     pub fn unique(mut self, unique: bool) -> Self {
         self.unique = unique;
         self
     }
 
+    /// Set a custom name for the index.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Set whether to only index documents where the key field exists.
     pub fn sparse(mut self, sparse: bool) -> Self {
         self.sparse = sparse;
         self

@@ -34,8 +34,8 @@
 //! BSON ObjectId without any conversion.
 
 use std::sync::{
-    OnceLock,
     atomic::{AtomicU32, Ordering},
+    OnceLock,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -234,7 +234,10 @@ mod tests {
         let r1 = &id1.bytes()[4..9];
         let r2 = &id2.bytes()[4..9];
 
-        assert_eq!(r1, r2, "process-random bytes must be stable within a process");
+        assert_eq!(
+            r1, r2,
+            "process-random bytes must be stable within a process"
+        );
     }
 
     #[test]
@@ -262,7 +265,11 @@ mod tests {
         }
 
         let set = results.lock().unwrap();
-        assert_eq!(set.len(), 8 * 128, "all 1024 concurrent ObjectIds must be unique");
+        assert_eq!(
+            set.len(),
+            8 * 128,
+            "all 1024 concurrent ObjectIds must be unique"
+        );
     }
 
     #[test]

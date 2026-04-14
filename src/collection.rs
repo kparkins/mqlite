@@ -61,11 +61,16 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
 
     /// Insert multiple documents. Returns the `_id` values of all inserted documents.
     pub fn insert_many(&self, docs: &[T]) -> Result<InsertManyResult> {
-        self.inner.insert_many(&self.name, docs, InsertManyOptions::new())
+        self.inner
+            .insert_many(&self.name, docs, InsertManyOptions::new())
     }
 
     /// Insert multiple documents with options.
-    pub fn insert_many_with_options(&self, docs: &[T], opts: InsertManyOptions) -> Result<InsertManyResult> {
+    pub fn insert_many_with_options(
+        &self,
+        docs: &[T],
+        opts: InsertManyOptions,
+    ) -> Result<InsertManyResult> {
         self.inner.insert_many(&self.name, docs, opts)
     }
 
@@ -94,21 +99,33 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
 
     /// Update the first document matching `filter`.
     pub fn update_one(&self, filter: Document, update: Document) -> Result<UpdateResult> {
-        self.inner.update_one(&self.name, filter, update, UpdateOptions::new())
+        self.inner
+            .update_one(&self.name, filter, update, UpdateOptions::new())
     }
 
     /// Update the first document matching `filter` with options (e.g., upsert).
-    pub fn update_one_with_options(&self, filter: Document, update: Document, opts: UpdateOptions) -> Result<UpdateResult> {
+    pub fn update_one_with_options(
+        &self,
+        filter: Document,
+        update: Document,
+        opts: UpdateOptions,
+    ) -> Result<UpdateResult> {
         self.inner.update_one(&self.name, filter, update, opts)
     }
 
     /// Update all documents matching `filter`.
     pub fn update_many(&self, filter: Document, update: Document) -> Result<UpdateResult> {
-        self.inner.update_many(&self.name, filter, update, UpdateOptions::new())
+        self.inner
+            .update_many(&self.name, filter, update, UpdateOptions::new())
     }
 
     /// Update all documents matching `filter` with options.
-    pub fn update_many_with_options(&self, filter: Document, update: Document, opts: UpdateOptions) -> Result<UpdateResult> {
+    pub fn update_many_with_options(
+        &self,
+        filter: Document,
+        update: Document,
+        opts: UpdateOptions,
+    ) -> Result<UpdateResult> {
         self.inner.update_many(&self.name, filter, update, opts)
     }
 
@@ -145,7 +162,8 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// Atomically find the first document matching `filter`, replace it with `replacement`,
     /// and return the original document. Returns `None` if no document matched.
     pub fn find_one_and_replace(&self, filter: Document, replacement: &T) -> Result<Option<T>> {
-        self.inner.find_one_and_replace(&self.name, filter, replacement)
+        self.inner
+            .find_one_and_replace(&self.name, filter, replacement)
     }
 
     // -------------------------------------------------------------------------

@@ -62,14 +62,22 @@
 // Public modules
 // ---------------------------------------------------------------------------
 
-pub mod database;
-pub mod collection;
-pub mod cursor;
-pub mod error;
-pub mod options;
-pub mod index;
-pub mod results;
+/// BSON re-exports for ergonomic use without a direct `bson` dependency.
 pub mod bson_compat;
+/// Typed collection handles for CRUD operations.
+pub mod collection;
+/// Lazy cursor for iterating query results.
+pub mod cursor;
+/// The database entry point: open, clone, and manage the database.
+pub mod database;
+/// Error types and MongoDB-compatible error codes.
+pub mod error;
+/// Index definition and metadata types.
+pub mod index;
+/// Configuration options for database opening and query operations.
+pub mod options;
+/// Operation result types returned by write operations.
+pub mod results;
 
 // Internal modules (not public API)
 mod query;
@@ -85,21 +93,16 @@ pub mod wire;
 // ---------------------------------------------------------------------------
 
 // Core entry points
-pub use database::Database;
 pub use collection::Collection;
 pub use cursor::Cursor;
+pub use database::Database;
 
 // Error and Result
 pub use error::{Error, Result};
 
 // Configuration
 pub use options::{
-    DurabilityMode,
-    FindOptions,
-    InsertManyOptions,
-    IndexOptions,
-    OpenOptions,
-    UpdateOptions,
+    DurabilityMode, FindOptions, IndexOptions, InsertManyOptions, OpenOptions, UpdateOptions,
 };
 
 // Index

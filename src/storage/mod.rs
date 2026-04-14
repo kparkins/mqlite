@@ -15,6 +15,11 @@
 //!
 //! - hq-9vo: File format — header, page formats, ObjectId generation
 
-pub(crate) mod page;
+// Phase 0: storage engine structs and functions are defined but not yet wired
+// into the query/write paths (Phase 1). Allow dead_code for the whole module.
+#[allow(dead_code)]
 pub(crate) mod header;
+#[allow(dead_code)]
 pub(crate) mod oid;
+#[allow(dead_code)]
+pub(crate) mod page;

@@ -3,6 +3,13 @@
 //! Page 0 is always exactly 4 096 bytes (one internal-node page). The first
 //! 128 bytes hold structured header fields; the remaining 3 968 bytes are
 //! zero-filled padding reserved for future use.
+
+// All expect() calls in this module operate on fixed-size slice conversions
+// (e.g. `buf[0..4].try_into().expect("4 bytes")`). The slices are guaranteed
+// correct by construction — the buffer is always exactly PAGE_SIZE bytes.
+// These are safe in practice; they are allowed here pending a Phase 1 refactor
+// to a custom byte-reader helper that avoids expect_used entirely.
+#![allow(clippy::expect_used)]
 //!
 //! ## On-disk layout
 //!
@@ -499,7 +506,7 @@ mod tests {
         let original = fresh_header();
         let mut bytes = original.to_bytes();
         bytes[64] ^= 0xFF; // corrupt wal_salt1 LSB
-        // from_bytes should succeed (checksum still valid; corruption is outside range)
+                           // from_bytes should succeed (checksum still valid; corruption is outside range)
         let decoded = FileHeader::from_bytes(&bytes).expect("should parse");
         // The decoded salt reflects the corruption
         assert_ne!(decoded.wal_salt1, original.wal_salt1);

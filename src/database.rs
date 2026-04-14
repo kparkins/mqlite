@@ -18,6 +18,7 @@ use crate::{
 ///
 /// Wrapped in `Arc` and shared across `Database` clones, `Collection` handles, etc.
 /// This is the single-writer multi-reader (SWMR) synchronization point.
+#[allow(dead_code)] // Phase 0: fields used by storage engine (Phase 1)
 pub(crate) struct DatabaseInner {
     /// Path to the database file. `None` for in-memory databases.
     pub path: Option<PathBuf>,
@@ -46,8 +47,14 @@ impl DatabaseInner {
 // ---------------------------------------------------------------------------
 
 impl DatabaseInner {
-    pub(crate) fn insert_one<T: Serialize>(&self, _name: &str, _doc: &T) -> Result<InsertOneResult> {
-        Err(Error::Internal("insert_one: storage engine not yet implemented (Phase 1)".into()))
+    pub(crate) fn insert_one<T: Serialize>(
+        &self,
+        _name: &str,
+        _doc: &T,
+    ) -> Result<InsertOneResult> {
+        Err(Error::Internal(
+            "insert_one: storage engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn insert_many<T: Serialize>(
@@ -56,7 +63,9 @@ impl DatabaseInner {
         _docs: &[T],
         _opts: InsertManyOptions,
     ) -> Result<InsertManyResult> {
-        Err(Error::Internal("insert_many: storage engine not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "insert_many: storage engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn find_one<T: DeserializeOwned>(
@@ -64,7 +73,9 @@ impl DatabaseInner {
         _name: &str,
         _filter: Document,
     ) -> Result<Option<T>> {
-        Err(Error::Internal("find_one: query engine not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "find_one: query engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn find<T: DeserializeOwned>(
@@ -73,7 +84,9 @@ impl DatabaseInner {
         _filter: Document,
         _opts: FindOptions,
     ) -> Result<Cursor<T>> {
-        Err(Error::Internal("find: query engine not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "find: query engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn update_one(
@@ -83,7 +96,9 @@ impl DatabaseInner {
         _update: Document,
         _opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        Err(Error::Internal("update_one: storage engine not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "update_one: storage engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn update_many(
@@ -93,15 +108,21 @@ impl DatabaseInner {
         _update: Document,
         _opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        Err(Error::Internal("update_many: storage engine not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "update_many: storage engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn delete_one(&self, _name: &str, _filter: Document) -> Result<DeleteResult> {
-        Err(Error::Internal("delete_one: storage engine not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "delete_one: storage engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn delete_many(&self, _name: &str, _filter: Document) -> Result<DeleteResult> {
-        Err(Error::Internal("delete_many: storage engine not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "delete_many: storage engine not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn find_one_and_update<T: Serialize + DeserializeOwned>(
@@ -110,7 +131,9 @@ impl DatabaseInner {
         _filter: Document,
         _update: Document,
     ) -> Result<Option<T>> {
-        Err(Error::Internal("find_one_and_update: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "find_one_and_update: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn find_one_and_delete<T: DeserializeOwned>(
@@ -118,7 +141,9 @@ impl DatabaseInner {
         _name: &str,
         _filter: Document,
     ) -> Result<Option<T>> {
-        Err(Error::Internal("find_one_and_delete: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "find_one_and_delete: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn find_one_and_replace<T: Serialize + DeserializeOwned>(
@@ -127,47 +152,69 @@ impl DatabaseInner {
         _filter: Document,
         _replacement: &T,
     ) -> Result<Option<T>> {
-        Err(Error::Internal("find_one_and_replace: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "find_one_and_replace: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn estimated_document_count(&self, _name: &str) -> Result<u64> {
-        Err(Error::Internal("estimated_document_count: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "estimated_document_count: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn count_documents(&self, _name: &str, _filter: Document) -> Result<u64> {
-        Err(Error::Internal("count_documents: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "count_documents: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn create_index(&self, _name: &str, _model: IndexModel) -> Result<String> {
-        Err(Error::Internal("create_index: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "create_index: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn drop_index(&self, _name: &str, _index_name: &str) -> Result<()> {
-        Err(Error::Internal("drop_index: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "drop_index: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn list_indexes(&self, _name: &str) -> Result<Vec<IndexInfo>> {
-        Err(Error::Internal("list_indexes: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "list_indexes: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn list_collection_names(&self) -> Result<Vec<String>> {
-        Err(Error::Internal("list_collection_names: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "list_collection_names: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn drop_collection(&self, _name: &str) -> Result<()> {
-        Err(Error::Internal("drop_collection: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "drop_collection: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn create_collection(&self, _name: &str) -> Result<()> {
-        Err(Error::Internal("create_collection: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "create_collection: not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
-        Err(Error::Internal("checkpoint: WAL not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "checkpoint: WAL not yet implemented (Phase 1)".into(),
+        ))
     }
 
     pub(crate) fn backup(&self, _dest: &Path) -> Result<()> {
-        Err(Error::Internal("backup: not yet implemented (Phase 1)".into()))
+        Err(Error::Internal(
+            "backup: not yet implemented (Phase 1)".into(),
+        ))
     }
 }
 

@@ -28,7 +28,7 @@ impl WireProtocol {
     /// Connections are accepted on a separate task and the server is ready immediately.
     pub fn bind(_db: &Database, _addr: &str) -> Result<WireProtocol> {
         // Phase 1 stub: wire protocol implementation is tracked in hq-6d0
-        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        let (_tx, _rx) = tokio::sync::oneshot::channel::<()>();
         Err(crate::error::Error::Internal(
             "WireProtocol::bind: wire protocol not yet implemented (Phase 1, see hq-6d0)".into(),
         ))

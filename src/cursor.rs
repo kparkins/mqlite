@@ -29,6 +29,7 @@ pub struct Cursor<T> {
     done: bool,
 }
 
+#[allow(dead_code)] // Phase 0: constructors used by storage engine (Phase 1)
 impl<T> Cursor<T> {
     /// Create a cursor over a pre-loaded set of documents.
     /// Used internally by the collection implementation.

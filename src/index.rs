@@ -1,5 +1,6 @@
 use bson::Document;
 
+use crate::error::{Error, Result};
 use crate::options::IndexOptions;
 
 /// Specifies an index to create on a collection.
@@ -12,7 +13,8 @@ use crate::options::IndexOptions;
 /// let model = IndexModel::builder()
 ///     .keys(doc! { "email": 1 })
 ///     .options(IndexOptions::new().unique(true))
-///     .build();
+///     .build()?;
+/// # Ok::<(), mqlite::Error>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct IndexModel {
@@ -51,13 +53,16 @@ impl IndexModelBuilder {
 
     /// Build the `IndexModel`.
     ///
-    /// # Panics
-    /// Panics if `keys` was not set.
-    pub fn build(self) -> IndexModel {
-        IndexModel {
-            keys: self.keys.expect("IndexModel::builder().keys(...) is required"),
+    /// # Errors
+    /// Returns [`Error::Internal`] if `keys` was not set.
+    pub fn build(self) -> Result<IndexModel> {
+        let keys = self
+            .keys
+            .ok_or_else(|| Error::Internal("IndexModel::builder().keys(...) is required".into()))?;
+        Ok(IndexModel {
+            keys,
             options: self.options,
-        }
+        })
     }
 }
 

@@ -20,8 +20,8 @@
 //! # Ok::<(), mqlite::Error>(())
 //! ```
 
-pub mod server;
-pub mod protocol;
 pub mod commands;
+pub mod protocol;
+pub mod server;
 
 pub use server::WireProtocol;

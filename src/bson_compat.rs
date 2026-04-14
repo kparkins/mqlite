@@ -6,11 +6,4 @@
 /// ```no_run
 /// use mqlite::{doc, Document, Bson, ObjectId, DateTime};
 /// ```
-
-pub use bson::{
-    doc,
-    Bson,
-    Document,
-    DateTime,
-    oid::ObjectId,
-};
+pub use bson::{doc, oid::ObjectId, Bson, DateTime, Document};
