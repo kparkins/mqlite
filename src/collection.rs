@@ -13,7 +13,7 @@ use crate::{
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
 };
 
-/// A handle to a named collection within a [`Database`].
+/// A handle to a named collection within a [`crate::Database`].
 ///
 /// `Collection<T>` is cheap to clone — all clones share the same underlying storage.
 ///

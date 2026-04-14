@@ -118,7 +118,7 @@ pub fn encode_key(value: &Bson) -> Vec<u8> {
 
 /// Encode a compound index key from a list of `(value, ascending)` pairs.
 ///
-/// Fields are separated by [`COMPOUND_SEP`] (`0x01`).  Descending fields have
+/// Fields are separated by `COMPOUND_SEP` (`0x01`).  Descending fields have
 /// their encoding bytes bitwise-inverted so that `memcmp` reverses their order.
 ///
 /// # Examples

@@ -31,7 +31,7 @@ impl std::fmt::Debug for BusyHandler {
     }
 }
 
-/// Configuration for [`Database::open_with_options`].
+/// Configuration for [`crate::Database::open_with_options`].
 ///
 /// Use the builder methods for ergonomic construction:
 /// ```no_run
@@ -57,7 +57,7 @@ pub struct OpenOptions {
     /// Set to `Duration::ZERO` for immediate failure (SQLite-style SQLITE_BUSY).
     pub busy_timeout: Duration,
     /// Optional busy handler callback. Called when the writer lock is contended.
-    /// Return `true` to retry, `false` to fail with [`Error::WriterBusy`].
+    /// Return `true` to retry, `false` to fail with [`crate::Error::WriterBusy`].
     pub busy_handler: Option<BusyHandler>,
     /// Open in read-only mode. WAL replay is skipped.
     /// Default: false.
@@ -123,7 +123,7 @@ impl OpenOptions {
 
     /// Set a callback invoked when the writer lock is contended.
     /// `attempts` is the number of retries so far.
-    /// Return `true` to retry, `false` to fail with [`Error::WriterBusy`].
+    /// Return `true` to retry, `false` to fail with [`crate::Error::WriterBusy`].
     pub fn busy_handler(mut self, handler: impl Fn(u32) -> bool + Send + Sync + 'static) -> Self {
         self.busy_handler = Some(BusyHandler(Arc::new(handler)));
         self

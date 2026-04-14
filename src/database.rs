@@ -695,7 +695,7 @@ impl Database {
 impl Drop for Database {
     /// Non-blocking close.
     ///
-    /// Drops this handle's reference to the shared [`DatabaseInner`]. When
+    /// Drops this handle's reference to the shared `DatabaseInner`. When
     /// the **last** clone is dropped the OS advisory file lock is released
     /// automatically by `DatabaseInner`'s destructor (which drops
     /// `file_lock`).
@@ -709,7 +709,7 @@ impl Drop for Database {
     /// guaranteed-clean shutdown (e.g., before copying the database file
     /// as a backup).
     ///
-    /// In-memory databases (`open_in_memory`) hold a [`NoopFileLock`]; their
+    /// In-memory databases (`open_in_memory`) hold a `NoopFileLock`; their
     /// drop is a free Arc decrement with no I/O.
     fn drop(&mut self) {
         // The Arc<DatabaseInner> field is dropped automatically by the

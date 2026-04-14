@@ -51,6 +51,49 @@
 //! The base crate is **sync-only**. Enabling the `wire` feature adds an async
 //! runtime dependency (tokio) for the TCP listener, but the core CRUD API remains
 //! synchronous. This keeps the dependency footprint minimal for embedded and IoT use cases.
+//!
+//! # Thread Safety
+//!
+//! | Type | `Send` | `Sync` | Notes |
+//! |------|--------|--------|-------|
+//! | [`Database`] | ✅ | ✅ | Clone and share across threads freely |
+//! | [`Collection<T>`] | ✅ | ✅ | Same shared state as `Database` |
+//! | [`Cursor<T>`] | ✅ | ❌ | Move to another thread; use `Mutex` for concurrent access |
+//! | [`Error`] | ✅ | ✅ | — |
+//!
+//! `Database` and `Collection<T>` can be cloned and sent to other threads without
+//! any additional synchronization. mqlite serializes concurrent writes internally
+//! with a `Mutex`. Reads are also serialized through the engine `Mutex` in Phase 1.
+//!
+//! `Cursor<T>` is `Send` but not `Sync` — matching the MongoDB Rust driver contract.
+//! Use `Mutex<Cursor<T>>` if you need to drive a cursor from multiple threads simultaneously.
+//!
+//! # File Lifecycle
+//!
+//! ```text
+//! Database::open("myapp.mqlite")
+//!   ├─ Creates myapp.mqlite        (main database file)
+//!   ├─ Creates myapp.mqlite-wal    (write-ahead log; accumulates writes)
+//!   └─ Creates myapp.mqlite-shm   (WAL shared-memory index; deleted on clean close)
+//!
+//! Database::close(self)           (blocking flush + checkpoint)
+//!   └─ myapp.mqlite-wal is checkpointed into myapp.mqlite and removed
+//!      → "single file" state
+//!
+//! drop(db)                        (non-blocking)
+//!   └─ myapp.mqlite-wal remains on disk
+//!      → Replayed automatically on next Database::open
+//! ```
+//!
+//! The `close()` method is the recommended shutdown path when you need a guaranteed-clean
+//! single-file state (e.g., before copying the database as a backup).
+//!
+//! # Security Notes
+//!
+//! - **File permissions**: new `.mqlite` files are created with mode `0600` (Unix)
+//! - **Symlink prevention**: [`Error::SymlinkRejected`] is returned if the path is a symlink
+//! - **Wire protocol**: no authentication in Phase 1 — bind to `127.0.0.1` only;
+//!   see the [Wire Protocol Security Advisory](https://github.com/kyleparkinson/mqlite/blob/master/docs/WIRE-SECURITY.md)
 
 // Lint policy: deny common footguns that indicate implementation errors.
 // Unwrap-used is left as a warning (not deny) because stub implementations use it during
