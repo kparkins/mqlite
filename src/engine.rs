@@ -73,6 +73,15 @@ impl EngineState {
             collections: HashMap::new(),
         }
     }
+}
+
+impl Default for EngineState {
+    fn default() -> Self {
+        EngineState::new()
+    }
+}
+
+impl EngineState {
 
     // Lazily create a collection on first access.
     fn get_or_create(&mut self, name: &str) -> &mut CollectionState {
@@ -115,6 +124,11 @@ impl EngineState {
             }
         };
 
+        // Enforce unique index constraints before inserting.
+        {
+            let coll = self.get_or_create(name);
+            Self::check_unique_constraints(coll, &bson_doc)?;
+        }
         let coll = self.get_or_create(name);
         coll.docs.push(bson_doc);
         Ok(InsertOneResult { inserted_id: oid })
@@ -129,15 +143,15 @@ impl EngineState {
         let mut inserted_ids: HashMap<usize, Bson> = HashMap::new();
         let mut errors: Vec<BulkWriteError> = Vec::new();
 
-        for (idx, raw) in docs.iter().enumerate() {
+        'outer: for (idx, raw) in docs.iter().enumerate() {
             // Serialize + validate each document independently.
             let result: Result<Document> = (|| {
-                let mut bson_doc = bson::to_document(raw).map_err(Error::BsonSerialization)?;
+                let bson_doc = bson::to_document(raw).map_err(Error::BsonSerialization)?;
                 validate_document(&bson_doc)?;
                 Ok(bson_doc)
             })();
 
-            match result {
+            let mut bson_doc = match result {
                 Err(e) => {
                     errors.push(BulkWriteError {
                         index: idx,
@@ -145,19 +159,34 @@ impl EngineState {
                         message: e.to_string(),
                     });
                     if opts.ordered {
-                        // Stop at first error.
-                        return Err(Error::Internal(format!(
-                            "insert_many ordered: stopped at index {idx}: {e}"
-                        )));
+                        // Stop processing at first error (ordered semantics).
+                        break 'outer;
                     }
+                    continue;
                 }
-                Ok(mut bson_doc) => {
-                    let id = Self::ensure_id(&mut bson_doc);
-                    let coll = self.get_or_create(name);
-                    coll.docs.push(bson_doc);
-                    inserted_ids.insert(idx, id);
+                Ok(doc) => doc,
+            };
+
+            // Enforce unique index constraints.
+            {
+                let coll = self.get_or_create(name);
+                if let Err(e) = Self::check_unique_constraints(coll, &bson_doc) {
+                    errors.push(BulkWriteError {
+                        index: idx,
+                        code: e.code().unwrap_or(1),
+                        message: e.to_string(),
+                    });
+                    if opts.ordered {
+                        break 'outer;
+                    }
+                    continue;
                 }
             }
+
+            let id = Self::ensure_id(&mut bson_doc);
+            let coll = self.get_or_create(name);
+            coll.docs.push(bson_doc);
+            inserted_ids.insert(idx, id);
         }
 
         Ok(InsertManyResult {
@@ -216,12 +245,16 @@ impl EngineState {
             match scan_plan {
                 ScanPlan::CollScan => {
                     let docs_examined = coll.docs.len() as u64;
-                    let matched = coll
-                        .docs
-                        .iter()
-                        .filter(|doc| eval_filter(doc, &filter).unwrap_or(false))
-                        .cloned()
-                        .collect();
+                    // Propagate filter errors instead of silently suppressing
+                    // them (e.g., UnsupportedOperator for $where).
+                    let mut matched: Vec<Document> = Vec::new();
+                    for doc in &coll.docs {
+                        match eval_filter(doc, &filter) {
+                            Ok(true) => matched.push(doc.clone()),
+                            Ok(false) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
                     (matched, docs_examined, None)
                 }
 
@@ -247,11 +280,15 @@ impl EngineState {
                     let docs_examined = candidates.len() as u64;
 
                     // Step 2 — Apply the full query predicate for correctness.
-                    let matched: Vec<Document> = candidates
-                        .into_iter()
-                        .filter(|doc| eval_filter(doc, &filter).unwrap_or(false))
-                        .cloned()
-                        .collect();
+                    // Propagate filter errors instead of silently suppressing them.
+                    let mut matched: Vec<Document> = Vec::new();
+                    for doc in candidates {
+                        match eval_filter(doc, &filter) {
+                            Ok(true) => matched.push(doc.clone()),
+                            Ok(false) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
 
                     (matched, docs_examined, Some(index_name))
                 }
@@ -719,6 +756,178 @@ impl EngineState {
                 sparse: r.model.options.sparse,
             })
             .collect())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Unique index constraint checking
+    // ---------------------------------------------------------------------------
+
+    /// Check all unique indexes on `coll` for conflicts with `doc`.
+    ///
+    /// Returns `Err(Error::DuplicateKey)` if any unique index would be violated
+    /// by inserting `doc`. Sparse indexes skip documents where all key fields
+    /// are absent.
+    fn check_unique_constraints(coll: &CollectionState, doc: &Document) -> Result<()> {
+        use crate::key_encoding::encode_key;
+
+        for idx_record in &coll.indexes {
+            if !idx_record.model.options.unique {
+                continue;
+            }
+
+            let fields: Vec<&str> = idx_record.model.keys.keys().map(String::as_str).collect();
+
+            // Build encoded key for the new document.
+            let new_encoded: Vec<Vec<u8>> = fields
+                .iter()
+                .map(|f| encode_key(doc.get(*f).unwrap_or(&Bson::Null)))
+                .collect();
+
+            // Sparse index: skip when all indexed fields are null/absent.
+            let null_encoded = encode_key(&Bson::Null);
+            if idx_record.model.options.sparse
+                && new_encoded.iter().all(|v| v == &null_encoded)
+            {
+                continue;
+            }
+
+            // Check against every existing document.
+            for existing_doc in &coll.docs {
+                let existing_encoded: Vec<Vec<u8>> = fields
+                    .iter()
+                    .map(|f| encode_key(existing_doc.get(*f).unwrap_or(&Bson::Null)))
+                    .collect();
+
+                if new_encoded == existing_encoded {
+                    return Err(Error::DuplicateKey {
+                        detail: format!(
+                            "E11000 duplicate key error — unique index '{}': dup key {{{}}}",
+                            idx_record.name,
+                            fields
+                                .iter()
+                                .map(|f| format!("{}: {:?}", f, doc.get(*f)))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Persistence: BSON snapshot serialization / deserialization
+    // ---------------------------------------------------------------------------
+
+    /// Serialize the entire engine state to a BSON-encoded snapshot.
+    ///
+    /// Format:
+    /// ```bson
+    /// { version: 1, collections: { <name>: { docs: [...], indexes: [...] } } }
+    /// ```
+    pub(crate) fn to_bson_bytes(&self) -> Result<Vec<u8>> {
+        let mut collections_doc = Document::new();
+
+        for (name, coll) in &self.collections {
+            let docs: Vec<Bson> = coll.docs.iter().map(|d| Bson::Document(d.clone())).collect();
+
+            let indexes: Vec<Bson> = coll
+                .indexes
+                .iter()
+                .map(|idx| {
+                    Bson::Document(bson::doc! {
+                        "name": &idx.name,
+                        "keys": idx.model.keys.clone(),
+                        "unique": idx.model.options.unique,
+                        "sparse": idx.model.options.sparse,
+                        "customName": idx.model.options.name.clone().unwrap_or_default(),
+                    })
+                })
+                .collect();
+
+            collections_doc.insert(
+                name.as_str(),
+                Bson::Document(bson::doc! {
+                    "docs":    Bson::Array(docs),
+                    "indexes": Bson::Array(indexes),
+                }),
+            );
+        }
+
+        let snapshot = bson::doc! {
+            "version":     1i32,
+            "collections": collections_doc,
+        };
+
+        bson::to_vec(&snapshot).map_err(Error::BsonSerialization)
+    }
+
+    /// Deserialize engine state from BSON bytes produced by [`to_bson_bytes`].
+    ///
+    /// On parse failure returns `Err` — callers should fall back to a fresh
+    /// `EngineState::new()` if no prior data is expected.
+    pub(crate) fn from_bson_bytes(bytes: &[u8]) -> Result<Self> {
+        use crate::options::IndexOptions;
+
+        let snapshot: Document = bson::from_slice(bytes).map_err(Error::BsonDeserialization)?;
+
+        let mut engine = EngineState::new();
+
+        let Some(Bson::Document(collections_doc)) = snapshot.get("collections") else {
+            return Ok(engine);
+        };
+
+        for (name, coll_bson) in collections_doc {
+            let Bson::Document(coll_doc) = coll_bson else {
+                continue;
+            };
+
+            let coll = engine.get_or_create(name);
+
+            if let Some(Bson::Array(docs)) = coll_doc.get("docs") {
+                for doc_bson in docs {
+                    if let Bson::Document(d) = doc_bson {
+                        coll.docs.push(d.clone());
+                    }
+                }
+            }
+
+            if let Some(Bson::Array(indexes)) = coll_doc.get("indexes") {
+                for idx_bson in indexes {
+                    let Bson::Document(idx_doc) = idx_bson else {
+                        continue;
+                    };
+                    let Ok(idx_name) = idx_doc.get_str("name") else {
+                        continue;
+                    };
+                    let Ok(keys) = idx_doc.get_document("keys") else {
+                        continue;
+                    };
+                    let unique = idx_doc.get_bool("unique").unwrap_or(false);
+                    let sparse = idx_doc.get_bool("sparse").unwrap_or(false);
+                    let custom = idx_doc
+                        .get_str("customName")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+
+                    coll.indexes.push(IndexRecord {
+                        name: idx_name.to_string(),
+                        model: crate::index::IndexModel {
+                            keys: keys.clone(),
+                            options: IndexOptions {
+                                unique,
+                                sparse,
+                                name: custom,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+
+        Ok(engine)
     }
 }
 
