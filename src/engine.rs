@@ -26,7 +26,10 @@ use crate::{
         FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
         FindOptions, InsertManyOptions, ReturnDocument, UpdateOptions,
     },
-    query::{eval_filter, get_nested_field},
+    query::{
+        eval_filter, get_nested_field,
+        planner::{self, IndexMeta, ScanPlan},
+    },
     results::{BulkWriteError, DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
     storage::oid::ObjectIdGenerator,
     update_operators::{apply_update, is_operator_update, upsert_base_from_filter},
@@ -195,16 +198,64 @@ impl EngineState {
             return Ok(crate::cursor::Cursor::empty());
         };
 
-        // Track total documents examined (full collection scan in Phase 1).
-        let docs_examined = coll.docs.len() as u64;
-
-        // Collect all matching documents.
-        let mut matched: Vec<Document> = coll
-            .docs
+        // Build lightweight index descriptors for the planner.
+        let index_metas: Vec<IndexMeta<'_>> = coll
+            .indexes
             .iter()
-            .filter(|doc| eval_filter(doc, &filter).unwrap_or(false))
-            .cloned()
+            .map(|r| IndexMeta {
+                name: &r.name,
+                keys: &r.model.keys,
+            })
             .collect();
+
+        // Select a query plan.
+        let scan_plan = planner::select_plan(&filter, &index_metas);
+
+        // Execute the selected plan and collect matched documents.
+        let (mut matched, docs_examined, index_used): (Vec<Document>, u64, Option<String>) =
+            match scan_plan {
+                ScanPlan::CollScan => {
+                    let docs_examined = coll.docs.len() as u64;
+                    let matched = coll
+                        .docs
+                        .iter()
+                        .filter(|doc| eval_filter(doc, &filter).unwrap_or(false))
+                        .cloned()
+                        .collect();
+                    (matched, docs_examined, None)
+                }
+
+                ScanPlan::IndexScan {
+                    index_name,
+                    primary_field,
+                    condition,
+                } => {
+                    // Phase 1b: in-memory index scan.
+                    //
+                    // Step 1 — Pre-filter: collect documents whose indexed field
+                    // satisfies the index condition.  This is a necessary (not
+                    // sufficient) condition, so docs_examined reflects the
+                    // number of candidates examined by the index.
+                    let candidates: Vec<&Document> = coll
+                        .docs
+                        .iter()
+                        .filter(|doc| {
+                            let val = get_nested_field(doc, &primary_field);
+                            planner::index_condition_matches(val, &condition)
+                        })
+                        .collect();
+                    let docs_examined = candidates.len() as u64;
+
+                    // Step 2 — Apply the full query predicate for correctness.
+                    let matched: Vec<Document> = candidates
+                        .into_iter()
+                        .filter(|doc| eval_filter(doc, &filter).unwrap_or(false))
+                        .cloned()
+                        .collect();
+
+                    (matched, docs_examined, Some(index_name))
+                }
+            };
 
         // Sort.
         if let Some(sort_doc) = opts.sort {
@@ -228,7 +279,7 @@ impl EngineState {
             }
         }
 
-        // Projection (basic include/exclude).
+        // Projection (include/exclude fields).
         if let Some(proj) = opts.projection {
             matched = matched
                 .into_iter()
@@ -236,7 +287,15 @@ impl EngineState {
                 .collect();
         }
 
-        Ok(crate::cursor::Cursor::new(matched, docs_examined))
+        // Build cursor with the correct explain plan.
+        match index_used {
+            None => Ok(crate::cursor::Cursor::new(matched, docs_examined)),
+            Some(idx_name) => Ok(crate::cursor::Cursor::new_index_scan(
+                matched,
+                docs_examined,
+                idx_name,
+            )),
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -1416,5 +1475,472 @@ mod tests {
         //
         // fn needs_sync<T: Sync>() {}
         // needs_sync::<crate::cursor::Cursor<Document>>();  // ← compile error
+    }
+
+    // ---- Query planner: index selection ------------------------------------
+
+    #[test]
+    fn ixscan_selected_when_index_exists_for_filter_field() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "email": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..5i32 {
+            eng.insert_one("u", &doc! { "email": format!("user{}@x.com", i) })
+                .unwrap();
+        }
+
+        let cursor = eng
+            .find::<Document>("u", doc! { "email": "user2@x.com" }, FindOptions::new())
+            .unwrap();
+        let explain = cursor.explain().unwrap();
+
+        assert!(!explain.full_scan, "expected IXSCAN, got COLLSCAN");
+        assert_eq!(explain.index_used.as_deref(), Some("email_1"));
+        assert!(explain.plan.contains("IXSCAN"));
+    }
+
+    #[test]
+    fn collscan_when_no_index_matches_filter() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        // Index on "email" but we filter on "name".
+        let model = IndexModel::builder()
+            .keys(doc! { "email": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        eng.insert_one("u", &doc! { "name": "Alice", "email": "a@x.com" })
+            .unwrap();
+
+        let cursor = eng
+            .find::<Document>("u", doc! { "name": "Alice" }, FindOptions::new())
+            .unwrap();
+        let explain = cursor.explain().unwrap();
+
+        assert!(explain.full_scan);
+        assert!(explain.index_used.is_none());
+    }
+
+    #[test]
+    fn ixscan_docs_examined_less_than_total_docs() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        // 10 docs; only 2 have score == 42.
+        for i in 0..8i32 {
+            eng.insert_one("u", &doc! { "score": i }).unwrap();
+        }
+        eng.insert_one("u", &doc! { "score": 42i32 }).unwrap();
+        eng.insert_one("u", &doc! { "score": 42i32 }).unwrap();
+
+        let cursor = eng
+            .find::<Document>("u", doc! { "score": 42i32 }, FindOptions::new())
+            .unwrap();
+        let explain = cursor.explain().unwrap();
+
+        assert!(!explain.full_scan);
+        // Only the 2 matching docs were examined via the index.
+        assert_eq!(explain.docs_examined, 2);
+    }
+
+    // ---- Index-vs-scan consistency -----------------------------------------
+
+    /// Helper: run the same query with and without an index; verify same results.
+    fn consistency_check(
+        eng: &mut EngineState,
+        filter: Document,
+        expected_count: usize,
+    ) {
+        // With index (IXSCAN).
+        let ixscan_docs: Vec<Document> = eng
+            .find::<Document>("u", filter.clone(), FindOptions::new())
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        // Drop the index so the next query uses COLLSCAN.
+        eng.drop_index("u", "score_1").unwrap();
+
+        let collscan_docs: Vec<Document> = eng
+            .find::<Document>("u", filter, FindOptions::new())
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        // Recreate the index for the next test run.
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+
+        assert_eq!(
+            ixscan_docs.len(),
+            expected_count,
+            "IXSCAN returned wrong count"
+        );
+        assert_eq!(
+            collscan_docs.len(),
+            expected_count,
+            "COLLSCAN returned wrong count"
+        );
+
+        // Same document _ids in both result sets.
+        // Encode _ids as bytes (Vec<u8>) for Hash/Eq comparison.
+        let id_bytes = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
+            use crate::key_encoding::encode_key;
+            docs.iter()
+                .filter_map(|d| d.get("_id"))
+                .map(encode_key)
+                .collect()
+        };
+        assert_eq!(
+            id_bytes(&ixscan_docs),
+            id_bytes(&collscan_docs),
+            "IXSCAN and COLLSCAN returned different documents"
+        );
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_eq() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..10i32 {
+            eng.insert_one("u", &doc! { "score": i % 5 }).unwrap();
+        }
+        consistency_check(&mut eng, doc! { "score": 3i32 }, 2);
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_gt() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..10i32 {
+            eng.insert_one("u", &doc! { "score": i }).unwrap();
+        }
+        consistency_check(&mut eng, doc! { "score": { "$gt": 7i32 } }, 2);
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_gte() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..10i32 {
+            eng.insert_one("u", &doc! { "score": i }).unwrap();
+        }
+        consistency_check(&mut eng, doc! { "score": { "$gte": 8i32 } }, 2);
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_lt() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..10i32 {
+            eng.insert_one("u", &doc! { "score": i }).unwrap();
+        }
+        consistency_check(&mut eng, doc! { "score": { "$lt": 2i32 } }, 2);
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_lte() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..10i32 {
+            eng.insert_one("u", &doc! { "score": i }).unwrap();
+        }
+        consistency_check(&mut eng, doc! { "score": { "$lte": 1i32 } }, 2);
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_in() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..10i32 {
+            eng.insert_one("u", &doc! { "score": i }).unwrap();
+        }
+        consistency_check(&mut eng, doc! { "score": { "$in": [2i32, 5i32, 8i32] } }, 3);
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_range_combined() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "score": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        for i in 0..10i32 {
+            eng.insert_one("u", &doc! { "score": i }).unwrap();
+        }
+        // $gte: 3, $lte: 6  → docs 3,4,5,6
+        consistency_check(
+            &mut eng,
+            doc! { "score": { "$gte": 3i32, "$lte": 6i32 } },
+            4,
+        );
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_elematch() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "scores": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", model).unwrap();
+        // Drop + re-index helper uses "score_1"; use a different name here.
+        eng.drop_index("u", "scores_1").unwrap();
+        let model2 = IndexModel::builder()
+            .keys(doc! { "scores": 1i32 })
+            .build()
+            .unwrap();
+        let idx_name = eng.create_index("u", model2).unwrap();
+
+        eng.insert_one("u", &doc! { "scores": [1i32, 2i32, 3i32] })
+            .unwrap();
+        eng.insert_one("u", &doc! { "scores": [10i32, 20i32] })
+            .unwrap();
+        eng.insert_one("u", &doc! { "scores": [5i32, 6i32] })
+            .unwrap();
+
+        // With index.
+        let with_idx: Vec<Document> = eng
+            .find::<Document>(
+                "u",
+                doc! { "scores": { "$elemMatch": { "$gt": 15i32 } } },
+                FindOptions::new(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        // Drop index.
+        eng.drop_index("u", &idx_name).unwrap();
+
+        // Without index.
+        let without_idx: Vec<Document> = eng
+            .find::<Document>(
+                "u",
+                doc! { "scores": { "$elemMatch": { "$gt": 15i32 } } },
+                FindOptions::new(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        assert_eq!(with_idx.len(), 1, "should match doc with [10,20]");
+        assert_eq!(without_idx.len(), 1, "should match doc with [10,20]");
+        let id_keys = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
+            use crate::key_encoding::encode_key;
+            docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+        };
+        assert_eq!(id_keys(&with_idx), id_keys(&without_idx));
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_all() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "tags": 1i32 })
+            .build()
+            .unwrap();
+        let idx_name = eng.create_index("u", model).unwrap();
+
+        eng.insert_one("u", &doc! { "tags": ["rust", "db"] }).unwrap();
+        eng.insert_one("u", &doc! { "tags": ["rust", "web"] }).unwrap();
+        eng.insert_one("u", &doc! { "tags": ["python", "db"] }).unwrap();
+
+        // With index.
+        let with_idx: Vec<Document> = eng
+            .find::<Document>(
+                "u",
+                doc! { "tags": { "$all": ["rust", "db"] } },
+                FindOptions::new(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        eng.drop_index("u", &idx_name).unwrap();
+
+        let without_idx: Vec<Document> = eng
+            .find::<Document>(
+                "u",
+                doc! { "tags": { "$all": ["rust", "db"] } },
+                FindOptions::new(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        assert_eq!(with_idx.len(), 1);
+        assert_eq!(without_idx.len(), 1);
+        {
+            let id_keys = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
+                use crate::key_encoding::encode_key;
+                docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+            };
+            assert_eq!(id_keys(&with_idx), id_keys(&without_idx));
+        }
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_regex() {
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "email": 1i32 })
+            .build()
+            .unwrap();
+        let idx_name = eng.create_index("u", model).unwrap();
+
+        eng.insert_one("u", &doc! { "email": "alice@example.com" }).unwrap();
+        eng.insert_one("u", &doc! { "email": "bob@test.org" }).unwrap();
+        eng.insert_one("u", &doc! { "email": "carol@example.com" }).unwrap();
+
+        let with_idx: Vec<Document> = eng
+            .find::<Document>(
+                "u",
+                doc! { "email": { "$regex": "@example\\.com$" } },
+                FindOptions::new(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        eng.drop_index("u", &idx_name).unwrap();
+
+        let without_idx: Vec<Document> = eng
+            .find::<Document>(
+                "u",
+                doc! { "email": { "$regex": "@example\\.com$" } },
+                FindOptions::new(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+
+        assert_eq!(with_idx.len(), 2);
+        assert_eq!(without_idx.len(), 2);
+        {
+            let id_keys = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
+                use crate::key_encoding::encode_key;
+                docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+            };
+            assert_eq!(id_keys(&with_idx), id_keys(&without_idx));
+        }
+    }
+
+    #[test]
+    fn compound_index_used_for_leftmost_prefix_query() {
+        let mut eng = engine();
+        eng.create_collection("orders").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "customer": 1i32, "amount": -1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("orders", model).unwrap();
+
+        for i in 0..5i32 {
+            eng.insert_one(
+                "orders",
+                &doc! { "customer": "Alice", "amount": i * 10 },
+            )
+            .unwrap();
+        }
+        eng.insert_one("orders", &doc! { "customer": "Bob", "amount": 99i32 })
+            .unwrap();
+
+        let cursor = eng
+            .find::<Document>(
+                "orders",
+                doc! { "customer": "Alice" },
+                FindOptions::new(),
+            )
+            .unwrap();
+        let explain = cursor.explain().unwrap();
+
+        assert!(!explain.full_scan);
+        assert_eq!(
+            explain.index_used.as_deref(),
+            Some("customer_1_amount_-1")
+        );
+        let docs: Vec<Document> = eng
+            .find::<Document>(
+                "orders",
+                doc! { "customer": "Alice" },
+                FindOptions::new(),
+            )
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(docs.len(), 5);
+    }
+
+    #[test]
+    fn compound_index_not_used_for_non_prefix_query() {
+        let mut eng = engine();
+        eng.create_collection("orders").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "customer": 1i32, "amount": -1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("orders", model).unwrap();
+
+        eng.insert_one("orders", &doc! { "customer": "Alice", "amount": 50i32 })
+            .unwrap();
+
+        // Filter on "amount" only — leftmost key "customer" is absent.
+        let cursor = eng
+            .find::<Document>(
+                "orders",
+                doc! { "amount": { "$gte": 30i32 } },
+                FindOptions::new(),
+            )
+            .unwrap();
+        let explain = cursor.explain().unwrap();
+        assert!(explain.full_scan);
+        assert!(explain.index_used.is_none());
     }
 }

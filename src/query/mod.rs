@@ -8,13 +8,10 @@
 //! - hq-mx1: Error taxonomy and MongoDB error code mapping
 //! - hq-uii: Filter evaluation engine (comparison, logical, element operators)
 //! - hq-ca5: Array operators ($elemMatch, $all, $size) and evaluation ($regex)
+//! - hq-1gt: Query planner (index selection, sort, projection)
 
 mod filter;
+pub(crate) mod planner;
 
-// Filter evaluation is the primary query-engine entry point.
-// Suppressed unused-import warnings: these will be used when the storage
-// engine calls into the query engine (Phase 1 follow-up work).
-#[allow(unused_imports)]
 pub(crate) use filter::eval_filter;
-#[allow(unused_imports)]
 pub(crate) use filter::get_nested_field;
