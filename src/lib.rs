@@ -139,6 +139,10 @@ mod wal;
 #[cfg(all(test, unix))]
 mod crash_recovery_tests;
 
+// Native API compatibility and persistence tests (hq-2yk).
+#[cfg(test)]
+mod compat_tests;
+
 // Wire protocol shim (feature-gated)
 #[cfg(feature = "wire")]
 pub mod wire;

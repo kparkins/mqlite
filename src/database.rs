@@ -191,6 +191,23 @@ impl DatabaseInner {
             engine: Mutex::new(EngineState::new()),
         }
     }
+
+    /// Create a `DatabaseInner` with a pre-loaded `EngineState` (used when
+    /// restoring a persisted snapshot on `open_with_options`).
+    fn new_with_engine(
+        path: Option<PathBuf>,
+        opts: OpenOptions,
+        file_lock: Box<dyn FileLock>,
+        engine: EngineState,
+    ) -> Self {
+        DatabaseInner {
+            path,
+            opts,
+            writer_lock: Mutex::new(()),
+            file_lock,
+            engine: Mutex::new(engine),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,8 +446,19 @@ impl DatabaseInner {
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
-        // Phase 1b: in-memory engine has no WAL to checkpoint.
-        // This is a no-op until the B+tree/WAL storage engine is wired in.
+        // Serialize the in-memory engine state to the database file.
+        //
+        // Phase 1b persistence: the engine state is written as a BSON snapshot
+        // at byte offset HEADER_PAGE_SIZE in the database file.  On re-open,
+        // `open_with_options` reads and restores this snapshot.
+        //
+        // In-memory databases (path == None) are a no-op.
+        if self.path.is_none() {
+            return Ok(());
+        }
+
+        let snapshot = self.engine.lock().unwrap().to_bson_bytes()?;
+        self.file_lock.write_at(HEADER_PAGE_SIZE as u64, &snapshot)?;
         Ok(())
     }
 
@@ -614,7 +642,23 @@ impl Database {
             read_and_validate_header(file_lock.as_ref(), &path)?;
         }
 
-        let inner = Arc::new(DatabaseInner::new(Some(path.clone()), opts, file_lock));
+        // Restore persisted engine state if a snapshot is present.
+        //
+        // A snapshot is written by `checkpoint()` / `close()` at byte offset
+        // HEADER_PAGE_SIZE.  If the file is larger than the header, we attempt
+        // to deserialize the snapshot; failures start with a fresh engine.
+        let engine = if file_size > HEADER_PAGE_SIZE as u64 {
+            let snapshot_len = (file_size as usize) - HEADER_PAGE_SIZE;
+            let mut snapshot_buf = vec![0u8; snapshot_len];
+            match file_lock.read_exact_at(HEADER_PAGE_SIZE as u64, &mut snapshot_buf) {
+                Ok(()) => EngineState::from_bson_bytes(&snapshot_buf).unwrap_or_default(),
+                Err(_) => EngineState::default(),
+            }
+        } else {
+            EngineState::default()
+        };
+
+        let inner = Arc::new(DatabaseInner::new_with_engine(Some(path.clone()), opts, file_lock, engine));
         #[cfg(feature = "tracing")]
         tracing::info!(
             target: "mqlite",
@@ -712,11 +756,15 @@ impl Drop for Database {
     /// In-memory databases (`open_in_memory`) hold a `NoopFileLock`; their
     /// drop is a free Arc decrement with no I/O.
     fn drop(&mut self) {
-        // The Arc<DatabaseInner> field is dropped automatically by the
-        // compiler-generated field-drop glue that runs after this method
-        // returns.  No explicit action is needed here for Phase 1.
+        // Flush the engine state to disk when the last reference is dropped.
         //
-        // Future: signal the background WAL flusher thread to stop.
+        // We only checkpoint when this is the last clone (strong_count == 1)
+        // to avoid redundant writes from intermediate clones being dropped.
+        // In-memory databases (path == None) skip the write.
+        if Arc::strong_count(&self.inner) == 1 {
+            // Best-effort: ignore errors in drop (cannot propagate).
+            let _ = self.inner.checkpoint();
+        }
     }
 }
 
