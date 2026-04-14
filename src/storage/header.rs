@@ -594,4 +594,79 @@ mod tests {
         // different salts.
         assert_ne!(s1a, s1b);
     }
+
+    // -----------------------------------------------------------------------
+    // Golden bytes — cross-platform endianness contract
+    // -----------------------------------------------------------------------
+
+    /// Verify exact byte layout of the serialized header.
+    ///
+    /// This test proves that every multi-byte field is written in
+    /// **explicit little-endian** order.  A file created on x86_64
+    /// must be byte-identical and readable on aarch64 (and vice-versa).
+    ///
+    /// If native-endian writes were ever introduced, this test would fail
+    /// on big-endian targets and the cross-platform CI job would catch the
+    /// regression on aarch64 hardware.
+    #[test]
+    fn golden_bytes_little_endian_layout() {
+        let h = FileHeader::new(TEST_TS, 0xDEAD_BEEF, 0xCAFE_BABE);
+        let bytes = h.to_bytes();
+
+        // Magic "MQLT" is ASCII — byte order is irrelevant but must be exact.
+        assert_eq!(&bytes[0..4], b"MQLT", "magic mismatch");
+
+        // Format version = 1  →  LE bytes [0x01, 0x00, 0x00, 0x00]
+        // (BE would give [0x00, 0x00, 0x00, 0x01])
+        assert_eq!(bytes[4], 0x01, "version LSB at offset 4");
+        assert_eq!(bytes[5], 0x00);
+        assert_eq!(bytes[6], 0x00);
+        assert_eq!(bytes[7], 0x00, "version MSB at offset 7");
+
+        // Internal page size = 4096 = 0x0000_1000
+        // LE bytes: [0x00, 0x10, 0x00, 0x00]
+        assert_eq!(bytes[8], 0x00);
+        assert_eq!(bytes[9], 0x10, "page_size_internal byte 1");
+        assert_eq!(bytes[10], 0x00);
+        assert_eq!(bytes[11], 0x00);
+
+        // Leaf page size = 32768 = 0x0000_8000
+        // LE bytes: [0x00, 0x80, 0x00, 0x00]
+        assert_eq!(bytes[12], 0x00);
+        assert_eq!(bytes[13], 0x80, "page_size_leaf byte 1");
+        assert_eq!(bytes[14], 0x00);
+        assert_eq!(bytes[15], 0x00);
+
+        // created_at = TEST_TS = 1_700_000_000_000  →  exact LE bytes
+        assert_eq!(
+            &bytes[16..24],
+            &TEST_TS.to_le_bytes(),
+            "created_at LE bytes"
+        );
+
+        // checkpointed_at same as created_at for a brand-new header
+        assert_eq!(
+            &bytes[24..32],
+            &TEST_TS.to_le_bytes(),
+            "checkpointed_at LE bytes"
+        );
+
+        // Checksum algorithm = 1 (CRC32C)  →  LE bytes [0x01, 0x00, 0x00, 0x00]
+        assert_eq!(bytes[56], 0x01, "checksum_algo LSB");
+        assert_eq!(bytes[57], 0x00);
+        assert_eq!(bytes[58], 0x00);
+        assert_eq!(bytes[59], 0x00, "checksum_algo MSB");
+
+        // WAL salt 1 = 0xDEAD_BEEF  →  LE bytes [0xEF, 0xBE, 0xAD, 0xDE]
+        assert_eq!(bytes[64], 0xEF, "wal_salt1 byte 0 (LSB)");
+        assert_eq!(bytes[65], 0xBE);
+        assert_eq!(bytes[66], 0xAD);
+        assert_eq!(bytes[67], 0xDE, "wal_salt1 byte 3 (MSB)");
+
+        // WAL salt 2 = 0xCAFE_BABE  →  LE bytes [0xBE, 0xBA, 0xFE, 0xCA]
+        assert_eq!(bytes[68], 0xBE, "wal_salt2 byte 0 (LSB)");
+        assert_eq!(bytes[69], 0xBA);
+        assert_eq!(bytes[70], 0xFE);
+        assert_eq!(bytes[71], 0xCA, "wal_salt2 byte 3 (MSB)");
+    }
 }

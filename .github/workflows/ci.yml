@@ -188,6 +188,126 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ---------------------------------------------------------------------------
+  # Cross-platform file format compatibility (x86_64 ↔ aarch64)
+  # ---------------------------------------------------------------------------
+  #
+  # Verifies that a .mqlite file created on one architecture is readable
+  # (byte-identical) on the other.  Both directions are tested:
+  #
+  #   x86_64  write  → aarch64 read
+  #   aarch64 write  → x86_64  read
+  #
+  # The `format_compat` binary writes 100 BSON documents with known content
+  # into a minimal .mqlite-structured file, then reads and verifies them.
+  # Any native-endian integer I/O would produce a checksum mismatch or a
+  # BSON parse error on the reading side.
+  compat-write-x86:
+    name: Format compat — write (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: compat-x86
+
+      - name: Build format_compat binary
+        run: cargo build --release --bin format_compat
+
+      - name: Write compat file
+        run: ./target/release/format_compat write compat_x86.mqlite
+
+      - name: Upload compat file artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-file-x86_64
+          path: compat_x86.mqlite
+          retention-days: 1
+
+  compat-read-aarch64:
+    name: Format compat — read (aarch64, file from x86_64)
+    runs-on: ubuntu-24.04-arm
+    needs: compat-write-x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: compat-aarch64-read
+
+      - name: Build format_compat binary
+        run: cargo build --release --bin format_compat
+
+      - name: Download compat file (written by x86_64)
+        uses: actions/download-artifact@v4
+        with:
+          name: compat-file-x86_64
+
+      - name: Verify compat file on aarch64
+        run: ./target/release/format_compat read compat_x86.mqlite
+
+  compat-write-aarch64:
+    name: Format compat — write (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: compat-aarch64-write
+
+      - name: Build format_compat binary
+        run: cargo build --release --bin format_compat
+
+      - name: Write compat file
+        run: ./target/release/format_compat write compat_aarch64.mqlite
+
+      - name: Upload compat file artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-file-aarch64
+          path: compat_aarch64.mqlite
+          retention-days: 1
+
+  compat-read-x86:
+    name: Format compat — read (x86_64, file from aarch64)
+    runs-on: ubuntu-latest
+    needs: compat-write-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: compat-x86-read
+
+      - name: Build format_compat binary
+        run: cargo build --release --bin format_compat
+
+      - name: Download compat file (written by aarch64)
+        uses: actions/download-artifact@v4
+        with:
+          name: compat-file-aarch64
+
+      - name: Verify compat file on x86_64
+        run: ./target/release/format_compat read compat_aarch64.mqlite
+
+  # ---------------------------------------------------------------------------
   # Benchmarks — run on PRs, compare vs baseline, flag >2× regression
   # ---------------------------------------------------------------------------
   bench:
