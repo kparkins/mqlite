@@ -537,7 +537,7 @@ Users should need only `use mqlite::*` or specific imports from `mqlite::` — n
 
 4. **How should the wire protocol shim report its server version?** Reporting as a real MongoDB version (e.g., 7.0) triggers feature detection in drivers that expects capabilities mqlite doesn't have. Reporting a low version (3.6) limits driver features. Reporting a custom version string may confuse drivers entirely. This needs testing with actual `mongosh` and driver versions.
 
-5. **Is a CLI tool (`mqlite` binary) in scope for Phase 1?** A `mqlite serve <file>`, `mqlite stats <file>`, `mqlite compact <file>` CLI would dramatically improve the file management UX. But it's additional scope.
+5. ~~**Is a CLI tool (`mqlite` binary) in scope for Phase 1?**~~ **RESOLVED**: Defer to Phase 1.1. Phase 1 ships with programmatic `WireProtocol::bind()` API only. A `mqlite serve <file>` CLI would improve the wire protocol UX but is not required — Story 3 can be satisfied with programmatic binding. The CLI (serve, stats, compact subcommands) is planned for Phase 1.1.
 
 6. **Should `find()` return an `Iterator` or a custom `Cursor` type that implements `Iterator`?** A custom `Cursor` can expose additional methods (`explain()`, `count()`, `batch_size()`) while still being usable in `for` loops. The MongoDB driver uses a `Cursor` type — mqlite should follow suit but with a sync `Iterator` implementation, not an async `Stream`.
 

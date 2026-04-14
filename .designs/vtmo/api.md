@@ -116,10 +116,18 @@ pub struct OpenOptions {
     durability: Option<DurabilityMode>,     // Default: Interval(100ms)
     wal_auto_checkpoint: Option<u32>,       // Default: 1000 pages
     busy_timeout: Option<Duration>,         // Default: 5 seconds
-    read_only: Option<bool>,               // Default: false
+    read_only: Option<bool>,               // Default: false (see note below)
     create_if_missing: Option<bool>,       // Default: true
     max_readers: Option<u32>,              // Default: 64
 }
+
+// Note on read_only mode:
+// When `read_only: true`:
+// - WAL replay is skipped (database state is as of last checkpoint)
+// - No writes are attempted, even for recovery
+// - Safe for opening databases on read-only filesystems
+// - Useful for forensic access after IoT/edge failures
+// - If WAL exists with uncommitted changes, they are NOT visible
 
 pub enum DurabilityMode {
     /// fsync after every commit. Safest, slowest.
@@ -268,6 +276,12 @@ pub struct IndexOptions {
     pub unique: Option<bool>,        // Default: false
     pub sparse: Option<bool>,        // Default: false
 }
+
+// Note on create_index behavior:
+// `create_index` is a BLOCKING operation in Phase 1. It acquires the writer lock
+// and holds it until the entire collection is scanned and the index is built.
+// For a collection with 100K documents, this may take several seconds.
+// Background index builds (non-blocking) are planned for Phase 2.
 ```
 
 **Unsupported index types**: `createIndex` requests specifying unsupported index options (TTL via `expireAfterSeconds`, text indexes, geospatial indexes via `2dsphere`/`2d`, partial indexes via `partialFilterExpression`, hashed indexes) must return an appropriate error. Use error code 67 (`CannotCreateIndex`) with a message naming the unsupported option and listing supported index types (single-field, compound, unique, sparse, multikey).
@@ -433,6 +447,8 @@ Response Builder (construct OP_MSG reply with MongoDB-format result doc)
 
 The wire protocol shim runs in a tokio runtime that is internal to the `wire` feature. It does not leak async into the public API. Each client connection gets a task. Command handlers call into the sync native API using `spawn_blocking` to avoid blocking the async runtime.
 
+**Cursor pinning**: Cursors created via `find` are pinned to the TCP connection that created them. `getMore` requests must be sent on the same connection; otherwise, error code 43 (`CursorNotFound`) is returned. This matches MongoDB behavior and ensures cursor snapshot state is correctly associated with the client. The wire protocol shim tracks cursor ownership per connection and cleans up cursors when connections close.
+
 ## Thread Safety Contract
 
 | Type | Send | Sync | Clone | Notes |
@@ -480,7 +496,7 @@ There are no multi-document ACID transactions, sessions, or `startTransaction`/`
 
 ## Open Questions
 
-1. **Should `find_one_and_update` return the pre-modification or post-modification document by default?** MongoDB's `findAndModify` defaults to returning the pre-modification document. The Rust driver's `find_one_and_update` also defaults to pre-modification. mqlite should match this behavior, but it should be configurable via `FindOneAndUpdateOptions { return_document: ReturnDocument::Before | After }`.
+1. ~~**Should `find_one_and_update` return the pre-modification or post-modification document by default?**~~ **RESOLVED**: Default is `ReturnDocument::Before` (return the pre-modification document), matching MongoDB's `findAndModify` behavior and the MongoDB Rust driver. Configurable via `FindOneAndUpdateOptions { return_document: ReturnDocument::Before | After }`. The `Before` default ensures backward compatibility with MongoDB code that relies on this behavior.
 
 2. **Should `Database` implement `Drop` with WAL flush?** If `Drop` flushes the WAL, it may block. If it doesn't, data written since the last flush may be lost (but recoverable via WAL replay on next open). The recommended behavior: `Drop` does a non-blocking close. Explicit `db.close()` method for blocking flush. Document this clearly.
 

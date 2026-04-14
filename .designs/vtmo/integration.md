@@ -154,7 +154,9 @@ Drivers and tools that check `buildInfo.version` to determine capabilities will 
 
 ## MongoDB Driver Compatibility
 
-### mongosh Compatibility
+### mongosh and Compass Compatibility
+
+mongosh and MongoDB Compass exercise the following commands during typical sessions. Compass uses the same wire protocol as mongosh but may exercise additional commands for its GUI features (schema analysis, explain visualization). Phase 1 targets mongosh compatibility; Compass compatibility is a stretch goal.
 
 mongosh exercises the following commands during a typical session:
 
@@ -584,9 +586,9 @@ Insert a document via the native API, read it via the wire protocol (pymongo). I
 
 ## Open Questions
 
-1. **Should mqlite handle session IDs in commands gracefully?** pymongo 4.x sends `lsid` (logical session ID) with every command by default. If mqlite rejects commands with `lsid`, pymongo won't work. Recommendation: silently ignore `lsid` fields rather than erroring. Log a warning at debug level.
+1. ~~**Should mqlite handle session IDs in commands gracefully?**~~ **RESOLVED**: Silently ignore `lsid` (logical session ID) fields in all commands. pymongo 4.x sends `lsid` with every command by default; rejecting it would break compatibility. Log at DEBUG level: `"Ignoring lsid field (sessions not supported)"`. Do NOT return an error.
 
-2. **How should mqlite handle `readConcern` and `writeConcern` in commands?** Drivers send these by default. Ignoring them is safe for an embedded database (there's only one copy of data). Recommendation: accept and ignore, with a debug-level warning.
+2. ~~**How should mqlite handle `readConcern` and `writeConcern` in commands?**~~ **RESOLVED**: Accept and silently ignore. Drivers send these by default. For an embedded single-file database, there is only one copy of data, so concerns are meaningless. Log at DEBUG level: `"Ignoring readConcern/writeConcern (embedded mode)"`. Do NOT return an error. This enables MongoDB driver code to work unchanged.
 
 3. **Should the wire protocol support `explain` command?** mongosh's `.explain()` sends an `explain` wrapper command. This is useful for debugging but adds implementation scope. Recommendation: Phase 1.1.
 
@@ -594,9 +596,9 @@ Insert a document via the native API, read it via the wire protocol (pymongo). I
 
 5. **Should mqlite provide a compatibility test harness as a developer tool?** A `mqlite-compat-test` binary that runs the curated test suite against a running mqlite instance would help contributors verify compatibility. This is developer tooling, not user-facing.
 
-6. **How does mqlite handle `$db` field in OP_MSG?** MongoDB 3.6+ sends the database name in every command via `$db`. mqlite is single-database. Options: (a) ignore `$db`, (b) validate it matches the opened database name, (c) error if it doesn't match. Recommendation: validate and error on mismatch — this catches configuration bugs early.
+6. ~~**How does mqlite handle `$db` field in OP_MSG?**~~ **RESOLVED**: Validate `$db` and error on mismatch. mqlite is single-database (one file = one database). When `$db` in a command does not match the opened database name, return error code 13 (`Unauthorized`) with message: `"Database 'X' does not match opened database 'Y'. mqlite is single-database."` This catches configuration bugs (e.g., pymongo client using wrong database name) early rather than silently operating on a different-than-expected database.
 
-7. **Should the wire protocol support cursor pinning for getMore?** In MongoDB, getMore must be sent on the same connection that created the cursor. This is relevant for connection pooling in drivers. mqlite should enforce this for correctness.
+7. ~~**Should the wire protocol support cursor pinning for getMore?**~~ **RESOLVED**: Yes, enforce cursor pinning. `getMore` must be sent on the same TCP connection that created the cursor via `find`. If `getMore` is sent on a different connection, return error code 43 (`CursorNotFound`). This matches MongoDB behavior and is required for correctness — cursors hold snapshot state tied to the originating connection. The wire protocol shim tracks cursor ownership per connection.
 
 8. **What is the testing strategy for cross-platform file format compatibility?** A .mqlite file created on x86_64 Linux should be readable on aarch64 macOS. This requires consistent byte ordering (BSON is little-endian, page headers should be little-endian). Add a CI job that creates a file on one platform and reads it on another.
 
