@@ -272,6 +272,13 @@ impl FileHeader {
                 .expect("4 bytes"),
         );
         if stored != computed {
+            #[cfg(feature = "tracing")]
+            tracing::error!(
+                target: "mqlite",
+                stored,
+                computed,
+                "mqlite::corrupt_page"
+            );
             return Err(Error::CorruptDatabase {
                 path: std::path::PathBuf::new(),
                 detail: format!(

@@ -161,10 +161,18 @@ impl Partition {
     /// Evict the frame at `idx`, flushing to disk if dirty.
     fn evict_frame(&mut self, idx: usize, io: &dyn PageIo, size: PageSize) -> Result<()> {
         if let Some(frame) = &self.frames[idx] {
-            if frame.dirty {
+            let was_dirty = frame.dirty;
+            if was_dirty {
                 io.write_page(frame.page_number, size, &frame.data)?;
             }
             self.page_map.remove(&frame.page_number);
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                target: "mqlite",
+                pages_evicted = 1u64,
+                dirty_pages_flushed = was_dirty as u64,
+                "mqlite::eviction"
+            );
         }
         Ok(())
     }

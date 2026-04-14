@@ -164,6 +164,8 @@ impl<'a> PageAllocator<'a> {
             let page_number = self.header.total_page_count;
             self.header.total_page_count =
                 self.header.total_page_count.checked_add(1).ok_or_else(|| {
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(target: "mqlite", "mqlite::disk_full");
                     Error::DiskFull {
                         path: std::path::PathBuf::new(),
                         required_bytes: 4096,

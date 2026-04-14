@@ -203,6 +203,11 @@ impl WalManager {
 
         let checkpoint_seq = wal_header.checkpoint_seq;
 
+        #[cfg(feature = "tracing")]
+        let _rec_start = std::time::Instant::now();
+        #[cfg(feature = "tracing")]
+        let mut _frames_replayed: u64 = 0;
+
         // Scan frames: collect committed batches.
         // A "batch" is a sequence of non-commit frames followed by one commit frame.
         // On recovery we apply each committed batch to the main file.
@@ -255,6 +260,10 @@ impl WalManager {
                     shm.insert(*pn, *off);
                 }
                 last_committed_db_page_count = Some(db_page_count);
+                #[cfg(feature = "tracing")]
+                {
+                    _frames_replayed += pending.len() as u64;
+                }
                 pending.clear();
 
                 // Seek back to after this commit frame for next iteration.
@@ -280,6 +289,17 @@ impl WalManager {
         wal_file
             .seek(SeekFrom::Start(write_cursor))
             .map_err(Error::Io)?;
+
+        #[cfg(feature = "tracing")]
+        {
+            let duration_ms = _rec_start.elapsed().as_millis() as u64;
+            tracing::warn!(
+                target: "mqlite",
+                frames_replayed = _frames_replayed,
+                duration_ms,
+                "mqlite::wal_recovery"
+            );
+        }
 
         Ok(Some(WalManager {
             wal_path: wal_path.to_path_buf(),
@@ -475,6 +495,11 @@ impl WalManager {
         main_file: &mut File,
         main_header: &mut FileHeader,
     ) -> Result<()> {
+        #[cfg(feature = "tracing")]
+        let _chk_start = std::time::Instant::now();
+        #[cfg(feature = "tracing")]
+        let _wal_size_before = self.write_cursor;
+
         // Collect all entries from the SHM index.
         let entries: Vec<(u32, u64)> = self.shm.iter_entries().collect();
 
@@ -514,6 +539,18 @@ impl WalManager {
         // Clear SHM index.
         self.shm.clear_index();
         self.shm.save(&self.shm_path)?;
+
+        #[cfg(feature = "tracing")]
+        {
+            let duration_ms = _chk_start.elapsed().as_millis() as u64;
+            tracing::info!(
+                target: "mqlite",
+                pages_copied = entries.len() as u64,
+                duration_ms,
+                wal_size_before = _wal_size_before,
+                "mqlite::checkpoint"
+            );
+        }
 
         Ok(())
     }

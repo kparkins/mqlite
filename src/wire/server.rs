@@ -355,12 +355,34 @@ fn dispatch_op_msg(msg: &OpMsg, request_id: i32, response_to: i32) -> Result<Vec
 
 /// Route a command name to the appropriate handler.
 fn route_command(command_name: &str) -> Document {
-    match command_name.to_ascii_lowercase().as_str() {
+    #[cfg(feature = "tracing")]
+    let _cmd_start = std::time::Instant::now();
+
+    let result = match command_name.to_ascii_lowercase().as_str() {
         "hello" | "ismaster" => handle_hello(),
         "ping" => handle_ping(),
         "buildinfo" => handle_build_info(),
         other => handle_unknown(other),
+    };
+
+    #[cfg(feature = "tracing")]
+    {
+        let duration_ms = _cmd_start.elapsed().as_millis() as u64;
+        let ok = result
+            .get("ok")
+            .and_then(|v| v.as_f64())
+            .map(|v| v >= 1.0)
+            .unwrap_or(false);
+        tracing::debug!(
+            target: "mqlite",
+            command_name,
+            duration_ms,
+            ok,
+            "mqlite::wire::command"
+        );
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +461,12 @@ fn handle_build_info() -> Document {
 
 /// Unknown command — returns `CommandNotFound` (error code 59).
 fn handle_unknown(name: &str) -> Document {
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+        target: "mqlite",
+        operator = name,
+        "mqlite::unsupported_op"
+    );
     doc! {
         "ok": 0.0_f64,
         "errmsg": format!("no such command: '{}'", name),

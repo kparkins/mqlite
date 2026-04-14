@@ -203,6 +203,14 @@ impl DatabaseInner {
         let bson_doc = bson::to_document(doc).map_err(Error::BsonSerialization)?;
         crate::validation::validate_document(&bson_doc)?;
 
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "mqlite",
+            collection = _name,
+            doc_count = 1u64,
+            "mqlite::insert"
+        );
+
         Err(Error::Internal(
             "insert_one: storage engine not yet implemented (Phase 1)".into(),
         ))
@@ -221,6 +229,14 @@ impl DatabaseInner {
             crate::validation::validate_document(&bson_doc)?;
         }
 
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "mqlite",
+            collection = _name,
+            doc_count = docs.len() as u64,
+            "mqlite::insert"
+        );
+
         Err(Error::Internal(
             "insert_many: storage engine not yet implemented (Phase 1)".into(),
         ))
@@ -231,6 +247,28 @@ impl DatabaseInner {
         _name: &str,
         _filter: Document,
     ) -> Result<Option<T>> {
+        #[cfg(feature = "tracing")]
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in _filter.keys() {
+                k.hash(&mut h);
+            }
+            let filter_hash = h.finish();
+            tracing::debug!(
+                target: "mqlite",
+                collection = _name,
+                filter_hash,
+                doc_count = 0u64,
+                "mqlite::find"
+            );
+            tracing::debug!(
+                target: "mqlite",
+                collection = _name,
+                docs_examined = 0u64,
+                "mqlite::collection_scan"
+            );
+        }
         Err(Error::Internal(
             "find_one: query engine not yet implemented (Phase 1)".into(),
         ))
@@ -242,6 +280,28 @@ impl DatabaseInner {
         _filter: Document,
         _opts: FindOptions,
     ) -> Result<Cursor<T>> {
+        #[cfg(feature = "tracing")]
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in _filter.keys() {
+                k.hash(&mut h);
+            }
+            let filter_hash = h.finish();
+            tracing::debug!(
+                target: "mqlite",
+                collection = _name,
+                filter_hash,
+                doc_count = 0u64,
+                "mqlite::find"
+            );
+            tracing::debug!(
+                target: "mqlite",
+                collection = _name,
+                docs_examined = 0u64,
+                "mqlite::collection_scan"
+            );
+        }
         Err(Error::Internal(
             "find: query engine not yet implemented (Phase 1)".into(),
         ))
@@ -489,20 +549,30 @@ impl Database {
         // opened) and BEFORE any data is read or written.
         let file_lock = lock::open_file_lock(&path)?;
         let busy_timeout = opts.busy_timeout;
+        #[cfg(feature = "tracing")]
+        let _lock_t = std::time::Instant::now();
         let was_contended = if opts.read_only {
             file_lock.acquire_shared(busy_timeout)?
         } else {
             file_lock.acquire_exclusive(busy_timeout)?
         };
 
+        #[cfg(feature = "tracing")]
+        {
+            let wait_ms = _lock_t.elapsed().as_millis() as u64;
+            tracing::debug!(
+                target: "mqlite",
+                wait_duration_ms = wait_ms,
+                acquired = true,
+                "mqlite::writer_lock"
+            );
+        }
         if was_contended {
-            // Another process held the lock; we waited it out.
-            // Log at WARN when the tracing feature is enabled.
             #[cfg(feature = "tracing")]
             tracing::warn!(
+                target: "mqlite",
                 path = %path.display(),
-                "database writer lock was contended on open — \
-                 another process held the lock"
+                "database writer lock was contended on open"
             );
         }
 
@@ -541,7 +611,14 @@ impl Database {
             read_and_validate_header(file_lock.as_ref(), &path)?;
         }
 
-        let inner = Arc::new(DatabaseInner::new(Some(path), opts, file_lock));
+        let inner = Arc::new(DatabaseInner::new(Some(path.clone()), opts, file_lock));
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            target: "mqlite",
+            path = %path.display(),
+            format_version = crate::storage::header::FORMAT_VERSION,
+            "mqlite::open"
+        );
         Ok(Database { inner })
     }
 

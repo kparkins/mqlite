@@ -116,12 +116,20 @@ fn eval_top_level(doc: &Document, key: &str, condition: &Bson) -> Result<bool> {
         )),
         // $expr is explicitly rejected — it uses aggregation expressions which
         // are not supported in mqlite.  It must never be silently passed through.
-        "$expr" => Err(Error::UnsupportedOperator {
-            operator: "$expr".to_owned(),
-        }),
-        k if k.starts_with('$') => Err(Error::UnsupportedOperator {
-            operator: k.to_owned(),
-        }),
+        "$expr" => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(target: "mqlite", operator = "$expr", "mqlite::unsupported_op");
+            Err(Error::UnsupportedOperator {
+                operator: "$expr".to_owned(),
+            })
+        }
+        k if k.starts_with('$') => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(target: "mqlite", operator = k, "mqlite::unsupported_op");
+            Err(Error::UnsupportedOperator {
+                operator: k.to_owned(),
+            })
+        }
         // Field path (possibly dotted, e.g. "a.b.c").
         field_path => {
             let field_value = get_nested_field(doc, field_path);
@@ -275,9 +283,13 @@ fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bo
         "$all" => eval_all(field_value, arg),
         "$size" => eval_size(field_value, arg),
         // ---- Evaluation operators ($regex/$options handled by eval_operator_document) ----
-        "$regex" | "$options" => Err(Error::UnsupportedOperator {
-            operator: op.to_owned(),
-        }),
+        "$regex" | "$options" => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(target: "mqlite", operator = op, "mqlite::unsupported_op");
+            Err(Error::UnsupportedOperator {
+                operator: op.to_owned(),
+            })
+        }
         // ---- Explicitly unsupported operators (error code 9) ----
         // These are named individually to ensure they are never silently ignored.
         "$expr"           // Aggregation-expression passthrough — explicitly forbidden.
@@ -291,13 +303,21 @@ fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bo
         | "$comment"      // Query annotation — not implemented.
         | "$rand"         // Random sampling — not implemented.
         | "$natural"      // Natural sort hint — not valid in query filters.
-        => Err(Error::UnsupportedOperator {
-            operator: op.to_owned(),
-        }),
+        => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(target: "mqlite", operator = op, "mqlite::unsupported_op");
+            Err(Error::UnsupportedOperator {
+                operator: op.to_owned(),
+            })
+        }
         // ---- Catch-all for any other unknown operator ----
-        other => Err(Error::UnsupportedOperator {
-            operator: other.to_owned(),
-        }),
+        other => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(target: "mqlite", operator = other, "mqlite::unsupported_op");
+            Err(Error::UnsupportedOperator {
+                operator: other.to_owned(),
+            })
+        }
     }
 }
 

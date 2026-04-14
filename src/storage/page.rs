@@ -165,6 +165,13 @@ pub(crate) fn verify_internal_page_checksum(
     let header = InternalPageHeader::from_bytes(page)?;
     let computed = internal_page_checksum(page);
     if header.checksum != computed {
+        #[cfg(feature = "tracing")]
+        tracing::error!(
+            target: "mqlite",
+            stored = header.checksum,
+            computed,
+            "mqlite::corrupt_page"
+        );
         return Err(Error::Internal(format!(
             "internal page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
             header.checksum, computed
@@ -281,6 +288,13 @@ pub(crate) fn verify_leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) ->
     let header = LeafPageHeader::from_bytes(page)?;
     let computed = leaf_page_checksum(page);
     if header.checksum != computed {
+        #[cfg(feature = "tracing")]
+        tracing::error!(
+            target: "mqlite",
+            stored = header.checksum,
+            computed,
+            "mqlite::corrupt_page"
+        );
         return Err(Error::Internal(format!(
             "leaf page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
             header.checksum, computed
@@ -378,6 +392,13 @@ pub(crate) fn verify_overflow_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]
     let header = OverflowPageHeader::from_bytes(page)?;
     let computed = overflow_page_checksum(page);
     if header.checksum != computed {
+        #[cfg(feature = "tracing")]
+        tracing::error!(
+            target: "mqlite",
+            stored = header.checksum,
+            computed,
+            "mqlite::corrupt_page"
+        );
         return Err(Error::Internal(format!(
             "overflow page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
             header.checksum, computed
