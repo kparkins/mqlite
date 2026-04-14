@@ -224,6 +224,32 @@ jobs:
           -- -max_total_time=30
 
   # ---------------------------------------------------------------------------
+  # Crash Recovery — 500 Jepsen-style SIGKILL cycles (hq-ele)
+  #
+  # Runs 50 cycles × 10 scenarios against the WAL layer.  Each cycle:
+  #   1. Sets up a database with pre-committed WAL data
+  #   2. Forks a child that performs a scenario-specific write operation
+  #   3. SIGKILLs the child at the scenario injection point
+  #   4. Validates all five recovery correctness conditions
+  #
+  # Failure = any of the 500 cycles violates a correctness condition.
+  # ---------------------------------------------------------------------------
+  crash-recovery:
+    name: Crash Recovery (500 cycles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Crash recovery — 500 cycles, 10 scenarios
+        run: cargo test crash_recovery_500_cycles --all-features -- --nocapture
+
+  # ---------------------------------------------------------------------------
   # Security audit — scan dependencies for known vulnerabilities
   # ---------------------------------------------------------------------------
   audit:

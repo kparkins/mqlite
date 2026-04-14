@@ -89,6 +89,11 @@ mod validation;
 #[allow(dead_code)]
 mod wal;
 
+// Crash recovery testing (hq-ele): 500 cycles, 10 scenarios.
+// Unix-only; accesses pub(crate) WAL internals.
+#[cfg(all(test, unix))]
+mod crash_recovery_tests;
+
 // Wire protocol shim (feature-gated)
 #[cfg(feature = "wire")]
 pub mod wire;
