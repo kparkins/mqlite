@@ -12,6 +12,8 @@
 //! - `hello` / `isMaster` — driver handshake
 //! - `ping` — connectivity check (`admin.command('ping')`)
 //! - `buildInfo` — version metadata
+//! - `serverStatus` — runtime diagnostics
+//! - `listDatabases` — enumerate the single mqlite database
 //!
 //! All other commands return `CommandNotFound` (code 59).
 //!
@@ -29,10 +31,15 @@
 //! - OP_QUERY → OP_REPLY  (initial handshake only)
 //! - OP_MSG   → OP_MSG    (all subsequent commands)
 
+use std::sync::{
+    atomic::{AtomicI32, Ordering},
+    Arc,
+};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use bson::{doc, DateTime, Document};
+use bson::{doc, oid::ObjectId, DateTime, Document};
 
 use crate::{database::Database, error::Result};
 use super::protocol::{MsgHeader, OpMsg, MAX_MESSAGE_SIZE};
@@ -47,6 +54,101 @@ const OP_QUERY: i32 = 2004;
 
 /// OP_REPLY — legacy response opcode for OP_QUERY messages.
 const OP_REPLY: i32 = 1;
+
+// ---------------------------------------------------------------------------
+// Server state
+// ---------------------------------------------------------------------------
+
+/// Shared state for the wire protocol server.
+///
+/// Created once at [`WireProtocol::bind`] time and cloned (cheaply, via
+/// `Arc`) into each connection task.  All fields behind `Arc` are shared
+/// across every connection so counters are global to the server instance.
+#[derive(Clone)]
+struct ServerState {
+    /// Time when this `WireProtocol` instance was started.
+    /// Used to compute uptime in the `serverStatus` response.
+    start_time: Arc<std::time::Instant>,
+
+    /// Monotonically increasing counter used to assign unique per-connection IDs.
+    /// Starts at 1; each new connection receives the old value before increment.
+    next_connection_id: Arc<AtomicI32>,
+
+    /// Path to the database file (`None` for in-memory databases).
+    /// Used to locate the WAL file (`<path>-wal`) for `serverStatus`.
+    db_path: Option<std::path::PathBuf>,
+
+    /// `topologyVersion.processId` — a random [`ObjectId`] generated once at
+    /// server start and included in every `hello` / `isMaster` response.
+    topology_process_id: ObjectId,
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        ServerState {
+            start_time: Arc::new(std::time::Instant::now()),
+            next_connection_id: Arc::new(AtomicI32::new(1)),
+            db_path: None,
+            topology_process_id: ObjectId::new(),
+        }
+    }
+}
+
+impl ServerState {
+    /// Create state for a database at the given path.
+    fn new(db_path: Option<std::path::PathBuf>) -> Self {
+        ServerState {
+            start_time: Arc::new(std::time::Instant::now()),
+            next_connection_id: Arc::new(AtomicI32::new(1)),
+            db_path,
+            topology_process_id: ObjectId::new(),
+        }
+    }
+
+    /// Reserve and return the next connection ID (pre-increment).
+    fn next_conn_id(&self) -> i32 {
+        self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Return server uptime in whole seconds.
+    fn uptime_secs(&self) -> i64 {
+        self.start_time.elapsed().as_secs() as i64
+    }
+
+    /// Return the size of the WAL file in bytes, or 0 if absent / in-memory.
+    fn wal_file_size(&self) -> u64 {
+        let wal_path = match &self.db_path {
+            Some(p) => {
+                let mut s = p.as_os_str().to_owned();
+                s.push("-wal");
+                std::path::PathBuf::from(s)
+            }
+            None => return 0,
+        };
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Total number of connections that have been opened since server start.
+    fn total_connections(&self) -> i32 {
+        // next_connection_id starts at 1; subtract 1 for the count of allocated IDs.
+        self.next_connection_id
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
+    }
+
+    /// Derive the logical database name from the file path.
+    ///
+    /// For `/path/to/myapp.mqlite` returns `"myapp"`.
+    /// For in-memory databases returns `"local"`.
+    fn db_name(&self) -> String {
+        self.db_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| "local".to_owned())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public handle
@@ -85,11 +187,15 @@ impl WireProtocol {
     ///
     /// Returns `Err` if the TCP listener cannot be bound (port in use, bad
     /// address, permissions, etc.).
-    pub fn bind(_db: &Database, addr: &str) -> Result<WireProtocol> {
+    pub fn bind(db: &Database, addr: &str) -> Result<WireProtocol> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Channel to report bind success/failure back to the caller synchronously.
         let (bind_tx, bind_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+
+        // Capture the database path for serverStatus / listDatabases.
+        let db_path = db.inner.path.clone();
+        let state = ServerState::new(db_path);
 
         let addr = addr.to_owned();
 
@@ -114,7 +220,7 @@ impl WireProtocol {
 
                 // Run the accept loop until the shutdown signal arrives.
                 tokio::select! {
-                    _ = accept_loop(listener) => {}
+                    _ = accept_loop(listener, state) => {}
                     _ = shutdown_rx => {}
                 }
             });
@@ -141,11 +247,12 @@ impl WireProtocol {
 // ---------------------------------------------------------------------------
 
 /// Accept incoming connections and spawn a task for each.
-async fn accept_loop(listener: tokio::net::TcpListener) {
+async fn accept_loop(listener: tokio::net::TcpListener, state: ServerState) {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
-                tokio::spawn(handle_connection(stream));
+                let conn_state = state.clone();
+                tokio::spawn(handle_connection(stream, conn_state));
             }
             // A hard listener error causes an exit.
             Err(_) => break,
@@ -160,7 +267,8 @@ async fn accept_loop(listener: tokio::net::TcpListener) {
 /// Handle all wire protocol messages on a single TCP connection.
 ///
 /// Handles both OP_QUERY (initial handshake) and OP_MSG (subsequent commands).
-async fn handle_connection(mut stream: TcpStream) {
+async fn handle_connection(mut stream: TcpStream, state: ServerState) {
+    let connection_id = state.next_conn_id();
     let mut next_request_id: i32 = 1;
 
     loop {
@@ -198,7 +306,7 @@ async fn handle_connection(mut stream: TcpStream) {
         let response_bytes = match opcode {
             OP_QUERY => {
                 // Legacy OP_QUERY — initial handshake from driver.
-                match dispatch_op_query(&full, next_request_id, request_id) {
+                match dispatch_op_query(&full, next_request_id, request_id, &state, connection_id) {
                     Ok(b) => b,
                     Err(_) => break,
                 }
@@ -209,7 +317,7 @@ async fn handle_connection(mut stream: TcpStream) {
                     Ok(m) => m,
                     Err(_) => break,
                 };
-                match dispatch_op_msg(&msg, next_request_id, request_id) {
+                match dispatch_op_msg(&msg, next_request_id, request_id, &state, connection_id) {
                     Ok(b) => b,
                     Err(_) => break,
                 }
@@ -322,7 +430,13 @@ fn build_op_reply(request_id: i32, response_to: i32, body: &Document) -> Result<
 // ---------------------------------------------------------------------------
 
 /// Dispatch an OP_QUERY message, returning a serialised OP_REPLY response.
-fn dispatch_op_query(full_msg: &[u8], request_id: i32, response_to: i32) -> Result<Vec<u8>> {
+fn dispatch_op_query(
+    full_msg: &[u8],
+    request_id: i32,
+    response_to: i32,
+    state: &ServerState,
+    connection_id: i32,
+) -> Result<Vec<u8>> {
     // OP_QUERY body starts after the 16-byte header.
     let body_buf = &full_msg[MsgHeader::SIZE..];
     let doc = parse_op_query_body(body_buf)?;
@@ -332,12 +446,18 @@ fn dispatch_op_query(full_msg: &[u8], request_id: i32, response_to: i32) -> Resu
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
             detail: "OP_QUERY command document is empty".into(),
         })?;
-    let response_body = route_command(command_name);
+    let response_body = route_command(command_name, &doc, state, connection_id);
     build_op_reply(request_id, response_to, &response_body)
 }
 
 /// Dispatch an OP_MSG message, returning a serialised OP_MSG response.
-fn dispatch_op_msg(msg: &OpMsg, request_id: i32, response_to: i32) -> Result<Vec<u8>> {
+fn dispatch_op_msg(
+    msg: &OpMsg,
+    request_id: i32,
+    response_to: i32,
+    state: &ServerState,
+    connection_id: i32,
+) -> Result<Vec<u8>> {
     let body = msg
         .body()
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
@@ -349,19 +469,45 @@ fn dispatch_op_msg(msg: &OpMsg, request_id: i32, response_to: i32) -> Result<Vec
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
             detail: "command body document is empty".into(),
         })?;
-    let response_body = route_command(command_name);
+    let response_body = route_command(command_name, body, state, connection_id);
     OpMsg::build_response(request_id, response_to, &response_body)
 }
 
 /// Route a command name to the appropriate handler.
-fn route_command(command_name: &str) -> Document {
+///
+/// Silently ignores LSID / session / cluster-time fields per the wire protocol
+/// spec — these are logged at DEBUG level and never returned as errors.
+fn route_command(
+    command_name: &str,
+    body: &Document,
+    state: &ServerState,
+    connection_id: i32,
+) -> Document {
+    // Silently log (and ignore) fields that mqlite does not support.
+    // Per integration.md: lsid, readConcern, writeConcern, $clusterTime, txnNumber
+    // are silently ignored in Phase 1 — log at DEBUG, never return error.
+    #[cfg(feature = "tracing")]
+    {
+        for key in ["lsid", "readConcern", "writeConcern", "$clusterTime", "txnNumber"] {
+            if body.contains_key(key) {
+                tracing::debug!(
+                    target: "mqlite",
+                    field = key,
+                    "mqlite::wire::ignored_field"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "tracing")]
     let _cmd_start = std::time::Instant::now();
 
     let result = match command_name.to_ascii_lowercase().as_str() {
-        "hello" | "ismaster" => handle_hello(),
+        "hello" | "ismaster" => handle_hello(state, connection_id),
         "ping" => handle_ping(),
         "buildinfo" => handle_build_info(),
+        "serverstatus" => handle_server_status(state),
+        "listdatabases" => handle_list_databases(state),
         other => handle_unknown(other),
     };
 
@@ -382,6 +528,9 @@ fn route_command(command_name: &str) -> Document {
         );
     }
 
+    // Suppress unused-variable warning when tracing feature is disabled.
+    let _ = body;
+
     result
 }
 
@@ -396,11 +545,14 @@ fn route_command(command_name: &str) -> Document {
 /// - `maxWireVersion: 21` (MongoDB 8.0) to prevent driver downgrades
 /// - `helloOk: true` — signals to pymongo and mongosh that the server supports
 ///   the `hello` command, so subsequent topology checks use `hello` via OP_MSG
+/// - `topologyVersion` — required by MongoDB 5.0+ drivers; `processId` is
+///   generated once at server start, `counter` is always 0 (not a replica set)
+/// - `connectionId` — unique per-connection integer identifier
 /// - No sessions, no auth, no transactions — strips capabilities mqlite lacks
 /// - `mqlite.version` so tooling can detect it is talking to mqlite
 ///
-/// See api.md §Handshake Response Design for the full field rationale.
-fn handle_hello() -> Document {
+/// See integration.md §Handshake Response Design for the full field rationale.
+fn handle_hello(state: &ServerState, connection_id: i32) -> Document {
     doc! {
         // Standalone — no replica set discovery.
         "isWritablePrimary": true,
@@ -410,6 +562,14 @@ fn handle_hello() -> Document {
         // retrying with legacy `isMaster` via OP_QUERY.
         "helloOk": true,
 
+        // Topology version — required by MongoDB 5.0+ drivers.
+        // processId is a random ObjectId generated once at server start.
+        // counter is always 0 (mqlite is not a replica set and never transitions state).
+        "topologyVersion": {
+            "processId": state.topology_process_id,
+            "counter": bson::Bson::Int64(0_i64),
+        },
+
         // Capacity limits (match MongoDB 8.0 defaults).
         "maxBsonObjectSize": 16_777_216i32,
         "maxMessageSizeBytes": 48_000_000i32,
@@ -417,6 +577,9 @@ fn handle_hello() -> Document {
 
         // Current server time (used by drivers for clock skew detection).
         "localTime": DateTime::now(),
+
+        // Unique identifier for this connection.
+        "connectionId": connection_id,
 
         // Wire protocol version range.
         // minWireVersion: 0  — accept all drivers.
@@ -447,14 +610,93 @@ fn handle_ping() -> Document {
 /// `buildInfo` — server build metadata.
 ///
 /// Returns mqlite version information in MongoDB buildInfo format.
+/// See integration.md §Server Version Reporting for field rationale.
 fn handle_build_info() -> Document {
     doc! {
         "version": env!("CARGO_PKG_VERSION"),
-        "versionArray": [0i32, 1i32, 0i32, 0i32],
-        "gitVersion": "mqlite",
-        "sysInfo": "Rust",
-        // Identify ourselves clearly — do not claim to be MongoDB.
-        "engine": "mqlite",
+        "gitVersion": env!("CARGO_PKG_VERSION"),
+        // Empty modules array — mqlite has no enterprise/community modules.
+        "modules": [],
+        // Memory allocator identity.
+        "allocator": "rust",
+        // Identify this as mqlite, not MongoDB.
+        "mqlite": true,
+        "ok": 1.0_f64,
+    }
+}
+
+/// `serverStatus` — runtime diagnostic statistics.
+///
+/// Returns uptime, WAL file size, connection count, and placeholder buffer pool
+/// stats sourced from internal server state (not the public `stats()` API,
+/// which is deferred to Phase 2 per api.md).
+///
+/// Data sources:
+/// - **uptime**: elapsed seconds since `WireProtocol::bind()`.
+/// - **WAL size**: `std::fs::metadata("<db>-wal")?.len()` — best-effort, 0 if absent.
+/// - **connections.current**: approximate (counts connections opened, not live ones).
+/// - **buffer pool**: placeholder zeros (pool instrumentation is Phase 2).
+fn handle_server_status(state: &ServerState) -> Document {
+    let uptime_secs = state.uptime_secs();
+    let wal_size = state.wal_file_size() as i64;
+    let total_conns = state.total_connections();
+
+    doc! {
+        "host": "mqlite",
+        "version": env!("CARGO_PKG_VERSION"),
+        "process": "mqlite",
+        "pid": bson::Bson::Int64(std::process::id() as i64),
+        "uptime": bson::Bson::Int64(uptime_secs),
+        "uptimeMillis": bson::Bson::Int64(uptime_secs * 1_000),
+        "uptimeEstimate": bson::Bson::Int64(uptime_secs),
+        "localTime": DateTime::now(),
+        "connections": {
+            "current": total_conns,
+            "available": 64i32,
+            "totalCreated": total_conns,
+        },
+        "storageEngine": {
+            "name": "mqlite",
+            "persistent": true,
+            "supportsCommittedReads": false,
+            "readOnly": false,
+        },
+        // WAL-based storage stats.
+        "mqlite": {
+            "walFileSizeBytes": wal_size,
+        },
+        // Placeholder buffer pool stats (Phase 2: pool instrumentation).
+        "bufferPool": {
+            "hits": 0i64,
+            "misses": 0i64,
+            "pages": 0i64,
+        },
+        "ok": 1.0_f64,
+    }
+}
+
+/// `listDatabases` — enumerate available databases.
+///
+/// mqlite is single-database per file.  The database name is derived from the
+/// file stem of the `.mqlite` path (e.g., `myapp.mqlite` → `"myapp"`).
+/// In-memory databases are named `"local"`.
+fn handle_list_databases(state: &ServerState) -> Document {
+    let db_name = state.db_name();
+
+    // Approximate size: WAL file size is a proxy for recent write activity.
+    // Actual on-disk size requires stat() on the main file, which is best-effort.
+    let size_on_disk = state.wal_file_size() as i64;
+
+    doc! {
+        "databases": [
+            {
+                "name": &db_name,
+                "sizeOnDisk": size_on_disk,
+                "empty": false,
+            }
+        ],
+        "totalSize": size_on_disk,
+        "totalSizeMb": bson::Bson::Int64(size_on_disk / (1024 * 1024)),
         "ok": 1.0_f64,
     }
 }
@@ -643,9 +885,10 @@ mod tests {
 
     #[test]
     fn dispatch_op_msg_ping() {
+        let state = ServerState::default();
         let req_buf = make_op_msg_request(1, &doc! { "ping": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 10, msg.header.request_id).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 10, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -653,9 +896,10 @@ mod tests {
 
     #[test]
     fn dispatch_op_msg_hello() {
+        let state = ServerState::default();
         let req_buf = make_op_msg_request(2, &doc! { "hello": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 11, msg.header.request_id).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 11, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -663,16 +907,23 @@ mod tests {
         assert!(body.get_bool("helloOk").unwrap());
         assert_eq!(body.get_i32("maxWireVersion").unwrap(), 21);
         assert_eq!(body.get_i32("minWireVersion").unwrap(), 0);
+        // connectionId must be present and match the value passed.
+        assert_eq!(body.get_i32("connectionId").unwrap(), 1);
+        // topologyVersion must be present with processId and counter=0.
+        let tv = body.get_document("topologyVersion").unwrap();
+        assert!(tv.contains_key("processId"));
+        assert_eq!(tv.get_i64("counter").unwrap(), 0);
     }
 
     #[test]
     fn dispatch_op_query_ismaster() {
+        let state = ServerState::default();
         let req_buf = make_op_query_request(
             3,
             "admin.$cmd",
             &doc! { "ismaster": 1, "helloOk": true },
         );
-        let resp_bytes = dispatch_op_query(&req_buf, 12, 3).unwrap();
+        let resp_bytes = dispatch_op_query(&req_buf, 12, 3, &state, 2).unwrap();
 
         // Response must be OP_REPLY (opcode 1).
         let header = MsgHeader::parse(&resp_bytes).unwrap();
@@ -695,39 +946,208 @@ mod tests {
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
         assert!(body.get_bool("isWritablePrimary").unwrap());
         assert!(body.get_bool("helloOk").unwrap());
+        // topologyVersion must be present.
+        assert!(body.contains_key("topologyVersion"));
+        // connectionId must be present.
+        assert!(body.contains_key("connectionId"));
     }
 
     #[test]
     fn dispatch_op_msg_ismaster() {
+        let state = ServerState::default();
         let req_buf = make_op_msg_request(3, &doc! { "ismaster": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 12, msg.header.request_id).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 12, msg.header.request_id, &state, 3).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert!(body.get_bool("isWritablePrimary").unwrap());
+        assert_eq!(body.get_i32("connectionId").unwrap(), 3);
     }
 
     #[test]
     fn dispatch_op_msg_build_info() {
+        let state = ServerState::default();
         let req_buf = make_op_msg_request(4, &doc! { "buildInfo": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 13, msg.header.request_id).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 13, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
         assert!(body.get_str("version").is_ok());
+        // modules must be an empty array.
+        let modules = body.get_array("modules").unwrap();
+        assert!(modules.is_empty());
+        // allocator field.
+        assert_eq!(body.get_str("allocator").unwrap(), "rust");
+        // mqlite: true identity marker.
+        assert!(body.get_bool("mqlite").unwrap());
+    }
+
+    #[test]
+    fn dispatch_op_msg_server_status() {
+        let state = ServerState::default();
+        let req_buf = make_op_msg_request(5, &doc! { "serverStatus": 1, "$db": "admin" });
+        let msg = OpMsg::parse(&req_buf).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 14, msg.header.request_id, &state, 1).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        let body = resp.body().unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        // uptime must be non-negative.
+        assert!(body.get_i64("uptime").unwrap() >= 0);
+        // connections sub-document must be present.
+        assert!(body.contains_key("connections"));
+        // storageEngine sub-document must be present.
+        let se = body.get_document("storageEngine").unwrap();
+        assert_eq!(se.get_str("name").unwrap(), "mqlite");
+    }
+
+    #[test]
+    fn dispatch_op_msg_list_databases() {
+        let state = ServerState::default();
+        let req_buf =
+            make_op_msg_request(6, &doc! { "listDatabases": 1, "$db": "admin" });
+        let msg = OpMsg::parse(&req_buf).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 15, msg.header.request_id, &state, 1).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        let body = resp.body().unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        // Must contain exactly one database entry.
+        let dbs = body.get_array("databases").unwrap();
+        assert_eq!(dbs.len(), 1);
+        // The entry must have a "name" field.
+        let db_doc = dbs[0].as_document().unwrap();
+        assert!(db_doc.contains_key("name"));
     }
 
     #[test]
     fn dispatch_op_msg_unknown_command() {
-        let req_buf = make_op_msg_request(5, &doc! { "aggregate": 1, "$db": "test" });
+        let state = ServerState::default();
+        let req_buf = make_op_msg_request(7, &doc! { "aggregate": 1, "$db": "test" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 14, msg.header.request_id).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 16, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 0.0);
         assert_eq!(body.get_i32("code").unwrap(), 59);
         assert_eq!(body.get_str("codeName").unwrap(), "CommandNotFound");
+    }
+
+    // -----------------------------------------------------------------------
+    // hello response — spec compliance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hello_topology_version_fields() {
+        // topologyVersion must have a processId (ObjectId) and counter (Int64 = 0).
+        let state = ServerState::default();
+        let body = handle_hello(&state, 42);
+
+        let tv = body.get_document("topologyVersion").unwrap();
+        // processId must be an ObjectId.
+        assert!(
+            matches!(tv.get("processId"), Some(bson::Bson::ObjectId(_))),
+            "processId should be an ObjectId, got: {:?}",
+            tv.get("processId")
+        );
+        assert_eq!(tv.get_i64("counter").unwrap(), 0);
+        // connectionId must match the argument.
+        assert_eq!(body.get_i32("connectionId").unwrap(), 42);
+    }
+
+    #[test]
+    fn hello_topology_process_id_stable() {
+        // Two calls on the same ServerState must return the same processId.
+        let state = ServerState::default();
+        let body1 = handle_hello(&state, 1);
+        let body2 = handle_hello(&state, 2);
+        let pid1 = body1
+            .get_document("topologyVersion")
+            .unwrap()
+            .get("processId")
+            .cloned();
+        let pid2 = body2
+            .get_document("topologyVersion")
+            .unwrap()
+            .get("processId")
+            .cloned();
+        assert_eq!(pid1, pid2, "topology processId should be stable across calls");
+    }
+
+    #[test]
+    fn hello_connection_ids_unique_per_connection() {
+        // Two connections on the same ServerState must get different connectionIds.
+        let state = ServerState::default();
+        let id1 = state.next_conn_id();
+        let id2 = state.next_conn_id();
+        assert_ne!(id1, id2);
+    }
+
+    // -----------------------------------------------------------------------
+    // buildInfo — spec compliance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_info_required_fields() {
+        let body = handle_build_info();
+        assert!(body.get_str("version").is_ok());
+        assert!(body.get_str("gitVersion").is_ok());
+        assert_eq!(body.get_str("allocator").unwrap(), "rust");
+        assert!(body.get_bool("mqlite").unwrap());
+        assert!(body.get_array("modules").unwrap().is_empty());
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // serverStatus — spec compliance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn server_status_required_fields() {
+        let state = ServerState::default();
+        let body = handle_server_status(&state);
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        assert!(body.get_i64("uptime").unwrap() >= 0);
+        assert!(body.get_i64("uptimeMillis").unwrap() >= 0);
+        assert!(body.contains_key("connections"));
+        assert!(body.contains_key("storageEngine"));
+        assert!(body.contains_key("localTime"));
+    }
+
+    // -----------------------------------------------------------------------
+    // listDatabases — spec compliance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_databases_single_entry() {
+        let state = ServerState::default();
+        let body = handle_list_databases(&state);
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        let dbs = body.get_array("databases").unwrap();
+        assert_eq!(dbs.len(), 1, "mqlite must list exactly one database");
+        let db_doc = dbs[0].as_document().unwrap();
+        assert!(db_doc.contains_key("name"), "database entry must have a name");
+        assert!(db_doc.contains_key("sizeOnDisk"), "database entry must have sizeOnDisk");
+        assert!(db_doc.contains_key("empty"), "database entry must have empty");
+    }
+
+    #[test]
+    fn list_databases_name_from_path() {
+        // When a db_path is provided the name should be the file stem.
+        let state = ServerState::new(Some(std::path::PathBuf::from("/tmp/myapp.mqlite")));
+        let body = handle_list_databases(&state);
+        let dbs = body.get_array("databases").unwrap();
+        let db_doc = dbs[0].as_document().unwrap();
+        assert_eq!(db_doc.get_str("name").unwrap(), "myapp");
+    }
+
+    #[test]
+    fn list_databases_in_memory_name() {
+        // In-memory (no path) returns "local".
+        let state = ServerState::new(None);
+        let body = handle_list_databases(&state);
+        let dbs = body.get_array("databases").unwrap();
+        let db_doc = dbs[0].as_document().unwrap();
+        assert_eq!(db_doc.get_str("name").unwrap(), "local");
     }
 
     // -----------------------------------------------------------------------
@@ -838,5 +1258,55 @@ mod tests {
         assert!(body.get_bool("isWritablePrimary").unwrap());
         assert!(body.get_bool("helloOk").unwrap());
         assert_eq!(body.get_i32("maxWireVersion").unwrap(), 21);
+        // topologyVersion and connectionId must be present in OP_QUERY response too.
+        assert!(body.contains_key("topologyVersion"));
+        assert!(body.contains_key("connectionId"));
+    }
+
+    // -----------------------------------------------------------------------
+    // serverStatus — integration via WireProtocol bind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wire_protocol_server_status_round_trip() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let db = Database::open_in_memory().unwrap();
+        let _server = WireProtocol::bind(&db, &addr.to_string()).unwrap();
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let body_bson = bson::to_vec(&doc! { "serverStatus": 1, "$db": "admin" }).unwrap();
+        let total = (MsgHeader::SIZE + 4 + 1 + body_bson.len()) as i32;
+        let header = MsgHeader {
+            message_length: total,
+            request_id: 10,
+            response_to: 0,
+            op_code: super::super::protocol::OP_MSG,
+        };
+        use std::io::{Read, Write};
+        client.write_all(&header.to_bytes()).unwrap();
+        client.write_all(&0u32.to_le_bytes()).unwrap(); // flagBits
+        client.write_all(&[0u8]).unwrap(); // Kind-0
+        client.write_all(&body_bson).unwrap();
+
+        let mut hbuf = [0u8; MsgHeader::SIZE];
+        client.read_exact(&mut hbuf).unwrap();
+        let resp_header = MsgHeader::parse(&hbuf).unwrap();
+        let remaining = resp_header.message_length as usize - MsgHeader::SIZE;
+        let mut rest = vec![0u8; remaining];
+        client.read_exact(&mut rest).unwrap();
+
+        let mut full = hbuf.to_vec();
+        full.extend_from_slice(&rest);
+        let resp_msg = OpMsg::parse(&full).unwrap();
+        let resp_body = resp_msg.body().unwrap();
+        assert_eq!(resp_body.get_f64("ok").unwrap(), 1.0);
+        assert!(resp_body.get_i64("uptime").unwrap() >= 0);
     }
 }
