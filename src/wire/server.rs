@@ -42,8 +42,12 @@ use tokio::net::TcpStream;
 
 use bson::{doc, oid::ObjectId, DateTime, Document};
 
-use super::protocol::{MsgHeader, OpMsg, MAX_MESSAGE_SIZE};
-use crate::{database::Database, error::Result};
+use crate::{
+    database::{Database, DatabaseInner},
+    error::Result,
+    options::{FindOneAndDeleteOptions, FindOneAndUpdateOptions, FindOptions, InsertManyOptions, ReturnDocument, UpdateOptions},
+};
+use super::protocol::{MsgHeader, OpMsg, Section, MAX_MESSAGE_SIZE};
 
 // ---------------------------------------------------------------------------
 // Legacy opcodes (not in protocol.rs — used only for handshake interop)
@@ -195,27 +199,47 @@ struct ServerState {
     /// `topologyVersion.processId` — a random [`ObjectId`] generated once at
     /// server start and included in every `hello` / `isMaster` response.
     topology_process_id: ObjectId,
+
+    /// Shared database inner state — used by CRUD command handlers.
+    database: Arc<DatabaseInner>,
 }
 
 impl Default for ServerState {
     fn default() -> Self {
+        let db = Database::open_in_memory().expect("in-memory database never fails");
         ServerState {
             start_time: Arc::new(std::time::Instant::now()),
             next_connection_id: Arc::new(AtomicI32::new(1)),
             db_path: None,
             topology_process_id: ObjectId::new(),
+            database: Arc::clone(&db.inner),
         }
     }
 }
 
 impl ServerState {
-    /// Create state for a database at the given path.
+    /// Create state for a database at the given path (in-memory DB for non-CRUD state).
     fn new(db_path: Option<std::path::PathBuf>) -> Self {
+        let db = Database::open_in_memory().expect("in-memory database never fails");
         ServerState {
             start_time: Arc::new(std::time::Instant::now()),
             next_connection_id: Arc::new(AtomicI32::new(1)),
             db_path,
             topology_process_id: ObjectId::new(),
+            database: Arc::clone(&db.inner),
+        }
+    }
+
+    /// Create state backed by a real [`Database`] instance.
+    ///
+    /// Used by [`WireProtocol::bind`] to wire CRUD handlers to the actual DB.
+    fn new_with_db(db: &Database) -> Self {
+        ServerState {
+            start_time: Arc::new(std::time::Instant::now()),
+            next_connection_id: Arc::new(AtomicI32::new(1)),
+            db_path: db.inner.path.clone(),
+            topology_process_id: ObjectId::new(),
+            database: Arc::clone(&db.inner),
         }
     }
 
@@ -307,9 +331,8 @@ impl WireProtocol {
         // Channel to report bind success/failure back to the caller synchronously.
         let (bind_tx, bind_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
 
-        // Capture the database path for serverStatus / listDatabases.
-        let db_path = db.inner.path.clone();
-        let state = ServerState::new(db_path);
+        // Capture the database reference for CRUD command handlers.
+        let state = ServerState::new_with_db(db);
 
         let addr = addr.to_owned();
 
@@ -415,8 +438,10 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
 
         let declared_len =
             i32::from_le_bytes(header_buf[0..4].try_into().expect("slice is 4 bytes")) as usize;
-        let opcode = i32::from_le_bytes(header_buf[12..16].try_into().expect("slice is 4 bytes"));
-        let request_id = i32::from_le_bytes(header_buf[4..8].try_into().expect("slice is 4 bytes"));
+        let opcode =
+            i32::from_le_bytes(header_buf[12..16].try_into().expect("slice is 4 bytes"));
+        let request_id =
+            i32::from_le_bytes(header_buf[4..8].try_into().expect("slice is 4 bytes"));
 
         // Guard against oversized messages.
         if declared_len < MsgHeader::SIZE || declared_len > MAX_MESSAGE_SIZE {
@@ -450,7 +475,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
                     Ok(m) => m,
                     Err(_) => break,
                 };
-                match dispatch_op_msg(&msg, next_request_id, request_id, &state, connection_id) {
+                match dispatch_op_msg(&msg, next_request_id, request_id, &state, connection_id, &cursors) {
                     Ok(b) => b,
                     Err(_) => break,
                 }
@@ -492,11 +517,13 @@ fn parse_op_query_body(buf: &[u8]) -> Result<Document> {
     }
     // Skip flags (4 bytes), then find the null terminator of fullCollectionName.
     let after_flags = &buf[4..];
-    let null_pos = after_flags.iter().position(|&b| b == 0).ok_or_else(|| {
-        crate::error::Error::InvalidWireMessage {
-            detail: "OP_QUERY fullCollectionName not null-terminated".into(),
-        }
-    })?;
+    let null_pos =
+        after_flags
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| crate::error::Error::InvalidWireMessage {
+                detail: "OP_QUERY fullCollectionName not null-terminated".into(),
+            })?;
     // Skip the null terminator, then skip numberToSkip (4) and numberToReturn (4).
     let doc_offset = 4 + null_pos + 1 + 4 + 4;
     if doc_offset + 4 > buf.len() {
@@ -638,13 +665,16 @@ fn dispatch_op_query(
     }
 
     let doc = parse_op_query_body(body_buf)?;
-    let command_name =
-        doc.keys()
-            .next()
-            .ok_or_else(|| crate::error::Error::InvalidWireMessage {
-                detail: "OP_QUERY command document is empty".into(),
-            })?;
-    let response_body = route_command(command_name, &doc, state, connection_id);
+    let command_name = doc
+        .keys()
+        .next()
+        .ok_or_else(|| crate::error::Error::InvalidWireMessage {
+            detail: "OP_QUERY command document is empty".into(),
+        })?;
+    // OP_QUERY is only used for the initial handshake (hello/isMaster).
+    // Create a throwaway cursor map — CRUD commands never arrive via OP_QUERY.
+    let dummy_cursors = Arc::new(std::sync::Mutex::new(ConnectionCursors::new()));
+    let response_body = route_command(command_name, &doc, state, connection_id, &dummy_cursors);
     build_op_reply(request_id, response_to, &response_body)
 }
 
@@ -655,24 +685,28 @@ fn dispatch_op_msg(
     response_to: i32,
     state: &ServerState,
     connection_id: i32,
+    cursors: &Arc<std::sync::Mutex<ConnectionCursors>>,
 ) -> Result<Vec<u8>> {
     let body = msg
         .body()
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
             detail: "command message has no Kind-0 body section".into(),
         })?;
-    let command_name =
-        body.keys()
-            .next()
-            .ok_or_else(|| crate::error::Error::InvalidWireMessage {
-                detail: "command body document is empty".into(),
-            })?;
     // Validate $db before routing.  Returns Unauthorized (code 13) when
     // $db is present and does not match "admin" or the server's db name.
     if let Some(err) = check_db_field(body, &state.db_name()) {
         return OpMsg::build_response(request_id, response_to, &err);
     }
-    let response_body = route_command(command_name, body, state, connection_id);
+    // Merge Kind-1 document sequences (e.g. pymongo bulk inserts) into the
+    // body so handlers always see a complete document regardless of framing.
+    let merged_body = merge_doc_sequences_into_body(body, &msg.sections);
+    let command_name = merged_body
+        .keys()
+        .next()
+        .ok_or_else(|| crate::error::Error::InvalidWireMessage {
+            detail: "command body document is empty".into(),
+        })?;
+    let response_body = route_command(command_name, &merged_body, state, connection_id, cursors);
     OpMsg::build_response(request_id, response_to, &response_body)
 }
 
@@ -685,19 +719,14 @@ fn route_command(
     body: &Document,
     state: &ServerState,
     connection_id: i32,
+    cursors: &Arc<std::sync::Mutex<ConnectionCursors>>,
 ) -> Document {
     // Silently log (and ignore) fields that mqlite does not support.
     // Per integration.md: lsid, readConcern, writeConcern, $clusterTime, txnNumber
     // are silently ignored in Phase 1 — log at DEBUG, never return error.
     #[cfg(feature = "tracing")]
     {
-        for key in [
-            "lsid",
-            "readConcern",
-            "writeConcern",
-            "$clusterTime",
-            "txnNumber",
-        ] {
+        for key in ["lsid", "readConcern", "writeConcern", "$clusterTime", "txnNumber"] {
             if body.contains_key(key) {
                 tracing::debug!(
                     target: "mqlite",
@@ -717,6 +746,12 @@ fn route_command(
         "buildinfo" => handle_build_info(),
         "serverstatus" => handle_server_status(state),
         "listdatabases" => handle_list_databases(state),
+        // CRUD commands
+        "insert" => handle_insert(body, state),
+        "find" => handle_find(body, state, cursors),
+        "update" => handle_update(body, state),
+        "delete" => handle_delete(body, state),
+        "findandmodify" => handle_find_and_modify(body, state),
         other => handle_unknown(other),
     };
 
@@ -737,7 +772,6 @@ fn route_command(
         );
     }
 
-    // Suppress unused-variable warning when tracing feature is disabled.
     let _ = body;
 
     result
@@ -910,6 +944,529 @@ fn handle_list_databases(state: &ServerState) -> Document {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helper utilities for CRUD command handlers
+// ---------------------------------------------------------------------------
+
+/// Merge Kind-1 document sequences into a clone of `body`.
+///
+/// Drivers such as pymongo send bulk payloads (e.g. `documents` for `insert`,
+/// `updates` for `update`, `deletes` for `delete`) as a Kind-1 section rather
+/// than embedding them in the Kind-0 body document.  This helper merges them so
+/// that command handlers always receive a fully-populated body.
+fn merge_doc_sequences_into_body(body: &Document, sections: &[Section]) -> Document {
+    let mut merged = body.clone();
+    for section in sections {
+        if let Section::DocSequence { identifier, documents } = section {
+            if !documents.is_empty() {
+                merged.insert(
+                    identifier.clone(),
+                    bson::Bson::Array(
+                        documents
+                            .iter()
+                            .map(|d| bson::Bson::Document(d.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+        }
+    }
+    merged
+}
+
+/// Extract an integer value from a BSON document field, coercing `Int32`,
+/// `Int64`, and `Double` variants to `i64`.
+fn get_i64(doc: &Document, key: &str) -> Option<i64> {
+    match doc.get(key) {
+        Some(bson::Bson::Int32(i)) => Some(*i as i64),
+        Some(bson::Bson::Int64(i)) => Some(*i),
+        Some(bson::Bson::Double(f)) => Some(*f as i64),
+        _ => None,
+    }
+}
+
+/// Build a `BadValue` (code 2) error response document.
+fn err_bad_value(msg: impl Into<String>) -> Document {
+    doc! {
+        "ok": 0.0_f64,
+        "errmsg": msg.into(),
+        "code": crate::error::codes::BAD_VALUE,
+        "codeName": "BadValue",
+    }
+}
+
+/// Build a `collation not supported` error response (code 2, BadValue).
+fn err_collation_unsupported() -> Document {
+    err_bad_value("collation is not supported in this version of mqlite")
+}
+
+/// Convert a mqlite `Error` into a top-level command error document.
+fn err_from_mqlite(e: crate::error::Error) -> Document {
+    let code = e.code().unwrap_or(crate::error::codes::INTERNAL_ERROR);
+    doc! {
+        "ok": 0.0_f64,
+        "errmsg": e.to_string(),
+        "code": code,
+        "codeName": mqlite_code_name(code),
+    }
+}
+
+/// Map a MongoDB error code to its canonical `codeName` string.
+fn mqlite_code_name(code: i32) -> &'static str {
+    match code {
+        crate::error::codes::DUPLICATE_KEY => "DuplicateKey",
+        crate::error::codes::NAMESPACE_NOT_FOUND => "NamespaceNotFound",
+        crate::error::codes::CURSOR_NOT_FOUND => "CursorNotFound",
+        crate::error::codes::BAD_VALUE => "BadValue",
+        crate::error::codes::UNSUPPORTED_OPERATOR => "FailedToParse",
+        crate::error::codes::CANNOT_CREATE_INDEX => "CannotCreateIndex",
+        _ => "InternalError",
+    }
+}
+
+/// Convert a mqlite `Error` to a write-error `(code, message)` pair for
+/// embedding inside a `writeErrors` array.
+fn write_err_from_mqlite(e: &crate::error::Error) -> (i32, String) {
+    let code = e.code().unwrap_or(crate::error::codes::INTERNAL_ERROR);
+    (code, e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// CRUD command handlers
+// ---------------------------------------------------------------------------
+
+/// `insert` — insert one or more documents.
+///
+/// Accepts documents from either `body["documents"]` (Kind-0) or a Kind-1
+/// `"documents"` section (pymongo bulk path); see [`merge_doc_sequences_into_body`].
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "n": <count>, "writeErrors": [...], "ok": 1.0 }
+/// ```
+fn handle_insert(body: &Document, state: &ServerState) -> Document {
+    if body.contains_key("collation") {
+        return err_collation_unsupported();
+    }
+
+    let coll_name = match body.get_str("insert") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("insert requires a collection name string"),
+    };
+
+    // Documents may arrive via Kind-1 merge or body array.
+    let docs: Vec<Document> = match body.get_array("documents") {
+        Ok(arr) => arr
+            .iter()
+            .filter_map(|b| b.as_document().cloned())
+            .collect(),
+        Err(_) => return err_bad_value("insert requires a \"documents\" array"),
+    };
+
+    if docs.is_empty() {
+        // MongoDB allows empty inserts; return n=0 with ok:1.
+        return doc! { "n": 0i32, "ok": 1.0_f64 };
+    }
+
+    let ordered = body.get_bool("ordered").unwrap_or(true);
+    let opts = InsertManyOptions { ordered };
+
+    match state.database.insert_many(&coll_name, &docs, opts) {
+        Ok(result) => {
+            let n = result.inserted_ids.len() as i32;
+            if result.errors.is_empty() {
+                doc! { "n": n, "ok": 1.0_f64 }
+            } else {
+                let write_errors: bson::Array = result
+                    .errors
+                    .iter()
+                    .map(|e| {
+                        bson::Bson::Document(doc! {
+                            "index": e.index as i32,
+                            "code": e.code,
+                            "errmsg": &e.message,
+                        })
+                    })
+                    .collect();
+                doc! {
+                    "n": n,
+                    "writeErrors": write_errors,
+                    "ok": 1.0_f64,
+                }
+            }
+        }
+        Err(e) => err_from_mqlite(e),
+    }
+}
+
+/// `find` — query documents with filter, sort, projection, limit, skip.
+///
+/// Returns a cursor response with `firstBatch` and a server-side cursor ID
+/// (non-zero when there are more results than the requested `batchSize`).
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "cursor": { "firstBatch": [...], "id": <cursor_id>, "ns": "db.coll" }, "ok": 1.0 }
+/// ```
+fn handle_find(
+    body: &Document,
+    state: &ServerState,
+    cursors: &Arc<std::sync::Mutex<ConnectionCursors>>,
+) -> Document {
+    if body.contains_key("collation") {
+        return err_collation_unsupported();
+    }
+
+    let coll_name = match body.get_str("find") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("find requires a collection name string"),
+    };
+
+    let filter = body.get_document("filter").cloned().unwrap_or_default();
+
+    let mut opts = FindOptions::new();
+    if let Ok(sort) = body.get_document("sort") {
+        opts.sort = Some(sort.clone());
+    }
+    if let Ok(proj) = body.get_document("projection") {
+        opts.projection = Some(proj.clone());
+    }
+    if let Some(limit) = get_i64(body, "limit") {
+        opts.limit = Some(limit);
+    }
+    if let Some(skip) = get_i64(body, "skip") {
+        opts.skip = Some(skip as u64);
+    }
+
+    // Default first-batch size mirrors MongoDB 8.0 (101 documents).
+    let batch_size = get_i64(body, "batchSize")
+        .map(|n| if n <= 0 { 101usize } else { n as usize })
+        .unwrap_or(101);
+
+    let cursor = match state.database.find::<Document>(&coll_name, filter, opts) {
+        Ok(c) => c,
+        Err(e) => return err_from_mqlite(e),
+    };
+
+    // Collect all matching documents (cursor is already fully buffered in
+    // memory by the storage engine, so this is a cheap move operation).
+    let mut all_docs: Vec<Document> = Vec::new();
+    for result in cursor {
+        match result {
+            Ok(d) => all_docs.push(d),
+            Err(e) => return err_from_mqlite(e),
+        }
+    }
+
+    let split_at = batch_size.min(all_docs.len());
+    let remaining: Vec<Document> = all_docs.drain(split_at..).collect();
+    let first_batch: bson::Array = all_docs
+        .iter()
+        .map(|d| bson::Bson::Document(d.clone()))
+        .collect();
+
+    // Store a server-side cursor for the remaining documents if any.
+    let cursor_id: i64 = if remaining.is_empty() {
+        0
+    } else {
+        let remaining_cursor = crate::Cursor::<Document>::new(remaining, 0);
+        cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(remaining_cursor)
+    };
+
+    let ns = format!("{}.{}", state.db_name(), coll_name);
+    doc! {
+        "cursor": {
+            "firstBatch": first_batch,
+            "id": bson::Bson::Int64(cursor_id),
+            "ns": ns,
+        },
+        "ok": 1.0_f64,
+    }
+}
+
+/// `update` — update matching documents.
+///
+/// Processes the `updates` array; each entry may set `multi` and `upsert`.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "n": <matched>, "nModified": <modified>, "upserted": [...], "ok": 1.0 }
+/// ```
+fn handle_update(body: &Document, state: &ServerState) -> Document {
+    if body.contains_key("collation") {
+        return err_collation_unsupported();
+    }
+
+    let coll_name = match body.get_str("update") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("update requires a collection name string"),
+    };
+
+    let updates = match body.get_array("updates") {
+        Ok(arr) => arr.clone(),
+        Err(_) => return err_bad_value("update requires an \"updates\" array"),
+    };
+
+    let mut total_matched: i64 = 0;
+    let mut total_modified: i64 = 0;
+    let mut upserted: bson::Array = Vec::new();
+    let mut write_errors: bson::Array = Vec::new();
+
+    for (i, spec_bson) in updates.iter().enumerate() {
+        let spec = match spec_bson.as_document() {
+            Some(d) => d,
+            None => continue,
+        };
+
+        // Per-spec collation check.
+        if spec.contains_key("collation") {
+            return err_collation_unsupported();
+        }
+
+        let filter = spec.get_document("q").cloned().unwrap_or_default();
+        let update_doc = match spec.get_document("u") {
+            Ok(u) => u.clone(),
+            Err(_) => {
+                write_errors.push(bson::Bson::Document(doc! {
+                    "index": i as i32,
+                    "code": crate::error::codes::BAD_VALUE,
+                    "errmsg": "update spec missing required \"u\" field",
+                }));
+                continue;
+            }
+        };
+        let multi = spec.get_bool("multi").unwrap_or(false);
+        let upsert = spec.get_bool("upsert").unwrap_or(false);
+        let opts = UpdateOptions { upsert };
+
+        let result = if multi {
+            state.database.update_many(&coll_name, filter, update_doc, opts)
+        } else {
+            state.database.update_one(&coll_name, filter, update_doc, opts)
+        };
+
+        match result {
+            Ok(r) => {
+                total_matched += r.matched_count as i64;
+                total_modified += r.modified_count as i64;
+                if let Some(id) = r.upserted_id {
+                    upserted.push(bson::Bson::Document(doc! {
+                        "index": i as i32,
+                        "_id": id,
+                    }));
+                }
+            }
+            Err(e) => {
+                let (code, msg) = write_err_from_mqlite(&e);
+                write_errors.push(bson::Bson::Document(doc! {
+                    "index": i as i32,
+                    "code": code,
+                    "errmsg": msg,
+                }));
+            }
+        }
+    }
+
+    let mut response = doc! {
+        "n": bson::Bson::Int64(total_matched),
+        "nModified": bson::Bson::Int64(total_modified),
+        "ok": 1.0_f64,
+    };
+    if !upserted.is_empty() {
+        response.insert("upserted", bson::Bson::Array(upserted));
+    }
+    if !write_errors.is_empty() {
+        response.insert("writeErrors", bson::Bson::Array(write_errors));
+    }
+    response
+}
+
+/// `delete` — delete matching documents.
+///
+/// Processes the `deletes` array; `limit: 1` means deleteOne, `limit: 0` means
+/// deleteMany (matching MongoDB wire protocol semantics).
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "n": <deleted>, "ok": 1.0 }
+/// ```
+fn handle_delete(body: &Document, state: &ServerState) -> Document {
+    if body.contains_key("collation") {
+        return err_collation_unsupported();
+    }
+
+    let coll_name = match body.get_str("delete") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("delete requires a collection name string"),
+    };
+
+    let deletes = match body.get_array("deletes") {
+        Ok(arr) => arr.clone(),
+        Err(_) => return err_bad_value("delete requires a \"deletes\" array"),
+    };
+
+    let mut total_deleted: i64 = 0;
+    let mut write_errors: bson::Array = Vec::new();
+
+    for (i, spec_bson) in deletes.iter().enumerate() {
+        let spec = match spec_bson.as_document() {
+            Some(d) => d,
+            None => continue,
+        };
+
+        // Per-spec collation check.
+        if spec.contains_key("collation") {
+            return err_collation_unsupported();
+        }
+
+        let filter = spec.get_document("q").cloned().unwrap_or_default();
+        // `limit: 0` = delete all matching; `limit: 1` (or any non-zero) = delete one.
+        let limit = get_i64(spec, "limit").unwrap_or(1);
+
+        let result = if limit == 0 {
+            state.database.delete_many(&coll_name, filter)
+        } else {
+            state.database.delete_one(&coll_name, filter)
+        };
+
+        match result {
+            Ok(r) => total_deleted += r.deleted_count as i64,
+            Err(e) => {
+                let (code, msg) = write_err_from_mqlite(&e);
+                write_errors.push(bson::Bson::Document(doc! {
+                    "index": i as i32,
+                    "code": code,
+                    "errmsg": msg,
+                }));
+            }
+        }
+    }
+
+    let mut response = doc! {
+        "n": bson::Bson::Int64(total_deleted),
+        "ok": 1.0_f64,
+    };
+    if !write_errors.is_empty() {
+        response.insert("writeErrors", bson::Bson::Array(write_errors));
+    }
+    response
+}
+
+/// `findAndModify` — atomically find and modify (update or remove) a document.
+///
+/// The response uses the `value` field (not `document`) as required by
+/// MongoDB 8.0 wire protocol semantics.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// {
+///   "value": <doc_or_null>,
+///   "lastErrorObject": { "n": 1, "updatedExisting": true },
+///   "ok": 1.0
+/// }
+/// ```
+fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
+    if body.contains_key("collation") {
+        return err_collation_unsupported();
+    }
+
+    // Command key can be either "findAndModify" or "findandmodify" (case-insensitive
+    // dispatch normalises to lowercase in route_command).
+    let coll_name = body
+        .get_str("findandmodify")
+        .or_else(|_| body.get_str("findAndModify"))
+        .map(|s| s.to_owned())
+        .unwrap_or_default();
+    if coll_name.is_empty() {
+        return err_bad_value("findAndModify requires a collection name string");
+    }
+
+    let filter = body.get_document("query").cloned().unwrap_or_default();
+    let remove = body.get_bool("remove").unwrap_or(false);
+    let return_new = body.get_bool("new").unwrap_or(false);
+    let upsert = body.get_bool("upsert").unwrap_or(false);
+    let sort = body.get_document("sort").ok().cloned();
+
+    if remove {
+        // ---- findAndModify + remove ----
+        let opts = FindOneAndDeleteOptions { sort };
+        match state
+            .database
+            .find_one_and_delete_with_options::<Document>(&coll_name, filter, opts)
+        {
+            Ok(Some(doc)) => doc! {
+                "value": bson::Bson::Document(doc),
+                "lastErrorObject": { "n": 1i32 },
+                "ok": 1.0_f64,
+            },
+            Ok(None) => doc! {
+                "value": bson::Bson::Null,
+                "lastErrorObject": { "n": 0i32 },
+                "ok": 1.0_f64,
+            },
+            Err(e) => err_from_mqlite(e),
+        }
+    } else {
+        // ---- findAndModify + update ----
+        let update_doc = match body.get_document("update") {
+            Ok(u) => u.clone(),
+            Err(_) => {
+                return err_bad_value(
+                    "findAndModify requires either \"update\" or \"remove\"",
+                )
+            }
+        };
+
+        let return_document = if return_new {
+            ReturnDocument::After
+        } else {
+            ReturnDocument::Before
+        };
+        let opts = FindOneAndUpdateOptions {
+            return_document,
+            upsert,
+            sort,
+        };
+
+        match state
+            .database
+            .find_one_and_update_with_options::<Document>(&coll_name, filter, update_doc, opts)
+        {
+            Ok(Some(doc)) => {
+                // A document was returned.
+                // With ReturnDocument::Before this is the original (updatedExisting=true).
+                // With ReturnDocument::After this is the post-update doc; we cannot
+                // distinguish update-of-existing vs upsert from the return value alone,
+                // so we conservatively report updatedExisting=true (the common path).
+                let updated_existing = true;
+                doc! {
+                    "value": bson::Bson::Document(doc),
+                    "lastErrorObject": {
+                        "n": 1i32,
+                        "updatedExisting": updated_existing,
+                    },
+                    "ok": 1.0_f64,
+                }
+            }
+            Ok(None) => {
+                // No document found (or upsert with ReturnDocument::Before).
+                doc! {
+                    "value": bson::Bson::Null,
+                    "lastErrorObject": {
+                        "n": if upsert { 1i32 } else { 0i32 },
+                        "updatedExisting": false,
+                    },
+                    "ok": 1.0_f64,
+                }
+            }
+            Err(e) => err_from_mqlite(e),
+        }
+    }
+}
+
 /// Unknown command — returns `CommandNotFound` (error code 59).
 fn handle_unknown(name: &str) -> Document {
     #[cfg(feature = "tracing")]
@@ -989,6 +1546,12 @@ mod tests {
     use super::*;
     use bson::doc;
     use tokio::net::{TcpListener, TcpStream as TokioStream};
+
+    /// Return an empty per-connection cursor map for use in unit tests that
+    /// do not exercise cursor-related functionality.
+    fn dummy_cursors() -> Arc<std::sync::Mutex<ConnectionCursors>> {
+        Arc::new(std::sync::Mutex::new(ConnectionCursors::new()))
+    }
 
     /// Helper: spin up a loopback TCP pair and return (client, server) streams.
     async fn loopback_pair() -> (TokioStream, TokioStream) {
@@ -1097,7 +1660,7 @@ mod tests {
         let state = ServerState::default();
         let req_buf = make_op_msg_request(1, &doc! { "ping": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 10, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 10, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1108,7 +1671,7 @@ mod tests {
         let state = ServerState::default();
         let req_buf = make_op_msg_request(2, &doc! { "hello": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 11, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 11, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1127,8 +1690,11 @@ mod tests {
     #[test]
     fn dispatch_op_query_ismaster() {
         let state = ServerState::default();
-        let req_buf =
-            make_op_query_request(3, "admin.$cmd", &doc! { "ismaster": 1, "helloOk": true });
+        let req_buf = make_op_query_request(
+            3,
+            "admin.$cmd",
+            &doc! { "ismaster": 1, "helloOk": true },
+        );
         let resp_bytes = dispatch_op_query(&req_buf, 12, 3, &state, 2).unwrap();
 
         // Response must be OP_REPLY (opcode 1).
@@ -1139,11 +1705,15 @@ mod tests {
         // Parse the OP_REPLY body.
         // Layout: header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
         let doc_start = 16 + 4 + 8 + 4 + 4;
-        let doc_size =
-            i32::from_le_bytes(resp_bytes[doc_start..doc_start + 4].try_into().unwrap()) as usize;
-        let raw =
-            bson::RawDocumentBuf::from_bytes(resp_bytes[doc_start..doc_start + doc_size].to_vec())
-                .unwrap();
+        let doc_size = i32::from_le_bytes(
+            resp_bytes[doc_start..doc_start + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let raw = bson::RawDocumentBuf::from_bytes(
+            resp_bytes[doc_start..doc_start + doc_size].to_vec(),
+        )
+        .unwrap();
         let body = bson::from_slice::<Document>(raw.as_bytes()).unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
         assert!(body.get_bool("isWritablePrimary").unwrap());
@@ -1159,7 +1729,7 @@ mod tests {
         let state = ServerState::default();
         let req_buf = make_op_msg_request(3, &doc! { "ismaster": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 12, msg.header.request_id, &state, 3).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 12, msg.header.request_id, &state, 3, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert!(body.get_bool("isWritablePrimary").unwrap());
@@ -1171,7 +1741,7 @@ mod tests {
         let state = ServerState::default();
         let req_buf = make_op_msg_request(4, &doc! { "buildInfo": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 13, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 13, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1190,7 +1760,7 @@ mod tests {
         let state = ServerState::default();
         let req_buf = make_op_msg_request(5, &doc! { "serverStatus": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 14, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 14, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1206,9 +1776,10 @@ mod tests {
     #[test]
     fn dispatch_op_msg_list_databases() {
         let state = ServerState::default();
-        let req_buf = make_op_msg_request(6, &doc! { "listDatabases": 1, "$db": "admin" });
+        let req_buf =
+            make_op_msg_request(6, &doc! { "listDatabases": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 15, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 15, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1226,7 +1797,7 @@ mod tests {
         // Use $db: "admin" (always allowed) to test CommandNotFound, not Unauthorized.
         let req_buf = make_op_msg_request(7, &doc! { "aggregate": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 16, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 16, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 0.0);
@@ -1272,10 +1843,11 @@ mod tests {
     #[test]
     fn dispatch_op_msg_db_mismatch_returns_unauthorized() {
         let state = ServerState::default(); // db_name() == "local"
-                                            // "wrongdb" != "admin" and "wrongdb" != "local" → Unauthorized
+        // "wrongdb" != "admin" and "wrongdb" != "local" → Unauthorized
         let req_buf = make_op_msg_request(20, &doc! { "ping": 1, "$db": "wrongdb" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 40, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 40, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 0.0);
@@ -1288,7 +1860,8 @@ mod tests {
         let state = ServerState::default();
         let req_buf = make_op_msg_request(21, &doc! { "ping": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 41, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 41, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1299,7 +1872,8 @@ mod tests {
         let state = ServerState::new(Some(std::path::PathBuf::from("/tmp/myapp.mqlite")));
         let req_buf = make_op_msg_request(22, &doc! { "ping": 1, "$db": "myapp" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes = dispatch_op_msg(&msg, 42, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 42, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1333,13 +1907,14 @@ mod tests {
     #[test]
     fn dispatch_op_query_db_mismatch_returns_unauthorized() {
         let state = ServerState::default(); // db_name() == "local"
-                                            // "wrongdb.$cmd" → db = "wrongdb" ≠ "admin" and ≠ "local"
+        // "wrongdb.$cmd" → db = "wrongdb" ≠ "admin" and ≠ "local"
         let req_buf = make_op_query_request(30, "wrongdb.$cmd", &doc! { "ismaster": 1 });
         let resp_bytes = dispatch_op_query(&req_buf, 50, 30, &state, 1).unwrap();
         // OP_REPLY: header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
         let doc_start = 16 + 4 + 8 + 4 + 4;
-        let doc_size =
-            i32::from_le_bytes(resp_bytes[doc_start..doc_start + 4].try_into().unwrap()) as usize;
+        let doc_size = i32::from_le_bytes(
+            resp_bytes[doc_start..doc_start + 4].try_into().unwrap(),
+        ) as usize;
         let raw =
             bson::RawDocumentBuf::from_bytes(resp_bytes[doc_start..doc_start + doc_size].to_vec())
                 .unwrap();
@@ -1457,10 +2032,7 @@ mod tests {
             .unwrap()
             .get("processId")
             .cloned();
-        assert_eq!(
-            pid1, pid2,
-            "topology processId should be stable across calls"
-        );
+        assert_eq!(pid1, pid2, "topology processId should be stable across calls");
     }
 
     #[test]
@@ -1515,18 +2087,9 @@ mod tests {
         let dbs = body.get_array("databases").unwrap();
         assert_eq!(dbs.len(), 1, "mqlite must list exactly one database");
         let db_doc = dbs[0].as_document().unwrap();
-        assert!(
-            db_doc.contains_key("name"),
-            "database entry must have a name"
-        );
-        assert!(
-            db_doc.contains_key("sizeOnDisk"),
-            "database entry must have sizeOnDisk"
-        );
-        assert!(
-            db_doc.contains_key("empty"),
-            "database entry must have empty"
-        );
+        assert!(db_doc.contains_key("name"), "database entry must have a name");
+        assert!(db_doc.contains_key("sizeOnDisk"), "database entry must have sizeOnDisk");
+        assert!(db_doc.contains_key("empty"), "database entry must have empty");
     }
 
     #[test]
@@ -1649,10 +2212,8 @@ mod tests {
 
         // BSON doc starts at offset 20 within rest.
         let doc_start = 20;
-        let doc_size =
-            i32::from_le_bytes(rest[doc_start..doc_start + 4].try_into().unwrap()) as usize;
-        let raw = bson::RawDocumentBuf::from_bytes(rest[doc_start..doc_start + doc_size].to_vec())
-            .unwrap();
+        let doc_size = i32::from_le_bytes(rest[doc_start..doc_start + 4].try_into().unwrap()) as usize;
+        let raw = bson::RawDocumentBuf::from_bytes(rest[doc_start..doc_start + doc_size].to_vec()).unwrap();
         let body = bson::from_slice::<Document>(raw.as_bytes()).unwrap();
 
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1709,5 +2270,560 @@ mod tests {
         let resp_body = resp_msg.body().unwrap();
         assert_eq!(resp_body.get_f64("ok").unwrap(), 1.0);
         assert!(resp_body.get_i64("uptime").unwrap() >= 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // CRUD command handler unit tests
+    // -----------------------------------------------------------------------
+
+    // ---- insert ----
+
+    #[test]
+    fn insert_single_document_returns_n_1() {
+        let state = ServerState::default();
+        let body = doc! {
+            "insert": "users",
+            "documents": [{"name": "Alice", "age": 30i32}],
+            "$db": "local",
+        };
+        let result = handle_insert(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+        assert_eq!(result.get_i32("n").unwrap(), 1);
+        assert!(!result.contains_key("writeErrors"));
+    }
+
+    #[test]
+    fn insert_many_documents_ordered() {
+        let state = ServerState::default();
+        let body = doc! {
+            "insert": "items",
+            "documents": [
+                {"x": 1i32},
+                {"x": 2i32},
+                {"x": 3i32},
+            ],
+            "ordered": true,
+            "$db": "local",
+        };
+        let result = handle_insert(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(result.get_i32("n").unwrap(), 3);
+    }
+
+    #[test]
+    fn insert_empty_documents_returns_n_0() {
+        let state = ServerState::default();
+        let body = doc! {
+            "insert": "empty",
+            "documents": [],
+            "$db": "local",
+        };
+        let result = handle_insert(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(result.get_i32("n").unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_collation_returns_bad_value() {
+        let state = ServerState::default();
+        let body = doc! {
+            "insert": "col",
+            "documents": [],
+            "collation": {"locale": "en"},
+            "$db": "local",
+        };
+        let result = handle_insert(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 2); // BadValue
+    }
+
+    /// Insert via Kind-1 document sequence (pymongo bulk path).
+    #[test]
+    fn insert_via_doc_sequence_merged_into_body() {
+        let state = ServerState::default();
+        // Simulate what happens after merge_doc_sequences_into_body:
+        // the Kind-1 "documents" section has been merged into the body.
+        let body = doc! {
+            "insert": "merged",
+            "documents": [{"a": 1i32}, {"a": 2i32}],
+            "$db": "local",
+        };
+        let result = handle_insert(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(result.get_i32("n").unwrap(), 2);
+    }
+
+    // ---- find ----
+
+    #[test]
+    fn find_empty_collection_returns_empty_first_batch() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        let body = doc! {
+            "find": "nonexistent",
+            "filter": {},
+            "$db": "local",
+        };
+        let result = handle_find(&body, &state, &cursors);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+        let cursor_doc = result.get_document("cursor").unwrap();
+        let first_batch = cursor_doc.get_array("firstBatch").unwrap();
+        assert!(first_batch.is_empty(), "empty collection must return firstBatch=[]");
+        assert_eq!(cursor_doc.get_i64("id").unwrap(), 0, "cursor id must be 0 when exhausted");
+        assert!(cursor_doc.get_str("ns").is_ok(), "ns field must be present");
+    }
+
+    #[test]
+    fn find_returns_inserted_documents() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        // Insert 3 docs first.
+        let insert_body = doc! {
+            "insert": "findtest",
+            "documents": [{"v": 1i32}, {"v": 2i32}, {"v": 3i32}],
+            "$db": "local",
+        };
+        let ins_res = handle_insert(&insert_body, &state);
+        assert_eq!(ins_res.get_f64("ok").unwrap(), 1.0);
+
+        let find_body = doc! {
+            "find": "findtest",
+            "filter": {},
+            "$db": "local",
+        };
+        let result = handle_find(&find_body, &state, &cursors);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let cursor_doc = result.get_document("cursor").unwrap();
+        let first_batch = cursor_doc.get_array("firstBatch").unwrap();
+        assert_eq!(first_batch.len(), 3);
+        // cursor exhausted — no server-side cursor needed
+        assert_eq!(cursor_doc.get_i64("id").unwrap(), 0);
+    }
+
+    #[test]
+    fn find_with_filter_returns_matching_docs() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        let insert_body = doc! {
+            "insert": "filtercoll",
+            "documents": [
+                {"status": "active", "n": 1i32},
+                {"status": "inactive", "n": 2i32},
+                {"status": "active", "n": 3i32},
+            ],
+            "$db": "local",
+        };
+        handle_insert(&insert_body, &state);
+
+        let find_body = doc! {
+            "find": "filtercoll",
+            "filter": {"status": "active"},
+            "$db": "local",
+        };
+        let result = handle_find(&find_body, &state, &cursors);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let cursor_doc = result.get_document("cursor").unwrap();
+        assert_eq!(cursor_doc.get_array("firstBatch").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn find_batch_size_creates_server_side_cursor() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        // Insert 5 documents.
+        let insert_body = doc! {
+            "insert": "batchcoll",
+            "documents": [
+                {"i": 0i32}, {"i": 1i32}, {"i": 2i32},
+                {"i": 3i32}, {"i": 4i32},
+            ],
+            "$db": "local",
+        };
+        handle_insert(&insert_body, &state);
+
+        // Request only 2 per batch.
+        let find_body = doc! {
+            "find": "batchcoll",
+            "filter": {},
+            "batchSize": 2i32,
+            "$db": "local",
+        };
+        let result = handle_find(&find_body, &state, &cursors);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let cursor_doc = result.get_document("cursor").unwrap();
+        let first_batch = cursor_doc.get_array("firstBatch").unwrap();
+        assert_eq!(first_batch.len(), 2, "firstBatch must have exactly batchSize docs");
+        let cursor_id = cursor_doc.get_i64("id").unwrap();
+        assert_ne!(cursor_id, 0, "cursor id must be non-zero when more docs remain");
+        // The server-side cursor should be stored.
+        assert_eq!(cursors.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn find_collation_returns_bad_value() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        let body = doc! {
+            "find": "col",
+            "filter": {},
+            "collation": {"locale": "en"},
+            "$db": "local",
+        };
+        let result = handle_find(&body, &state, &cursors);
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 2);
+    }
+
+    // ---- update ----
+
+    #[test]
+    fn update_one_modifies_single_document() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        // Seed.
+        handle_insert(
+            &doc! { "insert": "updcoll", "documents": [{"k": "a", "v": 1i32}, {"k": "a", "v": 2i32}], "$db": "local" },
+            &state,
+        );
+
+        let body = doc! {
+            "update": "updcoll",
+            "updates": [{
+                "q": {"k": "a"},
+                "u": {"$set": {"v": 99i32}},
+                "multi": false,
+            }],
+            "$db": "local",
+        };
+        let result = handle_update(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+        assert_eq!(result.get_i64("n").unwrap(), 1);
+        assert_eq!(result.get_i64("nModified").unwrap(), 1);
+
+        // Verify only one was modified.
+        let find_res = handle_find(
+            &doc! { "find": "updcoll", "filter": {"v": 99i32}, "$db": "local" },
+            &state,
+            &cursors,
+        );
+        let batch = find_res.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn update_many_modifies_all_matching() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        handle_insert(
+            &doc! { "insert": "multcoll", "documents": [{"x": 1i32}, {"x": 1i32}, {"x": 2i32}], "$db": "local" },
+            &state,
+        );
+
+        let body = doc! {
+            "update": "multcoll",
+            "updates": [{
+                "q": {"x": 1i32},
+                "u": {"$set": {"x": 10i32}},
+                "multi": true,
+            }],
+            "$db": "local",
+        };
+        let result = handle_update(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(result.get_i64("n").unwrap(), 2);
+        assert_eq!(result.get_i64("nModified").unwrap(), 2);
+    }
+
+    #[test]
+    fn update_with_upsert_inserts_new_document() {
+        let state = ServerState::default();
+        let body = doc! {
+            "update": "upsertcoll",
+            "updates": [{
+                "q": {"_id": "new-id"},
+                "u": {"$set": {"created": true}},
+                "upsert": true,
+            }],
+            "$db": "local",
+        };
+        let result = handle_update(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        // Upserted array must contain the new document id.
+        let upserted = result.get_array("upserted").unwrap();
+        assert_eq!(upserted.len(), 1);
+        let upsert_entry = upserted[0].as_document().unwrap();
+        assert_eq!(upsert_entry.get_i32("index").unwrap(), 0);
+        assert!(upsert_entry.contains_key("_id"));
+    }
+
+    #[test]
+    fn update_collation_returns_bad_value() {
+        let state = ServerState::default();
+        let body = doc! {
+            "update": "col",
+            "updates": [{"q": {}, "u": {"$set": {"x": 1i32}}}],
+            "collation": {"locale": "en"},
+            "$db": "local",
+        };
+        let result = handle_update(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 2);
+    }
+
+    // ---- delete ----
+
+    #[test]
+    fn delete_one_removes_single_document() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        handle_insert(
+            &doc! { "insert": "delcoll", "documents": [{"k": 1i32}, {"k": 1i32}, {"k": 2i32}], "$db": "local" },
+            &state,
+        );
+
+        let body = doc! {
+            "delete": "delcoll",
+            "deletes": [{ "q": {"k": 1i32}, "limit": 1i32 }],
+            "$db": "local",
+        };
+        let result = handle_delete(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+        assert_eq!(result.get_i64("n").unwrap(), 1);
+
+        // Two docs with k=1 were inserted; one remains.
+        let find_res = handle_find(
+            &doc! { "find": "delcoll", "filter": {"k": 1i32}, "$db": "local" },
+            &state,
+            &cursors,
+        );
+        let batch = find_res.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn delete_many_removes_all_matching() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        handle_insert(
+            &doc! { "insert": "delmanycoll", "documents": [{"t": "x"}, {"t": "x"}, {"t": "y"}], "$db": "local" },
+            &state,
+        );
+
+        let body = doc! {
+            "delete": "delmanycoll",
+            "deletes": [{ "q": {"t": "x"}, "limit": 0i32 }],
+            "$db": "local",
+        };
+        let result = handle_delete(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(result.get_i64("n").unwrap(), 2);
+
+        // Only doc with t=y remains.
+        let find_res = handle_find(
+            &doc! { "find": "delmanycoll", "filter": {}, "$db": "local" },
+            &state,
+            &cursors,
+        );
+        let batch = find_res.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn delete_collation_returns_bad_value() {
+        let state = ServerState::default();
+        let body = doc! {
+            "delete": "col",
+            "deletes": [{"q": {}, "limit": 1i32}],
+            "collation": {"locale": "en"},
+            "$db": "local",
+        };
+        let result = handle_delete(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 2);
+    }
+
+    // ---- findAndModify ----
+
+    #[test]
+    fn find_and_modify_update_returns_original_doc() {
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "famcoll", "documents": [{"name": "Alice", "score": 10i32}], "$db": "local" },
+            &state,
+        );
+
+        let body = doc! {
+            "findandmodify": "famcoll",
+            "query": {"name": "Alice"},
+            "update": {"$set": {"score": 99i32}},
+            "new": false,
+            "$db": "local",
+        };
+        let result = handle_find_and_modify(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+        // Response must use 'value' not 'document'.
+        assert!(result.contains_key("value"), "response must use 'value' field");
+        assert!(!result.contains_key("document"), "response must NOT use 'document' field");
+        let value = result.get_document("value").unwrap();
+        assert_eq!(value.get_str("name").unwrap(), "Alice");
+        // Original score before update.
+        assert_eq!(value.get_i32("score").unwrap(), 10);
+        let leo = result.get_document("lastErrorObject").unwrap();
+        assert_eq!(leo.get_i32("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn find_and_modify_update_new_true_returns_updated_doc() {
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "famnewcoll", "documents": [{"v": 1i32}], "$db": "local" },
+            &state,
+        );
+
+        let body = doc! {
+            "findandmodify": "famnewcoll",
+            "query": {"v": 1i32},
+            "update": {"$set": {"v": 2i32}},
+            "new": true,
+            "$db": "local",
+        };
+        let result = handle_find_and_modify(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let value = result.get_document("value").unwrap();
+        assert_eq!(value.get_i32("v").unwrap(), 2); // post-update
+    }
+
+    #[test]
+    fn find_and_modify_no_match_returns_null_value() {
+        let state = ServerState::default();
+        let body = doc! {
+            "findandmodify": "emptyfamcoll",
+            "query": {"nonexistent": true},
+            "update": {"$set": {"x": 1i32}},
+            "$db": "local",
+        };
+        let result = handle_find_and_modify(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(
+            result.get("value"),
+            Some(&bson::Bson::Null),
+            "value must be null when no doc matches"
+        );
+        let leo = result.get_document("lastErrorObject").unwrap();
+        assert_eq!(leo.get_i32("n").unwrap(), 0);
+    }
+
+    #[test]
+    fn find_and_modify_remove_true_deletes_and_returns_doc() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        handle_insert(
+            &doc! { "insert": "famremcoll", "documents": [{"tag": "del", "val": 42i32}], "$db": "local" },
+            &state,
+        );
+
+        let body = doc! {
+            "findandmodify": "famremcoll",
+            "query": {"tag": "del"},
+            "remove": true,
+            "$db": "local",
+        };
+        let result = handle_find_and_modify(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let value = result.get_document("value").unwrap();
+        assert_eq!(value.get_i32("val").unwrap(), 42);
+
+        // Verify the document is gone.
+        let find_res = handle_find(
+            &doc! { "find": "famremcoll", "filter": {}, "$db": "local" },
+            &state,
+            &cursors,
+        );
+        let batch = find_res.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn find_and_modify_collation_returns_bad_value() {
+        let state = ServerState::default();
+        let body = doc! {
+            "findandmodify": "col",
+            "query": {},
+            "update": {"$set": {"x": 1i32}},
+            "collation": {"locale": "en"},
+            "$db": "local",
+        };
+        let result = handle_find_and_modify(&body, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 2);
+    }
+
+    // ---- CRUD via full OP_MSG dispatch ----
+
+    /// End-to-end dispatch test: insert then find through the wire framing layer.
+    #[test]
+    fn dispatch_op_msg_insert_and_find() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+
+        // Insert
+        let insert_req = make_op_msg_request(
+            100,
+            &doc! { "insert": "disp_coll", "documents": [{"hello": "world"}], "$db": "local" },
+        );
+        let msg = OpMsg::parse(&insert_req).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 200, msg.header.request_id, &state, 1, &cursors).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        let body = resp.body().unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(body.get_i32("n").unwrap(), 1);
+
+        // Find
+        let find_req = make_op_msg_request(
+            101,
+            &doc! { "find": "disp_coll", "filter": {}, "$db": "local" },
+        );
+        let msg = OpMsg::parse(&find_req).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 201, msg.header.request_id, &state, 1, &cursors).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        let body = resp.body().unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        let cursor_doc = body.get_document("cursor").unwrap();
+        assert_eq!(cursor_doc.get_array("firstBatch").unwrap().len(), 1);
+        assert_eq!(cursor_doc.get_i64("id").unwrap(), 0);
+        assert!(cursor_doc.get_str("ns").unwrap().contains("disp_coll"));
+    }
+
+    /// Verify merge_doc_sequences_into_body works for the pymongo insert path.
+    #[test]
+    fn merge_doc_sequences_merges_kind1_documents() {
+        let body = doc! { "insert": "coll", "$db": "local" };
+        let docs = vec![doc! { "a": 1i32 }, doc! { "a": 2i32 }];
+        let sections = vec![
+            Section::Body(body.clone()),
+            Section::DocSequence {
+                identifier: "documents".to_owned(),
+                documents: docs.clone(),
+            },
+        ];
+        let merged = merge_doc_sequences_into_body(&body, &sections);
+        let arr = merged.get_array("documents").unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    /// `get_i64` must coerce Int32, Int64 and Double.
+    #[test]
+    fn get_i64_coerces_bson_types() {
+        let doc = doc! {
+            "int32": 7i32,
+            "int64": 100i64,
+            "double": 3.0_f64,
+        };
+        assert_eq!(get_i64(&doc, "int32"), Some(7));
+        assert_eq!(get_i64(&doc, "int64"), Some(100));
+        assert_eq!(get_i64(&doc, "double"), Some(3));
+        assert_eq!(get_i64(&doc, "missing"), None);
     }
 }
