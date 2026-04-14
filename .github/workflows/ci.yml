@@ -174,6 +174,56 @@ jobs:
         run: cargo build --all-features --target ${{ matrix.target }}
 
   # ---------------------------------------------------------------------------
+  # Fuzz — sanity pass with a short time limit on each target
+  #
+  # Runs on PRs and pushes to master.  The time limit (-max_total_time=30)
+  # keeps CI fast while still exercising all four attack surfaces with the
+  # seed corpus.  Long-running fuzzing sessions are left to the maintainer
+  # via `cargo +nightly fuzz run <target>`.
+  # ---------------------------------------------------------------------------
+  fuzz:
+    name: Fuzz (sanity pass)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-nightly
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --quiet
+
+      - name: Fuzz — bson_parser (30 s)
+        run: >
+          cargo +nightly fuzz run bson_parser
+          fuzz/corpus/bson_parser
+          -- -max_total_time=30
+
+      - name: Fuzz — wire_protocol (30 s)
+        run: >
+          cargo +nightly fuzz run wire_protocol
+          fuzz/corpus/wire_protocol
+          -- -max_total_time=30
+
+      - name: Fuzz — query_evaluator (30 s)
+        run: >
+          cargo +nightly fuzz run query_evaluator
+          fuzz/corpus/query_evaluator
+          -- -max_total_time=30
+
+      - name: Fuzz — key_encoder (30 s)
+        run: >
+          cargo +nightly fuzz run key_encoder
+          fuzz/corpus/key_encoder
+          -- -max_total_time=30
+
+  # ---------------------------------------------------------------------------
   # Security audit — scan dependencies for known vulnerabilities
   # ---------------------------------------------------------------------------
   audit:

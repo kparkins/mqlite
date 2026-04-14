@@ -122,3 +122,22 @@ pub use bson_compat::{doc, Bson, DateTime, Document, ObjectId};
 // Wire protocol entry point (feature-gated)
 #[cfg(feature = "wire")]
 pub use wire::WireProtocol;
+
+// ---------------------------------------------------------------------------
+// Fuzz helpers (feature = "fuzz" only — never enable in production)
+// ---------------------------------------------------------------------------
+
+/// Evaluate a MongoDB filter document against a BSON document.
+///
+/// This is a thin shim over the internal `query::eval_filter` function,
+/// exposed **only** under the `fuzz` feature so that fuzz targets in the
+/// `fuzz/` crate can reach it without making it part of the stable API.
+///
+/// Do **not** call this from application code.
+#[cfg(feature = "fuzz")]
+pub fn fuzz_eval_filter(
+    doc: &bson_compat::Document,
+    filter: &bson_compat::Document,
+) -> Result<bool> {
+    query::eval_filter(doc, filter)
+}

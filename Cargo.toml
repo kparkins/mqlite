@@ -13,6 +13,9 @@ categories = ["database", "embedded"]
 default = []
 wire = ["dep:tokio", "dep:tokio-util"]
 tracing = ["dep:tracing"]
+# Exposes internal functions (eval_filter, etc.) for fuzz targets.
+# Do NOT enable in production builds.
+fuzz = []
 
 [dependencies]
 bson = { version = "2", features = ["serde_with"] }

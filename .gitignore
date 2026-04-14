@@ -22,3 +22,7 @@ target
 
 # Gas Town local config
 CLAUDE.md
+
+# cargo-fuzz build artefacts (keep corpus/ and seeds/ committed)
+fuzz/target/
+fuzz/artifacts/

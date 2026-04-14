@@ -1,0 +1,45 @@
+[package]
+name = "mqlite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bson = { version = "2", features = ["serde_with"] }
+
+[dependencies.mqlite]
+path = ".."
+features = ["wire", "fuzz"]
+
+[[bin]]
+name = "bson_parser"
+path = "fuzz_targets/bson_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wire_protocol"
+path = "fuzz_targets/wire_protocol.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "query_evaluator"
+path = "fuzz_targets/query_evaluator.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "key_encoder"
+path = "fuzz_targets/key_encoder.rs"
+test = false
+doc = false
+
+# Declare an isolated workspace so cargo-fuzz can invoke us with nightly
+# without interfering with the parent workspace's stable toolchain.
+[workspace]
+members = ["."]
