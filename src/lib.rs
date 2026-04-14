@@ -85,6 +85,8 @@ pub mod results;
 mod query;
 mod storage;
 mod validation;
+// Phase 1: WAL module — not yet wired into the main read/write paths.
+#[allow(dead_code)]
 mod wal;
 
 // Wire protocol shim (feature-gated)
