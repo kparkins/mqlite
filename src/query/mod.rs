@@ -7,6 +7,7 @@
 //! - hq-apk: BSON key encoding (MongoDB comparison ordering)
 //! - hq-mx1: Error taxonomy and MongoDB error code mapping
 //! - hq-uii: Filter evaluation engine (comparison, logical, element operators)
+//! - hq-ca5: Array operators ($elemMatch, $all, $size) and evaluation ($regex)
 
 mod filter;
 

@@ -16,6 +16,9 @@ pub mod codes {
     pub const NAMESPACE_NOT_FOUND: i32 = 26;
     /// The database file format is not supported.
     pub const UNSUPPORTED_FORMAT: i32 = 115;
+    /// An MQL operator is not supported by mqlite.
+    /// Matches MongoDB error code 9 (FailedToParse / unknown operator).
+    pub const UNSUPPORTED_OPERATOR: i32 = 9;
     /// A document failed schema validation or structural constraints.
     /// Matches MongoDB error code 121.
     pub const DOCUMENT_VALIDATION_FAILURE: i32 = 121;
@@ -181,6 +184,7 @@ impl Error {
             Error::DocumentTooLarge { .. } => Some(codes::DOCUMENT_TOO_LARGE),
             Error::SymlinkRejected { .. } => Some(codes::BAD_VALUE),
             Error::InvalidWireMessage { .. } => Some(codes::ILLEGAL_OP),
+            Error::UnsupportedOperator { .. } => Some(codes::UNSUPPORTED_OPERATOR),
             _ => None,
         }
     }

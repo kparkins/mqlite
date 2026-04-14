@@ -15,6 +15,10 @@
 //!
 //! **Element:** `$exists`, `$type`
 //!
+//! **Array:** `$elemMatch`, `$all`, `$size`
+//!
+//! **Evaluation:** `$regex`
+//!
 //! # Cross-type comparison
 //!
 //! Ordering between BSON types follows MongoDB's canonical type ordering:
@@ -39,6 +43,7 @@
 use std::cmp::Ordering;
 
 use bson::{Bson, Document};
+use regex::RegexBuilder;
 
 use serde::de::Error as SerdeDeError;
 
@@ -82,6 +87,21 @@ pub(crate) fn eval_filter(doc: &Document, filter: &Document) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-query regex DFA size limit
+// ---------------------------------------------------------------------------
+
+/// Maximum DFA state bytes for compiled regex patterns (10 MB).
+///
+/// Prevents pathological patterns from consuming excessive memory during DFA
+/// compilation.  The `regex` crate uses a linear-time matching algorithm
+/// (DFA/NFA hybrid with lazy construction), so this limit covers compile-time
+/// cost; catastrophic backtracking at match time is architecturally impossible.
+///
+/// If a pattern exceeds this limit, `build_regex` returns `Error::BsonDeserialization`
+/// (MongoDB error code 2 / BadValue).
+const REGEX_DFA_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
 // Top-level condition dispatch
 // ---------------------------------------------------------------------------
 
@@ -94,6 +114,11 @@ fn eval_top_level(doc: &Document, key: &str, condition: &Bson) -> Result<bool> {
         "$not" => Err(bad_value(
             "$not cannot be used at the top level; use $nor instead",
         )),
+        // $expr is explicitly rejected — it uses aggregation expressions which
+        // are not supported in mqlite.  It must never be silently passed through.
+        "$expr" => Err(Error::UnsupportedOperator {
+            operator: "$expr".to_owned(),
+        }),
         k if k.starts_with('$') => Err(Error::UnsupportedOperator {
             operator: k.to_owned(),
         }),
@@ -170,6 +195,9 @@ fn eval_field_condition(field_value: Option<&Bson>, condition: &Bson) -> Result<
                 eval_eq(field_value, condition)
             }
         }
+        // /pattern/flags shorthand — condition is a BSON RegularExpression.
+        // Drivers (mongosh, pymongo) send {field: /pattern/flags} as this type.
+        Bson::RegularExpression(re) => eval_regex(field_value, &re.pattern, &re.options),
         // Any other value is an implicit $eq with array-unwrap semantics.
         _ => eval_eq(field_value, condition),
     }
@@ -178,7 +206,42 @@ fn eval_field_condition(field_value: Option<&Bson>, condition: &Bson) -> Result<
 /// Evaluate an operator document like `{$gt: 5, $lt: 10, $not: {$eq: 7}}`.
 ///
 /// All operators in the document must match (AND semantics).
+///
+/// `$regex` and `$options` are handled here as a compound pair because
+/// `$options` is only meaningful alongside `$regex`.
 fn eval_operator_document(field_value: Option<&Bson>, ops: &Document) -> Result<bool> {
+    // Handle $regex/$options as a unit before iterating the rest.
+    if let Some(pattern_bson) = ops.get("$regex") {
+        let pattern: &str = match pattern_bson {
+            Bson::String(s) => s.as_str(),
+            Bson::RegularExpression(re) => re.pattern.as_str(),
+            _ => return Err(bad_value("$regex must be a string or RegularExpression")),
+        };
+        let options: &str = match ops.get("$options") {
+            Some(Bson::String(s)) => s.as_str(),
+            Some(_) => return Err(bad_value("$options must be a string")),
+            None => "",
+        };
+        if !eval_regex(field_value, pattern, options)? {
+            return Ok(false);
+        }
+        // Process remaining operators, skipping $regex/$options.
+        for (op, arg) in ops.iter() {
+            if op == "$regex" || op == "$options" {
+                continue;
+            }
+            if !eval_single_op(field_value, op.as_str(), arg)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    // $options without $regex is an error.
+    if ops.contains_key("$options") {
+        return Err(bad_value("$options is only valid when used with $regex"));
+    }
+
     for (op, arg) in ops.iter() {
         if !eval_single_op(field_value, op.as_str(), arg)? {
             return Ok(false);
@@ -188,8 +251,12 @@ fn eval_operator_document(field_value: Option<&Bson>, ops: &Document) -> Result<
 }
 
 /// Evaluate a single operator (e.g. `$gt`) against a field value.
+///
+/// `$regex` and `$options` are NOT dispatched here; they are handled as a
+/// unit by [`eval_operator_document`] because `$options` depends on `$regex`.
 fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bool> {
     match op {
+        // ---- Comparison ----
         "$eq" => eval_eq(field_value, arg),
         "$ne" => Ok(!eval_eq(field_value, arg)?),
         "$gt" => eval_cmp(field_value, arg, Ordering::Greater, false),
@@ -198,9 +265,36 @@ fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bo
         "$lte" => eval_cmp(field_value, arg, Ordering::Less, true),
         "$in" => eval_in(field_value, arg),
         "$nin" => Ok(!eval_in(field_value, arg)?),
+        // ---- Logical (field-level) ----
         "$not" => eval_not(field_value, arg),
+        // ---- Element ----
         "$exists" => eval_exists(field_value, arg),
         "$type" => eval_type(field_value, arg),
+        // ---- Array ----
+        "$elemMatch" => eval_elem_match(field_value, arg),
+        "$all" => eval_all(field_value, arg),
+        "$size" => eval_size(field_value, arg),
+        // ---- Evaluation operators ($regex/$options handled by eval_operator_document) ----
+        "$regex" | "$options" => Err(Error::UnsupportedOperator {
+            operator: op.to_owned(),
+        }),
+        // ---- Explicitly unsupported operators (error code 9) ----
+        // These are named individually to ensure they are never silently ignored.
+        "$expr"           // Aggregation-expression passthrough — explicitly forbidden.
+        | "$jsonSchema"   // JSON Schema validation — Phase 2.
+        | "$mod"          // Modulo arithmetic — not implemented.
+        | "$text"         // Full-text search — not implemented.
+        | "$where"        // JavaScript evaluation — intentionally unsupported.
+        | "$geoWithin" | "$geoIntersects" | "$near" | "$nearSphere" // Geospatial.
+        | "$slice"        // Projection operator — not valid in query filters.
+        | "$meta"         // Projection meta — not valid in query filters.
+        | "$comment"      // Query annotation — not implemented.
+        | "$rand"         // Random sampling — not implemented.
+        | "$natural"      // Natural sort hint — not valid in query filters.
+        => Err(Error::UnsupportedOperator {
+            operator: op.to_owned(),
+        }),
+        // ---- Catch-all for any other unknown operator ----
         other => Err(Error::UnsupportedOperator {
             operator: other.to_owned(),
         }),
@@ -457,6 +551,180 @@ fn type_name_to_id(name: &str) -> Result<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// $elemMatch
+// ---------------------------------------------------------------------------
+
+/// Evaluate `$elemMatch` — a single array element must satisfy all conditions.
+///
+/// Only array-typed fields can match; scalars and missing fields never match.
+///
+/// If all top-level keys in `arg` start with `$`, the operators are applied
+/// directly to each element (e.g., `{$gt: 5, $lt: 10}` tests each number).
+/// Otherwise the element must be a sub-document matching `arg` as a filter.
+fn eval_elem_match(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
+    let cond_doc = require_document("$elemMatch", arg)?;
+    let arr = match field_value {
+        Some(Bson::Array(a)) => a,
+        _ => return Ok(false), // missing or non-array — no match
+    };
+    let is_operator_mode = cond_doc.keys().any(|k| k.starts_with('$'));
+    for elem in arr {
+        let matched = if is_operator_mode {
+            // Apply operator conditions directly to the element value.
+            eval_operator_document(Some(elem), cond_doc)?
+        } else {
+            // Element must be a document matching the sub-filter.
+            match elem {
+                Bson::Document(sub_doc) => eval_filter(sub_doc, cond_doc)?,
+                _ => false,
+            }
+        };
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// $all
+// ---------------------------------------------------------------------------
+
+/// Evaluate `$all` — every value in the list must appear in the field array.
+///
+/// For a scalar field, the field is treated as a single-element array
+/// (matching MongoDB 8.0 behaviour for `{a: {$all: [v]}}` vs `{a: v}`).
+///
+/// Returns `false` for an empty `$all` list or a missing/null field.
+///
+/// Each element in the `$all` list may itself be an `{$elemMatch: ...}` document;
+/// in that case the sub-condition is evaluated against the whole field array.
+fn eval_all(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
+    let required = require_array("$all", arg)?;
+    if required.is_empty() {
+        // An empty $all matches no documents.
+        return Ok(false);
+    }
+    match field_value {
+        None => Ok(false),
+        Some(Bson::Array(arr)) => {
+            for req_val in required {
+                // Check for $all: [{$elemMatch: {...}}] syntax.
+                let found = if let Bson::Document(cond) = req_val {
+                    if let Some(em_arg) = cond.get("$elemMatch") {
+                        eval_elem_match(Some(&Bson::Array(arr.clone())), em_arg)?
+                    } else {
+                        arr.iter().any(|elem| bson_eq(elem, req_val))
+                    }
+                } else {
+                    arr.iter().any(|elem| bson_eq(elem, req_val))
+                };
+                if !found {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Some(scalar) => {
+            // Treat a scalar as a single-element array.
+            for req_val in required {
+                if !bson_eq(scalar, req_val) {
+                    return Ok(false);
+                }
+            }
+            // Only matches if $all contains exactly one value (equal to scalar).
+            Ok(true)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// $size
+// ---------------------------------------------------------------------------
+
+/// Evaluate `$size` — field array must have exactly N elements.
+///
+/// Only array-typed fields can match.  Missing fields and scalar fields never
+/// match.  `N` must be a non-negative integer; fractional values are rejected.
+fn eval_size(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
+    let n = bson_to_i64_strict("$size", arg)?;
+    if n < 0 {
+        return Err(bad_value("$size must be a non-negative integer"));
+    }
+    match field_value {
+        Some(Bson::Array(arr)) => Ok(arr.len() as i64 == n),
+        _ => Ok(false),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// $regex
+// ---------------------------------------------------------------------------
+
+/// Evaluate `$regex` — field string must match the given pattern.
+///
+/// Only `String`-typed field values (or array elements that are strings) are
+/// tested against the pattern.  Non-string values are skipped.
+///
+/// `options` is a string of regex flag characters:
+/// - `i` — case-insensitive
+/// - `m` — multiline (`^`/`$` match line boundaries)
+/// - `s` — dotall (`.` matches `\n`)
+/// - `x` — extended / verbose (whitespace and `#` comments are ignored)
+///
+/// **PCRE incompatibilities**: the Rust `regex` crate does not support
+/// lookahead, lookbehind, atomic groups, possessive quantifiers, named
+/// backreferences, conditional patterns, or recursive patterns.  Patterns
+/// using these constructs will fail to compile.
+fn eval_regex(field_value: Option<&Bson>, pattern: &str, options: &str) -> Result<bool> {
+    let re = build_regex(pattern, options)?;
+    match field_value {
+        None => Ok(false),
+        Some(Bson::String(s)) => Ok(re.is_match(s)),
+        Some(Bson::Array(arr)) => {
+            // Array field: match if any string element matches.
+            for elem in arr {
+                if let Bson::String(s) = elem {
+                    if re.is_match(s) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        Some(_) => Ok(false), // non-string, non-array — no match
+    }
+}
+
+/// Compile a regex pattern with the given option flags.
+///
+/// Uses [`RegexBuilder`] with a DFA size cap ([`REGEX_DFA_SIZE_LIMIT`]) to
+/// prevent compile-time memory explosion on pathological patterns.
+fn build_regex(pattern: &str, options: &str) -> Result<regex::Regex> {
+    let mut b = RegexBuilder::new(pattern);
+    b.size_limit(REGEX_DFA_SIZE_LIMIT);
+    b.dfa_size_limit(REGEX_DFA_SIZE_LIMIT);
+    for flag in options.chars() {
+        match flag {
+            'i' => { b.case_insensitive(true); }
+            'm' => { b.multi_line(true); }
+            's' => { b.dot_matches_new_line(true); }
+            'x' => { b.ignore_whitespace(true); }
+            // 'l' (locale) and 'u' (unicode) are accepted but no-op:
+            // the regex crate is Unicode-aware by default and has no
+            // locale concept.
+            'l' | 'u' => {}
+            other => {
+                return Err(bad_value(&format!(
+                    "unknown $regex option '{other}'"
+                )));
+            }
+        }
+    }
+    b.build().map_err(|e| bad_value(&format!("invalid $regex pattern: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Nested field access (dot notation)
 // ---------------------------------------------------------------------------
 
@@ -541,6 +809,29 @@ fn require_document<'a>(ctx: &str, val: &'a Bson) -> Result<&'a Document> {
         Bson::Document(doc) => Ok(doc),
         _ => Err(bad_value(&format!(
             "{ctx} must be a document, got: {}",
+            bson_type_name(val)
+        ))),
+    }
+}
+
+/// Convert a BSON value to `i64`, accepting only whole-number values.
+///
+/// `Double` values are accepted only if they are exact integers (e.g., `2.0`).
+/// Used by `$size` which requires a non-negative integer argument.
+fn bson_to_i64_strict(op: &str, val: &Bson) -> Result<i64> {
+    match val {
+        Bson::Int32(n) => Ok(*n as i64),
+        Bson::Int64(n) => Ok(*n),
+        Bson::Double(f) => {
+            let i = *f as i64;
+            if i as f64 == *f {
+                Ok(i)
+            } else {
+                Err(bad_value(&format!("{op} requires a whole-number value, got {f}")))
+            }
+        }
+        _ => Err(bad_value(&format!(
+            "{op} must be a number, got: {}",
             bson_type_name(val)
         ))),
     }
@@ -1143,5 +1434,398 @@ mod tests {
     #[test]
     fn cross_type_numbers_lt_strings() {
         assert!(matches(doc! { "a": { "$lt": "z" } }, doc! { "a": 9999 }));
+    }
+
+    // -----------------------------------------------------------------------
+    // $elemMatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn elem_match_operator_mode_single_condition() {
+        // Single operator condition applied to each element.
+        let doc = doc! { "scores": [5, 15, 95] };
+        assert!(matches(
+            doc! { "scores": { "$elemMatch": { "$gt": 80 } } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "scores": { "$elemMatch": { "$gt": 100 } } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn elem_match_operator_mode_multi_condition() {
+        // A SINGLE element must satisfy ALL conditions (not any element per condition).
+        // Array [5, 15, 25]: only 15 satisfies both $gt:10 AND $lt:20.
+        let doc = doc! { "scores": [5, 15, 25] };
+        assert!(matches(
+            doc! { "scores": { "$elemMatch": { "$gt": 10, "$lt": 20 } } },
+            doc.clone()
+        ));
+        // No single element satisfies $gt:10 AND $lt:12.
+        assert!(no_match(
+            doc! { "scores": { "$elemMatch": { "$gt": 10, "$lt": 12 } } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn elem_match_document_mode() {
+        // Elements are documents; condition is a sub-filter.
+        let doc = doc! {
+            "items": [
+                { "name": "a", "qty": 5 },
+                { "name": "b", "qty": 15 },
+            ]
+        };
+        assert!(matches(
+            doc! { "items": { "$elemMatch": { "qty": { "$gt": 10 } } } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "items": { "$elemMatch": { "qty": { "$gt": 20 } } } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn elem_match_document_mode_multi_field() {
+        // The single-element multi-condition property: both qty > 10 AND
+        // price < 5 must hold for the SAME element.
+        let doc = doc! {
+            "items": [
+                { "qty": 15, "price": 3 },  // satisfies both
+                { "qty": 5,  "price": 1 },  // qty fails
+            ]
+        };
+        assert!(matches(
+            doc! { "items": { "$elemMatch": { "qty": { "$gt": 10 }, "price": { "$lt": 5 } } } },
+            doc.clone()
+        ));
+        // Neither element satisfies qty > 10 AND price > 4 simultaneously.
+        assert!(no_match(
+            doc! { "items": { "$elemMatch": { "qty": { "$gt": 10 }, "price": { "$gt": 4 } } } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn elem_match_non_array_no_match() {
+        // Scalar field — $elemMatch never matches.
+        assert!(no_match(
+            doc! { "a": { "$elemMatch": { "$gt": 0 } } },
+            doc! { "a": 5 }
+        ));
+        // Missing field — $elemMatch never matches.
+        assert!(no_match(
+            doc! { "a": { "$elemMatch": { "$gt": 0 } } },
+            doc! { "b": 5 }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // $all
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_basic() {
+        let doc = doc! { "tags": ["rust", "go", "python"] };
+        // All required tags present.
+        assert!(matches(
+            doc! { "tags": { "$all": ["rust", "python"] } },
+            doc.clone()
+        ));
+        // One required tag absent.
+        assert!(no_match(
+            doc! { "tags": { "$all": ["rust", "java"] } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn all_superset() {
+        // $all list is a superset of the array — must fail.
+        let doc = doc! { "nums": [1, 2] };
+        assert!(no_match(
+            doc! { "nums": { "$all": [1, 2, 3] } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn all_single_value_matches_scalar() {
+        // MongoDB treats scalar as single-element array for $all.
+        assert!(matches(
+            doc! { "a": { "$all": [42] } },
+            doc! { "a": 42 }
+        ));
+        assert!(no_match(
+            doc! { "a": { "$all": [42] } },
+            doc! { "a": 43 }
+        ));
+    }
+
+    #[test]
+    fn all_empty_list_never_matches() {
+        // $all: [] matches no documents.
+        assert!(no_match(
+            doc! { "a": { "$all": [] } },
+            doc! { "a": [1, 2, 3] }
+        ));
+    }
+
+    #[test]
+    fn all_missing_field_no_match() {
+        assert!(no_match(
+            doc! { "a": { "$all": [1] } },
+            doc! { "b": [1] }
+        ));
+    }
+
+    #[test]
+    fn all_with_elem_match() {
+        // $all: [{$elemMatch: {...}}] — each $elemMatch sub-condition must be
+        // satisfied by at least one element of the array.
+        let doc = doc! {
+            "results": [
+                { "product": "abc", "score": 10 },
+                { "product": "xyz", "score": 5 },
+            ]
+        };
+        // Both $elemMatch conditions are satisfied by different elements.
+        assert!(matches(
+            doc! { "results": { "$all": [
+                { "$elemMatch": { "product": "abc", "score": { "$gt": 8 } } },
+                { "$elemMatch": { "product": "xyz", "score": { "$lt": 10 } } }
+            ] } },
+            doc.clone()
+        ));
+        // One $elemMatch condition is not satisfied.
+        assert!(no_match(
+            doc! { "results": { "$all": [
+                { "$elemMatch": { "product": "abc", "score": { "$gt": 20 } } }
+            ] } },
+            doc.clone()
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // $size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn size_exact_match() {
+        let doc = doc! { "items": [1, 2, 3] };
+        assert!(matches(doc! { "items": { "$size": 3 } }, doc.clone()));
+        assert!(no_match(doc! { "items": { "$size": 2 } }, doc.clone()));
+        assert!(no_match(doc! { "items": { "$size": 4 } }, doc.clone()));
+    }
+
+    #[test]
+    fn size_empty_array() {
+        let doc = doc! { "items": [] };
+        assert!(matches(doc! { "items": { "$size": 0 } }, doc.clone()));
+        assert!(no_match(doc! { "items": { "$size": 1 } }, doc.clone()));
+    }
+
+    #[test]
+    fn size_non_array_no_match() {
+        assert!(no_match(doc! { "a": { "$size": 1 } }, doc! { "a": "hello" }));
+        assert!(no_match(doc! { "a": { "$size": 0 } }, doc! {}));
+    }
+
+    #[test]
+    fn size_float_whole_number() {
+        // 3.0 is accepted as a whole number.
+        let doc = doc! { "items": [1, 2, 3] };
+        assert!(matches(doc! { "items": { "$size": 3.0_f64 } }, doc.clone()));
+    }
+
+    #[test]
+    fn size_float_fractional_errors() {
+        // 2.5 is rejected.
+        assert!(errors(
+            doc! { "a": { "$size": 2.5_f64 } },
+            doc! { "a": [1, 2] }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // $regex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regex_basic_match() {
+        let doc = doc! { "name": "Alice Smith" };
+        assert!(matches(
+            doc! { "name": { "$regex": "^Alice" } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "name": { "$regex": "^Bob" } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn regex_case_insensitive() {
+        let doc = doc! { "name": "Alice" };
+        assert!(matches(
+            doc! { "name": { "$regex": "alice", "$options": "i" } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "name": { "$regex": "alice" } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn regex_multiline_flag() {
+        // With 'm', ^ matches the start of each line.
+        let doc = doc! { "text": "hello\nworld" };
+        assert!(matches(
+            doc! { "text": { "$regex": "^world", "$options": "m" } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "text": { "$regex": "^world" } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn regex_dotall_flag() {
+        // With 's', '.' matches newlines.
+        let doc = doc! { "text": "hello\nworld" };
+        assert!(matches(
+            doc! { "text": { "$regex": "hello.world", "$options": "s" } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "text": { "$regex": "hello.world" } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn regex_non_string_field_no_match() {
+        // $regex does not match numeric or boolean fields.
+        assert!(no_match(
+            doc! { "a": { "$regex": "1" } },
+            doc! { "a": 1 }
+        ));
+        assert!(no_match(
+            doc! { "a": { "$regex": "true" } },
+            doc! { "a": true }
+        ));
+    }
+
+    #[test]
+    fn regex_missing_field_no_match() {
+        assert!(no_match(
+            doc! { "a": { "$regex": ".*" } },
+            doc! { "b": "hello" }
+        ));
+    }
+
+    #[test]
+    fn regex_array_field() {
+        // $regex matches if any string element in the array matches.
+        let doc = doc! { "tags": ["rust", "systems", "fast"] };
+        assert!(matches(
+            doc! { "tags": { "$regex": "^rust" } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "tags": { "$regex": "^python" } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn regex_combined_with_other_ops() {
+        // $regex + $exists: true in the same operator document.
+        let doc = doc! { "name": "Alice" };
+        assert!(matches(
+            doc! { "name": { "$regex": "^A", "$exists": true } },
+            doc.clone()
+        ));
+        assert!(no_match(
+            doc! { "name": { "$regex": "^B", "$exists": true } },
+            doc.clone()
+        ));
+    }
+
+    #[test]
+    fn regex_bson_regular_expression_shorthand() {
+        // /pattern/flags shorthand — condition is Bson::RegularExpression.
+        let doc = doc! { "name": "Alice" };
+        let filter = bson::doc! {
+            "name": Bson::RegularExpression(bson::Regex {
+                pattern: "^alice".to_string(),
+                options: "i".to_string(),
+            })
+        };
+        assert!(matches(filter.clone(), doc.clone()));
+
+        let filter_no_match = bson::doc! {
+            "name": Bson::RegularExpression(bson::Regex {
+                pattern: "^bob".to_string(),
+                options: "".to_string(),
+            })
+        };
+        assert!(no_match(filter_no_match, doc));
+    }
+
+    #[test]
+    fn regex_options_without_regex_errors() {
+        assert!(errors(
+            doc! { "a": { "$options": "i" } },
+            doc! { "a": "hello" }
+        ));
+    }
+
+    #[test]
+    fn regex_invalid_pattern_errors() {
+        // Unclosed group is an invalid pattern.
+        assert!(errors(
+            doc! { "a": { "$regex": "(unclosed" } },
+            doc! { "a": "test" }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Explicitly unsupported operators (error code 9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsupported_operators_return_error() {
+        // Top-level
+        assert!(errors(doc! { "$expr": { "$gt": ["$a", 5] } }, doc! { "a": 1 }));
+        assert!(errors(doc! { "$text": { "$search": "foo" } }, doc! { "a": 1 }));
+        assert!(errors(doc! { "$where": "this.a > 1" }, doc! { "a": 1 }));
+
+        // Field-level
+        assert!(errors(doc! { "a": { "$mod": [4, 0] } }, doc! { "a": 4 }));
+        assert!(errors(doc! { "a": { "$jsonSchema": {} } }, doc! { "a": 1 }));
+    }
+
+    #[test]
+    fn unsupported_operator_has_code_9() {
+        use crate::error::{codes, Error};
+        let result = eval_filter(
+            &doc! { "a": 1 },
+            &doc! { "$expr": { "$gt": ["$a", 0] } },
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(codes::UNSUPPORTED_OPERATOR),
+            "UnsupportedOperator must carry error code 9"
+        );
+        // Confirm it's actually code 9.
+        assert_eq!(codes::UNSUPPORTED_OPERATOR, 9);
     }
 }

@@ -19,6 +19,7 @@ fuzz = []
 
 [dependencies]
 bson = { version = "2", features = ["serde_with"] }
+regex = "1"
 thiserror = "1"
 crc32c = "0.6.4"
 serde = { version = "1", features = ["derive"] }
