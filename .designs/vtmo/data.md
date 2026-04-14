@@ -82,7 +82,10 @@ Offset  Size   Field
 60      4      Header checksum: CRC32C of bytes 0-59
 64      4      WAL salt 1: uint32 (random, for WAL file association)
 68      4      WAL salt 2: uint32
-72      56     Reserved (zero-filled, for future use — encryption metadata, etc.)
+72      4      Catalog root backup: uint32 (redundant copy of offset 32, for catalog
+               corruption recovery. Written second after the primary at offset 32.
+               On open: if checksum of page at offset-32 fails, use this backup.)
+76      52     Reserved (zero-filled, for future use — encryption metadata, etc.)
 128     3968   Unused (padding to 4KB)
 ```
 
@@ -309,7 +312,16 @@ WAL Frames (repeated):
 - **Write**: New/modified pages are appended to the WAL. A commit frame has a non-zero "database page count" field.
 - **Read**: Readers check the WAL index (in SHM) first. If a page is in the WAL, use the most recent version. Otherwise, read from the main file.
 - **Checkpoint**: Copy committed pages from WAL to main file. Reset WAL to empty. Update main file header.
-- **Recovery**: On open, scan the WAL. Replay all committed frames (those with valid commit markers). Discard uncommitted frames at the end.
+- **Recovery (explicit algorithm)**:
+  1. Read WAL header. Verify magic bytes ("MQWL"), format version, and salt fields match the main file header. If salt mismatch: WAL is stale (left from a different database open session) — delete WAL file and proceed without replay.
+  2. Read WAL frames sequentially. For each frame:
+     a. Verify frame checksum (CRC32C covers the frame header fields + page data).
+     b. If checksum fails: this is the start of an uncommitted or partial write — stop replay here. All frames after this point are discarded.
+     c. If "database page count" field = 0: non-commit frame. Add to pending set (not yet applied).
+     d. If "database page count" field != 0: commit frame. Apply all pending frames to the main file. Update the main file header page count to this frame's value. Clear pending set. Advance the "last committed WAL position" marker.
+  3. Discard all frames after the last commit frame (the partial write interrupted by crash).
+  4. Rebuild the SHM WAL index from the committed frames. If SHM file is stale or missing, create a new SHM file.
+  5. The "Checkpoint sequence" field in the WAL header records how many complete checkpoints occurred in this WAL's lifetime. If resuming after a partial checkpoint, frames before the checkpoint boundary are already in the main file and can be skipped during replay (optimization: scan from checkpoint sequence boundary forward).
 
 ### Shared Memory File (.mqlite-shm)
 
@@ -319,8 +331,15 @@ The SHM file contains the WAL index — a hash table mapping page numbers to WAL
 SHM Layout:
   0      4    Reader count: uint32
   4      4    Writer lock: uint32 (PID of writer, 0 = unlocked)
-  8      24   Reader slots: [snapshot_id(4) | pid(4)] × 64 readers max
-  200    ...  WAL index: hash table [page_number(4) → wal_offset(8)]
+  8      512  Reader slots: [snapshot_id(4) | pid(4)] × 64 reader slots
+               (64 slots × 8 bytes each = 512 bytes)
+  520    ...  WAL index: hash table [page_number(4) → wal_offset(8)]
+               Fixed-size open-addressing hash table with linear probing.
+               Initial size: 4096 buckets × 12 bytes = 49152 bytes.
+               Load factor threshold: 75% (3072 entries). If WAL index
+               reaches 3072 unique page entries, trigger an emergency
+               checkpoint to reduce WAL size before allowing new writes.
+               Total SHM fixed size: 520 + 49152 = ~49.7 KB.
 ```
 
 ### Clean Close

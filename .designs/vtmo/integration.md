@@ -410,9 +410,11 @@ The compatibility test suite runs in two phases to enable earlier validation:
 - BSON round-trip: insert via native API, read back, verify byte-for-byte equality
 - All G2 query operators produce results matching MongoDB 8.0
 - Error code verification: each error condition returns the correct MongoDB error code
-- `insert_many` ordered/unordered semantics (R10)
-- `find_one_and_update` returns pre-modification document by default (ReturnDocument::Before)
-- Upsert semantics for `update_one` with `upsert: true`
+- **`insert_many` behavioral contract** (exact criteria): Insert 5 docs where doc[2] violates a unique index. With `ordered: true`: assert `inserted_ids` contains keys 0 and 1 only, assert `errors[0].index == 2` and `errors[0].code == 11000`, assert docs 3/4 are absent from DB. With `ordered: false`: assert docs 0,1,3,4 are inserted, doc 2 absent, `errors` has 1 entry.
+- **`find_one_and_update` behavioral contract** (exact criteria): Insert `{a: 1}`. Call `find_one_and_update({a: 1}, {$set: {a: 2}})`. Assert returned doc has `a: 1` (pre-modification). Assert DB contains `{a: 2}`. Call with `return_document: After`: assert returned doc has `a: 2`.
+- **Upsert behavioral contract** (exact criteria): `update_one({email: "a@b.com"}, {$set: {name: "Alice"}}, upsert: true)` on empty collection. Assert `upserted_id` is non-null. Assert `find_one({email: "a@b.com"})` returns `{email: "a@b.com", name: "Alice"}`.
+- **Persistence round-trip test** (required for Phase 1a exit): Open DB. Insert 1000 docs. Create `email` index. Query using index; verify results. Drop Database handle (clean close). Reopen from same file path. Assert count == 1000. Assert `list_indexes()` shows `email` index. Assert indexed query returns same results. **This test must pass before Phase 1 is complete.**
+- **Index-vs-scan consistency test** (required for Phase 1b exit): For each index type, compare results of `find_with_options(filter, hint: index_name)` vs `find(filter)` with no hint (full scan). Must match for operators: `$eq`, `$gt`, `$lt`, `$gte`, `$lte`, `$in`, `$ne`.
 - Compound index prefix queries and sort order
 - Multikey index correctness for `$elemMatch`, `$all`, `$size`
 
@@ -433,6 +435,7 @@ mqlite wire protocol stub:
 - All 18 Phase 1 commands return MongoDB-format responses
 - Unsupported commands (e.g., `aggregate`) return error code 59 (`CommandNotFound`)
 - `directConnection=true` required for all driver connections (documented)
+- **Wire protocol response format parity tests** (required): For each of the 18 Phase 1 commands, send the identical command to both MongoDB 8.0 and mqlite, compare the response document structure (field names, nesting level, BSON types). Key non-obvious formats: `findAndModify` (response uses `value` field and `lastErrorObject`), `getMore` (uses `nextBatch`), `createIndexes` (returns `numIndexesAfter` and `numIndexesBefore`), `find` with empty result (returns `cursor.firstBatch: []` not `null`), `insert` with partial failure (returns `writeErrors` array alongside `n`). Any structural divergence = compatibility bug. Implement these tests before closing Step 7.
 
 **Command Response Format Reference**:
 Key commands with non-obvious response shapes (consult MongoDB Wire Protocol docs):
@@ -450,7 +453,8 @@ Per Q5, crash testing is required. Implementation:
 1. **Crash injector**: Fork a child process running mqlite writes. Send SIGKILL at random intervals.
 2. **Validator**: Open the database in the parent process. Verify: (a) database opens without error, (b) WAL replays successfully, (c) all committed data is present, (d) no uncommitted data leaks through, (e) all indexes are consistent with data.
 3. **Fuzzer variations**: Kill during insert, update, delete, checkpoint, index build. Kill at various WAL sizes. Kill during multi-page overflow writes.
-4. **Automation**: Run thousands of crash cycles in CI. Any failure is a P0 bug.
+4. **Automation**: Run crash cycles in CI. Any failure is a P0 bug.
+5. **Acceptance criteria (exact gate)**: CI runs **500 crash-inject cycles per build** (50 cycles × 10 scenarios): insert at WAL frame 0, insert at WAL frame 10, insert at WAL frame 100, insert at final frame, checkpoint at 25%, checkpoint at 50%, checkpoint at 75%, index build at start, index build mid-way, index build at end. **All 500 cycles must pass**. Failure definition: any of (a)–(e) above. CI fails the merge if any single cycle fails. A flaky test that fails <1% of the time is still a bug — fix the implementation, do not mark expected-flaky.
 
 ### Fuzz Testing
 
@@ -492,7 +496,7 @@ When the `wire` feature is enabled and the wire protocol shim is started:
 | Backup (hot) | `db.backup("backup.mqlite")` | API acquires snapshot, copies consistently |
 | Backup (checkpoint) | `db.checkpoint()` then `cp` | Safe after checkpoint if no concurrent writes |
 | Monitor size | `db.stats().file_size` | Track growth, alert before disk full |
-| Shrink | `db.compact()` | Reclaims free pages, rewrites file |
+| Shrink | (Phase 2) | `compact()` is deferred to Phase 2. In Phase 1, delete unnecessary documents and run `db.checkpoint()?` to merge the WAL. The main file size does not automatically shrink — free pages are tracked internally and reused for new writes. |
 | Migrate | Copy .mqlite file | Portable across same-endian platforms |
 
 ## Migration Paths

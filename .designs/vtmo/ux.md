@@ -126,13 +126,13 @@ let db = Database::open_with_options(
 
 **Crash recovery UX:**
 - On normal open after a crash: mqlite automatically replays the WAL. No user action needed. A log message (via `tracing` or similar) indicates recovery happened.
-- On corrupt file detection: `Database::open` returns `Error::CorruptDatabase { path, detail }` with actionable detail: "WAL header checksum mismatch — database may be recoverable with `Database::repair(path)`".
-- Repair API: `Database::repair("myapp.mqlite")` attempts to recover what it can. Returns a report of what was recovered and what was lost.
+- On corrupt file detection: `Database::open` returns `Error::CorruptDatabase { path, detail, recoverable }` with actionable detail: "WAL header checksum mismatch." If `recoverable: true`, the most recent checkpoint is still accessible — restore from a backup or truncate the WAL to the last known-good checkpoint.
+- Phase 1 has no `repair()` API. `Database::repair()` is planned for Phase 2. In Phase 1, recovery options are: (1) restore from a backup copy, (2) open in `read_only` mode to access the last checkpointed state.
 
 **File management UX:**
 - "How do I back up?": `db.checkpoint()?` forces WAL merge, then the file is safe to copy. Or use `db.backup("backup.mqlite")?` for hot backup.
-- "How big is my database?": `db.stats()` returns `DatabaseStats { file_size, doc_count, collection_count, index_count, wal_size, free_pages }`.
-- "How do I shrink it?": `db.compact()?` reclaims free pages (like SQLite's `VACUUM`).
+- "How big is my database?": Use `std::fs::metadata("data.mqlite")?.len()` for file size. The `db.stats()` API that returns full `DatabaseStats` is a Phase 2 feature.
+- "How do I shrink it?": Phase 1 does not expose `compact()` (page reclamation/VACUUM). It is a Phase 2 feature. In Phase 1, delete unnecessary documents and run `db.checkpoint()?` to merge the WAL. The main file size does not automatically shrink — free pages are tracked internally and reused for new writes.
 
 ### Journey 2: The Test Double Developer (Story 2)
 
@@ -270,7 +270,7 @@ for doc in cursor {
 - Disk usage is predictable. WAL doesn't grow without bound. Auto-checkpoint keeps file size stable.
 - Crash recovery is automatic and reliable. Power cuts are expected in IoT; the database must recover without data loss (within the configured durability mode).
 - The library footprint is small. No tokio, no heavy transitive dependencies. Cross-compiles to ARM without issues.
-- `db.stats()` lets the gateway monitor disk usage and trigger alerts before the SD card fills up.
+- Monitor disk usage via `std::fs::metadata("/var/lib/gateway/readings.mqlite")?.len()` and the WAL file size. The `db.stats()` API is a Phase 2 feature; in Phase 1, OS-level file size is the primary disk monitoring mechanism.
 
 **Edge-specific concerns:**
 - **Disk full handling**: `Error::DiskFull` must be clearly distinguishable from other I/O errors. The database must remain readable after a disk-full write failure. The developer must be able to delete old documents to free space and resume writes.
@@ -343,8 +343,9 @@ Error: CorruptDatabase {
              (expected 0xa1b2c3d4, found 0x00000000).
              This may indicate a partial write due to power loss.",
     recoverable: true,
-    suggestion: "Run Database::repair(\"data.mqlite\") to attempt recovery.
-                 Consider keeping a backup before repair."
+    // Phase 1: No repair() API. Restore from a backup, or open in
+    // read_only mode to access the last successfully checkpointed state.
+    // Database::repair() is planned for Phase 2.
 }
 ```
 
@@ -408,32 +409,42 @@ Each Tier 1 doc (including the migration guide, per PRD mandate) must be complet
 
 Developers debugging issues need visibility into mqlite's behavior:
 
-```rust
-// Database statistics
-let stats = db.stats()?;
-println!("File size: {} bytes", stats.file_size);
-println!("Collections: {}", stats.collection_count);
-println!("Total documents: {}", stats.document_count);
-println!("WAL size: {} bytes", stats.wal_size);
-println!("Buffer pool: {}/{} pages used", stats.buffer_pool_used, stats.buffer_pool_total);
-println!("Free pages: {}", stats.free_page_count);
+### Phase 1: Tracing + Query Explain
 
-// Query plan explanation
+```rust
+// Query plan explanation (Phase 1)
 let plan = collection.find(doc! { "email": "alice@example.com" })
     .explain()?;
-println!("{}", plan);
-// Output:
-//   Query: { "email": "alice@example.com" }
+// ExplainResult fields:
+println!("Plan: {}", plan.plan);
+println!("Index used: {:?}", plan.index_used);
+println!("Docs examined: {}", plan.docs_examined);
+println!("Full scan: {}", plan.full_scan);
+// Example output:
 //   Plan: IndexScan { index: "email_1", bounds: ["alice@example.com", "alice@example.com"] }
-//   Estimated docs examined: 1
-//   Index used: yes
+//   Index used: Some("email_1")
+//   Docs examined: 1
+//   Full scan: false
 
-// Collection statistics
-let coll_stats = collection.stats()?;
-println!("Documents: {}", coll_stats.document_count);
-println!("Avg document size: {} bytes", coll_stats.avg_document_size);
-println!("Indexes: {:?}", coll_stats.index_names);
-println!("Total index size: {} bytes", coll_stats.total_index_size);
+// Phase 1 collection info (via existing API)
+let indexes = collection.list_indexes()?;
+println!("Indexes: {:?}", indexes);
+let count = collection.estimated_document_count()?;
+println!("Approx document count: {}", count);
+
+// Phase 1 disk usage (via OS file system)
+let file_size = std::fs::metadata("data.mqlite")?.len();
+println!("File size: {} bytes", file_size);
+```
+
+### Phase 2 (planned): Database and Collection Stats
+
+```rust
+// Phase 2 -- NOT available in Phase 1
+// db.stats() -> DatabaseStats { file_size, collection_count, document_count, wal_size,
+//                               buffer_pool_used, buffer_pool_total, free_page_count }
+// collection.stats() -> CollectionStats { document_count, avg_document_size,
+//                                          index_names, total_index_size }
 ```
 
 **Tracing integration**: mqlite should emit `tracing` spans/events (behind a feature flag) so applications using `tracing-subscriber` get automatic visibility into query execution, WAL operations, and checkpoint activity.
@@ -495,7 +506,9 @@ pub use index::IndexModel;
 pub use results::{InsertOneResult, InsertManyResult, UpdateResult, DeleteResult};
 
 // Options (progressive disclosure — all fields optional)
-pub use options::{FindOptions, UpdateOptions, DeleteOptions, CountOptions};
+pub use options::{FindOptions, UpdateOptions};
+// Note: DeleteOptions and CountOptions are Phase 2 -- neither delete nor count methods
+// accept options structs in Phase 1. They will be added with collation/hint support.
 
 // BSON re-exports (so users don't need a separate bson dependency)
 pub use bson::{doc, Document, Bson, oid::ObjectId, DateTime};
@@ -550,8 +563,8 @@ Users should need only `use mqlite::*` or specific imports from `mqlite::` — n
 ### With Storage Engine Design
 - **Buffer pool sizing** and **WAL checkpoint thresholds** are both UX-visible configuration knobs. The storage engine must expose these as tunable parameters that the API layer surfaces via `OpenOptions`.
 - **File lifecycle** (creation, WAL presence, checkpoint, close, auxiliary files) must be documented as user-facing behavior, not just implementation detail.
-- **Repair and integrity check** APIs depend on storage engine capabilities.
-- **`db.stats()` and `collection.stats()`** require the storage engine to expose page counts, free space, B+ tree depth, etc.
+- **Repair and integrity check** APIs (e.g., `Database::repair()`) are Phase 2. Phase 1 error handling for corrupt files returns `Error::CorruptDatabase` with detail and `recoverable` flag; recovery is via backup restore.
+- **`db.stats()` and `collection.stats()`** are Phase 2. In Phase 1, storage diagnostics are via tracing spans (`mqlite::checkpoint`, `mqlite::eviction`) and the `serverStatus` wire protocol command.
 
 ### With Query Engine Design
 - **Operator support matrix** defines the compatibility contract. Every operator the query engine implements (or doesn't) is a UX surface.

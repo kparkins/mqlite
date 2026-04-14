@@ -119,16 +119,39 @@ impl Clone for Database { ... }
 ### OpenOptions
 
 ```rust
-pub struct OpenOptions {
-    buffer_pool_size: Option<usize>,       // Default: 64MB
-    durability: Option<DurabilityMode>,     // Default: Interval(100ms)
-    wal_auto_checkpoint: Option<u32>,       // Default: 1000 pages
-    wal_max_size: Option<u64>,              // Default: 100MB. Absolute WAL size that forces a checkpoint
-                                            //          regardless of page count threshold.
-    busy_timeout: Option<Duration>,         // Default: 5 seconds
-    read_only: Option<bool>,               // Default: false (see note below)
-    create_if_missing: Option<bool>,       // Default: true
-    max_readers: Option<u32>,              // Default: 64
+/// Configuration for Database::open_with_options. Use builder methods for ergonomic construction:
+/// `OpenOptions::new().buffer_pool_size(64 * 1024 * 1024).durability(DurabilityMode::FullSync)`
+pub struct OpenOptions { /* private fields */ }
+
+impl OpenOptions {
+    pub fn new() -> Self;
+
+    /// Buffer pool size in bytes. Default: 64MB.
+    pub fn buffer_pool_size(self, bytes: usize) -> Self;
+    /// Durability mode. Default: Interval(100ms).
+    pub fn durability(self, mode: DurabilityMode) -> Self;
+    /// WAL auto-checkpoint threshold in pages. Default: 1000 pages.
+    pub fn wal_auto_checkpoint(self, pages: u32) -> Self;
+    /// WAL max size in bytes before forced checkpoint. Default: 100MB.
+    pub fn wal_max_size(self, bytes: u64) -> Self;
+    /// Timeout for acquiring the writer lock. Default: 5 seconds.
+    /// Set to Duration::ZERO for immediate failure (SQLite-style).
+    pub fn busy_timeout(self, duration: Duration) -> Self;
+    /// Callback invoked when writer lock is contended. Return true to retry, false to fail.
+    /// `attempts` is the number of retries so far. Called repeatedly until it returns false
+    /// or the lock is acquired. Alternative to busy_timeout for custom retry strategies.
+    pub fn busy_handler(self, handler: impl Fn(u32) -> bool + Send + 'static) -> Self;
+    /// Open in read-only mode. WAL replay is SKIPPED.
+    /// CAUTION: Committed data that exists only in the WAL (not yet checkpointed) will NOT
+    /// be visible. If the WAL file is present, it signals uncommitted/uncheckpointed state.
+    /// For forensic access where committed data may be in the WAL, use normal read-write mode
+    /// (which replays the WAL safely). Read-only mode shows only the last successful checkpoint.
+    /// Default: false.
+    pub fn read_only(self, val: bool) -> Self;
+    /// Create the file if it doesn't exist. Default: true.
+    pub fn create_if_missing(self, val: bool) -> Self;
+    /// Maximum concurrent readers. Default: 64 (Phase 1 hard limit).
+    pub fn max_readers(self, count: u32) -> Self;
 }
 
 // Note on read_only mode:
@@ -311,6 +334,18 @@ impl<T> Cursor<T> {
     /// Explain the query plan without executing.
     pub fn explain(&self) -> Result<ExplainResult>;
 }
+
+/// Result of a query plan explanation (from Cursor::explain).
+pub struct ExplainResult {
+    /// Human-readable description of the chosen query plan.
+    pub plan: String,
+    /// Name of the index used, if any. None = full collection scan.
+    pub index_used: Option<String>,
+    /// Estimated number of documents examined to satisfy the query.
+    pub docs_examined: u64,
+    /// Whether the query required a full collection scan.
+    pub full_scan: bool,
+}
 ```
 
 ### Result Types
@@ -490,6 +525,50 @@ For commands that exist but use unsupported features (e.g., `update` with `$bit`
 
 ## Wire Protocol Architecture
 
+### Public API (feature-gated)
+
+```rust
+#[cfg(feature = "wire")]
+pub struct WireProtocol { /* opaque */ }
+
+#[cfg(feature = "wire")]
+impl WireProtocol {
+    /// Bind the wire protocol shim to a TCP address.
+    /// Runs the listener in background threads; stops when dropped.
+    /// Default address: "127.0.0.1:27017".
+    /// Returns error if address is already in use.
+    pub fn bind(db: &Database, addr: &str) -> Result<WireProtocol>;
+}
+```
+
+### Cursor ID Contract (wire protocol ↔ native API)
+
+```
+Cursor IDs are int64, generated as an incrementing counter per TCP connection (starts at 1).
+The wire protocol layer maintains: HashMap<i64, Cursor<Document>> per TCP connection.
+
+- On `find`:     generate cursor_id, store Cursor in map, return cursor_id in response.
+- On `getMore`:  look up cursor_id in map, advance cursor, return next batch.
+- cursor_id = 0 in the response means cursor is exhausted (no more data). Remove from map.
+- On connection close: drop all Cursor handles associated with that connection (via map Drop).
+- On `killCursors`: remove specified cursor IDs from map (drops the Cursor handle).
+- Cursor IDs are connection-scoped: cursor ID 5 on connection A ≠ cursor ID 5 on connection B.
+- `getMore` on a cursor_id that doesn't exist in the map → error code 43 (CursorNotFound).
+```
+
+### Note on `serverStatus` Data Sources (Phase 1)
+
+`serverStatus` is a Phase 1 wire protocol command. The `Database::stats()` public API is
+deferred to Phase 2, so the `serverStatus` handler reads data from internal engine state
+directly:
+- Uptime: from process start timestamp (captured on `Database::open()`).
+- WAL file size: `std::fs::metadata(".mqlite-wal")?.len()` (best-effort; 0 if not present).
+- Connection count: from wire protocol connection tracker (connection counter in shim state).
+- Buffer pool stats: from the pool's internal hit/miss counters.
+These are implementation details of the serverStatus handler, not public API.
+
+### Internal Architecture
+
 ```
 TCP Listener (127.0.0.1:port)
     │
@@ -572,7 +651,7 @@ There are no multi-document ACID transactions, sessions, or `startTransaction`/`
 
 4. **Should the wire protocol support OP_COMPRESSED?** This reduces network bandwidth for large documents but adds compression library dependencies (snappy, zlib, zstd). For localhost-only debugging use, compression overhead may exceed benefit. Recommend: defer to Phase 1.1.
 
-5. **What is the cursor timeout for idle cursors opened via wire protocol?** MongoDB defaults to 10 minutes. mqlite should implement cursor timeout to prevent resource leaks from abandoned cursors. Native API cursors are cleaned up by Rust's Drop.
+5. ~~**What is the cursor timeout for idle cursors opened via wire protocol?**~~ **RESOLVED**: 600 seconds (10 min) — see scale.md Resource Limits table. Matches MongoDB's default. Configurable via wire protocol configuration. Native API cursors are cleaned up by Rust's Drop.
 
 6. ~~**Should `update_one`/`update_many` support upsert?**~~ **RESOLVED**: Yes, upsert is Phase 1. `UpdateOptions { upsert: bool }` added. When `upsert: true` and no documents match, a new document is created from the filter's equality conditions plus the update operators. The generated `_id` is returned in `UpdateResult::upserted_id`. Required for real-world test suites.
 
