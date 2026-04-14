@@ -32,3 +32,5 @@ pub(crate) mod allocator;
 pub(crate) mod lock;
 #[allow(dead_code)]
 pub(crate) mod btree;
+#[allow(dead_code)]
+pub(crate) mod catalog;
