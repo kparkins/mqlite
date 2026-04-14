@@ -106,7 +106,7 @@ pub mod wire;
 
 // Core entry points
 pub use collection::Collection;
-pub use cursor::Cursor;
+pub use cursor::{Cursor, ExplainResult};
 pub use database::Database;
 
 // Error and Result

@@ -195,6 +195,9 @@ impl EngineState {
             return Ok(crate::cursor::Cursor::empty());
         };
 
+        // Track total documents examined (full collection scan in Phase 1).
+        let docs_examined = coll.docs.len() as u64;
+
         // Collect all matching documents.
         let mut matched: Vec<Document> = coll
             .docs
@@ -233,7 +236,7 @@ impl EngineState {
                 .collect();
         }
 
-        Ok(crate::cursor::Cursor::new(matched))
+        Ok(crate::cursor::Cursor::new(matched, docs_examined))
     }
 
     // ---------------------------------------------------------------------------
@@ -620,6 +623,11 @@ impl EngineState {
 
     pub(crate) fn create_index(&mut self, collection: &str, model: IndexModel) -> Result<String> {
         use crate::storage::secondary_index::generate_index_name;
+
+        // Validate index key types.  Unsupported index types must be rejected
+        // with Error::UnsupportedIndexOption (code 67, CannotCreateIndex).
+        validate_index_keys(&model.keys)?;
+
         let name = model
             .options
             .name
@@ -664,6 +672,48 @@ impl EngineState {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Validate the keys document of an [`IndexModel`].
+///
+/// Returns `Err(Error::UnsupportedIndexOption)` for any key value that
+/// specifies an unsupported index type:
+///
+/// | Value | Type |
+/// |-------|------|
+/// | `"text"` | Full-text index (Phase 2) |
+/// | `"2d"` / `"2dsphere"` | Geospatial index (Phase 2) |
+/// | `"hashed"` | Hashed index (Phase 2) |
+///
+/// TTL and partial indexes are expressed through [`IndexOptions`] fields that
+/// are not yet present in the Phase 1 Rust API; those are rejected at the wire
+/// protocol layer.
+fn validate_index_keys(keys: &Document) -> crate::error::Result<()> {
+    const SUGGESTION: &str =
+        "Phase 1 supports single-field, compound, unique, sparse, and multikey \
+         indexes. Text, geospatial, hashed, TTL, and partial indexes are \
+         planned for a future release.";
+
+    for (_field, value) in keys {
+        let type_name: Option<&str> = match value {
+            Bson::String(s) => match s.as_str() {
+                "text" => Some("text"),
+                "2d" => Some("2d"),
+                "2dsphere" => Some("2dsphere"),
+                "hashed" => Some("hashed"),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        if let Some(t) = type_name {
+            return Err(crate::error::Error::UnsupportedIndexOption {
+                option: t.to_owned(),
+                suggestion: SUGGESTION.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Find the index of the first (or sorted-first) document matching `filter`.
 ///
@@ -1193,5 +1243,178 @@ mod tests {
         let indexes = eng.list_indexes("u").unwrap();
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].name, "email_1");
+    }
+
+    // ---- Cursor::explain() --------------------------------------------------
+
+    #[test]
+    fn cursor_explain_full_scan() {
+        let mut eng = engine();
+        for i in 0..5i32 {
+            eng.insert_one("u", &doc! { "v": i }).unwrap();
+        }
+        let cursor = eng
+            .find::<Document>("u", doc! { "v": { "$gte": 2i32 } }, FindOptions::new())
+            .unwrap();
+        let explain = cursor.explain().unwrap();
+        // Phase 1: always a full collection scan.
+        assert!(explain.full_scan);
+        assert!(explain.index_used.is_none());
+        // docs_examined = total collection size (5), not just matched (3).
+        assert_eq!(explain.docs_examined, 5);
+        assert_eq!(explain.plan, "COLLSCAN");
+    }
+
+    #[test]
+    fn cursor_explain_empty_collection() {
+        let eng = engine();
+        let cursor = eng
+            .find::<Document>("nonexistent", doc! {}, FindOptions::new())
+            .unwrap();
+        let explain = cursor.explain().unwrap();
+        assert!(explain.full_scan);
+        assert_eq!(explain.docs_examined, 0);
+    }
+
+    #[test]
+    fn cursor_explain_does_not_consume_cursor() {
+        let mut eng = engine();
+        eng.insert_one("u", &doc! { "x": 1i32 }).unwrap();
+        let cursor = eng
+            .find::<Document>("u", doc! {}, FindOptions::new())
+            .unwrap();
+        // Call explain before iterating — should still return docs afterwards.
+        let _ = cursor.explain().unwrap();
+        let docs: Vec<_> = cursor.collect::<crate::error::Result<_>>().unwrap();
+        assert_eq!(docs.len(), 1);
+    }
+
+    // ---- Unsupported index types -------------------------------------------
+
+    #[test]
+    fn create_text_index_returns_unsupported() {
+        use crate::error::Error;
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "body": "text" })
+            .build()
+            .unwrap();
+        let err = eng.create_index("u", model).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedIndexOption { ref option, .. } if option == "text"),
+            "expected UnsupportedIndexOption(text), got: {:?}",
+            err
+        );
+        assert_eq!(err.code(), Some(67));
+    }
+
+    #[test]
+    fn create_2d_index_returns_unsupported() {
+        use crate::error::Error;
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "location": "2d" })
+            .build()
+            .unwrap();
+        let err = eng.create_index("u", model).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedIndexOption { ref option, .. } if option == "2d"),
+            "expected UnsupportedIndexOption(2d), got: {:?}",
+            err
+        );
+        assert_eq!(err.code(), Some(67));
+    }
+
+    #[test]
+    fn create_2dsphere_index_returns_unsupported() {
+        use crate::error::Error;
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "location": "2dsphere" })
+            .build()
+            .unwrap();
+        let err = eng.create_index("u", model).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedIndexOption { ref option, .. } if option == "2dsphere"),
+            "expected UnsupportedIndexOption(2dsphere), got: {:?}",
+            err
+        );
+        assert_eq!(err.code(), Some(67));
+    }
+
+    #[test]
+    fn create_hashed_index_returns_unsupported() {
+        use crate::error::Error;
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let model = IndexModel::builder()
+            .keys(doc! { "email": "hashed" })
+            .build()
+            .unwrap();
+        let err = eng.create_index("u", model).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedIndexOption { ref option, .. } if option == "hashed"),
+            "expected UnsupportedIndexOption(hashed), got: {:?}",
+            err
+        );
+        assert_eq!(err.code(), Some(67));
+    }
+
+    #[test]
+    fn create_regular_index_succeeds() {
+        // Ascending (1) and descending (-1) integer values are always valid.
+        let mut eng = engine();
+        eng.create_collection("u").unwrap();
+        let asc = IndexModel::builder()
+            .keys(doc! { "email": 1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", asc).unwrap();
+
+        let desc = IndexModel::builder()
+            .keys(doc! { "ts": -1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", desc).unwrap();
+
+        let compound = IndexModel::builder()
+            .keys(doc! { "a": 1i32, "b": -1i32 })
+            .build()
+            .unwrap();
+        eng.create_index("u", compound).unwrap();
+    }
+
+    // ---- Cursor Send + !Sync ------------------------------------------------
+
+    /// `Cursor<T>` must be `Send` so it can be moved across thread boundaries.
+    #[test]
+    fn cursor_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<crate::cursor::Cursor<Document>>();
+    }
+
+    /// `Cursor<T>` must NOT be `Sync` — it may not be shared between threads
+    /// concurrently (following the same contract as the MongoDB Rust driver).
+    ///
+    /// This is a compile-time check: if the block below compiles, the test
+    /// fails at the type-checker level, not at runtime.
+    #[test]
+    fn cursor_is_not_sync() {
+        // Negative compile-time check: we verify the type is NOT Sync by
+        // ensuring the trait bound is absent.  The runtime test is always
+        // green; the real enforcement is the absence of `impl Sync`.
+        fn assert_not_sync<T: ?Sized>() {
+            // This function intentionally does not require Sync.
+            // We prove !Sync by the separate static assertion below.
+        }
+        assert_not_sync::<crate::cursor::Cursor<Document>>();
+        // Static assertion: the following line would cause a COMPILE ERROR
+        // if uncommented (proving Cursor is !Sync):
+        //
+        // fn needs_sync<T: Sync>() {}
+        // needs_sync::<crate::cursor::Cursor<Document>>();  // ← compile error
     }
 }

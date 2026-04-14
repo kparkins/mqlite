@@ -19,6 +19,9 @@ pub mod codes {
     /// An MQL operator is not supported by mqlite.
     /// Matches MongoDB error code 9 (FailedToParse / unknown operator).
     pub const UNSUPPORTED_OPERATOR: i32 = 9;
+    /// An index type or option is not supported.
+    /// Matches MongoDB error code 67 (CannotCreateIndex).
+    pub const CANNOT_CREATE_INDEX: i32 = 67;
     /// A document failed schema validation or structural constraints.
     /// Matches MongoDB error code 121.
     pub const DOCUMENT_VALIDATION_FAILURE: i32 = 121;
@@ -170,6 +173,24 @@ pub enum Error {
         /// The path that was detected as a symlink.
         path: std::path::PathBuf,
     },
+
+    /// An index type or option is not supported by mqlite.
+    /// MongoDB error code 67 (CannotCreateIndex).
+    ///
+    /// Returned by `create_index` when the caller requests a TTL, text,
+    /// geospatial, partial, or hashed index — none of which are supported in
+    /// Phase 1.
+    #[error(
+        "UnsupportedIndexOption(\"{option}\"): {suggestion}\n\
+         Supported index types: single-field, compound, unique, sparse, multikey."
+    )]
+    UnsupportedIndexOption {
+        /// The name of the unsupported option (e.g. `"expireAfterSeconds"`,
+        /// `"text"`, `"2dsphere"`).
+        option: String,
+        /// Human-readable suggestion listing supported alternatives.
+        suggestion: String,
+    },
 }
 
 impl Error {
@@ -185,6 +206,7 @@ impl Error {
             Error::SymlinkRejected { .. } => Some(codes::BAD_VALUE),
             Error::InvalidWireMessage { .. } => Some(codes::ILLEGAL_OP),
             Error::UnsupportedOperator { .. } => Some(codes::UNSUPPORTED_OPERATOR),
+            Error::UnsupportedIndexOption { .. } => Some(codes::CANNOT_CREATE_INDEX),
             _ => None,
         }
     }
