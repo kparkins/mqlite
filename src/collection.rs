@@ -6,7 +6,10 @@ use crate::{
     cursor::Cursor,
     error::Result,
     index::{IndexInfo, IndexModel},
-    options::{FindOptions, InsertManyOptions, UpdateOptions},
+    options::{
+        FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
+        InsertManyOptions, UpdateOptions,
+    },
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
 };
 
@@ -153,10 +156,32 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
         self.inner.find_one_and_update(&self.name, filter, update)
     }
 
+    /// Atomically find the first document matching `filter`, apply `update` with options.
+    /// Returns `None` if no document matched (and no upsert was performed).
+    pub fn find_one_and_update_with_options(
+        &self,
+        filter: Document,
+        update: Document,
+        opts: FindOneAndUpdateOptions,
+    ) -> Result<Option<T>> {
+        self.inner
+            .find_one_and_update_with_options(&self.name, filter, update, opts)
+    }
+
     /// Atomically find the first document matching `filter`, delete it, and return it.
     /// Returns `None` if no document matched.
     pub fn find_one_and_delete(&self, filter: Document) -> Result<Option<T>> {
         self.inner.find_one_and_delete(&self.name, filter)
+    }
+
+    /// Atomically find the first document matching `filter`, delete it, and return it with options.
+    pub fn find_one_and_delete_with_options(
+        &self,
+        filter: Document,
+        opts: FindOneAndDeleteOptions,
+    ) -> Result<Option<T>> {
+        self.inner
+            .find_one_and_delete_with_options(&self.name, filter, opts)
     }
 
     /// Atomically find the first document matching `filter`, replace it with `replacement`,
@@ -164,6 +189,18 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     pub fn find_one_and_replace(&self, filter: Document, replacement: &T) -> Result<Option<T>> {
         self.inner
             .find_one_and_replace(&self.name, filter, replacement)
+    }
+
+    /// Atomically find the first document matching `filter`, replace it with `replacement`
+    /// with options.  Returns `None` if no document matched (and no upsert was performed).
+    pub fn find_one_and_replace_with_options(
+        &self,
+        filter: Document,
+        replacement: &T,
+        opts: FindOneAndReplaceOptions,
+    ) -> Result<Option<T>> {
+        self.inner
+            .find_one_and_replace_with_options(&self.name, filter, replacement, opts)
     }
 
     // -------------------------------------------------------------------------

@@ -8,9 +8,13 @@ use std::{
 use crate::{
     collection::Collection,
     cursor::Cursor,
+    engine::EngineState,
     error::{Error, Result},
     index::{IndexInfo, IndexModel},
-    options::{FindOptions, InsertManyOptions, OpenOptions, UpdateOptions},
+    options::{
+        FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
+        InsertManyOptions, OpenOptions, UpdateOptions,
+    },
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
     storage::{
         header::{FileHeader, HEADER_PAGE_SIZE},
@@ -166,6 +170,12 @@ pub(crate) struct DatabaseInner {
     /// automatically when `DatabaseInner` is dropped (the underlying fd is
     /// closed, which releases the kernel lock).
     file_lock: Box<dyn FileLock>,
+    /// Phase 1b in-memory storage engine.
+    ///
+    /// All CRUD operations are routed through this engine.
+    /// The `writer_lock` mutex serialises all mutations; reads acquire the
+    /// `engine` mutex directly.
+    pub(crate) engine: Mutex<EngineState>,
 }
 
 impl DatabaseInner {
@@ -179,259 +189,240 @@ impl DatabaseInner {
             opts,
             writer_lock: Mutex::new(()),
             file_lock,
+            engine: Mutex::new(EngineState::new()),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Stub implementations for DatabaseInner methods called by Collection.
+// DatabaseInner method implementations (Phase 1b).
 //
-// These are intentional stubs: Phase 0 initializes the crate structure and
-// verifies that it compiles. Storage engine, query engine, WAL, and buffer
-// pool implementations are Phase 1 work items (hq-9vo, hq-apk, hq-6d0, etc.).
+// All CRUD operations are delegated to the in-memory EngineState which
+// lives behind a Mutex<EngineState> on DatabaseInner.  The writer_lock
+// serialises all mutations within a process.
 // ---------------------------------------------------------------------------
 
 impl DatabaseInner {
     pub(crate) fn insert_one<T: Serialize>(
         &self,
-        _name: &str,
+        name: &str,
         doc: &T,
     ) -> Result<InsertOneResult> {
-        // BSON validation is enforced at the insert boundary before any storage write.
-        // This ensures structural limits are checked even while the storage engine is
-        // still being implemented.  See security.md mandatory mitigation #3.
-        let bson_doc = bson::to_document(doc).map_err(Error::BsonSerialization)?;
-        crate::validation::validate_document(&bson_doc)?;
-
         #[cfg(feature = "tracing")]
-        tracing::debug!(
-            target: "mqlite",
-            collection = _name,
-            doc_count = 1u64,
-            "mqlite::insert"
-        );
+        tracing::debug!(target: "mqlite", collection = name, doc_count = 1u64, "mqlite::insert");
 
-        Err(Error::Internal(
-            "insert_one: storage engine not yet implemented (Phase 1)".into(),
-        ))
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().insert_one(name, doc)
     }
 
     pub(crate) fn insert_many<T: Serialize>(
         &self,
-        _name: &str,
+        name: &str,
         docs: &[T],
-        _opts: InsertManyOptions,
+        opts: InsertManyOptions,
     ) -> Result<InsertManyResult> {
-        // Validate every document before any write is attempted.
-        // Fail fast on the first invalid document (ordered validation).
-        for doc in docs {
-            let bson_doc = bson::to_document(doc).map_err(Error::BsonSerialization)?;
-            crate::validation::validate_document(&bson_doc)?;
-        }
-
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "mqlite",
-            collection = _name,
+            collection = name,
             doc_count = docs.len() as u64,
             "mqlite::insert"
         );
 
-        Err(Error::Internal(
-            "insert_many: storage engine not yet implemented (Phase 1)".into(),
-        ))
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().insert_many(name, docs, opts)
     }
 
     pub(crate) fn find_one<T: DeserializeOwned>(
         &self,
-        _name: &str,
-        _filter: Document,
+        name: &str,
+        filter: Document,
     ) -> Result<Option<T>> {
         #[cfg(feature = "tracing")]
         {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            for k in _filter.keys() {
-                k.hash(&mut h);
-            }
-            let filter_hash = h.finish();
+            for k in filter.keys() { k.hash(&mut h); }
             tracing::debug!(
                 target: "mqlite",
-                collection = _name,
-                filter_hash,
+                collection = name,
+                filter_hash = h.finish(),
                 doc_count = 0u64,
                 "mqlite::find"
             );
-            tracing::debug!(
-                target: "mqlite",
-                collection = _name,
-                docs_examined = 0u64,
-                "mqlite::collection_scan"
-            );
         }
-        Err(Error::Internal(
-            "find_one: query engine not yet implemented (Phase 1)".into(),
-        ))
+        self.engine.lock().unwrap().find_one(name, filter)
     }
 
     pub(crate) fn find<T: DeserializeOwned>(
         &self,
-        _name: &str,
-        _filter: Document,
-        _opts: FindOptions,
+        name: &str,
+        filter: Document,
+        opts: FindOptions,
     ) -> Result<Cursor<T>> {
         #[cfg(feature = "tracing")]
         {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            for k in _filter.keys() {
-                k.hash(&mut h);
-            }
-            let filter_hash = h.finish();
+            for k in filter.keys() { k.hash(&mut h); }
             tracing::debug!(
                 target: "mqlite",
-                collection = _name,
-                filter_hash,
+                collection = name,
+                filter_hash = h.finish(),
                 doc_count = 0u64,
                 "mqlite::find"
             );
-            tracing::debug!(
-                target: "mqlite",
-                collection = _name,
-                docs_examined = 0u64,
-                "mqlite::collection_scan"
-            );
         }
-        Err(Error::Internal(
-            "find: query engine not yet implemented (Phase 1)".into(),
-        ))
+        self.engine.lock().unwrap().find(name, filter, opts)
     }
 
     pub(crate) fn update_one(
         &self,
-        _name: &str,
-        _filter: Document,
-        _update: Document,
-        _opts: UpdateOptions,
+        name: &str,
+        filter: Document,
+        update: Document,
+        opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        Err(Error::Internal(
-            "update_one: storage engine not yet implemented (Phase 1)".into(),
-        ))
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().update_one(name, filter, update, opts)
     }
 
     pub(crate) fn update_many(
         &self,
-        _name: &str,
-        _filter: Document,
-        _update: Document,
-        _opts: UpdateOptions,
+        name: &str,
+        filter: Document,
+        update: Document,
+        opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        Err(Error::Internal(
-            "update_many: storage engine not yet implemented (Phase 1)".into(),
-        ))
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().update_many(name, filter, update, opts)
     }
 
-    pub(crate) fn delete_one(&self, _name: &str, _filter: Document) -> Result<DeleteResult> {
-        Err(Error::Internal(
-            "delete_one: storage engine not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn delete_one(&self, name: &str, filter: Document) -> Result<DeleteResult> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().delete_one(name, filter)
     }
 
-    pub(crate) fn delete_many(&self, _name: &str, _filter: Document) -> Result<DeleteResult> {
-        Err(Error::Internal(
-            "delete_many: storage engine not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn delete_many(&self, name: &str, filter: Document) -> Result<DeleteResult> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().delete_many(name, filter)
     }
 
     pub(crate) fn find_one_and_update<T: Serialize + DeserializeOwned>(
         &self,
-        _name: &str,
-        _filter: Document,
-        _update: Document,
+        name: &str,
+        filter: Document,
+        update: Document,
     ) -> Result<Option<T>> {
-        Err(Error::Internal(
-            "find_one_and_update: not yet implemented (Phase 1)".into(),
-        ))
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().find_one_and_update(name, filter, update)
+    }
+
+    pub(crate) fn find_one_and_update_with_options<T: Serialize + DeserializeOwned>(
+        &self,
+        name: &str,
+        filter: Document,
+        update: Document,
+        opts: FindOneAndUpdateOptions,
+    ) -> Result<Option<T>> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine
+            .lock()
+            .unwrap()
+            .find_one_and_update_with_options(name, filter, update, opts)
     }
 
     pub(crate) fn find_one_and_delete<T: DeserializeOwned>(
         &self,
-        _name: &str,
-        _filter: Document,
+        name: &str,
+        filter: Document,
     ) -> Result<Option<T>> {
-        Err(Error::Internal(
-            "find_one_and_delete: not yet implemented (Phase 1)".into(),
-        ))
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().find_one_and_delete(name, filter)
+    }
+
+    pub(crate) fn find_one_and_delete_with_options<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        filter: Document,
+        opts: FindOneAndDeleteOptions,
+    ) -> Result<Option<T>> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine
+            .lock()
+            .unwrap()
+            .find_one_and_delete_with_options(name, filter, opts)
     }
 
     pub(crate) fn find_one_and_replace<T: Serialize + DeserializeOwned>(
         &self,
-        _name: &str,
-        _filter: Document,
-        _replacement: &T,
+        name: &str,
+        filter: Document,
+        replacement: &T,
     ) -> Result<Option<T>> {
-        Err(Error::Internal(
-            "find_one_and_replace: not yet implemented (Phase 1)".into(),
-        ))
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().find_one_and_replace(name, filter, replacement)
     }
 
-    pub(crate) fn estimated_document_count(&self, _name: &str) -> Result<u64> {
-        Err(Error::Internal(
-            "estimated_document_count: not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn find_one_and_replace_with_options<T: Serialize + DeserializeOwned>(
+        &self,
+        name: &str,
+        filter: Document,
+        replacement: &T,
+        opts: FindOneAndReplaceOptions,
+    ) -> Result<Option<T>> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine
+            .lock()
+            .unwrap()
+            .find_one_and_replace_with_options(name, filter, replacement, opts)
     }
 
-    pub(crate) fn count_documents(&self, _name: &str, _filter: Document) -> Result<u64> {
-        Err(Error::Internal(
-            "count_documents: not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn estimated_document_count(&self, name: &str) -> Result<u64> {
+        self.engine.lock().unwrap().estimated_document_count(name)
     }
 
-    pub(crate) fn create_index(&self, _name: &str, _model: IndexModel) -> Result<String> {
-        Err(Error::Internal(
-            "create_index: not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn count_documents(&self, name: &str, filter: Document) -> Result<u64> {
+        self.engine.lock().unwrap().count_documents(name, filter)
     }
 
-    pub(crate) fn drop_index(&self, _name: &str, _index_name: &str) -> Result<()> {
-        Err(Error::Internal(
-            "drop_index: not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn create_index(&self, name: &str, model: IndexModel) -> Result<String> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().create_index(name, model)
     }
 
-    pub(crate) fn list_indexes(&self, _name: &str) -> Result<Vec<IndexInfo>> {
-        Err(Error::Internal(
-            "list_indexes: not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn drop_index(&self, name: &str, index_name: &str) -> Result<()> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().drop_index(name, index_name)
+    }
+
+    pub(crate) fn list_indexes(&self, name: &str) -> Result<Vec<IndexInfo>> {
+        self.engine.lock().unwrap().list_indexes(name)
     }
 
     pub(crate) fn list_collection_names(&self) -> Result<Vec<String>> {
-        Err(Error::Internal(
-            "list_collection_names: not yet implemented (Phase 1)".into(),
-        ))
+        self.engine.lock().unwrap().list_collection_names()
     }
 
-    pub(crate) fn drop_collection(&self, _name: &str) -> Result<()> {
-        Err(Error::Internal(
-            "drop_collection: not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn drop_collection(&self, name: &str) -> Result<()> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().drop_collection(name)
     }
 
-    pub(crate) fn create_collection(&self, _name: &str) -> Result<()> {
-        Err(Error::Internal(
-            "create_collection: not yet implemented (Phase 1)".into(),
-        ))
+    pub(crate) fn create_collection(&self, name: &str) -> Result<()> {
+        let _guard = self.writer_lock.lock().unwrap();
+        self.engine.lock().unwrap().create_collection(name)
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
-        Err(Error::Internal(
-            "checkpoint: WAL not yet implemented (Phase 1)".into(),
-        ))
+        // Phase 1b: in-memory engine has no WAL to checkpoint.
+        // This is a no-op until the B+tree/WAL storage engine is wired in.
+        Ok(())
     }
 
     pub(crate) fn backup(&self, _dest: &Path) -> Result<()> {
         Err(Error::Internal(
-            "backup: not yet implemented (Phase 1)".into(),
+            "backup: not yet implemented (Phase 2)".into(),
         ))
     }
 }

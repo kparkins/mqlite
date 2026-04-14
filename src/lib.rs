@@ -82,8 +82,10 @@ pub mod options;
 pub mod results;
 
 // Internal modules (not public API)
+mod engine;
 mod query;
 mod storage;
+mod update_operators;
 mod validation;
 // Phase 1: WAL module — not yet wired into the main read/write paths.
 #[allow(dead_code)]
@@ -112,14 +114,15 @@ pub use error::{Error, Result};
 
 // Configuration
 pub use options::{
-    DurabilityMode, FindOptions, IndexOptions, InsertManyOptions, OpenOptions, UpdateOptions,
+    DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
+    FindOptions, IndexOptions, InsertManyOptions, OpenOptions, ReturnDocument, UpdateOptions,
 };
 
 // Index
 pub use index::{IndexInfo, IndexModel};
 
 // Operation results
-pub use results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult};
+pub use results::{BulkWriteError, DeleteResult, InsertManyResult, InsertOneResult, UpdateResult};
 
 // BSON re-exports — users don't need a direct `bson` dependency for basic usage
 pub use bson_compat::{doc, Bson, DateTime, Document, ObjectId};
