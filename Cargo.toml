@@ -1,0 +1,29 @@
+[package]
+name = "mqlite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Embedded MongoDB-compatible document store"
+repository = "https://github.com/kyleparkinson/mqlite"
+keywords = ["mongodb", "embedded", "document", "database", "sqlite"]
+categories = ["database", "embedded"]
+
+[features]
+default = []
+wire = ["dep:tokio", "dep:tokio-util"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+bson = { version = "2", features = ["serde_with"] }
+thiserror = "1"
+crc32c = "0.6.4"
+serde = { version = "1", features = ["derive"] }
+
+
+# Optional: wire feature
+tokio = { version = "1", features = ["full"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+
+# Optional: tracing feature
+tracing = { version = "0.1", optional = true }

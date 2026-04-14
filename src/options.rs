@@ -1,0 +1,264 @@
+use bson::Document;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Durability mode controls when data is fsynced to disk.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DurabilityMode {
+    /// fsync after every commit. Safest, slowest.
+    FullSync,
+    /// Flush WAL at a configurable interval. Fast, small loss window.
+    Interval(Duration),
+    /// No durability guarantees (in-memory behavior for file-backed DBs).
+    None,
+}
+
+impl Default for DurabilityMode {
+    fn default() -> Self {
+        DurabilityMode::Interval(Duration::from_millis(100))
+    }
+}
+
+/// A boxed busy-handler callback.
+///
+/// Wrapped in `Arc` so that `OpenOptions` can implement `Clone`.
+#[derive(Clone)]
+pub struct BusyHandler(pub Arc<dyn Fn(u32) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for BusyHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BusyHandler").field(&"<fn>").finish()
+    }
+}
+
+/// Configuration for [`Database::open_with_options`].
+///
+/// Use the builder methods for ergonomic construction:
+/// ```no_run
+/// use mqlite::{OpenOptions, DurabilityMode};
+/// use std::time::Duration;
+///
+/// let opts = OpenOptions::new()
+///     .buffer_pool_size(64 * 1024 * 1024)
+///     .durability(DurabilityMode::FullSync)
+///     .busy_timeout(Duration::from_secs(5));
+/// ```
+#[derive(Debug, Clone)]
+pub struct OpenOptions {
+    /// Buffer pool size in bytes. Default: 64MB.
+    pub buffer_pool_size: usize,
+    /// Durability mode. Default: `Interval(100ms)`.
+    pub durability: DurabilityMode,
+    /// WAL auto-checkpoint threshold in pages. Default: 1000.
+    pub wal_auto_checkpoint: u32,
+    /// WAL max size in bytes before forced checkpoint. Default: 100MB.
+    pub wal_max_size: u64,
+    /// Timeout for acquiring the writer lock. Default: 5 seconds.
+    /// Set to `Duration::ZERO` for immediate failure (SQLite-style SQLITE_BUSY).
+    pub busy_timeout: Duration,
+    /// Optional busy handler callback. Called when the writer lock is contended.
+    /// Return `true` to retry, `false` to fail with [`Error::WriterBusy`].
+    pub busy_handler: Option<BusyHandler>,
+    /// Open in read-only mode. WAL replay is skipped.
+    /// Default: false.
+    pub read_only: bool,
+    /// Create the file if it doesn't exist. Default: true.
+    pub create_if_missing: bool,
+    /// Maximum concurrent readers. Default: 64.
+    pub max_readers: u32,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        OpenOptions {
+            buffer_pool_size: 64 * 1024 * 1024, // 64MB
+            durability: DurabilityMode::default(),
+            wal_auto_checkpoint: 1000,
+            wal_max_size: 100 * 1024 * 1024, // 100MB
+            busy_timeout: Duration::from_secs(5),
+            busy_handler: None,
+            read_only: false,
+            create_if_missing: true,
+            max_readers: 64,
+        }
+    }
+}
+
+impl OpenOptions {
+    /// Create a new `OpenOptions` with sensible defaults.
+    pub fn new() -> Self {
+        OpenOptions::default()
+    }
+
+    /// Set the buffer pool size in bytes.
+    pub fn buffer_pool_size(mut self, bytes: usize) -> Self {
+        self.buffer_pool_size = bytes;
+        self
+    }
+
+    /// Set the durability mode.
+    pub fn durability(mut self, mode: DurabilityMode) -> Self {
+        self.durability = mode;
+        self
+    }
+
+    /// Set the WAL auto-checkpoint threshold in pages.
+    pub fn wal_auto_checkpoint(mut self, pages: u32) -> Self {
+        self.wal_auto_checkpoint = pages;
+        self
+    }
+
+    /// Set the maximum WAL size in bytes before a forced checkpoint.
+    pub fn wal_max_size(mut self, bytes: u64) -> Self {
+        self.wal_max_size = bytes;
+        self
+    }
+
+    /// Set the timeout for acquiring the writer lock.
+    /// Use `Duration::ZERO` for immediate failure on contention.
+    pub fn busy_timeout(mut self, duration: Duration) -> Self {
+        self.busy_timeout = duration;
+        self
+    }
+
+    /// Set a callback invoked when the writer lock is contended.
+    /// `attempts` is the number of retries so far.
+    /// Return `true` to retry, `false` to fail with [`Error::WriterBusy`].
+    pub fn busy_handler(mut self, handler: impl Fn(u32) -> bool + Send + Sync + 'static) -> Self {
+        self.busy_handler = Some(BusyHandler(Arc::new(handler)));
+        self
+    }
+
+    /// Open in read-only mode. WAL replay is skipped.
+    pub fn read_only(mut self, val: bool) -> Self {
+        self.read_only = val;
+        self
+    }
+
+    /// Create the file if it doesn't exist.
+    pub fn create_if_missing(mut self, val: bool) -> Self {
+        self.create_if_missing = val;
+        self
+    }
+
+    /// Set the maximum number of concurrent readers.
+    pub fn max_readers(mut self, count: u32) -> Self {
+        self.max_readers = count;
+        self
+    }
+}
+
+/// Options for `find` and `find_one` operations.
+/// All fields are optional — omit to use defaults.
+#[derive(Debug, Clone, Default)]
+pub struct FindOptions {
+    /// Sort order. Documents are returned in insertion order if not specified.
+    pub sort: Option<Document>,
+    /// Maximum number of documents to return.
+    pub limit: Option<i64>,
+    /// Number of documents to skip before returning results.
+    pub skip: Option<u64>,
+    /// Projection — fields to include or exclude.
+    pub projection: Option<Document>,
+    /// Number of documents to fetch per internal batch. Default: 101.
+    pub batch_size: Option<u32>,
+}
+
+impl FindOptions {
+    pub fn new() -> Self {
+        FindOptions::default()
+    }
+
+    pub fn sort(mut self, sort: Document) -> Self {
+        self.sort = Some(sort);
+        self
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn skip(mut self, skip: u64) -> Self {
+        self.skip = Some(skip);
+        self
+    }
+
+    pub fn projection(mut self, projection: Document) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+
+    pub fn batch_size(mut self, batch_size: u32) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+}
+
+/// Options for `update_one` and `update_many` operations.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    /// If true, insert a new document when no document matches the filter.
+    pub upsert: bool,
+}
+
+impl UpdateOptions {
+    pub fn new() -> Self {
+        UpdateOptions::default()
+    }
+
+    pub fn upsert(mut self, upsert: bool) -> Self {
+        self.upsert = upsert;
+        self
+    }
+}
+
+/// Options for `insert_many` operations.
+#[derive(Debug, Clone, Default)]
+pub struct InsertManyOptions {
+    /// If true, continue inserting remaining documents when one fails. Default: false.
+    pub ordered: bool,
+}
+
+impl InsertManyOptions {
+    pub fn new() -> Self {
+        InsertManyOptions { ordered: false }
+    }
+
+    pub fn ordered(mut self, ordered: bool) -> Self {
+        self.ordered = ordered;
+        self
+    }
+}
+
+/// Options for `create_index` operations.
+#[derive(Debug, Clone, Default)]
+pub struct IndexOptions {
+    /// If true, the index enforces a unique constraint.
+    pub unique: bool,
+    /// Custom name for the index.
+    pub name: Option<String>,
+    /// If true, only index documents where the key field exists.
+    pub sparse: bool,
+}
+
+impl IndexOptions {
+    pub fn new() -> Self {
+        IndexOptions::default()
+    }
+
+    pub fn unique(mut self, unique: bool) -> Self {
+        self.unique = unique;
+        self
+    }
+
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn sparse(mut self, sparse: bool) -> Self {
+        self.sparse = sparse;
+        self
+    }
+}
