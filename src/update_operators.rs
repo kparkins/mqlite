@@ -11,9 +11,10 @@
 //! | `$rename`     | Rename fields |
 //! | `$min`        | Update if new value is less than current |
 //! | `$max`        | Update if new value is greater than current |
-//! | `$push`       | Append elements to arrays |
+//! | `$push`       | Append elements to arrays; modifiers: `$each`, `$position`, `$sort`, `$slice` |
 //! | `$pull`       | Remove matching elements from arrays |
-//! | `$addToSet`   | Add elements to arrays (no duplicates) |
+//! | `$pullAll`    | Remove all occurrences of specified values |
+//! | `$addToSet`   | Add elements to arrays (no duplicates); `$each` modifier supported |
 //! | `$pop`        | Remove first or last element from arrays |
 //! | `$currentDate`| Set to current date/timestamp |
 //! | `$setOnInsert`| Set fields only on upsert insert |
@@ -55,7 +56,7 @@ pub(crate) fn apply_update(
         // the argument type.
         match op.as_str() {
             "$set" | "$unset" | "$inc" | "$mul" | "$rename" | "$min" | "$max"
-            | "$push" | "$pull" | "$addToSet" | "$pop" | "$currentDate"
+            | "$push" | "$pull" | "$pullAll" | "$addToSet" | "$pop" | "$currentDate"
             | "$setOnInsert" => {}  // supported — fall through to args parse
 
             "$bit" => {
@@ -91,6 +92,7 @@ pub(crate) fn apply_update(
             "$max" => apply_max(doc, args_doc)?,
             "$push" => apply_push(doc, args_doc)?,
             "$pull" => apply_pull(doc, args_doc)?,
+            "$pullAll" => apply_pull_all(doc, args_doc)?,
             "$addToSet" => apply_add_to_set(doc, args_doc)?,
             "$pop" => apply_pop(doc, args_doc)?,
             "$currentDate" => apply_current_date(doc, args_doc)?,
@@ -320,16 +322,23 @@ fn apply_max(doc: &mut Document, args: &Document) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// $push
+// $push (with optional modifiers: $each, $position, $sort, $slice)
 // ---------------------------------------------------------------------------
 
 fn apply_push(doc: &mut Document, args: &Document) -> Result<()> {
     for (path, value) in args {
-        let field = get_nested_field(doc, path).cloned();
+        // If value is a modifier document (has $each key), handle modifiers.
+        if let Bson::Document(modifier) = value {
+            if modifier.contains_key("$each") {
+                apply_push_modifiers(doc, path, modifier)?;
+                continue;
+            }
+        }
 
+        // Simple single-element push.
+        let field = get_nested_field(doc, path).cloned();
         match field {
             None => {
-                // Create a new array with the element.
                 set_nested(doc, path, Bson::Array(vec![value.clone()]));
             }
             Some(Bson::Array(mut arr)) => {
@@ -344,6 +353,141 @@ fn apply_push(doc: &mut Document, args: &Document) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Handle `$push` with modifier sub-document (`$each` required; `$position`,
+/// `$sort`, `$slice` optional).
+fn apply_push_modifiers(doc: &mut Document, path: &str, modifiers: &Document) -> Result<()> {
+    let each_vals = modifiers
+        .get("$each")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::Internal("$push: $each modifier must be an array".into()))?;
+
+    let position: Option<i64> = modifiers
+        .get("$position")
+        .and_then(|v| as_f64(v))
+        .map(|f| f as i64);
+
+    let sort_spec = modifiers.get("$sort").cloned();
+
+    let slice: Option<i64> = modifiers
+        .get("$slice")
+        .and_then(|v| as_f64(v))
+        .map(|f| f as i64);
+
+    let field = get_nested_field(doc, path).cloned();
+    let mut arr = match field {
+        None => vec![],
+        Some(Bson::Array(a)) => a,
+        Some(_) => {
+            return Err(Error::Internal(format!(
+                "$push: field '{path}' is not an array"
+            )));
+        }
+    };
+
+    // Step 1: Insert elements at the specified position or append at the end.
+    match position {
+        Some(pos) => {
+            // Negative position: count from the end of the array.
+            let insert_at = if pos < 0 {
+                let from_end = arr.len() as i64 + pos;
+                if from_end < 0 { 0 } else { from_end as usize }
+            } else {
+                (pos as usize).min(arr.len())
+            };
+            for (i, val) in each_vals.iter().enumerate() {
+                arr.insert(insert_at + i, val.clone());
+            }
+        }
+        None => {
+            for val in each_vals {
+                arr.push(val.clone());
+            }
+        }
+    }
+
+    // Step 2: Apply $sort (runs before $slice).
+    if let Some(ref spec) = sort_spec {
+        sort_bson_array(&mut arr, spec)?;
+    }
+
+    // Step 3: Apply $slice.
+    if let Some(n) = slice {
+        slice_bson_array(&mut arr, n);
+    }
+
+    set_nested(doc, path, Bson::Array(arr));
+    Ok(())
+}
+
+/// Sort `arr` according to a MongoDB sort specification.
+///
+/// `spec` is either:
+/// - `1` / `-1` (scalar ascending / descending)
+/// - A document `{ field: 1|−1, ... }` for arrays of embedded documents
+fn sort_bson_array(arr: &mut [Bson], spec: &Bson) -> Result<()> {
+    // Scalar direction.
+    if let Some(d) = as_f64(spec) {
+        if d >= 0.0 {
+            arr.sort_by(|a, b| bson_cmp(a, b));
+        } else {
+            arr.sort_by(|a, b| bson_cmp(b, a));
+        }
+        return Ok(());
+    }
+
+    // Document sort spec: { field: direction, ... }
+    if let Bson::Document(sort_doc) = spec {
+        // Collect owned (String, f64) pairs so the closure doesn't borrow `spec`.
+        let sort_fields: Vec<(String, f64)> = sort_doc
+            .iter()
+            .map(|(k, v)| (k.clone(), as_f64(v).unwrap_or(1.0)))
+            .collect();
+
+        arr.sort_by(|a, b| {
+            for (field, dir) in &sort_fields {
+                let va = if let Bson::Document(ad) = a {
+                    get_nested_field(ad, field).cloned().unwrap_or(Bson::Null)
+                } else {
+                    Bson::Null
+                };
+                let vb = if let Bson::Document(bd) = b {
+                    get_nested_field(bd, field).cloned().unwrap_or(Bson::Null)
+                } else {
+                    Bson::Null
+                };
+                let ord = bson_cmp(&va, &vb);
+                if ord != std::cmp::Ordering::Equal {
+                    return if *dir >= 0.0 { ord } else { ord.reverse() };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        return Ok(());
+    }
+
+    Err(Error::Internal(format!(
+        "$push $sort: invalid sort specification {spec:?}"
+    )))
+}
+
+/// Trim `arr` to `n` elements using MongoDB `$slice` semantics.
+/// - `n > 0`: keep the first `n` elements
+/// - `n < 0`: keep the last `|n|` elements
+/// - `n == 0`: clear the array
+fn slice_bson_array(arr: &mut Vec<Bson>, n: i64) {
+    if n == 0 {
+        arr.clear();
+    } else if n > 0 {
+        arr.truncate(n as usize);
+    } else {
+        // Negative: keep last |n| elements.
+        let keep = (-n) as usize;
+        if keep < arr.len() {
+            arr.drain(..arr.len() - keep);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,29 +528,74 @@ fn matches_pull_condition(elem: &Bson, condition: &Bson) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// $addToSet
+// $addToSet (with optional $each modifier)
 // ---------------------------------------------------------------------------
 
 fn apply_add_to_set(doc: &mut Document, args: &Document) -> Result<()> {
     for (path, value) in args {
-        let field = get_nested_field(doc, path).cloned();
+        // Collect the elements to (potentially) add.
+        let elements: Vec<Bson> = if let Bson::Document(modifier) = value {
+            if let Some(each_arr) = modifier.get("$each").and_then(|v| v.as_array()) {
+                each_arr.clone()
+            } else {
+                vec![value.clone()]
+            }
+        } else {
+            vec![value.clone()]
+        };
 
-        match field {
-            None => {
-                set_nested(doc, path, Bson::Array(vec![value.clone()]));
-            }
-            Some(Bson::Array(mut arr)) => {
-                if !arr.contains(value) {
-                    arr.push(value.clone());
-                    set_nested(doc, path, Bson::Array(arr));
-                }
-            }
+        let field = get_nested_field(doc, path).cloned();
+        let field_missing = field.is_none();
+        let mut arr = match field {
+            None => vec![],
+            Some(Bson::Array(a)) => a,
             Some(_) => {
                 return Err(Error::Internal(format!(
                     "$addToSet: field '{path}' is not an array"
                 )));
             }
+        };
+
+        let mut any_added = false;
+        for elem in elements {
+            if !arr.contains(&elem) {
+                arr.push(elem);
+                any_added = true;
+            }
         }
+
+        // Write back whenever we added elements OR when the field didn't exist
+        // (so the field is created even if $each was empty).
+        if any_added || field_missing {
+            set_nested(doc, path, Bson::Array(arr));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// $pullAll
+// ---------------------------------------------------------------------------
+
+/// Remove all array elements that exactly match any value in the provided list.
+///
+/// Syntax: `{ $pullAll: { <field>: [ <value1>, <value2>, ... ] } }`
+fn apply_pull_all(doc: &mut Document, args: &Document) -> Result<()> {
+    for (path, values_bson) in args {
+        let values = values_bson.as_array().ok_or_else(|| {
+            Error::Internal(format!(
+                "$pullAll: argument for '{path}' must be an array, got {values_bson:?}"
+            ))
+        })?;
+
+        if let Some(Bson::Array(arr)) = get_nested_field(doc, path).cloned() {
+            let new_arr: Vec<Bson> = arr
+                .into_iter()
+                .filter(|elem| !values.contains(elem))
+                .collect();
+            set_nested(doc, path, Bson::Array(new_arr));
+        }
+        // If the field doesn't exist or isn't an array, $pullAll is a no-op.
     }
     Ok(())
 }
@@ -661,6 +850,273 @@ mod tests {
         let arr = doc.get_array("arr").unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0], Bson::Int32(2));
+    }
+
+    // ---- $push with modifiers -----------------------------------------------
+
+    #[test]
+    fn push_each_appends_multiple() {
+        let mut doc = doc! { "arr": [1i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [2i32, 3i32] } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[1], Bson::Int32(2));
+        assert_eq!(arr[2], Bson::Int32(3));
+    }
+
+    #[test]
+    fn push_each_empty_is_noop() {
+        let mut doc = doc! { "arr": [1i32, 2i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [] } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn push_each_position_at_start() {
+        let mut doc = doc! { "arr": [2i32, 3i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [0i32, 1i32], "$position": 0i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr, &[Bson::Int32(0), Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]);
+    }
+
+    #[test]
+    fn push_each_position_in_middle() {
+        let mut doc = doc! { "arr": [1i32, 4i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [2i32, 3i32], "$position": 1i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr, &[Bson::Int32(1), Bson::Int32(2), Bson::Int32(3), Bson::Int32(4)]);
+    }
+
+    #[test]
+    fn push_each_negative_position() {
+        // Negative $position counts from end.
+        // [10, 20, 30] + $each:[99] $position:-1 → insert before last → [10, 20, 99, 30]
+        let mut doc = doc! { "arr": [10i32, 20i32, 30i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [99i32], "$position": -1i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(
+            arr,
+            &[Bson::Int32(10), Bson::Int32(20), Bson::Int32(99), Bson::Int32(30)]
+        );
+    }
+
+    #[test]
+    fn push_each_slice_keeps_first_n() {
+        let mut doc = doc! { "arr": [1i32, 2i32, 3i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [4i32, 5i32], "$slice": 3i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        // After push: [1,2,3,4,5]; after $slice:3 → [1,2,3]
+        assert_eq!(arr, &[Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]);
+    }
+
+    #[test]
+    fn push_each_slice_negative_keeps_last_n() {
+        let mut doc = doc! { "arr": [1i32, 2i32, 3i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [4i32, 5i32], "$slice": -3i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        // After push: [1,2,3,4,5]; after $slice:-3 → [3,4,5]
+        assert_eq!(arr, &[Bson::Int32(3), Bson::Int32(4), Bson::Int32(5)]);
+    }
+
+    #[test]
+    fn push_each_slice_zero_clears_array() {
+        let mut doc = doc! { "arr": [1i32, 2i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [3i32], "$slice": 0i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn push_each_sort_ascending() {
+        let mut doc = doc! { "arr": [3i32, 1i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [2i32], "$sort": 1i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr, &[Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]);
+    }
+
+    #[test]
+    fn push_each_sort_descending() {
+        let mut doc = doc! { "arr": [1i32, 3i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [2i32], "$sort": -1i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr, &[Bson::Int32(3), Bson::Int32(2), Bson::Int32(1)]);
+    }
+
+    #[test]
+    fn push_each_sort_by_field() {
+        // Array of embedded documents sorted by "score" descending.
+        let mut doc = doc! {
+            "scores": [
+                { "name": "b", "score": 2i32 },
+                { "name": "c", "score": 3i32 },
+            ]
+        };
+        apply(
+            &mut doc,
+            &doc! {
+                "$push": {
+                    "scores": {
+                        "$each": [{ "name": "a", "score": 1i32 }],
+                        "$sort": { "score": -1i32 }
+                    }
+                }
+            },
+        )
+        .unwrap();
+        let arr = doc.get_array("scores").unwrap();
+        assert_eq!(arr.len(), 3);
+        // Descending order: score 3, 2, 1
+        let first = arr[0].as_document().unwrap();
+        let last = arr[2].as_document().unwrap();
+        assert_eq!(first.get_i32("score").unwrap(), 3);
+        assert_eq!(last.get_i32("score").unwrap(), 1);
+    }
+
+    #[test]
+    fn push_each_sort_then_slice() {
+        // Sort ascending then slice to keep first 2.
+        let mut doc = doc! { "arr": [3i32, 1i32, 5i32] };
+        apply(
+            &mut doc,
+            &doc! { "$push": { "arr": { "$each": [4i32, 2i32], "$sort": 1i32, "$slice": 3i32 } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        // After push: [3,1,5,4,2]; after sort: [1,2,3,4,5]; after slice:3 → [1,2,3]
+        assert_eq!(arr, &[Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]);
+    }
+
+    // ---- $addToSet with $each -----------------------------------------------
+
+    #[test]
+    fn add_to_set_each_adds_missing_elements() {
+        let mut doc = doc! { "tags": ["a", "b"] };
+        apply(
+            &mut doc,
+            &doc! { "$addToSet": { "tags": { "$each": ["b", "c", "d"] } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("tags").unwrap();
+        // "b" already present, "c" and "d" added → ["a", "b", "c", "d"]
+        assert_eq!(arr.len(), 4);
+    }
+
+    #[test]
+    fn add_to_set_each_no_duplicates_added() {
+        let mut doc = doc! { "tags": ["x", "y"] };
+        apply(
+            &mut doc,
+            &doc! { "$addToSet": { "tags": { "$each": ["x", "y"] } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("tags").unwrap();
+        assert_eq!(arr.len(), 2); // nothing added
+    }
+
+    #[test]
+    fn add_to_set_each_creates_array_when_missing() {
+        let mut doc = doc! {};
+        apply(
+            &mut doc,
+            &doc! { "$addToSet": { "new_field": { "$each": [1i32, 2i32] } } },
+        )
+        .unwrap();
+        let arr = doc.get_array("new_field").unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    // ---- $pullAll -----------------------------------------------------------
+
+    #[test]
+    fn pull_all_removes_listed_values() {
+        let mut doc = doc! { "scores": [0i32, 2i32, 5i32, 0i32, 3i32] };
+        apply(
+            &mut doc,
+            &doc! { "$pullAll": { "scores": [0i32, 5i32] } },
+        )
+        .unwrap();
+        let arr = doc.get_array("scores").unwrap();
+        // 0 and 5 should be removed; 2 and 3 remain
+        assert_eq!(arr.len(), 2);
+        assert!(arr.contains(&Bson::Int32(2)));
+        assert!(arr.contains(&Bson::Int32(3)));
+    }
+
+    #[test]
+    fn pull_all_removes_all_occurrences() {
+        let mut doc = doc! { "arr": [1i32, 2i32, 1i32, 3i32, 1i32] };
+        apply(
+            &mut doc,
+            &doc! { "$pullAll": { "arr": [1i32] } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(!arr.contains(&Bson::Int32(1)));
+    }
+
+    #[test]
+    fn pull_all_noop_when_field_missing() {
+        let mut doc = doc! {};
+        apply(
+            &mut doc,
+            &doc! { "$pullAll": { "arr": [1i32, 2i32] } },
+        )
+        .unwrap();
+        assert!(!doc.contains_key("arr"));
+    }
+
+    #[test]
+    fn pull_all_empty_list_removes_nothing() {
+        let mut doc = doc! { "arr": [1i32, 2i32, 3i32] };
+        apply(
+            &mut doc,
+            &doc! { "$pullAll": { "arr": [] } },
+        )
+        .unwrap();
+        let arr = doc.get_array("arr").unwrap();
+        assert_eq!(arr.len(), 3);
     }
 
     // ---- unsupported operator -----------------------------------------------
