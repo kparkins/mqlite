@@ -2,6 +2,8 @@ use thiserror::Error;
 
 /// MongoDB-compatible error codes.
 pub mod codes {
+    /// Received a wire protocol message that is malformed or not supported.
+    pub const ILLEGAL_OP: i32 = 48;
     /// Generic internal server error.
     pub const INTERNAL_ERROR: i32 = 1;
     /// A provided value is invalid for the given field or operation.
@@ -128,6 +130,15 @@ pub enum Error {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// A wire protocol message is malformed, exceeds size limits, or uses an
+    /// unsupported opcode (e.g. OP_COMPRESSED / opcode 2012).
+    /// MongoDB error code 48 (IllegalOperation).
+    #[error("Invalid wire message: {detail}")]
+    InvalidWireMessage {
+        /// Human-readable description of the problem.
+        detail: String,
+    },
+
     /// A document failed structural validation (nesting depth, field count, or field name
     /// constraints). MongoDB error code 121.
     #[error("Document failed validation: {detail}")]
@@ -169,6 +180,7 @@ impl Error {
             Error::DocumentValidationFailure { .. } => Some(codes::DOCUMENT_VALIDATION_FAILURE),
             Error::DocumentTooLarge { .. } => Some(codes::DOCUMENT_TOO_LARGE),
             Error::SymlinkRejected { .. } => Some(codes::BAD_VALUE),
+            Error::InvalidWireMessage { .. } => Some(codes::ILLEGAL_OP),
             _ => None,
         }
     }
