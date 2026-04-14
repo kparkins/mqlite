@@ -72,6 +72,9 @@ Dropping the handle is non-blocking and leaves the WAL on disk; the next open re
 - [Error Guide](docs/ERRORS.md)
 - [Migration Guide](docs/MIGRATION.md)
 - [Wire Protocol Security Advisory](docs/WIRE-SECURITY.md)
+- [Test Double Cookbook](docs/TEST-DOUBLE-COOKBOOK.md)
+- [File Management Guide](docs/FILE-MANAGEMENT.md)
+- [IoT and Embedded Deployment Guide](docs/IOT-DEPLOYMENT.md)
 
 ## License
 
