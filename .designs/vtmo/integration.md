@@ -87,8 +87,9 @@ The Rust ecosystem integration is straightforward but has one critical constrain
 
 Phase 1 implementation:
 - Parse Kind 0 (body) sections — this carries the command document.
-- Parse Kind 1 (document sequence) sections — used for bulk insert/update/delete documents.
-- Validate checksum if present; generate checksum on responses if client sent one.
+- **Kind 1 (document sequence): VERIFY FIRST.** Before implementing Kind 1, confirm during the pymongo connectivity spike (see below) whether pymongo 4.x and mongosh 2.x require Kind 1 for the 18 Phase 1 commands. If they use only Kind 0, defer Kind 1 to Phase 2.
+- **Checksum policy**: Validate incoming checksums if `flagChecksumPresent` is set in the client's flagBits. **Always omit checksums on outbound responses** (set flagBits to 0). Drivers accept responses without checksums, and generating CRC32C on every response adds overhead without benefit for localhost connections.
+- **`exhaustAllowed` flag (bit 16)**: Parse but ignore in Phase 1. Always respond with normal cursor batch semantics regardless of this flag. Exhaust cursor mode is Phase 2.
 - Reject messages exceeding 48MB (maxMessageSizeBytes).
 - Do NOT implement OP_COMPRESSED (opcode 2012) in Phase 1. If a client sends OP_COMPRESSED, return an error. Most drivers fall back to uncompressed when compression negotiation fails.
 
@@ -415,6 +416,15 @@ The compatibility test suite runs in two phases to enable earlier validation:
 - Compound index prefix queries and sort order
 - Multikey index correctness for `$elemMatch`, `$all`, `$size`
 
+**pymongo Connectivity Spike (REQUIRED before Step 7 full implementation)**:
+Before building the full 18-command surface, validate that pymongo can connect to a minimal
+mqlite wire protocol stub:
+1. Implement: `hello`/`isMaster` response, `ping`, `buildInfo` only.
+2. Test: `MongoClient("mongodb://localhost:27017/?directConnection=true").admin.command("ping")`.
+3. Confirm: no driver-side capability errors, no unexpected fallback behavior, no session errors.
+4. During this spike: verify which OP_MSG section kinds (Kind 0 vs Kind 1) pymongo uses.
+5. Document findings. Adjust Kind 1 implementation plan based on results.
+
 **Phase B — Wire protocol compat tests** (run after Step 7: Wire protocol complete):
 - `mongosh` 2.x connects and runs: `show dbs`, `show collections`, `db.coll.insertOne()`,
   `db.coll.find()`, `db.coll.updateOne()`, `db.coll.deleteOne()`
@@ -423,6 +433,15 @@ The compatibility test suite runs in two phases to enable earlier validation:
 - All 18 Phase 1 commands return MongoDB-format responses
 - Unsupported commands (e.g., `aggregate`) return error code 59 (`CommandNotFound`)
 - `directConnection=true` required for all driver connections (documented)
+
+**Command Response Format Reference**:
+Key commands with non-obvious response shapes (consult MongoDB Wire Protocol docs):
+- `findAndModify`: response uses `value` field (not `document`); includes `lastErrorObject`.
+- `getMore`: response uses `nextBatch` field (not `results` or `batch`).
+- `createIndexes`: response includes `numIndexesAfter` and `numIndexesBefore`.
+- `find` with no results: returns `cursor.firstBatch: []` (empty array), not `null`.
+- `insert` with partial failure: returns `writeErrors` array alongside `n`.
+Implement response format tests against real MongoDB 8.0 before finalizing each command.
 
 ### Jepsen-Style Crash Testing
 

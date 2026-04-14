@@ -96,11 +96,13 @@ impl Database {
     /// Hot backup to a new file.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()>;
 
-    /// Reclaim free pages (like SQLite VACUUM).
-    pub fn compact(&self) -> Result<()>;
+    // compact() -- DEFERRED TO PHASE 2
+    // Page reclamation (like SQLite VACUUM) is not in the Phase 1 DoD.
+    // Use checkpoint() for the "safe to copy" use case.
 
-    /// Database statistics.
-    pub fn stats(&self) -> Result<DatabaseStats>;
+    // stats() -- DEFERRED TO PHASE 2
+    // Database statistics are not in the Phase 1 DoD.
+    // Wire protocol's serverStatus command serves basic diagnostic needs in Phase 1.
 
     /// Flush WAL, checkpoint, and close. Blocks until complete.
     /// Use this when you need a guarantee that all committed data is in the main file.
@@ -200,7 +202,8 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     pub fn estimated_document_count(&self) -> Result<u64>;
 
     // --- Stats ---
-    pub fn stats(&self) -> Result<CollectionStats>;
+    // stats() -- DEFERRED TO PHASE 2
+    // Collection statistics are not in the Phase 1 DoD.
 }
 ```
 
@@ -553,6 +556,7 @@ There are no multi-document ACID transactions, sessions, or `startTransaction`/`
 7. **Options structs must have all-optional fields.** No required options. The zero-config path (`find(filter)`) must work without any options struct.
 
 8. **`bson` crate re-export pins the version.** mqlite's public API includes `bson` types (`Document`, `Bson`, `ObjectId`). Upgrading the `bson` dependency is a semver-breaking change for mqlite.
+   - **Version coupling policy**: mqlite uses a `>=X.Y, <(X+1).0` version bound on `bson`. Any `bson` major version bump triggers a mqlite major version bump. The Cargo.toml must specify: `bson = { version = "2", features = ["serde_with"] }` (or whatever the current major). When upgrading `bson` major versions: (a) announce in CHANGELOG, (b) provide a migration note if any re-exported types changed, (c) bump mqlite's own major version. This coupling is unavoidable given the MongoDB-familiarity goal — making it explicit is the correct mitigation.
 
 9. **Cursor batch size defaults to 101.** Matches MongoDB's default first-batch size. Subsequent batches can be larger. This prevents unbounded memory usage on large result sets.
 

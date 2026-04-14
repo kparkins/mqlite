@@ -394,12 +394,12 @@ Phase 1 is complete when ALL of the following are true:
 **Bottom-up build order** — each layer builds on the one below:
 
 0. **Project scaffolding and test infrastructure** *(before any implementation)*:
-   - Cargo workspace: `mqlite` crate, feature flags `wire` and `tracing`, `rust-version = "1.70"`, `license = "MIT OR Apache-2.0"`
+   - **Single `Cargo.toml`** (not a workspace): `mqlite` crate, feature flags `wire` and `tracing`, `rust-version = "1.70"`, `license = "MIT OR Apache-2.0"`. Convert to workspace in Phase 2 when subcrates (mqlite-ffi, mqlite-cli) are added.
    - Module structure per ux.md: `database`, `collection`, `cursor`, `error`, `options`, `index`, `results`, `wire/` (feature-gated)
    - Clippy: `#![deny(clippy::unwrap_used, clippy::expect_used)]` in library code
    - CI: cross-compile jobs (x86_64-linux, aarch64-linux, aarch64-darwin), `cargo audit`, pure-Rust dependency enforcement
-   - Dev dependencies: `proptest` (B+ tree property tests), `criterion` (benchmarks), `cargo-fuzz` (fuzz targets)
-   - Fuzz targets scaffolded: BSON parser, OP_MSG frame parser
+   - Dev dependencies: `proptest` (B+ tree property tests), `criterion` (benchmarks). **`cargo-fuzz` setup deferred**: add BSON parser fuzz target in Step 1 (when parser exists); add OP_MSG frame parser fuzz target in Step 7 (when wire protocol exists).
+   - **WAL correctness spike** (add to Phase 1a before full Step 2): implement minimal WAL (write frame + commit marker + CRC32C), test crash recovery (fork child, SIGKILL, reopen, verify committed data present). Must succeed on x86_64-linux and aarch64-darwin before full WAL implementation proceeds.
    - Error taxonomy implemented from api.md (`src/error.rs`) before any layer is built
    - Public API types scaffolded as stubs: `Database`, `Collection<T>`, `Cursor<T>`, result types, options types
 
@@ -411,7 +411,7 @@ Phase 1 is complete when ALL of the following are true:
 
 3b. **Buffer pool**: CLOCK-sweep eviction, separate pools for 4KB (internal nodes) and 32KB (leaf/overflow) pages, pin/unpin with dirty tracking. Available to WAL reader path (Step 2) and B+ tree (Step 3c).
 
-3c. **B+ tree storage engine**: Variable-page B+ tree using key encoding from 3a and buffer pool from 3b. Overflow pages for large documents. Property-based tests for all 8 tree invariants from data.md written concurrent with implementation.
+3c. **B+ tree storage engine**: Variable-page B+ tree using key encoding from 3a and buffer pool from 3b. Overflow pages for large documents per the overflow page format spec in data.md. Property-based tests for all **10** tree invariants from data.md (updated in round 2) written concurrent with implementation. **All 10 invariants must pass before Step 3c is declared complete.**
 
 4. **Collection and index management**: Catalog B+ tree mapping collection names to root pages. Define catalog schema as a data contract before implementation (collection entry format, index entry format). Auto `_id` index (clustered — documents stored in `_id` order). Secondary indexes with `_id` appended for uniqueness. Multikey indexes for array fields.
 
@@ -419,10 +419,14 @@ Phase 1 is complete when ALL of the following are true:
 
 6. **Native Rust API**: `Database::open()`, `Collection<T>` with serde support, all CRUD methods (including `close()`), index management. Sync-first. Error model with MongoDB error code mapping. `Database::open_in_memory()` for testing. After Step 6: run Phase A native API compatibility tests.
 
-7. **Wire protocol shim** (behind `wire` feature flag): OP_MSG framing, hello/isMaster handshake, 18 Phase 1 commands. Localhost-only binding with startup security warning. Internal tokio runtime via `spawn_blocking` to call sync native API. Silently ignore `lsid`, `readConcern`, `writeConcern` in all commands. After Step 7: run Phase B wire protocol compatibility tests (mongosh, pymongo).
+7. **Wire protocol shim** (behind `wire` feature flag): **Begin with pymongo connectivity spike** (hello/isMaster + ping + buildInfo only — confirm pymongo 4.x connects successfully and verify which OP_MSG section kinds are required before building full command surface). Then: OP_MSG framing, hello/isMaster handshake, 18 Phase 1 commands. Localhost-only binding with startup security warning. Internal tokio runtime via `spawn_blocking` to call sync native API. Silently ignore `lsid`, `readConcern`, `writeConcern` in all commands. After Step 7: run Phase B wire protocol compatibility tests (mongosh, pymongo).
 
 ### Sub-phases (if needed for timeline management)
 - **0**: Scaffolding + test infrastructure
-- **1a**: Storage engine (steps 1, 2, 3a, 3b, 3c) — file format, WAL, BSON key encoding, buffer pool, B+ tree
+- **1a**: Storage engine (steps 1, 2, 3a, 3b, 3c) — file format, WAL (including WAL correctness spike), BSON key encoding, buffer pool, B+ tree
 - **1b**: Query + API (steps 4-6) — catalog, query engine, native API. Phase A compat tests. Begin Tier 1 documentation.
-- **1c**: Wire protocol (step 7) — OP_MSG, commands, mongosh/pymongo validation. Phase B compat tests. Complete Tier 1 documentation.
+- **1c**: Wire protocol (step 7) — pymongo connectivity spike first, then OP_MSG, 18 commands, mongosh/pymongo validation. Phase B compat tests. Complete Tier 1 documentation.
+
+### Benchmark gate
+- A benchmark suite (covering all G7 operations) must exist and pass targets at Phase 1 DoD.
+- Progressive sub-phase baseline tracking is deferred to post-Phase-1 (where regressions between releases are the actual risk). No progressive baseline requirement during development.

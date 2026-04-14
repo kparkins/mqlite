@@ -128,7 +128,7 @@ The Rust implementation provides strong baseline memory safety guarantees that e
 
 1. **Wire protocol: bind localhost-only by default, document loudly.** The default bind address MUST be `127.0.0.1`. Binding to `0.0.0.0` should require explicit opt-in with a warning in logs. The README, API docs, and wire protocol startup output should all warn: "Wire protocol is unauthenticated. Do not expose to untrusted networks."
 
-2. **Wire protocol: add a `--require-token` flag** (Option 3 partial). A simple shared-secret token passed in the connection handshake metadata. Not MongoDB-standard, but prevents casual unauthorized access. Low effort, high value.
+2. ~~Wire protocol: `--require-token` flag~~ — **REMOVED (scope creep)**. The PRD explicitly lists authentication as a Phase 1 non-goal. A non-MongoDB-standard token mechanism conflicts with Phase 2's SCRAM-SHA-256 plan and is not usable by any driver. Phase 1 wire protocol is intentionally unauthenticated. Authentication is a Phase 2 feature.
 
 3. **BSON hardening (Option 4): enforce at parse boundary.** Max nesting depth = 100. Max document size = 16MB (enforced at BSON parse, not just storage). Max field count per document = 10,000. Max field name length = 1024 bytes. Reject documents exceeding these limits with a clear error.
 
@@ -167,7 +167,7 @@ The Rust implementation provides strong baseline memory safety guarantees that e
 | 4 | **`$regex`: ReDoS patterns** | User-controlled regex patterns with catastrophic backtracking can pin a CPU core indefinitely, blocking the single writer. | **High** | **High** (regex from user input is common) | Use Rust `regex` crate (linear-time guarantee). Add per-query timeout. Do NOT use PCRE. |
 | 5 | **Crafted .mqlite files** | A malicious file with corrupted page pointers, invalid B+ tree structure, or forged checksums can cause the storage engine to read arbitrary file offsets, corrupt memory, or enter infinite loops. | **High** | **Medium** (relevant for apps that open user-provided files) | Checksummed pages. Validate page pointers against file bounds. Validate B+ tree invariants on traversal. Magic bytes + version check. |
 | 6 | **No encryption at rest** | The .mqlite file is plaintext on disk. Filesystem access = full data access. Backups, cloud storage, lost devices all expose data. | **High** | **High** (every deployment without FDE) | Document limitation. File permissions 0600. Phase 2: encryption at rest. |
-| 7 | **MQL operator injection** | If application passes user input directly into filter documents (e.g., `{"field": user_input}` where user_input is `{"$gt": ""}`), attackers can inject query operators to bypass intended filters. | **High** | **High** (extremely common pattern in web apps) | Document safe API usage. Provide typed query builder API that prevents operator injection by construction. Validate that filter values don't contain unexpected operator keys when string values are expected. |
+| 7 | **MQL operator injection** | If application passes user input directly into filter documents (e.g., `{"field": user_input}` where user_input is `{"$gt": ""}`), attackers can inject query operators to bypass intended filters. | **High** | **High** (extremely common pattern in web apps) | Document safe API usage patterns. ~~Typed query builder API~~ — **REMOVED (scope creep, not in PRD)**. Mitigations: (1) clear documentation of safe usage, (2) runtime validation that rejects `$`-prefixed operator keys in filter value positions where a scalar value is expected. |
 
 ### Medium Severity
 

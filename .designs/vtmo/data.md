@@ -130,13 +130,20 @@ Value types:
 
 ```
 Offset  Size   Field
-0       1      Page type: 0x03 (overflow)
-1       3      Reserved
-4       4      Page checksum: CRC32C
-8       4      Next overflow page: uint32 (0 = last in chain)
-12      4      Data length in this page: uint32
-16      ...    Raw data (BSON fragment)
+0       1      Page type: 0x05 (overflow)  [distinct from leaf 0x02]
+1       3      Reserved (zero-filled)
+4       4      Page checksum: CRC32C of bytes 0-3 and 8 onward
+8       4      Next overflow page: uint32 (page number, 0 = last in chain)
+12      4      Data length in this page: uint32 (bytes of payload in this page)
+16      32752  Payload data (BSON fragment continuation)
 ```
+
+**Overflow update semantics**: On any document update, the entire overflow chain is rewritten
+as new WAL frames (full page images for every page in the chain). Partial overflow chain
+writes are not supported in Phase 1 — no in-place overflow page patching. The old overflow
+pages are marked free in the WAL commit frame. This simplifies crash recovery: the WAL always
+contains a complete, consistent chain. A crash mid-write leaves the old chain intact (not yet freed)
+and the new chain incomplete (no commit frame) — recovery discards the new chain and retains the old.
 
 ## BSON Key Encoding
 
@@ -392,8 +399,10 @@ Property-based testing (via `proptest` or `quickcheck`) must verify the followin
 6. **Overflow chain integrity**: Every overflow pointer in a leaf cell points to a valid overflow page chain. Following the chain reconstructs the complete document. No orphaned overflow pages.
 7. **Index-data consistency**: For secondary indexes, every index entry's `_id` reference points to a document that exists in the primary `_id` index. For multikey indexes, the number of index entries for a document matches the array length of the indexed field.
 8. **Checksum validity**: Every page's CRC32C checksum matches its content.
+9. **Sibling chain completeness after splits**: After any leaf split, the sibling chain (next/prev pointers) remains a valid doubly-linked list. The new sibling is correctly inserted into the chain between the split leaf and its old successor. No leaf is orphaned from the chain.
+10. **Split key coverage**: After any internal node split, the promoted separator key correctly covers all descendants of the two resulting subtrees. No key in the left subtree is ≥ the separator; no key in the right subtree is < the separator.
 
-Test strategy: Generate random sequences of (insert, update, delete) operations with random BSON documents. After each operation (or batch), verify all invariants hold. Use shrinking to minimize failing test cases.
+Test strategy: Generate random sequences of (insert, update, delete) operations with random BSON documents. After each operation (or batch), verify all invariants hold. Use shrinking to minimize failing test cases. **All 10 invariants must pass before Step 3c is declared complete.**
 
 ## Constraints Identified
 
@@ -405,7 +414,7 @@ Test strategy: Generate random sequences of (insert, update, delete) operations 
 
 4. **Multikey indexes add insertion complexity.** A single document insert on a multikey-indexed field requires N index insertions (N = array length). Updates that modify array fields require removing old entries and adding new ones. This is a significant hot-path cost.
 
-5. **The catalog is a single point of failure.** Catalog corruption makes the database unreadable. Consider: dual-write the catalog to two locations in the file, with consistency check on open.
+5. **The catalog is a single point of failure.** Catalog corruption makes the database unreadable. **Catalog hardening strategy**: (a) store the catalog root page number in TWO locations in the file header (primary at offset 32, backup at offset 76 within the currently reserved header space); (b) on catalog update, write the new catalog root to the WAL, update the primary header location after checkpoint completes, update the backup location as a second write; (c) on `Database::open()`, if the primary catalog root page fails checksum validation, fall back to the backup offset and log a warning. This provides single-failure tolerance for catalog corruption.
 
 6. **WAL page images are full pages.** A WAL entry for a 32KB leaf page is 32KB+header. WAL files can grow quickly under write-heavy workloads. The checkpoint threshold must balance WAL size against checkpoint frequency.
 

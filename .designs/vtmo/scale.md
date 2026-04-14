@@ -151,7 +151,7 @@ These are order-of-magnitude targets for Phase 1. SQLite achieves similar number
 | Resource | Default | Min | Max | Configuration |
 |----------|---------|-----|-----|--------------|
 | Buffer pool size | 64 MB | 512 KB | No limit | `OpenOptions::buffer_pool_size()` |
-| Max concurrent readers | 64 | 1 | 256 | `OpenOptions::max_readers()` |
+| Max concurrent readers | 64 | 1 | 64 (**Phase 1 hard limit**) | `OpenOptions::max_readers()` |
 | WAL auto-checkpoint | 1000 pages | 100 | No limit | `OpenOptions::wal_auto_checkpoint()` |
 | WAL max size (forced checkpoint) | 100 MB | 10 MB | No limit | `OpenOptions::wal_max_size()` |
 | Busy timeout (writer lock) | 5 seconds | 0 (immediate fail) | No limit | `OpenOptions::busy_timeout()` |
@@ -327,6 +327,8 @@ This is the recommended default for most applications. The 100ms default means a
 4. **Buffer pool sizing requires tuning.** The default 64MB is reasonable for desktop apps but may be too large for IoT and too small for server use. Application developers must size this for their deployment.
 
 5. **Multi-process access depends on correct file locking.** POSIX `fcntl` is reliable on local filesystems. Network filesystems (NFS, SMB) may not support it correctly. Document: "mqlite on network filesystems is unsupported."
+   - **macOS-specific fcntl behavior**: macOS differs from Linux in several ways: (a) `fcntl` locks are inherited by child processes after `fork()`, unlike Linux; (b) lock release behavior differs when a locked thread exits without releasing; (c) macOS has a ~10K advisory lock limit that can cause silent failures under load. Reference SQLite's `os_unix.c` VFS implementation for macOS workarounds before writing the locking protocol. Test multi-process access on both Linux and macOS in CI.
+   - **WAL design fallback**: If the SHM hash-table-based WAL index proves unworkable on target platforms, fall back to linear WAL scan for readers. Instead of the SHM hash table, readers scan the WAL file linearly to find the latest committed frame for each page they need. Performance is O(WAL frames) per page read but requires no SHM complexity. Acceptable for Phase 1 if WAL is aggressively checkpointed (e.g., every 100 pages). Define decision trigger: if SHM-based WAL index is not working correctly on both Linux and macOS after 2 weeks of implementation, switch to linear WAL scan for Phase 1.
 
 6. **Flash storage life is affected by write amplification.** The 64x write amplification for small documents means 1GB of logical writes = 64GB of physical writes. On consumer SD cards (100TB write endurance), this limits lifetime.
 
