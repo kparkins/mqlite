@@ -752,6 +752,17 @@ fn route_command(
         "update" => handle_update(body, state),
         "delete" => handle_delete(body, state),
         "findandmodify" => handle_find_and_modify(body, state),
+        // Cursor management
+        "getmore" => handle_get_more(body, state, cursors),
+        "killcursors" => handle_kill_cursors(body, cursors),
+        // Collection admin
+        "create" => handle_create(body, state),
+        "drop" => handle_drop(body, state),
+        "listcollections" => handle_list_collections(body, state),
+        // Index operations
+        "createindexes" => handle_create_indexes(body, state),
+        "dropindexes" => handle_drop_indexes(body, state),
+        "listindexes" => handle_list_indexes(body, state),
         other => handle_unknown(other),
     };
 
@@ -1464,6 +1475,428 @@ fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
             }
             Err(e) => err_from_mqlite(e),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cursor management command handlers
+// ---------------------------------------------------------------------------
+
+/// `getMore` — fetch the next batch of results from an open server-side cursor.
+///
+/// Cursors are pinned to the TCP connection that created them via `find`.  A
+/// `getMore` sent on a *different* connection will always get `CursorNotFound`
+/// (code 43) because the cursor map is per-connection.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "cursor": { "nextBatch": [...], "id": <cursor_id_or_0>, "ns": "db.coll" }, "ok": 1 }
+/// ```
+/// When the cursor is exhausted the response contains `"id": 0` and the cursor
+/// is removed from the per-connection map.
+fn handle_get_more(
+    body: &Document,
+    state: &ServerState,
+    cursors: &Arc<std::sync::Mutex<ConnectionCursors>>,
+) -> Document {
+    let cursor_id = match get_i64(body, "getMore") {
+        Some(id) => id,
+        None => return err_bad_value("getMore requires a cursor id (Int64)"),
+    };
+
+    let coll_name = match body.get_str("collection") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("getMore requires a \"collection\" field"),
+    };
+
+    // Default batch size mirrors MongoDB 8.0 (101 documents).
+    let batch_size = get_i64(body, "batchSize")
+        .map(|n| if n <= 0 { 101usize } else { n as usize })
+        .unwrap_or(101);
+
+    // Drain up to `batch_size` documents from the cursor in a single critical section.
+    let (next_batch, exhausted) = {
+        let mut guard = cursors.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get_mut(cursor_id) {
+            None => {
+                return doc! {
+                    "ok": 0.0_f64,
+                    "errmsg": format!("cursor id {} not found", cursor_id),
+                    "code": crate::error::codes::CURSOR_NOT_FOUND,
+                    "codeName": "CursorNotFound",
+                };
+            }
+            Some(cursor) => {
+                let batch: bson::Array = cursor
+                    .by_ref()
+                    .take(batch_size)
+                    .filter_map(|r| r.ok().map(bson::Bson::Document))
+                    .collect();
+                let done = cursor.is_exhausted();
+                (batch, done)
+            }
+        }
+    };
+
+    // Remove the cursor from the map once it is exhausted.
+    let returned_id: i64 = if exhausted {
+        cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(cursor_id);
+        0
+    } else {
+        cursor_id
+    };
+
+    let ns = format!("{}.{}", state.db_name(), coll_name);
+    doc! {
+        "cursor": {
+            "nextBatch": next_batch,
+            "id": bson::Bson::Int64(returned_id),
+            "ns": ns,
+        },
+        "ok": 1.0_f64,
+    }
+}
+
+/// `killCursors` — close one or more open server-side cursors and release resources.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "cursorsKilled": [...], "cursorsNotFound": [...], "ok": 1 }
+/// ```
+fn handle_kill_cursors(
+    body: &Document,
+    cursors: &Arc<std::sync::Mutex<ConnectionCursors>>,
+) -> Document {
+    let cursor_ids: Vec<i64> = match body.get_array("cursors") {
+        Ok(arr) => arr
+            .iter()
+            .filter_map(|b| match b {
+                bson::Bson::Int64(id) => Some(*id),
+                bson::Bson::Int32(id) => Some(*id as i64),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => return err_bad_value("killCursors requires a \"cursors\" array"),
+    };
+
+    let mut killed: bson::Array = Vec::new();
+    let mut not_found: bson::Array = Vec::new();
+
+    let mut guard = cursors.lock().unwrap_or_else(|e| e.into_inner());
+    for id in &cursor_ids {
+        if guard.remove(*id).is_some() {
+            killed.push(bson::Bson::Int64(*id));
+        } else {
+            not_found.push(bson::Bson::Int64(*id));
+        }
+    }
+
+    doc! {
+        "cursorsKilled": killed,
+        "cursorsNotFound": not_found,
+        "ok": 1.0_f64,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Collection admin command handlers
+// ---------------------------------------------------------------------------
+
+/// `create` — explicitly create a collection.
+///
+/// This is idempotent: creating an already-existing collection returns `{ok: 1}`.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "ok": 1 }
+/// ```
+fn handle_create(body: &Document, state: &ServerState) -> Document {
+    let coll_name = match body.get_str("create") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("create requires a collection name string"),
+    };
+
+    match state.database.create_collection(&coll_name) {
+        Ok(_) => doc! { "ok": 1.0_f64 },
+        Err(e) => err_from_mqlite(e),
+    }
+}
+
+/// `drop` — drop a collection and all its indexes.
+///
+/// Dropping a non-existent collection returns `{ok: 1}` (idempotent, matching
+/// MongoDB 8.0 behaviour for `drop` on a missing namespace).
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "ok": 1 }
+/// ```
+fn handle_drop(body: &Document, state: &ServerState) -> Document {
+    let coll_name = match body.get_str("drop") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("drop requires a collection name string"),
+    };
+
+    match state.database.drop_collection(&coll_name) {
+        Ok(_) => doc! { "ok": 1.0_f64 },
+        Err(e) => err_from_mqlite(e),
+    }
+}
+
+/// `listCollections` — list collections in the current database.
+///
+/// Supports an optional `filter` document with a `name` equality filter.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "cursor": { "firstBatch": [{name, type, options, idIndex, info}], "id": 0 }, "ok": 1 }
+/// ```
+fn handle_list_collections(body: &Document, state: &ServerState) -> Document {
+    // Optional `filter: {name: "<name>"}` — only a simple equality filter on `name`
+    // is supported in Phase 1.
+    let name_filter: Option<String> = body
+        .get_document("filter")
+        .ok()
+        .and_then(|f| f.get_str("name").ok())
+        .map(|s| s.to_owned());
+
+    let names = match state.database.list_collection_names() {
+        Ok(n) => n,
+        Err(e) => return err_from_mqlite(e),
+    };
+
+    let db_name = state.db_name();
+    let first_batch: bson::Array = names
+        .into_iter()
+        .filter(|name| {
+            name_filter
+                .as_ref()
+                .map_or(true, |filter| name == filter)
+        })
+        .map(|name| {
+            bson::Bson::Document(doc! {
+                "name": &name,
+                "type": "collection",
+                "options": {},
+                "idIndex": {
+                    "v": 2i32,
+                    "key": {"_id": 1i32},
+                    "name": "_id_",
+                },
+                "info": {
+                    "readOnly": false,
+                },
+            })
+        })
+        .collect();
+
+    // The cursor namespace for listCollections uses `$cmd.listCollections`.
+    let ns = format!("{}.$cmd.listCollections", db_name);
+    doc! {
+        "cursor": {
+            "firstBatch": first_batch,
+            "id": bson::Bson::Int64(0i64),
+            "ns": ns,
+        },
+        "ok": 1.0_f64,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index operation command handlers
+// ---------------------------------------------------------------------------
+
+/// `createIndexes` — create one or more indexes on a collection.
+///
+/// Each index specification in `indexes` must contain at minimum a `key`
+/// document.  Optionally: `name`, `unique`, `sparse`.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "numIndexesBefore": <n>, "numIndexesAfter": <n>, "ok": 1 }
+/// ```
+/// `numIndexesBefore` and `numIndexesAfter` both include the synthetic `_id_`
+/// index (always present in every MongoDB collection).
+fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
+    let coll_name = match body.get_str("createIndexes") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("createIndexes requires a collection name string"),
+    };
+
+    let indexes_arr = match body.get_array("indexes") {
+        Ok(arr) => arr.clone(),
+        Err(_) => return err_bad_value("createIndexes requires an \"indexes\" array"),
+    };
+
+    // Count existing user-created indexes before creation.
+    // Add 1 for the always-present synthetic `_id_` index.
+    let num_before = state
+        .database
+        .list_indexes(&coll_name)
+        .map(|idxs| idxs.len() as i32 + 1)
+        .unwrap_or(1);
+
+    for idx_bson in &indexes_arr {
+        let spec = match idx_bson.as_document() {
+            Some(d) => d,
+            None => continue,
+        };
+
+        let key = match spec.get_document("key") {
+            Ok(k) => k.clone(),
+            Err(_) => return err_bad_value("each index spec requires a \"key\" document"),
+        };
+
+        let mut opts = crate::options::IndexOptions::new();
+        if let Ok(b) = spec.get_bool("unique") {
+            opts = opts.unique(b);
+        }
+        if let Ok(b) = spec.get_bool("sparse") {
+            opts = opts.sparse(b);
+        }
+        if let Ok(name) = spec.get_str("name") {
+            opts = opts.name(name);
+        }
+
+        let model = crate::index::IndexModel { keys: key, options: opts };
+        if let Err(e) = state.database.create_index(&coll_name, model) {
+            return err_from_mqlite(e);
+        }
+    }
+
+    // Count user-created indexes after creation (+1 for synthetic `_id_`).
+    let num_after = state
+        .database
+        .list_indexes(&coll_name)
+        .map(|idxs| idxs.len() as i32 + 1)
+        .unwrap_or(1);
+
+    doc! {
+        "numIndexesBefore": num_before,
+        "numIndexesAfter": num_after,
+        "ok": 1.0_f64,
+    }
+}
+
+/// `dropIndexes` — drop one or all user-created indexes on a collection.
+///
+/// The `index` field may be:
+/// - `"*"` — drop all user-created indexes (the `_id_` index is never dropped).
+/// - `"<name>"` — drop the named index.
+/// - `{<key pattern>}` — drop the index with the matching key pattern.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "ok": 1 }
+/// ```
+fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
+    let coll_name = match body.get_str("dropIndexes") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("dropIndexes requires a collection name string"),
+    };
+
+    match body.get("index") {
+        Some(bson::Bson::String(name)) if name == "*" => {
+            // Drop all user-created indexes.
+            let indexes = match state.database.list_indexes(&coll_name) {
+                Ok(idxs) => idxs,
+                Err(e) => return err_from_mqlite(e),
+            };
+            for idx in &indexes {
+                if let Err(e) = state.database.drop_index(&coll_name, &idx.name) {
+                    return err_from_mqlite(e);
+                }
+            }
+            doc! { "ok": 1.0_f64 }
+        }
+        Some(bson::Bson::String(name)) => {
+            // Drop a specific index by name.
+            match state.database.drop_index(&coll_name, name) {
+                Ok(_) => doc! { "ok": 1.0_f64 },
+                Err(e) => err_from_mqlite(e),
+            }
+        }
+        Some(bson::Bson::Document(key_doc)) => {
+            // Drop by key pattern — find the index whose key matches.
+            let key_doc = key_doc.clone();
+            let indexes = match state.database.list_indexes(&coll_name) {
+                Ok(idxs) => idxs,
+                Err(e) => return err_from_mqlite(e),
+            };
+            match indexes.iter().find(|idx| idx.keys == key_doc) {
+                Some(idx) => match state.database.drop_index(&coll_name, &idx.name.clone()) {
+                    Ok(_) => doc! { "ok": 1.0_f64 },
+                    Err(e) => err_from_mqlite(e),
+                },
+                None => doc! {
+                    "ok": 0.0_f64,
+                    "errmsg": "index not found with name",
+                    "code": 27i32,
+                    "codeName": "IndexNotFound",
+                },
+            }
+        }
+        _ => err_bad_value(
+            "dropIndexes requires an \"index\" field (string name, \"*\", or key document)",
+        ),
+    }
+}
+
+/// `listIndexes` — list indexes on a collection.
+///
+/// Always returns the synthetic `_id_` index first (MongoDB always reports it),
+/// followed by any user-created indexes.
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "cursor": { "firstBatch": [{v, key, name, ...}], "id": 0 }, "ok": 1 }
+/// ```
+fn handle_list_indexes(body: &Document, state: &ServerState) -> Document {
+    let coll_name = match body.get_str("listIndexes") {
+        Ok(s) => s.to_owned(),
+        Err(_) => return err_bad_value("listIndexes requires a collection name string"),
+    };
+
+    let indexes = match state.database.list_indexes(&coll_name) {
+        Ok(idxs) => idxs,
+        Err(e) => return err_from_mqlite(e),
+    };
+
+    // The `_id_` index is always present in every MongoDB collection.
+    let mut first_batch: bson::Array = vec![
+        bson::Bson::Document(doc! {
+            "v": 2i32,
+            "key": {"_id": 1i32},
+            "name": "_id_",
+        })
+    ];
+
+    for idx in &indexes {
+        let mut idx_doc = doc! {
+            "v": 2i32,
+            "key": idx.keys.clone(),
+            "name": &idx.name,
+        };
+        if idx.unique {
+            idx_doc.insert("unique", true);
+        }
+        if idx.sparse {
+            idx_doc.insert("sparse", true);
+        }
+        first_batch.push(bson::Bson::Document(idx_doc));
+    }
+
+    let ns = format!("{}.{}", state.db_name(), coll_name);
+    doc! {
+        "cursor": {
+            "firstBatch": first_batch,
+            "id": bson::Bson::Int64(0i64),
+            "ns": ns,
+        },
+        "ok": 1.0_f64,
     }
 }
 
@@ -2825,5 +3258,469 @@ mod tests {
         assert_eq!(get_i64(&doc, "int64"), Some(100));
         assert_eq!(get_i64(&doc, "double"), Some(3));
         assert_eq!(get_i64(&doc, "missing"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // getMore
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_more_paginates_through_cursor() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+
+        // Insert 5 documents.
+        handle_insert(
+            &doc! { "insert": "pgcoll", "documents": [
+                {"i": 0i32}, {"i": 1i32}, {"i": 2i32}, {"i": 3i32}, {"i": 4i32}
+            ], "$db": "local" },
+            &state,
+        );
+
+        // Find with batchSize=2: get first 2, server-side cursor for the rest.
+        let find_res = handle_find(
+            &doc! { "find": "pgcoll", "filter": {}, "batchSize": 2i32, "$db": "local" },
+            &state,
+            &cursors,
+        );
+        let cursor_doc = find_res.get_document("cursor").unwrap();
+        let cursor_id = cursor_doc.get_i64("id").unwrap();
+        assert_ne!(cursor_id, 0, "first batch should leave a live cursor");
+        assert_eq!(cursor_doc.get_array("firstBatch").unwrap().len(), 2);
+
+        // getMore: next 2.
+        let more_res = handle_get_more(
+            &doc! { "getMore": bson::Bson::Int64(cursor_id), "collection": "pgcoll", "batchSize": 2i32, "$db": "local" },
+            &state,
+            &cursors,
+        );
+        assert_eq!(more_res.get_f64("ok").unwrap(), 1.0, "{more_res:?}");
+        let more_cursor = more_res.get_document("cursor").unwrap();
+        assert_eq!(more_cursor.get_array("nextBatch").unwrap().len(), 2);
+        let mid_id = more_cursor.get_i64("id").unwrap();
+        assert_ne!(mid_id, 0, "one doc still remains");
+
+        // getMore: last 1.
+        let last_res = handle_get_more(
+            &doc! { "getMore": bson::Bson::Int64(mid_id), "collection": "pgcoll", "$db": "local" },
+            &state,
+            &cursors,
+        );
+        assert_eq!(last_res.get_f64("ok").unwrap(), 1.0, "{last_res:?}");
+        let last_cursor = last_res.get_document("cursor").unwrap();
+        assert_eq!(last_cursor.get_array("nextBatch").unwrap().len(), 1);
+        // Cursor exhausted: id must be 0.
+        assert_eq!(last_cursor.get_i64("id").unwrap(), 0, "cursor must be exhausted");
+        // Cursor removed from map.
+        assert_eq!(cursors.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn get_more_unknown_cursor_returns_cursor_not_found() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        let result = handle_get_more(
+            &doc! { "getMore": bson::Bson::Int64(9999i64), "collection": "c", "$db": "local" },
+            &state,
+            &cursors,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 43); // CursorNotFound
+        assert_eq!(result.get_str("codeName").unwrap(), "CursorNotFound");
+    }
+
+    // -----------------------------------------------------------------------
+    // killCursors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kill_cursors_removes_known_cursors() {
+        let cursors = dummy_cursors();
+        // Store two cursors.
+        let id1 = cursors.lock().unwrap().store(crate::Cursor::<Document>::empty());
+        let id2 = cursors.lock().unwrap().store(crate::Cursor::<Document>::empty());
+        assert_eq!(cursors.lock().unwrap().len(), 2);
+
+        let result = handle_kill_cursors(
+            &doc! { "killCursors": "c", "cursors": [bson::Bson::Int64(id1), bson::Bson::Int64(id2)], "$db": "local" },
+            &cursors,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let killed = result.get_array("cursorsKilled").unwrap();
+        assert_eq!(killed.len(), 2);
+        let not_found = result.get_array("cursorsNotFound").unwrap();
+        assert!(not_found.is_empty());
+        assert_eq!(cursors.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn kill_cursors_reports_not_found_for_missing_ids() {
+        let cursors = dummy_cursors();
+        let result = handle_kill_cursors(
+            &doc! { "killCursors": "c", "cursors": [bson::Bson::Int64(42i64)], "$db": "local" },
+            &cursors,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        assert!(result.get_array("cursorsKilled").unwrap().is_empty());
+        assert_eq!(result.get_array("cursorsNotFound").unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // create / drop
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_collection_returns_ok() {
+        let state = ServerState::default();
+        let result = handle_create(
+            &doc! { "create": "newcoll", "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn create_collection_is_idempotent() {
+        let state = ServerState::default();
+        handle_create(&doc! { "create": "idmcoll", "$db": "local" }, &state);
+        // Creating again must still return ok:1.
+        let result = handle_create(&doc! { "create": "idmcoll", "$db": "local" }, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn drop_collection_returns_ok() {
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "dropcoll", "documents": [{"x": 1i32}], "$db": "local" },
+            &state,
+        );
+        let result = handle_drop(&doc! { "drop": "dropcoll", "$db": "local" }, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn drop_nonexistent_collection_returns_ok() {
+        let state = ServerState::default();
+        let result = handle_drop(&doc! { "drop": "ghost", "$db": "local" }, &state);
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // listCollections
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_collections_empty_db() {
+        let state = ServerState::default();
+        let result = handle_list_collections(
+            &doc! { "listCollections": 1, "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let cursor_doc = result.get_document("cursor").unwrap();
+        assert_eq!(cursor_doc.get_i64("id").unwrap(), 0);
+        assert!(cursor_doc.get_array("firstBatch").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_collections_after_insert() {
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "alpha", "documents": [{"x": 1i32}], "$db": "local" },
+            &state,
+        );
+        handle_insert(
+            &doc! { "insert": "beta", "documents": [{"y": 2i32}], "$db": "local" },
+            &state,
+        );
+        let result = handle_list_collections(
+            &doc! { "listCollections": 1, "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let batch = result
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        // Each entry must have name, type, options, idIndex.
+        for entry in batch {
+            let doc = entry.as_document().unwrap();
+            assert!(doc.contains_key("name"));
+            assert_eq!(doc.get_str("type").unwrap(), "collection");
+            assert!(doc.contains_key("options"));
+            assert!(doc.contains_key("idIndex"));
+        }
+    }
+
+    #[test]
+    fn list_collections_name_filter() {
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "matchme", "documents": [{"a": 1i32}], "$db": "local" },
+            &state,
+        );
+        handle_insert(
+            &doc! { "insert": "other", "documents": [{"a": 2i32}], "$db": "local" },
+            &state,
+        );
+        let result = handle_list_collections(
+            &doc! { "listCollections": 1, "filter": {"name": "matchme"}, "$db": "local" },
+            &state,
+        );
+        let batch = result
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].as_document().unwrap().get_str("name").unwrap(),
+            "matchme"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // createIndexes / dropIndexes / listIndexes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_indexes_returns_num_before_after() {
+        let state = ServerState::default();
+        let result = handle_create_indexes(
+            &doc! {
+                "createIndexes": "idxcoll",
+                "indexes": [{
+                    "key": {"email": 1i32},
+                    "name": "email_1",
+                }],
+                "$db": "local",
+            },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+        // Before: only synthetic _id_ (= 1). After: _id_ + email_1 (= 2).
+        assert_eq!(result.get_i32("numIndexesBefore").unwrap(), 1);
+        assert_eq!(result.get_i32("numIndexesAfter").unwrap(), 2);
+    }
+
+    #[test]
+    fn create_indexes_unique_flag() {
+        let state = ServerState::default();
+        handle_create_indexes(
+            &doc! {
+                "createIndexes": "uniqcoll",
+                "indexes": [{"key": {"uid": 1i32}, "name": "uid_1", "unique": true}],
+                "$db": "local",
+            },
+            &state,
+        );
+        let list_res = handle_list_indexes(
+            &doc! { "listIndexes": "uniqcoll", "$db": "local" },
+            &state,
+        );
+        let batch = list_res
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        // _id_ at index 0, uid_1 at index 1.
+        let uid_doc = batch[1].as_document().unwrap();
+        assert_eq!(uid_doc.get_str("name").unwrap(), "uid_1");
+        assert!(uid_doc.get_bool("unique").unwrap());
+    }
+
+    #[test]
+    fn list_indexes_always_includes_id_index() {
+        let state = ServerState::default();
+        // Collection with no user-created indexes.
+        handle_create(&doc! { "create": "barelidx", "$db": "local" }, &state);
+        let result = handle_list_indexes(
+            &doc! { "listIndexes": "barelidx", "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let batch = result
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(batch.len(), 1, "only _id_ index expected");
+        let id_idx = batch[0].as_document().unwrap();
+        assert_eq!(id_idx.get_str("name").unwrap(), "_id_");
+        assert_eq!(id_idx.get_i32("v").unwrap(), 2);
+        let key = id_idx.get_document("key").unwrap();
+        assert_eq!(key.get_i32("_id").unwrap(), 1);
+    }
+
+    #[test]
+    fn drop_indexes_by_name() {
+        let state = ServerState::default();
+        handle_create_indexes(
+            &doc! {
+                "createIndexes": "dropbynamecoll",
+                "indexes": [{"key": {"score": 1i32}, "name": "score_1"}],
+                "$db": "local",
+            },
+            &state,
+        );
+        let result = handle_drop_indexes(
+            &doc! { "dropIndexes": "dropbynamecoll", "index": "score_1", "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        // Verify the index is gone.
+        let list_res = handle_list_indexes(
+            &doc! { "listIndexes": "dropbynamecoll", "$db": "local" },
+            &state,
+        );
+        let batch = list_res
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(batch.len(), 1, "only _id_ should remain");
+    }
+
+    #[test]
+    fn drop_indexes_star_drops_all_user_indexes() {
+        let state = ServerState::default();
+        handle_create_indexes(
+            &doc! {
+                "createIndexes": "staridxcoll",
+                "indexes": [
+                    {"key": {"a": 1i32}, "name": "a_1"},
+                    {"key": {"b": 1i32}, "name": "b_1"},
+                ],
+                "$db": "local",
+            },
+            &state,
+        );
+        let result = handle_drop_indexes(
+            &doc! { "dropIndexes": "staridxcoll", "index": "*", "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+        let list_res = handle_list_indexes(
+            &doc! { "listIndexes": "staridxcoll", "$db": "local" },
+            &state,
+        );
+        let batch = list_res
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+        assert_eq!(batch.len(), 1, "only _id_ should remain after drop *");
+    }
+
+    // -----------------------------------------------------------------------
+    // Full OP_MSG dispatch tests for new commands
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_op_msg_create_and_list_collections() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+
+        // Create collection via wire protocol.
+        let req = make_op_msg_request(200, &doc! { "create": "wiredcoll", "$db": "local" });
+        let msg = OpMsg::parse(&req).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 300, msg.header.request_id, &state, 1, &cursors).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        assert_eq!(resp.body().unwrap().get_f64("ok").unwrap(), 1.0);
+
+        // listCollections should show it.
+        let req2 = make_op_msg_request(201, &doc! { "listCollections": 1i32, "$db": "local" });
+        let msg2 = OpMsg::parse(&req2).unwrap();
+        let resp2_bytes = dispatch_op_msg(&msg2, 301, msg2.header.request_id, &state, 1, &cursors).unwrap();
+        let resp2 = OpMsg::parse(&resp2_bytes).unwrap();
+        let body2 = resp2.body().unwrap();
+        assert_eq!(body2.get_f64("ok").unwrap(), 1.0);
+        let batch = body2.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].as_document().unwrap().get_str("name").unwrap(), "wiredcoll");
+    }
+
+    #[test]
+    fn dispatch_op_msg_get_more_pagination() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+
+        // Insert 3 docs.
+        let ins_req = make_op_msg_request(
+            210,
+            &doc! { "insert": "gm_coll", "documents": [{"i": 1i32}, {"i": 2i32}, {"i": 3i32}], "$db": "local" },
+        );
+        let ins_msg = OpMsg::parse(&ins_req).unwrap();
+        dispatch_op_msg(&ins_msg, 310, ins_msg.header.request_id, &state, 1, &cursors).unwrap();
+
+        // Find with batchSize=1.
+        let find_req = make_op_msg_request(
+            211,
+            &doc! { "find": "gm_coll", "filter": {}, "batchSize": 1i32, "$db": "local" },
+        );
+        let find_msg = OpMsg::parse(&find_req).unwrap();
+        let find_resp_bytes = dispatch_op_msg(&find_msg, 311, find_msg.header.request_id, &state, 1, &cursors).unwrap();
+        let find_resp = OpMsg::parse(&find_resp_bytes).unwrap();
+        let find_body = find_resp.body().unwrap();
+        assert_eq!(find_body.get_f64("ok").unwrap(), 1.0);
+        let cursor_id = find_body.get_document("cursor").unwrap().get_i64("id").unwrap();
+        assert_ne!(cursor_id, 0);
+
+        // getMore.
+        let gm_req = make_op_msg_request(
+            212,
+            &doc! { "getMore": bson::Bson::Int64(cursor_id), "collection": "gm_coll", "batchSize": 10i32, "$db": "local" },
+        );
+        let gm_msg = OpMsg::parse(&gm_req).unwrap();
+        let gm_resp_bytes = dispatch_op_msg(&gm_msg, 312, gm_msg.header.request_id, &state, 1, &cursors).unwrap();
+        let gm_resp = OpMsg::parse(&gm_resp_bytes).unwrap();
+        let gm_body = gm_resp.body().unwrap();
+        assert_eq!(gm_body.get_f64("ok").unwrap(), 1.0);
+        let gm_cursor = gm_body.get_document("cursor").unwrap();
+        // nextBatch must exist (not firstBatch).
+        assert!(gm_cursor.contains_key("nextBatch"), "getMore response must use 'nextBatch'");
+        assert!(!gm_cursor.contains_key("firstBatch"), "getMore must NOT use 'firstBatch'");
+        // Remaining 2 docs plus cursor exhausted.
+        assert_eq!(gm_cursor.get_array("nextBatch").unwrap().len(), 2);
+        assert_eq!(gm_cursor.get_i64("id").unwrap(), 0, "cursor must be exhausted");
+    }
+
+    #[test]
+    fn dispatch_op_msg_create_and_list_indexes() {
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+
+        // createIndexes.
+        let ci_req = make_op_msg_request(
+            220,
+            &doc! {
+                "createIndexes": "idx_test_coll",
+                "indexes": [{"key": {"name": 1i32}, "name": "name_1"}],
+                "$db": "local",
+            },
+        );
+        let ci_msg = OpMsg::parse(&ci_req).unwrap();
+        let ci_resp_bytes = dispatch_op_msg(&ci_msg, 320, ci_msg.header.request_id, &state, 1, &cursors).unwrap();
+        let ci_resp = OpMsg::parse(&ci_resp_bytes).unwrap();
+        let ci_body = ci_resp.body().unwrap();
+        assert_eq!(ci_body.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(ci_body.get_i32("numIndexesBefore").unwrap(), 1);
+        assert_eq!(ci_body.get_i32("numIndexesAfter").unwrap(), 2);
+
+        // listIndexes.
+        let li_req = make_op_msg_request(221, &doc! { "listIndexes": "idx_test_coll", "$db": "local" });
+        let li_msg = OpMsg::parse(&li_req).unwrap();
+        let li_resp_bytes = dispatch_op_msg(&li_msg, 321, li_msg.header.request_id, &state, 1, &cursors).unwrap();
+        let li_resp = OpMsg::parse(&li_resp_bytes).unwrap();
+        let li_body = li_resp.body().unwrap();
+        assert_eq!(li_body.get_f64("ok").unwrap(), 1.0);
+        let batch = li_body.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        // _id_ + name_1
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].as_document().unwrap().get_str("name").unwrap(), "_id_");
+        assert_eq!(batch[1].as_document().unwrap().get_str("name").unwrap(), "name_1");
     }
 }

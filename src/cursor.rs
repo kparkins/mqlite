@@ -160,6 +160,16 @@ impl<T> Cursor<T> {
         }
     }
 
+    /// Returns `true` if the cursor has no remaining documents to return.
+    ///
+    /// A cursor becomes exhausted when the internal buffer is empty.  This is
+    /// used by the wire protocol `getMore` handler to determine whether to
+    /// keep the cursor in the per-connection map or remove it and return
+    /// `cursor.id = 0` to the driver.
+    pub fn is_exhausted(&self) -> bool {
+        self.done || self.buffer.is_empty()
+    }
+
     /// Explain the query plan that was used to produce this cursor.
     ///
     /// Returns a snapshot of the plan captured when the cursor was created.
