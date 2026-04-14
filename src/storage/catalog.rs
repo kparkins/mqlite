@@ -425,9 +425,7 @@ impl<S: BTreePageStore> Catalog<S> {
         // Remove all index entries first (range delete).
         let start = index_prefix_start(name);
         let end_excl = index_prefix_end(name);
-        let index_entries = self
-            .tree
-            .range_scan(Some(&start), Some(&end_excl))?;
+        let index_entries = self.tree.range_scan(Some(&start), Some(&end_excl))?;
         let index_keys: Vec<Vec<u8>> = index_entries
             .into_iter()
             .filter(|(k, _)| k.starts_with(&start) && k < &end_excl)
@@ -677,7 +675,9 @@ where
     // Both roots are corrupt.
     Err(Error::CorruptDatabase {
         path: std::path::PathBuf::new(),
-        detail: "catalog root page failed checksum; backup root also failed — database is unrecoverable".into(),
+        detail:
+            "catalog root page failed checksum; backup root also failed — database is unrecoverable"
+                .into(),
         recoverable: false,
     })
 }
@@ -915,8 +915,7 @@ mod tests {
         cat.create_collection("users", doc! {}, now()).unwrap();
         cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
             .unwrap();
-        let result =
-            cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1");
+        let result = cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1");
         assert!(matches!(result, Err(Error::DuplicateKey { .. })));
     }
 
@@ -926,12 +925,8 @@ mod tests {
         cat.create_collection("users", doc! {}, now()).unwrap();
         cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
             .unwrap();
-        cat.create_index(
-            "users",
-            &index_model(doc! { "age": -1 }),
-            "age_-1",
-        )
-        .unwrap();
+        cat.create_index("users", &index_model(doc! { "age": -1 }), "age_-1")
+            .unwrap();
 
         let names: Vec<String> = cat
             .list_indexes("users")
@@ -959,12 +954,8 @@ mod tests {
         cat.create_collection("orders", doc! {}, now()).unwrap();
         cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
             .unwrap();
-        cat.create_index(
-            "orders",
-            &index_model(doc! { "total": 1 }),
-            "total_1",
-        )
-        .unwrap();
+        cat.create_index("orders", &index_model(doc! { "total": 1 }), "total_1")
+            .unwrap();
 
         let user_idxs = cat.list_indexes("users").unwrap();
         assert!(user_idxs.iter().all(|e| e.collection == "users"));
@@ -1060,8 +1051,7 @@ mod tests {
     #[test]
     fn open_with_fallback_new_db_creates_empty_catalog() {
         let store = MemPageStore::new();
-        let (cat, used_backup) =
-            open_with_fallback(store, 0, 0, 0, 0, |_| true).unwrap();
+        let (cat, used_backup) = open_with_fallback(store, 0, 0, 0, 0, |_| true).unwrap();
         assert!(!used_backup);
         assert!(cat.list_collections().unwrap().is_empty());
     }

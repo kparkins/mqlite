@@ -45,19 +45,14 @@ use crate::query::get_nested_field;
 ///
 /// - [`Error::UnsupportedOperator`] for any unrecognised `$` operator.
 /// - [`Error::Internal`] for type mismatches (e.g. `$inc` on a non-number).
-pub(crate) fn apply_update(
-    doc: &mut Document,
-    update: &Document,
-    is_insert: bool,
-) -> Result<()> {
+pub(crate) fn apply_update(doc: &mut Document, update: &Document, is_insert: bool) -> Result<()> {
     for (op, args) in update {
         // Validate / reject the operator BEFORE attempting to parse args.
         // This ensures Error::UnsupportedOperator is returned regardless of
         // the argument type.
         match op.as_str() {
-            "$set" | "$unset" | "$inc" | "$mul" | "$rename" | "$min" | "$max"
-            | "$push" | "$pull" | "$pullAll" | "$addToSet" | "$pop" | "$currentDate"
-            | "$setOnInsert" => {}  // supported — fall through to args parse
+            "$set" | "$unset" | "$inc" | "$mul" | "$rename" | "$min" | "$max" | "$push"
+            | "$pull" | "$pullAll" | "$addToSet" | "$pop" | "$currentDate" | "$setOnInsert" => {} // supported — fall through to args parse
 
             "$bit" => {
                 return Err(Error::UnsupportedOperator {
@@ -392,7 +387,11 @@ fn apply_push_modifiers(doc: &mut Document, path: &str, modifiers: &Document) ->
             // Negative position: count from the end of the array.
             let insert_at = if pos < 0 {
                 let from_end = arr.len() as i64 + pos;
-                if from_end < 0 { 0 } else { from_end as usize }
+                if from_end < 0 {
+                    0
+                } else {
+                    from_end as usize
+                }
             } else {
                 (pos as usize).min(arr.len())
             };
@@ -606,9 +605,8 @@ fn apply_pull_all(doc: &mut Document, args: &Document) -> Result<()> {
 
 fn apply_pop(doc: &mut Document, args: &Document) -> Result<()> {
     for (path, dir) in args {
-        let dir_n = as_f64(dir).ok_or_else(|| {
-            Error::Internal(format!("$pop: value must be 1 or -1, got {dir:?}"))
-        })?;
+        let dir_n = as_f64(dir)
+            .ok_or_else(|| Error::Internal(format!("$pop: value must be 1 or -1, got {dir:?}")))?;
 
         let field = get_nested_field(doc, path).cloned();
         if let Some(Bson::Array(mut arr)) = field {
@@ -645,7 +643,10 @@ fn apply_current_date(doc: &mut Document, args: &Document) -> Result<()> {
                     "timestamp" => {
                         let secs = (now_ms / 1000) as u32;
                         let inc = (now_ms % 1000) as u32;
-                        Bson::Timestamp(Timestamp { time: secs, increment: inc })
+                        Bson::Timestamp(Timestamp {
+                            time: secs,
+                            increment: inc,
+                        })
                     }
                     _ => Bson::DateTime(DateTime::from_millis(now_ms)),
                 }
@@ -871,11 +872,7 @@ mod tests {
     #[test]
     fn push_each_empty_is_noop() {
         let mut doc = doc! { "arr": [1i32, 2i32] };
-        apply(
-            &mut doc,
-            &doc! { "$push": { "arr": { "$each": [] } } },
-        )
-        .unwrap();
+        apply(&mut doc, &doc! { "$push": { "arr": { "$each": [] } } }).unwrap();
         let arr = doc.get_array("arr").unwrap();
         assert_eq!(arr.len(), 2);
     }
@@ -889,7 +886,15 @@ mod tests {
         )
         .unwrap();
         let arr = doc.get_array("arr").unwrap();
-        assert_eq!(arr, &[Bson::Int32(0), Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]);
+        assert_eq!(
+            arr,
+            &[
+                Bson::Int32(0),
+                Bson::Int32(1),
+                Bson::Int32(2),
+                Bson::Int32(3)
+            ]
+        );
     }
 
     #[test]
@@ -901,7 +906,15 @@ mod tests {
         )
         .unwrap();
         let arr = doc.get_array("arr").unwrap();
-        assert_eq!(arr, &[Bson::Int32(1), Bson::Int32(2), Bson::Int32(3), Bson::Int32(4)]);
+        assert_eq!(
+            arr,
+            &[
+                Bson::Int32(1),
+                Bson::Int32(2),
+                Bson::Int32(3),
+                Bson::Int32(4)
+            ]
+        );
     }
 
     #[test]
@@ -917,7 +930,12 @@ mod tests {
         let arr = doc.get_array("arr").unwrap();
         assert_eq!(
             arr,
-            &[Bson::Int32(10), Bson::Int32(20), Bson::Int32(99), Bson::Int32(30)]
+            &[
+                Bson::Int32(10),
+                Bson::Int32(20),
+                Bson::Int32(99),
+                Bson::Int32(30)
+            ]
         );
     }
 
@@ -1071,11 +1089,7 @@ mod tests {
     #[test]
     fn pull_all_removes_listed_values() {
         let mut doc = doc! { "scores": [0i32, 2i32, 5i32, 0i32, 3i32] };
-        apply(
-            &mut doc,
-            &doc! { "$pullAll": { "scores": [0i32, 5i32] } },
-        )
-        .unwrap();
+        apply(&mut doc, &doc! { "$pullAll": { "scores": [0i32, 5i32] } }).unwrap();
         let arr = doc.get_array("scores").unwrap();
         // 0 and 5 should be removed; 2 and 3 remain
         assert_eq!(arr.len(), 2);
@@ -1086,11 +1100,7 @@ mod tests {
     #[test]
     fn pull_all_removes_all_occurrences() {
         let mut doc = doc! { "arr": [1i32, 2i32, 1i32, 3i32, 1i32] };
-        apply(
-            &mut doc,
-            &doc! { "$pullAll": { "arr": [1i32] } },
-        )
-        .unwrap();
+        apply(&mut doc, &doc! { "$pullAll": { "arr": [1i32] } }).unwrap();
         let arr = doc.get_array("arr").unwrap();
         assert_eq!(arr.len(), 2);
         assert!(!arr.contains(&Bson::Int32(1)));
@@ -1099,22 +1109,14 @@ mod tests {
     #[test]
     fn pull_all_noop_when_field_missing() {
         let mut doc = doc! {};
-        apply(
-            &mut doc,
-            &doc! { "$pullAll": { "arr": [1i32, 2i32] } },
-        )
-        .unwrap();
+        apply(&mut doc, &doc! { "$pullAll": { "arr": [1i32, 2i32] } }).unwrap();
         assert!(!doc.contains_key("arr"));
     }
 
     #[test]
     fn pull_all_empty_list_removes_nothing() {
         let mut doc = doc! { "arr": [1i32, 2i32, 3i32] };
-        apply(
-            &mut doc,
-            &doc! { "$pullAll": { "arr": [] } },
-        )
-        .unwrap();
+        apply(&mut doc, &doc! { "$pullAll": { "arr": [] } }).unwrap();
         let arr = doc.get_array("arr").unwrap();
         assert_eq!(arr.len(), 3);
     }
@@ -1175,14 +1177,24 @@ mod tests {
     #[test]
     fn set_on_insert_applied_when_is_insert() {
         let mut doc = doc! {};
-        apply_update(&mut doc, &doc! { "$setOnInsert": { "created": 1i32 } }, true).unwrap();
+        apply_update(
+            &mut doc,
+            &doc! { "$setOnInsert": { "created": 1i32 } },
+            true,
+        )
+        .unwrap();
         assert_eq!(doc.get_i32("created").unwrap(), 1);
     }
 
     #[test]
     fn set_on_insert_not_applied_when_not_insert() {
         let mut doc = doc! {};
-        apply_update(&mut doc, &doc! { "$setOnInsert": { "created": 1i32 } }, false).unwrap();
+        apply_update(
+            &mut doc,
+            &doc! { "$setOnInsert": { "created": 1i32 } },
+            false,
+        )
+        .unwrap();
         assert!(!doc.contains_key("created"));
     }
 }

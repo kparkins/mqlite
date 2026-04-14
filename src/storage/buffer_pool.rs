@@ -353,7 +353,9 @@ impl<'pool> PinnedPage<'pool> {
 impl Drop for PinnedPage<'_> {
     fn drop(&mut self) {
         // Errors are intentionally swallowed — Drop must not panic.
-        let _ = self.pool.unpin_internal(self.page_number, self.page_size, self.dirty);
+        let _ = self
+            .pool
+            .unpin_internal(self.page_number, self.page_size, self.dirty);
     }
 }
 
@@ -554,10 +556,7 @@ mod tests {
 
         fn write_page(&self, page_number: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
             *self.write_count.lock().unwrap() += 1;
-            self.pages
-                .lock()
-                .unwrap()
-                .insert(page_number, buf.to_vec());
+            self.pages.lock().unwrap().insert(page_number, buf.to_vec());
             Ok(())
         }
     }
@@ -757,11 +756,7 @@ mod tests {
 
         pool.flush().unwrap();
 
-        assert_eq!(
-            io.write_count(),
-            0,
-            "flush must not write clean pages"
-        );
+        assert_eq!(io.write_count(), 0, "flush must not write clean pages");
     }
 
     #[test]
@@ -779,7 +774,11 @@ mod tests {
 
         pool.flush().unwrap();
 
-        assert_eq!(io.write_count(), 2, "flush must write one page from each partition");
+        assert_eq!(
+            io.write_count(),
+            2,
+            "flush must write one page from each partition"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -871,10 +870,7 @@ mod tests {
             let g = pool.inner_32k.lock().unwrap();
             assert!(g.is_cached(3), "new page must be in pool");
             // Exactly one of the original pages was evicted
-            let cached_count = [1u32, 2u32]
-                .iter()
-                .filter(|&&pn| g.is_cached(pn))
-                .count();
+            let cached_count = [1u32, 2u32].iter().filter(|&&pn| g.is_cached(pn)).count();
             assert_eq!(cached_count, 1, "exactly one original page should remain");
         }
     }

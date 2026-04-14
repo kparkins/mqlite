@@ -438,16 +438,14 @@ fn read_bson_document(buf: &mut &[u8]) -> Result<Document> {
         });
     }
     let doc_bytes = &buf[..size];
-    let raw = RawDocumentBuf::from_bytes(doc_bytes.to_vec()).map_err(|e| {
-        Error::InvalidWireMessage {
+    let raw =
+        RawDocumentBuf::from_bytes(doc_bytes.to_vec()).map_err(|e| Error::InvalidWireMessage {
             detail: format!("invalid BSON in section: {}", e),
-        }
-    })?;
-    let doc = bson::from_slice::<Document>(raw.as_bytes()).map_err(|e| {
-        Error::InvalidWireMessage {
+        })?;
+    let doc =
+        bson::from_slice::<Document>(raw.as_bytes()).map_err(|e| Error::InvalidWireMessage {
             detail: format!("BSON deserialisation failed: {}", e),
-        }
-    })?;
+        })?;
     *buf = &buf[size..];
     Ok(doc)
 }
@@ -585,11 +583,7 @@ mod tests {
         let err = OpMsg::parse(&buf).unwrap_err();
         match err {
             Error::InvalidWireMessage { detail } => {
-                assert!(
-                    detail.contains("checksum mismatch"),
-                    "got: {}",
-                    detail
-                );
+                assert!(detail.contains("checksum mismatch"), "got: {}", detail);
             }
             _ => panic!("wrong error type: {:?}", err),
         }
@@ -712,7 +706,7 @@ mod tests {
         let mut buf = Vec::with_capacity(total);
         buf.extend_from_slice(&header.to_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // flagBits
-        // Kind-0
+                                                    // Kind-0
         buf.push(SECTION_KIND_BODY);
         buf.extend_from_slice(&body_bytes);
         // Kind-1
@@ -727,10 +721,7 @@ mod tests {
     #[test]
     fn kind1_doc_sequence_parsed() {
         let body = doc! { "insert": "users", "$db": "test" };
-        let docs = vec![
-            doc! { "name": "Alice" },
-            doc! { "name": "Bob" },
-        ];
+        let docs = vec![doc! { "name": "Alice" }, doc! { "name": "Bob" }];
         let buf = build_request_with_doc_seq(10, &body, "documents", &docs);
         let msg = OpMsg::parse(&buf).unwrap();
 
@@ -747,14 +738,8 @@ mod tests {
         let (id, docs_parsed) = seq.expect("should have a DocSequence section");
         assert_eq!(id, "documents");
         assert_eq!(docs_parsed.len(), 2);
-        assert_eq!(
-            docs_parsed[0].get_str("name").unwrap(),
-            "Alice"
-        );
-        assert_eq!(
-            docs_parsed[1].get_str("name").unwrap(),
-            "Bob"
-        );
+        assert_eq!(docs_parsed[0].get_str("name").unwrap(), "Alice");
+        assert_eq!(docs_parsed[1].get_str("name").unwrap(), "Bob");
     }
 
     // -----------------------------------------------------------------------

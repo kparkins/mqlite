@@ -120,8 +120,7 @@ fn index_can_accelerate(
     index_keys: &Document,
 ) -> Option<(String, IndexCondition)> {
     let (first_field, _) = index_keys.iter().next()?;
-    extract_field_condition(filter, first_field.as_str())
-        .map(|cond| (first_field.clone(), cond))
+    extract_field_condition(filter, first_field.as_str()).map(|cond| (first_field.clone(), cond))
 }
 
 /// Try to extract an index-eligible condition for `field` from `filter`.
@@ -236,9 +235,9 @@ pub(crate) fn index_condition_matches(
 
         IndexCondition::Range { gt, gte, lt, lte } => match field_value {
             None => false,
-            Some(Bson::Array(arr)) => arr.iter().any(|e| {
-                range_check(e, gt.as_ref(), gte.as_ref(), lt.as_ref(), lte.as_ref())
-            }),
+            Some(Bson::Array(arr)) => arr
+                .iter()
+                .any(|e| range_check(e, gt.as_ref(), gte.as_ref(), lt.as_ref(), lte.as_ref())),
             Some(v) => range_check(v, gt.as_ref(), gte.as_ref(), lt.as_ref(), lte.as_ref()),
         },
     }
@@ -396,10 +395,7 @@ mod tests {
     fn ixscan_for_elematch_operator() {
         let specs = [("tags_1", doc! { "tags": 1i32 })];
         let indexes = make_indexes(&specs);
-        let plan = select_plan(
-            &doc! { "tags": { "$elemMatch": { "x": 1i32 } } },
-            &indexes,
-        );
+        let plan = select_plan(&doc! { "tags": { "$elemMatch": { "x": 1i32 } } }, &indexes);
         assert!(matches!(plan, ScanPlan::IndexScan { .. }));
     }
 
@@ -453,10 +449,15 @@ mod tests {
 
     #[test]
     fn in_matches_one_of_targets() {
-        let cond =
-            IndexCondition::In(vec![Bson::String("a".into()), Bson::String("b".into())]);
-        assert!(index_condition_matches(Some(&Bson::String("a".into())), &cond));
-        assert!(!index_condition_matches(Some(&Bson::String("z".into())), &cond));
+        let cond = IndexCondition::In(vec![Bson::String("a".into()), Bson::String("b".into())]);
+        assert!(index_condition_matches(
+            Some(&Bson::String("a".into())),
+            &cond
+        ));
+        assert!(!index_condition_matches(
+            Some(&Bson::String("z".into())),
+            &cond
+        ));
     }
 
     #[test]

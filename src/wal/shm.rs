@@ -79,11 +79,11 @@ const SHM_WRITER_LOCK_OFFSET: usize = 4;
 const SHM_READER_SLOTS_OFFSET: usize = 8;
 
 /// Byte offset of the hash table.
-const SHM_HASH_TABLE_OFFSET: usize = SHM_READER_SLOTS_OFFSET + SHM_MAX_READERS * SHM_READER_SLOT_SIZE;
+const SHM_HASH_TABLE_OFFSET: usize =
+    SHM_READER_SLOTS_OFFSET + SHM_MAX_READERS * SHM_READER_SLOT_SIZE;
 
 /// Total SHM file size in bytes.
-pub(crate) const SHM_FILE_SIZE: usize =
-    SHM_HASH_TABLE_OFFSET + SHM_HASH_BUCKETS * SHM_BUCKET_SIZE;
+pub(crate) const SHM_FILE_SIZE: usize = SHM_HASH_TABLE_OFFSET + SHM_HASH_BUCKETS * SHM_BUCKET_SIZE;
 
 /// Sentinel page_number indicating an empty bucket.
 const EMPTY_BUCKET: u32 = u32::MAX;
@@ -310,15 +310,12 @@ impl ShmIndex {
     pub(crate) fn acquire_reader_slot(&mut self, snapshot_wal_end: u64) -> Option<usize> {
         for i in 0..SHM_MAX_READERS {
             let off = SHM_READER_SLOTS_OFFSET + i * SHM_READER_SLOT_SIZE;
-            let pid = u32::from_le_bytes(
-                self.data[off + 4..off + 8].try_into().expect("4 bytes"),
-            );
+            let pid = u32::from_le_bytes(self.data[off + 4..off + 8].try_into().expect("4 bytes"));
             if pid == 0 {
                 // Free slot — claim it.
                 let snap = snapshot_wal_end as u32; // low 32 bits (sufficient for Phase 1)
                 self.data[off..off + 4].copy_from_slice(&snap.to_le_bytes());
-                self.data[off + 4..off + 8]
-                    .copy_from_slice(&std::process::id().to_le_bytes());
+                self.data[off + 4..off + 8].copy_from_slice(&std::process::id().to_le_bytes());
                 // Increment reader count
                 let count = self.reader_count() + 1;
                 self.data[SHM_READER_COUNT_OFFSET..SHM_READER_COUNT_OFFSET + 4]

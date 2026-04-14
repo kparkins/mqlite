@@ -91,9 +91,7 @@ pub fn validate_document(doc: &Document) -> Result<()> {
 fn validate_doc_recursive(doc: &Document, depth: u32, field_count: &mut usize) -> Result<()> {
     if depth > MAX_NESTING_DEPTH {
         return Err(Error::DocumentValidationFailure {
-            detail: format!(
-                "maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded"
-            ),
+            detail: format!("maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded"),
         });
     }
 
@@ -105,9 +103,7 @@ fn validate_doc_recursive(doc: &Document, depth: u32, field_count: &mut usize) -
         *field_count += 1;
         if *field_count > MAX_FIELD_COUNT {
             return Err(Error::DocumentValidationFailure {
-                detail: format!(
-                    "field count exceeds maximum ({MAX_FIELD_COUNT})"
-                ),
+                detail: format!("field count exceeds maximum ({MAX_FIELD_COUNT})"),
             });
         }
 
@@ -185,7 +181,10 @@ mod tests {
         // content = MAX_DOCUMENT_SIZE - 13 → serialized = MAX_DOCUMENT_SIZE exactly.
         let content_len = MAX_DOCUMENT_SIZE - 13;
         let big_doc = doc! { "d": "x".repeat(content_len) };
-        assert!(validate_document(&big_doc).is_ok(), "document at limit should pass");
+        assert!(
+            validate_document(&big_doc).is_ok(),
+            "document at limit should pass"
+        );
     }
 
     /// A document that exceeds 16MB must be rejected with `DocumentTooLarge`.
@@ -211,7 +210,10 @@ mod tests {
     #[test]
     fn document_at_nesting_limit_passes() {
         let doc = build_nested_doc(MAX_NESTING_DEPTH as usize);
-        assert!(validate_document(&doc).is_ok(), "nesting at limit should pass");
+        assert!(
+            validate_document(&doc).is_ok(),
+            "nesting at limit should pass"
+        );
     }
 
     /// A document nested 101 levels deep must fail with `DocumentValidationFailure`.
@@ -258,7 +260,10 @@ mod tests {
     fn field_name_at_limit_passes() {
         let name = "a".repeat(MAX_FIELD_NAME_LEN);
         let doc = doc! { name: 1 };
-        assert!(validate_document(&doc).is_ok(), "field name at limit should pass");
+        assert!(
+            validate_document(&doc).is_ok(),
+            "field name at limit should pass"
+        );
     }
 
     /// A field name of 1,025 bytes must fail.

@@ -63,7 +63,10 @@ fn wal_path(db_path: &Path) -> PathBuf {
 ///
 /// **Uses the lock fd** to avoid the POSIX fcntl footgun: closing *any* fd
 /// for a file while an advisory lock is held releases the lock.
-fn read_and_validate_header(lock: &dyn crate::storage::lock::FileLock, path: &Path) -> Result<FileHeader> {
+fn read_and_validate_header(
+    lock: &dyn crate::storage::lock::FileLock,
+    path: &Path,
+) -> Result<FileHeader> {
     let mut buf = [0u8; HEADER_PAGE_SIZE];
     lock.read_exact_at(0, &mut buf)?;
     let header = FileHeader::from_bytes(&buf).map_err(|e| enrich_path(e, path))?;
@@ -179,11 +182,7 @@ pub(crate) struct DatabaseInner {
 }
 
 impl DatabaseInner {
-    fn new(
-        path: Option<PathBuf>,
-        opts: OpenOptions,
-        file_lock: Box<dyn FileLock>,
-    ) -> Self {
+    fn new(path: Option<PathBuf>, opts: OpenOptions, file_lock: Box<dyn FileLock>) -> Self {
         DatabaseInner {
             path,
             opts,
@@ -203,11 +202,7 @@ impl DatabaseInner {
 // ---------------------------------------------------------------------------
 
 impl DatabaseInner {
-    pub(crate) fn insert_one<T: Serialize>(
-        &self,
-        name: &str,
-        doc: &T,
-    ) -> Result<InsertOneResult> {
+    pub(crate) fn insert_one<T: Serialize>(&self, name: &str, doc: &T) -> Result<InsertOneResult> {
         #[cfg(feature = "tracing")]
         tracing::debug!(target: "mqlite", collection = name, doc_count = 1u64, "mqlite::insert");
 
@@ -242,7 +237,9 @@ impl DatabaseInner {
         {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            for k in filter.keys() { k.hash(&mut h); }
+            for k in filter.keys() {
+                k.hash(&mut h);
+            }
             tracing::debug!(
                 target: "mqlite",
                 collection = name,
@@ -264,7 +261,9 @@ impl DatabaseInner {
         {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            for k in filter.keys() { k.hash(&mut h); }
+            for k in filter.keys() {
+                k.hash(&mut h);
+            }
             tracing::debug!(
                 target: "mqlite",
                 collection = name,
@@ -284,7 +283,10 @@ impl DatabaseInner {
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().update_one(name, filter, update, opts)
+        self.engine
+            .lock()
+            .unwrap()
+            .update_one(name, filter, update, opts)
     }
 
     pub(crate) fn update_many(
@@ -295,7 +297,10 @@ impl DatabaseInner {
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().update_many(name, filter, update, opts)
+        self.engine
+            .lock()
+            .unwrap()
+            .update_many(name, filter, update, opts)
     }
 
     pub(crate) fn delete_one(&self, name: &str, filter: Document) -> Result<DeleteResult> {
@@ -315,7 +320,10 @@ impl DatabaseInner {
         update: Document,
     ) -> Result<Option<T>> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().find_one_and_update(name, filter, update)
+        self.engine
+            .lock()
+            .unwrap()
+            .find_one_and_update(name, filter, update)
     }
 
     pub(crate) fn find_one_and_update_with_options<T: Serialize + DeserializeOwned>(
@@ -338,7 +346,10 @@ impl DatabaseInner {
         filter: Document,
     ) -> Result<Option<T>> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().find_one_and_delete(name, filter)
+        self.engine
+            .lock()
+            .unwrap()
+            .find_one_and_delete(name, filter)
     }
 
     pub(crate) fn find_one_and_delete_with_options<T: DeserializeOwned>(
@@ -361,7 +372,10 @@ impl DatabaseInner {
         replacement: &T,
     ) -> Result<Option<T>> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().find_one_and_replace(name, filter, replacement)
+        self.engine
+            .lock()
+            .unwrap()
+            .find_one_and_replace(name, filter, replacement)
     }
 
     pub(crate) fn find_one_and_replace_with_options<T: Serialize + DeserializeOwned>(
@@ -575,9 +589,7 @@ impl Database {
         //
         // We hold the exclusive (or shared-read) file lock at this point, so
         // no other process can race us here.
-        let file_size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         if file_size == 0 {
             if !opts.read_only {
@@ -715,9 +727,9 @@ impl Drop for Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     #[cfg(unix)]
     use libc;
+    use std::fs;
 
     // ---- Symlink rejection -------------------------------------------------
 
@@ -756,7 +768,11 @@ mod tests {
 
         let result = Database::open(&symlink_path);
         let err = result.err().unwrap();
-        assert_eq!(err.code(), Some(2), "SymlinkRejected should have error code BAD_VALUE (2)");
+        assert_eq!(
+            err.code(),
+            Some(2),
+            "SymlinkRejected should have error code BAD_VALUE (2)"
+        );
     }
 
     /// Opening a path that does not yet exist (new database) must succeed.
@@ -784,7 +800,11 @@ mod tests {
 
         let meta = fs::metadata(&db_path).expect("metadata");
         let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "database file must have mode 0600, got {:o}", mode);
+        assert_eq!(
+            mode, 0o600,
+            "database file must have mode 0600, got {:o}",
+            mode
+        );
     }
 
     /// Opening an existing regular file (not a symlink) must succeed.
@@ -838,13 +858,7 @@ mod tests {
             unsafe { libc::close(read_fd) };
             let _db = Database::open(&db_path).expect("child: Database::open");
             let ready: u8 = 1;
-            unsafe {
-                libc::write(
-                    write_fd,
-                    &ready as *const u8 as *const libc::c_void,
-                    1,
-                )
-            };
+            unsafe { libc::write(write_fd, &ready as *const u8 as *const libc::c_void, 1) };
             std::thread::sleep(std::time::Duration::from_secs(5));
             unsafe { libc::_exit(0) };
         }
@@ -852,16 +866,14 @@ mod tests {
         // Parent: wait for child's ready signal.
         unsafe { libc::close(write_fd) };
         let mut buf = 0u8;
-        let n =
-            unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+        let n = unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
         assert_eq!(n, 1, "parent: did not receive child ready signal");
         unsafe { libc::close(read_fd) };
 
         // Try to open with zero timeout — must get WriterBusy.
         let result = Database::open_with_options(
             &db_path,
-            OpenOptions::new()
-                .busy_timeout(std::time::Duration::ZERO),
+            OpenOptions::new().busy_timeout(std::time::Duration::ZERO),
         );
         assert!(
             matches!(result, Err(Error::WriterBusy)),
@@ -894,21 +906,14 @@ mod tests {
             unsafe { libc::close(read_fd) };
             let _db = Database::open(&db_path).expect("child: Database::open");
             let ready: u8 = 1;
-            unsafe {
-                libc::write(
-                    write_fd,
-                    &ready as *const u8 as *const libc::c_void,
-                    1,
-                )
-            };
+            unsafe { libc::write(write_fd, &ready as *const u8 as *const libc::c_void, 1) };
             std::thread::sleep(std::time::Duration::from_secs(60));
             unsafe { libc::_exit(0) };
         }
 
         unsafe { libc::close(write_fd) };
         let mut buf = 0u8;
-        let n =
-            unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+        let n = unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
         assert_eq!(n, 1);
         unsafe { libc::close(read_fd) };
 
@@ -977,9 +982,8 @@ mod tests {
         let good_header = FileHeader::new_now();
         let mut bytes = good_header.to_bytes();
         bytes[0] = b'X'; // corrupt magic
-        // Recompute checksum so only the magic is wrong.
-        let checksum =
-            FileHeader::compute_checksum(bytes[..60].try_into().expect("60 bytes"));
+                         // Recompute checksum so only the magic is wrong.
+        let checksum = FileHeader::compute_checksum(bytes[..60].try_into().expect("60 bytes"));
         bytes[60..64].copy_from_slice(&checksum.to_le_bytes());
         fs::write(&db_path, &bytes).expect("write bad-magic file");
 
@@ -1004,7 +1008,10 @@ mod tests {
 
         let result = Database::open(&db_path);
         assert!(
-            matches!(result.err().expect("expected error"), Error::CorruptDatabase { .. }),
+            matches!(
+                result.err().expect("expected error"),
+                Error::CorruptDatabase { .. }
+            ),
             "expected CorruptDatabase for truncated file"
         );
     }
@@ -1063,17 +1070,13 @@ mod tests {
     #[test]
     fn in_memory_creates_no_files() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let file_count_before = fs::read_dir(dir.path())
-            .expect("read dir")
-            .count();
+        let file_count_before = fs::read_dir(dir.path()).expect("read dir").count();
 
         {
             let _db = Database::open_in_memory().expect("in-memory open");
         }
 
-        let file_count_after = fs::read_dir(dir.path())
-            .expect("read dir")
-            .count();
+        let file_count_after = fs::read_dir(dir.path()).expect("read dir").count();
 
         assert_eq!(
             file_count_before, file_count_after,
@@ -1095,8 +1098,7 @@ mod tests {
         // A third process-level open (would compete for the lock) is not
         // tested here because POSIX fcntl locks are per-process.  Instead,
         // verify the clone still works (no panic, inner is alive).
-        let _collections: Vec<String> = db2
-            .list_collection_names()
-            .unwrap_or_default(); // stub returns Err, that's fine
+        let _collections: Vec<String> = db2.list_collection_names().unwrap_or_default();
+        // stub returns Err, that's fine
     }
 }

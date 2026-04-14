@@ -28,10 +28,9 @@
 use crate::error::{Error, Result};
 use crate::storage::page::{
     internal_page_checksum, leaf_page_checksum, overflow_page_checksum, InternalPageHeader,
-    LeafPageHeader, OverflowPageHeader, INTERNAL_HEADER_SIZE, LEAF_HEADER_SIZE,
-    LEAF_FLAG_HAS_OVERFLOW, OVERFLOW_HEADER_SIZE, PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF,
-    PAGE_TYPE_INTERNAL, PAGE_TYPE_LEAF, PAGE_TYPE_OVERFLOW, VALUE_TYPE_INLINE,
-    VALUE_TYPE_OVERFLOW,
+    LeafPageHeader, OverflowPageHeader, INTERNAL_HEADER_SIZE, LEAF_FLAG_HAS_OVERFLOW,
+    LEAF_HEADER_SIZE, OVERFLOW_HEADER_SIZE, PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF, PAGE_TYPE_INTERNAL,
+    PAGE_TYPE_LEAF, PAGE_TYPE_OVERFLOW, VALUE_TYPE_INLINE, VALUE_TYPE_OVERFLOW,
 };
 
 // ---------------------------------------------------------------------------
@@ -199,23 +198,23 @@ impl InternalNode {
 
         for _ in 0..hdr.key_count {
             if pos + 2 > data.len() {
-                return Err(Error::Internal("internal page truncated reading key_len".into()));
+                return Err(Error::Internal(
+                    "internal page truncated reading key_len".into(),
+                ));
             }
             let key_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
 
             if pos + key_len + 4 > data.len() {
-                return Err(Error::Internal("internal page truncated reading key/child".into()));
+                return Err(Error::Internal(
+                    "internal page truncated reading key/child".into(),
+                ));
             }
             let key = data[pos..pos + key_len].to_vec();
             pos += key_len;
 
-            let child_page = u32::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-            ]);
+            let child_page =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
 
             entries.push((key, child_page));
@@ -358,7 +357,7 @@ impl LeafCell {
     fn encoded_size(&self) -> usize {
         let value_size = match &self.value {
             CellValue::Inline(v) => 4 + v.len(), // bson_len(4) + bson_data
-            CellValue::Overflow { .. } => 8,       // first_page(4) + total_length(4)
+            CellValue::Overflow { .. } => 8,     // first_page(4) + total_length(4)
         };
         2 + self.key.len() + 1 + value_size
     }
@@ -389,7 +388,9 @@ impl LeafNode {
         let cell_ptr_base = LEAF_HEADER_SIZE; // always 20
 
         if cell_ptr_base + n * 2 > data.len() {
-            return Err(Error::Internal("leaf page: cell pointer array out of bounds".into()));
+            return Err(Error::Internal(
+                "leaf page: cell pointer array out of bounds".into(),
+            ));
         }
 
         let mut cells = Vec::with_capacity(n);
@@ -424,7 +425,9 @@ impl LeafNode {
         let pos = offset + 2;
 
         if pos + key_len + 1 > data.len() {
-            return Err(Error::Internal("leaf cell: key or value_type out of bounds".into()));
+            return Err(Error::Internal(
+                "leaf cell: key or value_type out of bounds".into(),
+            ));
         }
         let key = data[pos..pos + key_len].to_vec();
         let value_type = data[pos + key_len];
@@ -433,7 +436,9 @@ impl LeafNode {
         let value = match value_type {
             VALUE_TYPE_INLINE => {
                 if value_pos + 4 > data.len() {
-                    return Err(Error::Internal("leaf cell: inline bson_len out of bounds".into()));
+                    return Err(Error::Internal(
+                        "leaf cell: inline bson_len out of bounds".into(),
+                    ));
                 }
                 let bson_len = u32::from_le_bytes([
                     data[value_pos],
@@ -443,13 +448,17 @@ impl LeafNode {
                 ]) as usize;
                 let data_start = value_pos + 4;
                 if data_start + bson_len > data.len() {
-                    return Err(Error::Internal("leaf cell: inline bson data out of bounds".into()));
+                    return Err(Error::Internal(
+                        "leaf cell: inline bson data out of bounds".into(),
+                    ));
                 }
                 CellValue::Inline(data[data_start..data_start + bson_len].to_vec())
             }
             VALUE_TYPE_OVERFLOW => {
                 if value_pos + 8 > data.len() {
-                    return Err(Error::Internal("leaf cell: overflow pointer out of bounds".into()));
+                    return Err(Error::Internal(
+                        "leaf cell: overflow pointer out of bounds".into(),
+                    ));
                 }
                 let first_page = u32::from_le_bytes([
                     data[value_pos],
@@ -583,8 +592,7 @@ impl LeafNode {
     /// Binary-search for `key`.  Returns `Ok(idx)` if found, `Err(idx)` for
     /// the insertion position.
     fn binary_search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
-        self.cells
-            .binary_search_by(|c| c.key.as_slice().cmp(key))
+        self.cells.binary_search_by(|c| c.key.as_slice().cmp(key))
     }
 }
 
@@ -629,7 +637,11 @@ fn write_overflow_chain<S: BTreePageStore>(store: &mut S, data: &[u8]) -> Result
     Ok(pages[0])
 }
 
-fn read_overflow_chain<S: BTreePageStore>(store: &S, first_page: u32, total_length: u32) -> Result<Vec<u8>> {
+fn read_overflow_chain<S: BTreePageStore>(
+    store: &S,
+    first_page: u32,
+    total_length: u32,
+) -> Result<Vec<u8>> {
     let mut result = Vec::with_capacity(total_length as usize);
     let mut cur = first_page;
     while cur != 0 {
@@ -759,7 +771,11 @@ impl<S: BTreePageStore> BTree<S> {
             Some(CellValue::Overflow {
                 first_page,
                 total_length,
-            }) => Ok(Some(read_overflow_chain(&self.store, first_page, total_length)?)),
+            }) => Ok(Some(read_overflow_chain(
+                &self.store,
+                first_page,
+                total_length,
+            )?)),
         }
     }
 
@@ -884,9 +900,7 @@ impl<S: BTreePageStore> BTree<S> {
         new_cell: LeafCell,
     ) -> Result<Option<SplitResult>> {
         // Insert new_cell into the cell list (maintaining sorted order).
-        let pos = left_node
-            .binary_search(&new_cell.key)
-            .unwrap_err();
+        let pos = left_node.binary_search(&new_cell.key).unwrap_err();
         left_node.cells.insert(pos, new_cell);
 
         let total = left_node.cells.len();
@@ -1073,12 +1087,7 @@ impl<S: BTreePageStore> BTree<S> {
     }
 
     /// Delete `key` from the leaf at `page`, then handle underflow.
-    fn delete_from_leaf(
-        &mut self,
-        page: u32,
-        key: &[u8],
-        path: &[( u32, usize)],
-    ) -> Result<bool> {
+    fn delete_from_leaf(&mut self, page: u32, key: &[u8], path: &[(u32, usize)]) -> Result<bool> {
         let buf = self.store.read_leaf(page)?;
         let mut node = LeafNode::parse(&buf[..])?;
 
@@ -1247,7 +1256,7 @@ impl<S: BTreePageStore> BTree<S> {
             // parent.entries[0].1 in the updated parent — but we're removing entries[0].
             // After remove: entries[0] becomes the OLD entries[1] which has child_page
             // pointing to the new child_idx=2, not right_page.
-            // 
+            //
             // Hmm, this is tricky. Let me reconsider.
             //
             // parent.entries stores: [(key[0], child[0]), (key[1], child[1]), ..., (key[n-1], child[n-1])]
@@ -1536,7 +1545,11 @@ mod tests {
         // All keys must still be found.
         for i in 0u64..160 {
             let found = tree.get(&key(i)).unwrap();
-            assert_eq!(found.as_deref(), Some(v.as_slice()), "key {i} missing after split");
+            assert_eq!(
+                found.as_deref(),
+                Some(v.as_slice()),
+                "key {i} missing after split"
+            );
         }
     }
 
@@ -1620,7 +1633,10 @@ mod tests {
             assert!(tree.delete(&key(i)).unwrap(), "key {i} should be deleted");
         }
         for i in 0u64..10 {
-            assert!(tree.get(&key(i)).unwrap().is_none(), "key {i} should be gone");
+            assert!(
+                tree.get(&key(i)).unwrap().is_none(),
+                "key {i} should be gone"
+            );
         }
     }
 
@@ -1644,11 +1660,18 @@ mod tests {
         // Remaining keys must all still be accessible.
         for i in 0..10 {
             let found = tree.get(&key(i)).unwrap();
-            assert_eq!(found.as_deref(), Some(v.as_slice()), "key {i} should still exist");
+            assert_eq!(
+                found.as_deref(),
+                Some(v.as_slice()),
+                "key {i} should still exist"
+            );
         }
         // Deleted keys must be gone.
         for i in 10..n {
-            assert!(tree.get(&key(i)).unwrap().is_none(), "key {i} should be gone");
+            assert!(
+                tree.get(&key(i)).unwrap().is_none(),
+                "key {i} should be gone"
+            );
         }
     }
 
@@ -1824,7 +1847,10 @@ mod tests {
         }
         // Even keys must be gone.
         for i in (0u64..200).step_by(2) {
-            assert!(tree.get(&key(i)).unwrap().is_none(), "key {i} should be gone");
+            assert!(
+                tree.get(&key(i)).unwrap().is_none(),
+                "key {i} should be gone"
+            );
         }
     }
 
@@ -1889,7 +1915,10 @@ mod tests {
         }
         let buf = tree.store.read_internal(page).unwrap();
         let node = InternalNode::parse(&buf[..]).unwrap();
-        assert_eq!(node.level, level, "internal node at page {page} has wrong level");
+        assert_eq!(
+            node.level, level,
+            "internal node at page {page} has wrong level"
+        );
         for (_, child) in &node.entries {
             verify_leaf_depth(tree, *child, level - 1);
         }

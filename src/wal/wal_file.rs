@@ -418,7 +418,10 @@ mod tests {
         let page_data = vec![0xABu8; PAGE_SIZE_INTERNAL as usize];
         let mut buf = Vec::new();
         frame.write(&mut buf, &page_data).unwrap();
-        assert_eq!(buf.len(), WAL_FRAME_HEADER_SIZE + PAGE_SIZE_INTERNAL as usize);
+        assert_eq!(
+            buf.len(),
+            WAL_FRAME_HEADER_SIZE + PAGE_SIZE_INTERNAL as usize
+        );
 
         // Read back
         let mut cursor = std::io::Cursor::new(&buf);
@@ -495,10 +498,7 @@ mod tests {
     #[test]
     fn wal_page_size_roundtrip() {
         assert_eq!(WalPageSize::from_u32(4096).unwrap(), WalPageSize::Small4k);
-        assert_eq!(
-            WalPageSize::from_u32(32768).unwrap(),
-            WalPageSize::Large32k
-        );
+        assert_eq!(WalPageSize::from_u32(32768).unwrap(), WalPageSize::Large32k);
         assert!(WalPageSize::from_u32(9999).is_err());
     }
 }

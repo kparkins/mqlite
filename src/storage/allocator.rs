@@ -207,17 +207,19 @@ impl<'a> PageAllocator<'a> {
         match size {
             PageSize::Small4k => {
                 self.header.free_list_head_4k = page_number;
-                self.header.free_page_count_4k =
-                    self.header.free_page_count_4k.checked_add(1).ok_or_else(|| {
-                        Error::Internal("free_page_count_4k overflow".into())
-                    })?;
+                self.header.free_page_count_4k = self
+                    .header
+                    .free_page_count_4k
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Internal("free_page_count_4k overflow".into()))?;
             }
             PageSize::Large32k => {
                 self.header.free_list_head_32k = page_number;
-                self.header.free_page_count_32k =
-                    self.header.free_page_count_32k.checked_add(1).ok_or_else(|| {
-                        Error::Internal("free_page_count_32k overflow".into())
-                    })?;
+                self.header.free_page_count_32k = self
+                    .header
+                    .free_page_count_32k
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Internal("free_page_count_32k overflow".into()))?;
             }
         }
 
@@ -416,7 +418,10 @@ mod tests {
         let next = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         assert_eq!(next, 0, "single free page → next = 0");
         // All bytes beyond the link must be zero.
-        assert!(raw[4..].iter().all(|&b| b == 0), "tail bytes must be zeroed");
+        assert!(
+            raw[4..].iter().all(|&b| b == 0),
+            "tail bytes must be zeroed"
+        );
     }
 
     #[test]
@@ -625,7 +630,13 @@ mod tests {
         // Allocating would push total_page_count past u32::MAX.
         let result = alloc.allocate_4k();
         assert!(
-            matches!(result, Err(Error::DiskFull { available_bytes: 0, .. })),
+            matches!(
+                result,
+                Err(Error::DiskFull {
+                    available_bytes: 0,
+                    ..
+                })
+            ),
             "u32 overflow must return DiskFull, got {result:?}"
         );
     }

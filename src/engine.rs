@@ -23,8 +23,8 @@ use crate::{
     error::{Error, Result},
     index::{IndexInfo, IndexModel},
     options::{
-        FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
-        FindOptions, InsertManyOptions, ReturnDocument, UpdateOptions,
+        FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
+        InsertManyOptions, ReturnDocument, UpdateOptions,
     },
     query::{
         eval_filter, get_nested_field,
@@ -348,8 +348,7 @@ impl EngineState {
             None => {
                 // Collection doesn't exist yet.  Upsert creates it.
                 if opts.upsert {
-                    let upserted_id =
-                        self.do_upsert(name, &filter, &update, false)?;
+                    let upserted_id = self.do_upsert(name, &filter, &update, false)?;
                     return Ok(UpdateResult {
                         matched_count: 0,
                         modified_count: 0,
@@ -427,12 +426,7 @@ impl EngineState {
         self.delete_impl(name, filter, true)
     }
 
-    fn delete_impl(
-        &mut self,
-        name: &str,
-        filter: Document,
-        many: bool,
-    ) -> Result<DeleteResult> {
+    fn delete_impl(&mut self, name: &str, filter: Document, many: bool) -> Result<DeleteResult> {
         let Some(coll) = self.collections.get_mut(name) else {
             return Ok(DeleteResult { deleted_count: 0 });
         };
@@ -815,12 +809,8 @@ fn compare_documents(a: &Document, b: &Document, sort: &Document) -> std::cmp::O
 
     for (field, dir) in sort {
         let ascending = !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
-        let a_val = get_nested_field(a, field)
-            .cloned()
-            .unwrap_or(Bson::Null);
-        let b_val = get_nested_field(b, field)
-            .cloned()
-            .unwrap_or(Bson::Null);
+        let a_val = get_nested_field(a, field).cloned().unwrap_or(Bson::Null);
+        let b_val = get_nested_field(b, field).cloned().unwrap_or(Bson::Null);
 
         let ord = encode_key(&a_val).cmp(&encode_key(&b_val));
         if ord == std::cmp::Ordering::Equal {
@@ -909,9 +899,7 @@ mod tests {
         let res = eng.insert_one("users", &user).unwrap();
         assert_ne!(res.inserted_id.to_hex(), "");
 
-        let found: Option<User> = eng
-            .find_one("users", doc! { "name": "Alice" })
-            .unwrap();
+        let found: Option<User> = eng.find_one("users", doc! { "name": "Alice" }).unwrap();
         assert_eq!(found, Some(user));
     }
 
@@ -955,11 +943,7 @@ mod tests {
         // Two documents; second is too large to serialize cleanly.
         // Use a bad document (simulate by manually injecting a validated-fail).
         // For simplicity, test basic ordered insert with all-valid docs first.
-        let docs = vec![
-            doc! { "a": 1i32 },
-            doc! { "a": 2i32 },
-            doc! { "a": 3i32 },
-        ];
+        let docs = vec![doc! { "a": 1i32 }, doc! { "a": 2i32 }, doc! { "a": 3i32 }];
         let res = eng
             .insert_many("coll", &docs, InsertManyOptions::new())
             .unwrap();
@@ -1147,8 +1131,7 @@ mod tests {
         let mut eng = engine();
         eng.insert_one("u", &doc! { "n": 7i32 }).unwrap();
 
-        let deleted: Option<Document> =
-            eng.find_one_and_delete("u", doc! { "n": 7i32 }).unwrap();
+        let deleted: Option<Document> = eng.find_one_and_delete("u", doc! { "n": 7i32 }).unwrap();
 
         assert_eq!(deleted.unwrap().get_i32("n").unwrap(), 7);
         assert_eq!(eng.count_documents("u", doc! {}).unwrap(), 0);
@@ -1159,8 +1142,7 @@ mod tests {
     #[test]
     fn find_one_and_replace_returns_before_by_default() {
         let mut eng = engine();
-        eng.insert_one("u", &doc! { "a": 1i32, "b": 2i32 })
-            .unwrap();
+        eng.insert_one("u", &doc! { "a": 1i32, "b": 2i32 }).unwrap();
 
         let before: Option<Document> = eng
             .find_one_and_replace("u", doc! { "a": 1i32 }, &doc! { "c": 3i32 })
@@ -1554,11 +1536,7 @@ mod tests {
     // ---- Index-vs-scan consistency -----------------------------------------
 
     /// Helper: run the same query with and without an index; verify same results.
-    fn consistency_check(
-        eng: &mut EngineState,
-        filter: Document,
-        expected_count: usize,
-    ) {
+    fn consistency_check(eng: &mut EngineState, filter: Document, expected_count: usize) {
         // With index (IXSCAN).
         let ixscan_docs: Vec<Document> = eng
             .find::<Document>("u", filter.clone(), FindOptions::new())
@@ -1772,7 +1750,10 @@ mod tests {
         assert_eq!(without_idx.len(), 1, "should match doc with [10,20]");
         let id_keys = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
             use crate::key_encoding::encode_key;
-            docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+            docs.iter()
+                .filter_map(|d| d.get("_id"))
+                .map(encode_key)
+                .collect()
         };
         assert_eq!(id_keys(&with_idx), id_keys(&without_idx));
     }
@@ -1787,9 +1768,12 @@ mod tests {
             .unwrap();
         let idx_name = eng.create_index("u", model).unwrap();
 
-        eng.insert_one("u", &doc! { "tags": ["rust", "db"] }).unwrap();
-        eng.insert_one("u", &doc! { "tags": ["rust", "web"] }).unwrap();
-        eng.insert_one("u", &doc! { "tags": ["python", "db"] }).unwrap();
+        eng.insert_one("u", &doc! { "tags": ["rust", "db"] })
+            .unwrap();
+        eng.insert_one("u", &doc! { "tags": ["rust", "web"] })
+            .unwrap();
+        eng.insert_one("u", &doc! { "tags": ["python", "db"] })
+            .unwrap();
 
         // With index.
         let with_idx: Vec<Document> = eng
@@ -1819,7 +1803,10 @@ mod tests {
         {
             let id_keys = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
                 use crate::key_encoding::encode_key;
-                docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+                docs.iter()
+                    .filter_map(|d| d.get("_id"))
+                    .map(encode_key)
+                    .collect()
             };
             assert_eq!(id_keys(&with_idx), id_keys(&without_idx));
         }
@@ -1835,9 +1822,12 @@ mod tests {
             .unwrap();
         let idx_name = eng.create_index("u", model).unwrap();
 
-        eng.insert_one("u", &doc! { "email": "alice@example.com" }).unwrap();
-        eng.insert_one("u", &doc! { "email": "bob@test.org" }).unwrap();
-        eng.insert_one("u", &doc! { "email": "carol@example.com" }).unwrap();
+        eng.insert_one("u", &doc! { "email": "alice@example.com" })
+            .unwrap();
+        eng.insert_one("u", &doc! { "email": "bob@test.org" })
+            .unwrap();
+        eng.insert_one("u", &doc! { "email": "carol@example.com" })
+            .unwrap();
 
         let with_idx: Vec<Document> = eng
             .find::<Document>(
@@ -1866,7 +1856,10 @@ mod tests {
         {
             let id_keys = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
                 use crate::key_encoding::encode_key;
-                docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+                docs.iter()
+                    .filter_map(|d| d.get("_id"))
+                    .map(encode_key)
+                    .collect()
             };
             assert_eq!(id_keys(&with_idx), id_keys(&without_idx));
         }
@@ -1883,35 +1876,21 @@ mod tests {
         eng.create_index("orders", model).unwrap();
 
         for i in 0..5i32 {
-            eng.insert_one(
-                "orders",
-                &doc! { "customer": "Alice", "amount": i * 10 },
-            )
-            .unwrap();
+            eng.insert_one("orders", &doc! { "customer": "Alice", "amount": i * 10 })
+                .unwrap();
         }
         eng.insert_one("orders", &doc! { "customer": "Bob", "amount": 99i32 })
             .unwrap();
 
         let cursor = eng
-            .find::<Document>(
-                "orders",
-                doc! { "customer": "Alice" },
-                FindOptions::new(),
-            )
+            .find::<Document>("orders", doc! { "customer": "Alice" }, FindOptions::new())
             .unwrap();
         let explain = cursor.explain().unwrap();
 
         assert!(!explain.full_scan);
-        assert_eq!(
-            explain.index_used.as_deref(),
-            Some("customer_1_amount_-1")
-        );
+        assert_eq!(explain.index_used.as_deref(), Some("customer_1_amount_-1"));
         let docs: Vec<Document> = eng
-            .find::<Document>(
-                "orders",
-                doc! { "customer": "Alice" },
-                FindOptions::new(),
-            )
+            .find::<Document>("orders", doc! { "customer": "Alice" }, FindOptions::new())
             .unwrap()
             .collect::<Result<_>>()
             .unwrap();

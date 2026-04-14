@@ -42,8 +42,8 @@ use tokio::net::TcpStream;
 
 use bson::{doc, oid::ObjectId, DateTime, Document};
 
-use crate::{database::Database, error::Result};
 use super::protocol::{MsgHeader, OpMsg, MAX_MESSAGE_SIZE};
+use crate::{database::Database, error::Result};
 
 // ---------------------------------------------------------------------------
 // Legacy opcodes (not in protocol.rs — used only for handshake interop)
@@ -415,10 +415,8 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
 
         let declared_len =
             i32::from_le_bytes(header_buf[0..4].try_into().expect("slice is 4 bytes")) as usize;
-        let opcode =
-            i32::from_le_bytes(header_buf[12..16].try_into().expect("slice is 4 bytes"));
-        let request_id =
-            i32::from_le_bytes(header_buf[4..8].try_into().expect("slice is 4 bytes"));
+        let opcode = i32::from_le_bytes(header_buf[12..16].try_into().expect("slice is 4 bytes"));
+        let request_id = i32::from_le_bytes(header_buf[4..8].try_into().expect("slice is 4 bytes"));
 
         // Guard against oversized messages.
         if declared_len < MsgHeader::SIZE || declared_len > MAX_MESSAGE_SIZE {
@@ -494,13 +492,11 @@ fn parse_op_query_body(buf: &[u8]) -> Result<Document> {
     }
     // Skip flags (4 bytes), then find the null terminator of fullCollectionName.
     let after_flags = &buf[4..];
-    let null_pos =
-        after_flags
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| crate::error::Error::InvalidWireMessage {
-                detail: "OP_QUERY fullCollectionName not null-terminated".into(),
-            })?;
+    let null_pos = after_flags.iter().position(|&b| b == 0).ok_or_else(|| {
+        crate::error::Error::InvalidWireMessage {
+            detail: "OP_QUERY fullCollectionName not null-terminated".into(),
+        }
+    })?;
     // Skip the null terminator, then skip numberToSkip (4) and numberToReturn (4).
     let doc_offset = 4 + null_pos + 1 + 4 + 4;
     if doc_offset + 4 > buf.len() {
@@ -642,12 +638,12 @@ fn dispatch_op_query(
     }
 
     let doc = parse_op_query_body(body_buf)?;
-    let command_name = doc
-        .keys()
-        .next()
-        .ok_or_else(|| crate::error::Error::InvalidWireMessage {
-            detail: "OP_QUERY command document is empty".into(),
-        })?;
+    let command_name =
+        doc.keys()
+            .next()
+            .ok_or_else(|| crate::error::Error::InvalidWireMessage {
+                detail: "OP_QUERY command document is empty".into(),
+            })?;
     let response_body = route_command(command_name, &doc, state, connection_id);
     build_op_reply(request_id, response_to, &response_body)
 }
@@ -665,12 +661,12 @@ fn dispatch_op_msg(
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
             detail: "command message has no Kind-0 body section".into(),
         })?;
-    let command_name = body
-        .keys()
-        .next()
-        .ok_or_else(|| crate::error::Error::InvalidWireMessage {
-            detail: "command body document is empty".into(),
-        })?;
+    let command_name =
+        body.keys()
+            .next()
+            .ok_or_else(|| crate::error::Error::InvalidWireMessage {
+                detail: "command body document is empty".into(),
+            })?;
     // Validate $db before routing.  Returns Unauthorized (code 13) when
     // $db is present and does not match "admin" or the server's db name.
     if let Some(err) = check_db_field(body, &state.db_name()) {
@@ -695,7 +691,13 @@ fn route_command(
     // are silently ignored in Phase 1 — log at DEBUG, never return error.
     #[cfg(feature = "tracing")]
     {
-        for key in ["lsid", "readConcern", "writeConcern", "$clusterTime", "txnNumber"] {
+        for key in [
+            "lsid",
+            "readConcern",
+            "writeConcern",
+            "$clusterTime",
+            "txnNumber",
+        ] {
             if body.contains_key(key) {
                 tracing::debug!(
                     target: "mqlite",
@@ -1125,11 +1127,8 @@ mod tests {
     #[test]
     fn dispatch_op_query_ismaster() {
         let state = ServerState::default();
-        let req_buf = make_op_query_request(
-            3,
-            "admin.$cmd",
-            &doc! { "ismaster": 1, "helloOk": true },
-        );
+        let req_buf =
+            make_op_query_request(3, "admin.$cmd", &doc! { "ismaster": 1, "helloOk": true });
         let resp_bytes = dispatch_op_query(&req_buf, 12, 3, &state, 2).unwrap();
 
         // Response must be OP_REPLY (opcode 1).
@@ -1140,15 +1139,11 @@ mod tests {
         // Parse the OP_REPLY body.
         // Layout: header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
         let doc_start = 16 + 4 + 8 + 4 + 4;
-        let doc_size = i32::from_le_bytes(
-            resp_bytes[doc_start..doc_start + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let raw = bson::RawDocumentBuf::from_bytes(
-            resp_bytes[doc_start..doc_start + doc_size].to_vec(),
-        )
-        .unwrap();
+        let doc_size =
+            i32::from_le_bytes(resp_bytes[doc_start..doc_start + 4].try_into().unwrap()) as usize;
+        let raw =
+            bson::RawDocumentBuf::from_bytes(resp_bytes[doc_start..doc_start + doc_size].to_vec())
+                .unwrap();
         let body = bson::from_slice::<Document>(raw.as_bytes()).unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
         assert!(body.get_bool("isWritablePrimary").unwrap());
@@ -1211,8 +1206,7 @@ mod tests {
     #[test]
     fn dispatch_op_msg_list_databases() {
         let state = ServerState::default();
-        let req_buf =
-            make_op_msg_request(6, &doc! { "listDatabases": 1, "$db": "admin" });
+        let req_buf = make_op_msg_request(6, &doc! { "listDatabases": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
         let resp_bytes = dispatch_op_msg(&msg, 15, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
@@ -1278,11 +1272,10 @@ mod tests {
     #[test]
     fn dispatch_op_msg_db_mismatch_returns_unauthorized() {
         let state = ServerState::default(); // db_name() == "local"
-        // "wrongdb" != "admin" and "wrongdb" != "local" → Unauthorized
+                                            // "wrongdb" != "admin" and "wrongdb" != "local" → Unauthorized
         let req_buf = make_op_msg_request(20, &doc! { "ping": 1, "$db": "wrongdb" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes =
-            dispatch_op_msg(&msg, 40, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 40, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 0.0);
@@ -1295,8 +1288,7 @@ mod tests {
         let state = ServerState::default();
         let req_buf = make_op_msg_request(21, &doc! { "ping": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes =
-            dispatch_op_msg(&msg, 41, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 41, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1307,8 +1299,7 @@ mod tests {
         let state = ServerState::new(Some(std::path::PathBuf::from("/tmp/myapp.mqlite")));
         let req_buf = make_op_msg_request(22, &doc! { "ping": 1, "$db": "myapp" });
         let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes =
-            dispatch_op_msg(&msg, 42, msg.header.request_id, &state, 1).unwrap();
+        let resp_bytes = dispatch_op_msg(&msg, 42, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1342,14 +1333,13 @@ mod tests {
     #[test]
     fn dispatch_op_query_db_mismatch_returns_unauthorized() {
         let state = ServerState::default(); // db_name() == "local"
-        // "wrongdb.$cmd" → db = "wrongdb" ≠ "admin" and ≠ "local"
+                                            // "wrongdb.$cmd" → db = "wrongdb" ≠ "admin" and ≠ "local"
         let req_buf = make_op_query_request(30, "wrongdb.$cmd", &doc! { "ismaster": 1 });
         let resp_bytes = dispatch_op_query(&req_buf, 50, 30, &state, 1).unwrap();
         // OP_REPLY: header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
         let doc_start = 16 + 4 + 8 + 4 + 4;
-        let doc_size = i32::from_le_bytes(
-            resp_bytes[doc_start..doc_start + 4].try_into().unwrap(),
-        ) as usize;
+        let doc_size =
+            i32::from_le_bytes(resp_bytes[doc_start..doc_start + 4].try_into().unwrap()) as usize;
         let raw =
             bson::RawDocumentBuf::from_bytes(resp_bytes[doc_start..doc_start + doc_size].to_vec())
                 .unwrap();
@@ -1467,7 +1457,10 @@ mod tests {
             .unwrap()
             .get("processId")
             .cloned();
-        assert_eq!(pid1, pid2, "topology processId should be stable across calls");
+        assert_eq!(
+            pid1, pid2,
+            "topology processId should be stable across calls"
+        );
     }
 
     #[test]
@@ -1522,9 +1515,18 @@ mod tests {
         let dbs = body.get_array("databases").unwrap();
         assert_eq!(dbs.len(), 1, "mqlite must list exactly one database");
         let db_doc = dbs[0].as_document().unwrap();
-        assert!(db_doc.contains_key("name"), "database entry must have a name");
-        assert!(db_doc.contains_key("sizeOnDisk"), "database entry must have sizeOnDisk");
-        assert!(db_doc.contains_key("empty"), "database entry must have empty");
+        assert!(
+            db_doc.contains_key("name"),
+            "database entry must have a name"
+        );
+        assert!(
+            db_doc.contains_key("sizeOnDisk"),
+            "database entry must have sizeOnDisk"
+        );
+        assert!(
+            db_doc.contains_key("empty"),
+            "database entry must have empty"
+        );
     }
 
     #[test]
@@ -1647,8 +1649,10 @@ mod tests {
 
         // BSON doc starts at offset 20 within rest.
         let doc_start = 20;
-        let doc_size = i32::from_le_bytes(rest[doc_start..doc_start + 4].try_into().unwrap()) as usize;
-        let raw = bson::RawDocumentBuf::from_bytes(rest[doc_start..doc_start + doc_size].to_vec()).unwrap();
+        let doc_size =
+            i32::from_le_bytes(rest[doc_start..doc_start + 4].try_into().unwrap()) as usize;
+        let raw = bson::RawDocumentBuf::from_bytes(rest[doc_start..doc_start + doc_size].to_vec())
+            .unwrap();
         let body = bson::from_slice::<Document>(raw.as_bytes()).unwrap();
 
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);

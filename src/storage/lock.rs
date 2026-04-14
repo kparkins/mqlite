@@ -495,10 +495,7 @@ mod tests {
     #[test]
     fn noop_acquire_shared_succeeds() {
         let lock = NoopFileLock;
-        assert_eq!(
-            lock.acquire_shared(Duration::from_secs(1)).unwrap(),
-            false
-        );
+        assert_eq!(lock.acquire_shared(Duration::from_secs(1)).unwrap(), false);
     }
 
     #[test]
@@ -636,9 +633,7 @@ mod tests {
 
             // Wait for child's ready signal.
             let mut buf = 0u8;
-            let n = unsafe {
-                libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1)
-            };
+            let n = unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
             assert_eq!(n, 1, "parent: did not receive child ready signal");
             unsafe { libc::close(read_fd) };
 
@@ -693,8 +688,7 @@ mod tests {
             // Parent waits for child ready signal.
             unsafe { libc::close(write_fd) };
             let mut buf = 0u8;
-            let n =
-                unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+            let n = unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
             assert_eq!(n, 1);
             unsafe { libc::close(read_fd) };
 
@@ -713,12 +707,18 @@ mod tests {
         #[test]
         fn lock_region_is_within_reserved_header_area() {
             // Header reserved area: offsets 76–127 (see storage/header.rs).
-            assert!(READER_LOCK_OFFSET >= 76, "reader lock must be in reserved area");
+            assert!(
+                READER_LOCK_OFFSET >= 76,
+                "reader lock must be in reserved area"
+            );
             assert!(
                 READER_LOCK_OFFSET + READER_LOCK_LEN <= 128,
                 "reader lock must end before padding"
             );
-            assert!(WRITER_LOCK_OFFSET >= 76, "writer lock must be in reserved area");
+            assert!(
+                WRITER_LOCK_OFFSET >= 76,
+                "writer lock must be in reserved area"
+            );
             assert!(
                 WRITER_LOCK_OFFSET + WRITER_LOCK_LEN <= 128,
                 "writer lock must end before padding"
@@ -727,7 +727,10 @@ mod tests {
             let r_end = READER_LOCK_OFFSET + READER_LOCK_LEN;
             let w_end = WRITER_LOCK_OFFSET + WRITER_LOCK_LEN;
             let no_overlap = r_end <= WRITER_LOCK_OFFSET || w_end <= READER_LOCK_OFFSET;
-            assert!(no_overlap, "reader and writer lock regions must not overlap");
+            assert!(
+                no_overlap,
+                "reader and writer lock regions must not overlap"
+            );
         }
     }
 }

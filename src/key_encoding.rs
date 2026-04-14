@@ -303,11 +303,7 @@ fn encode_f64(buf: &mut Vec<u8>, v: f64) {
         return;
     }
 
-    let (class, abs_val) = if v < 0.0 {
-        (NUM_NEG, -v)
-    } else {
-        (NUM_POS, v)
-    };
+    let (class, abs_val) = if v < 0.0 { (NUM_NEG, -v) } else { (NUM_POS, v) };
 
     // Integer part: truncate to u64 (saturating for very large values).
     let int_part: u64 = abs_val.trunc() as u64;
@@ -566,10 +562,7 @@ mod tests {
         assert_eq_key(&Bson::Int32(1), &Bson::Double(1.0));
         assert_eq_key(&Bson::Int64(-42), &Bson::Double(-42.0));
         assert_eq_key(&Bson::Int32(i32::MAX), &Bson::Int64(i32::MAX as i64));
-        assert_eq_key(
-            &Bson::Int32(i32::MAX),
-            &Bson::Double(i32::MAX as f64),
-        );
+        assert_eq_key(&Bson::Int32(i32::MAX), &Bson::Double(i32::MAX as f64));
     }
 
     #[test]
@@ -623,22 +616,10 @@ mod tests {
 
     #[test]
     fn strings_lexicographic_order() {
-        assert_lt(
-            &Bson::String("".into()),
-            &Bson::String("a".into()),
-        );
-        assert_lt(
-            &Bson::String("a".into()),
-            &Bson::String("b".into()),
-        );
-        assert_lt(
-            &Bson::String("abc".into()),
-            &Bson::String("abd".into()),
-        );
-        assert_lt(
-            &Bson::String("abc".into()),
-            &Bson::String("abcd".into()),
-        );
+        assert_lt(&Bson::String("".into()), &Bson::String("a".into()));
+        assert_lt(&Bson::String("a".into()), &Bson::String("b".into()));
+        assert_lt(&Bson::String("abc".into()), &Bson::String("abd".into()));
+        assert_lt(&Bson::String("abc".into()), &Bson::String("abcd".into()));
     }
 
     #[test]
@@ -770,14 +751,8 @@ mod tests {
     #[test]
     fn compound_key_descending_second_field() {
         // (1, "b") should sort BEFORE (1, "a") when second field is descending.
-        let a = encode_compound_key(&[
-            (&Bson::Int32(1), true),
-            (&Bson::String("a".into()), false),
-        ]);
-        let b = encode_compound_key(&[
-            (&Bson::Int32(1), true),
-            (&Bson::String("b".into()), false),
-        ]);
+        let a = encode_compound_key(&[(&Bson::Int32(1), true), (&Bson::String("a".into()), false)]);
+        let b = encode_compound_key(&[(&Bson::Int32(1), true), (&Bson::String("b".into()), false)]);
         // "b" > "a" ascending, so with descending flag: b_key < a_key
         assert!(b < a, "descending: 'b' sorts before 'a'");
     }
@@ -786,10 +761,7 @@ mod tests {
     fn compound_key_missing_field_encoded_as_null() {
         // Missing fields are encoded as Null in MongoDB indexes.
         let missing = encode_compound_key(&[(&Bson::Null, true), (&Bson::Int32(1), true)]);
-        let present = encode_compound_key(&[
-            (&Bson::Int32(0), true),
-            (&Bson::Int32(1), true),
-        ]);
+        let present = encode_compound_key(&[(&Bson::Int32(0), true), (&Bson::Int32(1), true)]);
         // Null (0x05) < Number (0x10), so missing < present.
         assert!(missing < present);
     }
@@ -812,7 +784,7 @@ mod tests {
             Bson::Double(-1.5),
             Bson::Int32(-1),
             Bson::Double(-0.5),
-            Bson::Int32(0),  // -0.0 == 0 == +0.0 in MongoDB ordering
+            Bson::Int32(0), // -0.0 == 0 == +0.0 in MongoDB ordering
             Bson::Double(0.5),
             Bson::Int64(1),
             Bson::Double(1.5),

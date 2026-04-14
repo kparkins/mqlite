@@ -310,8 +310,7 @@ pub(crate) fn update_index_on_delete<S: BTreePageStore>(
     index_tree: &mut BTree<S>,
     index_entry: &IndexEntry,
 ) -> Result<()> {
-    let (keys, _) =
-        build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
+    let (keys, _) = build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
 
     for key in &keys {
         index_tree.delete(key)?;
@@ -380,15 +379,13 @@ where
             } => data_tree.read_overflow(*first_page, *total_length)?,
         };
 
-        let doc: Document =
-            bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
+        let doc: Document = bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
 
         let doc_id = doc.get("_id").ok_or_else(|| {
             Error::Internal("document missing '_id' field during index build".into())
         })?;
 
-        let is_multikey =
-            update_index_on_insert(&doc, doc_id, index_tree, index_entry)?;
+        let is_multikey = update_index_on_insert(&doc, doc_id, index_tree, index_entry)?;
         if is_multikey {
             any_multikey = true;
         }
@@ -404,9 +401,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bson::{doc, oid::ObjectId, Bson};
     use crate::storage::btree::{BTree, MemPageStore};
     use crate::storage::catalog::IndexEntry;
+    use bson::{doc, oid::ObjectId, Bson};
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -440,18 +437,12 @@ mod tests {
 
     #[test]
     fn index_name_single_ascending() {
-        assert_eq!(
-            generate_index_name(&doc! { "email": 1 }),
-            "email_1"
-        );
+        assert_eq!(generate_index_name(&doc! { "email": 1 }), "email_1");
     }
 
     #[test]
     fn index_name_single_descending() {
-        assert_eq!(
-            generate_index_name(&doc! { "score": -1 }),
-            "score_-1"
-        );
+        assert_eq!(generate_index_name(&doc! { "score": -1 }), "score_-1");
     }
 
     #[test]
@@ -501,13 +492,7 @@ mod tests {
     fn single_field_key_ascending() {
         let id = Bson::Int32(42);
         let doc = doc! { "email": "alice@example.com" };
-        let (keys, multikey) = build_index_keys(
-            &doc,
-            &doc! { "email": 1 },
-            &id,
-            false,
-        )
-        .unwrap();
+        let (keys, multikey) = build_index_keys(&doc, &doc! { "email": 1 }, &id, false).unwrap();
         assert_eq!(keys.len(), 1);
         assert!(!multikey);
     }
@@ -594,13 +579,7 @@ mod tests {
     fn multikey_one_entry_per_element() {
         let id = Bson::Int32(1);
         let doc = doc! { "tags": ["rust", "db", "bson"] };
-        let (keys, multikey) = build_index_keys(
-            &doc,
-            &doc! { "tags": 1 },
-            &id,
-            false,
-        )
-        .unwrap();
+        let (keys, multikey) = build_index_keys(&doc, &doc! { "tags": 1 }, &id, false).unwrap();
         assert_eq!(keys.len(), 3, "three tags → three index entries");
         assert!(multikey);
     }
@@ -609,8 +588,7 @@ mod tests {
     fn multikey_duplicate_array_elements() {
         let id = Bson::Int32(1);
         let doc = doc! { "tags": ["rust", "rust"] }; // duplicate
-        let (keys, multikey) =
-            build_index_keys(&doc, &doc! { "tags": 1 }, &id, false).unwrap();
+        let (keys, multikey) = build_index_keys(&doc, &doc! { "tags": 1 }, &id, false).unwrap();
         // Two identical keys are produced; deduplication happens at insert time.
         assert_eq!(keys.len(), 2);
         assert!(multikey);
@@ -785,10 +763,8 @@ mod tests {
         assert_eq!(all.len(), 1, "exactly one entry after update");
 
         // Verify the entry is for "new@test.com", not "old@test.com".
-        let (old_keys, _) =
-            build_index_keys(&old_doc, &entry.key_pattern, &id, false).unwrap();
-        let (new_keys, _) =
-            build_index_keys(&new_doc, &entry.key_pattern, &id, false).unwrap();
+        let (old_keys, _) = build_index_keys(&old_doc, &entry.key_pattern, &id, false).unwrap();
+        let (new_keys, _) = build_index_keys(&new_doc, &entry.key_pattern, &id, false).unwrap();
 
         assert!(
             tree.search(&old_keys[0]).unwrap().is_none(),
@@ -859,7 +835,10 @@ mod tests {
 
         let index_entry = make_index_entry(doc! { "tags": 1 }, false, false);
         let any_multikey = build_index(&data_tree, &mut idx_tree, &index_entry).unwrap();
-        assert!(any_multikey, "document with array field should trigger multikey");
+        assert!(
+            any_multikey,
+            "document with array field should trigger multikey"
+        );
 
         let all_idx = idx_tree.range_scan(None, None).unwrap();
         assert_eq!(all_idx.len(), 2, "two tags → two index entries");

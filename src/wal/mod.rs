@@ -46,8 +46,7 @@ use crate::storage::header::FileHeader;
 
 use self::shm::ShmIndex;
 use self::wal_file::{
-    WalFrameHeader, WalHeader, WalPageSize, WAL_FRAME_HEADER_SIZE,
-    WAL_HEADER_SIZE,
+    WalFrameHeader, WalHeader, WalPageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -110,13 +109,7 @@ impl WalManager {
         // Does a WAL file already exist?
         if wal_path.exists() {
             // Try to recover it.
-            let recovered = Self::recover_existing(
-                &wal_path,
-                &shm_path,
-                salt1,
-                salt2,
-                main_file,
-            )?;
+            let recovered = Self::recover_existing(&wal_path, &shm_path, salt1, salt2, main_file)?;
             if let Some(mgr) = recovered {
                 return Ok(mgr);
             }
@@ -247,10 +240,20 @@ impl WalManager {
 
             if frame_hdr.db_page_count == 0 {
                 // Non-commit frame — add to pending.
-                pending.push((frame_hdr.page_number, frame_hdr.page_size, page_data, frame_offset));
+                pending.push((
+                    frame_hdr.page_number,
+                    frame_hdr.page_size,
+                    page_data,
+                    frame_offset,
+                ));
             } else {
                 // Commit frame — apply all pending + this frame.
-                pending.push((frame_hdr.page_number, frame_hdr.page_size, page_data, frame_offset));
+                pending.push((
+                    frame_hdr.page_number,
+                    frame_hdr.page_size,
+                    page_data,
+                    frame_offset,
+                ));
 
                 let db_page_count = frame_hdr.db_page_count;
                 for (pn, ps, data, off) in &pending {
@@ -348,7 +351,10 @@ impl WalManager {
         page_data: &[u8],
         db_page_count: u32,
     ) -> Result<bool> {
-        debug_assert!(db_page_count > 0, "commit frame must have non-zero page count");
+        debug_assert!(
+            db_page_count > 0,
+            "commit frame must have non-zero page count"
+        );
         let offset = self.append_frame(page_number, db_page_count, page_size, page_data)?;
         self.last_committed_db_page_count = Some(db_page_count);
 
@@ -506,7 +512,9 @@ impl WalManager {
         // For each indexed page, read the WAL frame and write to main file.
         for (page_number, frame_offset) in &entries {
             self.wal_file
-                .seek(SeekFrom::Start(*frame_offset + WAL_FRAME_HEADER_SIZE as u64))
+                .seek(SeekFrom::Start(
+                    *frame_offset + WAL_FRAME_HEADER_SIZE as u64,
+                ))
                 .map_err(Error::Io)?;
 
             // Read page_size from the frame header.
@@ -598,9 +606,7 @@ impl WalManager {
     /// Truncate the WAL file to just its 32-byte header and reposition the
     /// write cursor.
     fn truncate_wal(&mut self) -> Result<()> {
-        self.wal_file
-            .seek(SeekFrom::Start(0))
-            .map_err(Error::Io)?;
+        self.wal_file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
 
         // Re-write header with incremented checkpoint sequence.
         self.checkpoint_seq = self.checkpoint_seq.wrapping_add(1);
@@ -666,9 +672,7 @@ pub(crate) fn write_page_to_main(
     page_data: &[u8],
 ) -> Result<()> {
     let offset = page_number as u64 * page_size_bytes as u64;
-    main_file
-        .seek(SeekFrom::Start(offset))
-        .map_err(Error::Io)?;
+    main_file.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
     main_file.write_all(page_data).map_err(Error::Io)?;
     Ok(())
 }
@@ -757,7 +761,8 @@ mod tests {
         let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
         let page_data = make_page_4k(0xAB);
-        mgr.append_non_commit(3, WalPageSize::Small4k, &page_data).unwrap();
+        mgr.append_non_commit(3, WalPageSize::Small4k, &page_data)
+            .unwrap();
 
         let result = mgr.read_page(3).unwrap();
         assert_eq!(result, Some(page_data));
@@ -772,7 +777,8 @@ mod tests {
         let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
         let page_data = make_page_32k(0xCC);
-        mgr.append_non_commit(10, WalPageSize::Large32k, &page_data).unwrap();
+        mgr.append_non_commit(10, WalPageSize::Large32k, &page_data)
+            .unwrap();
 
         let result = mgr.read_page(10).unwrap();
         assert_eq!(result, Some(page_data));
@@ -787,8 +793,10 @@ mod tests {
 
         let page_v1 = make_page_4k(0x01);
         let page_v2 = make_page_4k(0x02);
-        mgr.append_non_commit(5, WalPageSize::Small4k, &page_v1).unwrap();
-        mgr.append_non_commit(5, WalPageSize::Small4k, &page_v2).unwrap();
+        mgr.append_non_commit(5, WalPageSize::Small4k, &page_v1)
+            .unwrap();
+        mgr.append_non_commit(5, WalPageSize::Small4k, &page_v2)
+            .unwrap();
 
         // SHM lookup returns offset of latest (second) frame.
         let result = mgr.read_page(5).unwrap().unwrap();
@@ -808,10 +816,9 @@ mod tests {
 
         let page_a = make_page_4k(0xAA);
         let page_b = make_page_4k(0xBB);
-        mgr.append_non_commit(1, WalPageSize::Small4k, &page_a).unwrap();
-        let emergency = mgr
-            .commit(2, WalPageSize::Small4k, &page_b, 10)
+        mgr.append_non_commit(1, WalPageSize::Small4k, &page_a)
             .unwrap();
+        let emergency = mgr.commit(2, WalPageSize::Small4k, &page_b, 10).unwrap();
         assert!(!emergency);
         assert_eq!(mgr.last_committed_db_page_count, Some(10));
     }
@@ -830,7 +837,8 @@ mod tests {
         let mut mgr = WalManager::open_or_create(&db_path, &mut header, &mut main_file).unwrap();
 
         let page_data = make_page_4k(0x42);
-        mgr.append_non_commit(2, WalPageSize::Small4k, &page_data).unwrap();
+        mgr.append_non_commit(2, WalPageSize::Small4k, &page_data)
+            .unwrap();
         mgr.commit(2, WalPageSize::Small4k, &page_data, 5).unwrap();
 
         mgr.checkpoint(&mut main_file, &mut header).unwrap();
@@ -874,12 +882,12 @@ mod tests {
 
         // Write two frames and commit.
         {
-            let mut mgr =
-                WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+            let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
             let page_a = make_page_4k(0xAA);
             let page_b = make_page_4k(0xBB);
-            mgr.append_non_commit(1, WalPageSize::Small4k, &page_a).unwrap();
+            mgr.append_non_commit(1, WalPageSize::Small4k, &page_a)
+                .unwrap();
             mgr.commit(2, WalPageSize::Small4k, &page_b, 5).unwrap();
             // Simulate crash: don't call close_and_cleanup.
             // WAL file left on disk.
@@ -916,14 +924,15 @@ mod tests {
 
         // Write one committed frame, then one uncommitted (simulated crash mid-tx).
         {
-            let mut mgr =
-                WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+            let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
             let page_committed = make_page_4k(0xCC);
             let page_uncommitted = make_page_4k(0xDD);
-            mgr.commit(1, WalPageSize::Small4k, &page_committed, 3).unwrap();
+            mgr.commit(1, WalPageSize::Small4k, &page_committed, 3)
+                .unwrap();
             // Append non-commit frame — transaction never completed.
-            mgr.append_non_commit(2, WalPageSize::Small4k, &page_uncommitted).unwrap();
+            mgr.append_non_commit(2, WalPageSize::Small4k, &page_uncommitted)
+                .unwrap();
             // Crash: no commit for page 2.
         }
 
@@ -1003,7 +1012,8 @@ mod tests {
         let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
         let page_data = make_page_4k(0x77);
-        mgr.append_non_commit(7, WalPageSize::Small4k, &page_data).unwrap();
+        mgr.append_non_commit(7, WalPageSize::Small4k, &page_data)
+            .unwrap();
 
         let result = mgr.read_page_linear(7).unwrap();
         assert_eq!(result, Some(page_data));

@@ -726,22 +726,29 @@ fn build_regex(pattern: &str, options: &str) -> Result<regex::Regex> {
     b.dfa_size_limit(REGEX_DFA_SIZE_LIMIT);
     for flag in options.chars() {
         match flag {
-            'i' => { b.case_insensitive(true); }
-            'm' => { b.multi_line(true); }
-            's' => { b.dot_matches_new_line(true); }
-            'x' => { b.ignore_whitespace(true); }
+            'i' => {
+                b.case_insensitive(true);
+            }
+            'm' => {
+                b.multi_line(true);
+            }
+            's' => {
+                b.dot_matches_new_line(true);
+            }
+            'x' => {
+                b.ignore_whitespace(true);
+            }
             // 'l' (locale) and 'u' (unicode) are accepted but no-op:
             // the regex crate is Unicode-aware by default and has no
             // locale concept.
             'l' | 'u' => {}
             other => {
-                return Err(bad_value(&format!(
-                    "unknown $regex option '{other}'"
-                )));
+                return Err(bad_value(&format!("unknown $regex option '{other}'")));
             }
         }
     }
-    b.build().map_err(|e| bad_value(&format!("invalid $regex pattern: {e}")))
+    b.build()
+        .map_err(|e| bad_value(&format!("invalid $regex pattern: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -847,7 +854,9 @@ fn bson_to_i64_strict(op: &str, val: &Bson) -> Result<i64> {
             if i as f64 == *f {
                 Ok(i)
             } else {
-                Err(bad_value(&format!("{op} requires a whole-number value, got {f}")))
+                Err(bad_value(&format!(
+                    "{op} requires a whole-number value, got {f}"
+                )))
             }
         }
         _ => Err(bad_value(&format!(
@@ -1576,14 +1585,8 @@ mod tests {
     #[test]
     fn all_single_value_matches_scalar() {
         // MongoDB treats scalar as single-element array for $all.
-        assert!(matches(
-            doc! { "a": { "$all": [42] } },
-            doc! { "a": 42 }
-        ));
-        assert!(no_match(
-            doc! { "a": { "$all": [42] } },
-            doc! { "a": 43 }
-        ));
+        assert!(matches(doc! { "a": { "$all": [42] } }, doc! { "a": 42 }));
+        assert!(no_match(doc! { "a": { "$all": [42] } }, doc! { "a": 43 }));
     }
 
     #[test]
@@ -1597,10 +1600,7 @@ mod tests {
 
     #[test]
     fn all_missing_field_no_match() {
-        assert!(no_match(
-            doc! { "a": { "$all": [1] } },
-            doc! { "b": [1] }
-        ));
+        assert!(no_match(doc! { "a": { "$all": [1] } }, doc! { "b": [1] }));
     }
 
     #[test]
@@ -1651,7 +1651,10 @@ mod tests {
 
     #[test]
     fn size_non_array_no_match() {
-        assert!(no_match(doc! { "a": { "$size": 1 } }, doc! { "a": "hello" }));
+        assert!(no_match(
+            doc! { "a": { "$size": 1 } },
+            doc! { "a": "hello" }
+        ));
         assert!(no_match(doc! { "a": { "$size": 0 } }, doc! {}));
     }
 
@@ -1682,10 +1685,7 @@ mod tests {
             doc! { "name": { "$regex": "^Alice" } },
             doc.clone()
         ));
-        assert!(no_match(
-            doc! { "name": { "$regex": "^Bob" } },
-            doc.clone()
-        ));
+        assert!(no_match(doc! { "name": { "$regex": "^Bob" } }, doc.clone()));
     }
 
     #[test]
@@ -1732,10 +1732,7 @@ mod tests {
     #[test]
     fn regex_non_string_field_no_match() {
         // $regex does not match numeric or boolean fields.
-        assert!(no_match(
-            doc! { "a": { "$regex": "1" } },
-            doc! { "a": 1 }
-        ));
+        assert!(no_match(doc! { "a": { "$regex": "1" } }, doc! { "a": 1 }));
         assert!(no_match(
             doc! { "a": { "$regex": "true" } },
             doc! { "a": true }
@@ -1754,10 +1751,7 @@ mod tests {
     fn regex_array_field() {
         // $regex matches if any string element in the array matches.
         let doc = doc! { "tags": ["rust", "systems", "fast"] };
-        assert!(matches(
-            doc! { "tags": { "$regex": "^rust" } },
-            doc.clone()
-        ));
+        assert!(matches(doc! { "tags": { "$regex": "^rust" } }, doc.clone()));
         assert!(no_match(
             doc! { "tags": { "$regex": "^python" } },
             doc.clone()
@@ -1823,8 +1817,14 @@ mod tests {
     #[test]
     fn unsupported_operators_return_error() {
         // Top-level
-        assert!(errors(doc! { "$expr": { "$gt": ["$a", 5] } }, doc! { "a": 1 }));
-        assert!(errors(doc! { "$text": { "$search": "foo" } }, doc! { "a": 1 }));
+        assert!(errors(
+            doc! { "$expr": { "$gt": ["$a", 5] } },
+            doc! { "a": 1 }
+        ));
+        assert!(errors(
+            doc! { "$text": { "$search": "foo" } },
+            doc! { "a": 1 }
+        ));
         assert!(errors(doc! { "$where": "this.a > 1" }, doc! { "a": 1 }));
 
         // Field-level
@@ -1835,10 +1835,7 @@ mod tests {
     #[test]
     fn unsupported_operator_has_code_9() {
         use crate::error::{codes, Error};
-        let result = eval_filter(
-            &doc! { "a": 1 },
-            &doc! { "$expr": { "$gt": ["$a", 0] } },
-        );
+        let result = eval_filter(&doc! { "a": 1 }, &doc! { "$expr": { "$gt": ["$a", 0] } });
         let err = result.unwrap_err();
         assert_eq!(
             err.code(),
