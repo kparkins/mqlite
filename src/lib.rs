@@ -74,6 +74,8 @@ pub mod database;
 pub mod error;
 /// Index definition and metadata types.
 pub mod index;
+/// BSON key encoding for B+ tree index storage.
+pub mod key_encoding;
 /// Configuration options for database opening and query operations.
 pub mod options;
 /// Operation result types returned by write operations.
