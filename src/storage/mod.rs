@@ -34,3 +34,5 @@ pub(crate) mod lock;
 pub(crate) mod btree;
 #[allow(dead_code)]
 pub(crate) mod catalog;
+#[allow(dead_code)]
+pub(crate) mod secondary_index;
