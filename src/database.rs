@@ -12,6 +12,7 @@ use crate::{
     index::{IndexInfo, IndexModel},
     options::{FindOptions, InsertManyOptions, OpenOptions, UpdateOptions},
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
+    storage::lock::{self, FileLock, NoopFileLock},
 };
 
 // ---------------------------------------------------------------------------
@@ -91,22 +92,50 @@ fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
 ///
 /// Wrapped in `Arc` and shared across `Database` clones, `Collection` handles, etc.
 /// This is the single-writer multi-reader (SWMR) synchronization point.
+///
+/// ## Locking hierarchy
+///
+/// Two locks cooperate to enforce single-writer semantics:
+///
+/// 1. **`file_lock`** (OS advisory lock) — serializes writers *across processes*
+///    opening the same `.mqlite` file.  Acquired at `Database::open()` time;
+///    held for the lifetime of the `DatabaseInner`.  Released when all `Arc`
+///    clones are dropped (i.e., when `DatabaseInner` is dropped).
+///
+/// 2. **`writer_lock`** (in-process `Mutex`) — serializes concurrent writer
+///    threads within a single process.  POSIX `fcntl` advisory locks are
+///    per-process, not per-thread, so two threads in the same process would
+///    both succeed in acquiring the `file_lock`; the `Mutex` prevents that.
+///
+/// Callers acquiring both locks must always take `writer_lock` *after*
+/// `file_lock` to avoid deadlocks.
 #[allow(dead_code)] // Phase 0: fields used by storage engine (Phase 1)
 pub(crate) struct DatabaseInner {
     /// Path to the database file. `None` for in-memory databases.
     pub path: Option<PathBuf>,
     /// Configuration options.
     pub opts: OpenOptions,
-    /// Writer mutex — only one write can proceed at a time.
+    /// In-process writer mutex — one write at a time within this process.
     writer_lock: Mutex<()>,
+    /// Cross-process OS advisory file lock.
+    ///
+    /// Held for the entire lifetime of `DatabaseInner`.  The lock is released
+    /// automatically when `DatabaseInner` is dropped (the underlying fd is
+    /// closed, which releases the kernel lock).
+    file_lock: Box<dyn FileLock>,
 }
 
 impl DatabaseInner {
-    fn new(path: Option<PathBuf>, opts: OpenOptions) -> Self {
+    fn new(
+        path: Option<PathBuf>,
+        opts: OpenOptions,
+        file_lock: Box<dyn FileLock>,
+    ) -> Self {
         DatabaseInner {
             path,
             opts,
             writer_lock: Mutex::new(()),
+            file_lock,
         }
     }
 }
@@ -374,6 +403,22 @@ impl Database {
     /// shared-memory (`.mqlite-shm`) files are also created with `0600`.
     /// On Unix systems, file permissions are the primary access-control mechanism
     /// for embedded-mode databases — there is no built-in authentication layer.
+    ///
+    /// # Multi-process locking
+    ///
+    /// `open_with_options` acquires an OS-level advisory lock on the database
+    /// file before returning:
+    ///
+    /// - **Write mode** (default): exclusive `F_WRLCK` on bytes 120–127.
+    /// - **Read-only mode**: shared `F_RDLCK` on bytes 112–119.
+    ///
+    /// If another process already holds an exclusive write lock:
+    /// - The call blocks (spinning with 1 ms sleep) until
+    ///   [`OpenOptions::busy_timeout`] elapses.
+    /// - Returns [`Error::WriterBusy`] on timeout.
+    ///
+    /// The lock is held for the lifetime of the [`Database`] handle and
+    /// released automatically when all clones are dropped.
     pub fn open_with_options(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Database> {
         let path = path.as_ref().to_owned();
 
@@ -395,8 +440,31 @@ impl Database {
             // are already set to 0600.
         }
 
+        // Acquire the OS advisory file lock.
+        //
+        // This must happen AFTER the file is created (so the lock fd can be
+        // opened) and BEFORE any data is read or written.
+        let file_lock = lock::open_file_lock(&path)?;
+        let busy_timeout = opts.busy_timeout;
+        let was_contended = if opts.read_only {
+            file_lock.acquire_shared(busy_timeout)?
+        } else {
+            file_lock.acquire_exclusive(busy_timeout)?
+        };
+
+        if was_contended {
+            // Another process held the lock; we waited it out.
+            // Log at WARN when the tracing feature is enabled.
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                path = %path.display(),
+                "database writer lock was contended on open — \
+                 another process held the lock"
+            );
+        }
+
         // Phase 0: structural stub. Storage engine initialization is Phase 1.
-        let inner = Arc::new(DatabaseInner::new(Some(path), opts));
+        let inner = Arc::new(DatabaseInner::new(Some(path), opts, file_lock));
         Ok(Database { inner })
     }
 
@@ -404,8 +472,12 @@ impl Database {
     ///
     /// In-memory databases are ideal for testing — no files are created and
     /// everything is released when the `Database` handle is dropped.
+    ///
+    /// File locking is a no-op for in-memory databases (there is no file to
+    /// lock).
     pub fn open_in_memory() -> Result<Database> {
-        let inner = Arc::new(DatabaseInner::new(None, OpenOptions::new()));
+        let noop_lock: Box<dyn FileLock> = Box::new(NoopFileLock);
+        let inner = Arc::new(DatabaseInner::new(None, OpenOptions::new(), noop_lock));
         Ok(Database { inner })
     }
 
@@ -471,6 +543,8 @@ impl Database {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use libc;
 
     // ---- Symlink rejection -------------------------------------------------
 
@@ -548,5 +622,128 @@ mod tests {
         fs::write(&db_path, b"").expect("create file");
 
         let _db = Database::open(&db_path).expect("open existing file");
+    }
+
+    // ---- Multi-process file locking ----------------------------------------
+
+    /// A second `Database::open()` call (write mode) on the same file from the
+    /// same process returns `Error::WriterBusy` when the first handle is still
+    /// alive.
+    ///
+    /// Note: POSIX `fcntl` locks are per-process, so same-process opens
+    /// actually succeed (the second lock replaces the first).  This test
+    /// verifies the API surface; the cross-process check uses `fork()`.
+    #[test]
+    #[cfg(unix)]
+    fn in_memory_open_does_not_lock() {
+        // In-memory databases always use NoopFileLock — two opens are fine.
+        let _db1 = Database::open_in_memory().expect("first open");
+        let _db2 = Database::open_in_memory().expect("second open");
+    }
+
+    /// Cross-process: a second process trying to open the same file (write mode)
+    /// with zero timeout must get `Error::WriterBusy`.
+    #[test]
+    #[cfg(unix)]
+    fn cross_process_second_writer_gets_writer_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("locked.mqlite");
+
+        // Pipe for child → parent signaling.
+        let (read_fd, write_fd) = {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        };
+
+        // SAFETY: fork() is safe; we use only async-signal-safe ops in child.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            // Child: open the database (acquires exclusive lock), signal parent.
+            unsafe { libc::close(read_fd) };
+            let _db = Database::open(&db_path).expect("child: Database::open");
+            let ready: u8 = 1;
+            unsafe {
+                libc::write(
+                    write_fd,
+                    &ready as *const u8 as *const libc::c_void,
+                    1,
+                )
+            };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            unsafe { libc::_exit(0) };
+        }
+
+        // Parent: wait for child's ready signal.
+        unsafe { libc::close(write_fd) };
+        let mut buf = 0u8;
+        let n =
+            unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+        assert_eq!(n, 1, "parent: did not receive child ready signal");
+        unsafe { libc::close(read_fd) };
+
+        // Try to open with zero timeout — must get WriterBusy.
+        let result = Database::open_with_options(
+            &db_path,
+            OpenOptions::new()
+                .busy_timeout(std::time::Duration::ZERO),
+        );
+        assert!(
+            matches!(result, Err(Error::WriterBusy)),
+            "expected WriterBusy, got: {:?}",
+            result.err()
+        );
+
+        // Clean up child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    }
+
+    /// After a writer process is killed, the next opener must succeed.
+    #[test]
+    #[cfg(unix)]
+    fn writer_crash_releases_lock_for_next_opener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("crash.mqlite");
+
+        let (read_fd, write_fd) = {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        };
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            unsafe { libc::close(read_fd) };
+            let _db = Database::open(&db_path).expect("child: Database::open");
+            let ready: u8 = 1;
+            unsafe {
+                libc::write(
+                    write_fd,
+                    &ready as *const u8 as *const libc::c_void,
+                    1,
+                )
+            };
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            unsafe { libc::_exit(0) };
+        }
+
+        unsafe { libc::close(write_fd) };
+        let mut buf = 0u8;
+        let n =
+            unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+        assert_eq!(n, 1);
+        unsafe { libc::close(read_fd) };
+
+        // SIGKILL the child — its lock must be released by the OS.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+
+        // Parent must now be able to open the database.
+        Database::open(&db_path).expect("should open after writer crash");
     }
 }

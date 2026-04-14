@@ -29,3 +29,4 @@ pub(crate) mod page;
 pub(crate) mod buffer_pool;
 #[allow(dead_code)]
 pub(crate) mod allocator;
+pub(crate) mod lock;

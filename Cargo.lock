@@ -551,6 +551,7 @@ dependencies = [
  "bson",
  "crc32c",
  "criterion",
+ "libc",
  "serde",
  "tempfile",
  "thiserror",

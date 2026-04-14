@@ -20,6 +20,9 @@ thiserror = "1"
 crc32c = "0.6.4"
 serde = { version = "1", features = ["derive"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 
 # Optional: wire feature
 tokio = { version = "1", features = ["full"], optional = true }
