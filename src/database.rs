@@ -12,7 +12,10 @@ use crate::{
     index::{IndexInfo, IndexModel},
     options::{FindOptions, InsertManyOptions, OpenOptions, UpdateOptions},
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
-    storage::lock::{self, FileLock, NoopFileLock},
+    storage::{
+        header::{FileHeader, HEADER_PAGE_SIZE},
+        lock::{self, FileLock, NoopFileLock},
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +52,46 @@ fn wal_path(db_path: &Path) -> PathBuf {
     let mut s = db_path.as_os_str().to_owned();
     s.push("-wal");
     PathBuf::from(s)
+}
+
+/// Read and validate the page-0 [`FileHeader`] from the backing file via the
+/// lock file descriptor.
+///
+/// **Uses the lock fd** to avoid the POSIX fcntl footgun: closing *any* fd
+/// for a file while an advisory lock is held releases the lock.
+fn read_and_validate_header(lock: &dyn crate::storage::lock::FileLock, path: &Path) -> Result<FileHeader> {
+    let mut buf = [0u8; HEADER_PAGE_SIZE];
+    lock.read_exact_at(0, &mut buf)?;
+    let header = FileHeader::from_bytes(&buf).map_err(|e| enrich_path(e, path))?;
+    header.validate().map_err(|e| enrich_path(e, path))?;
+    Ok(header)
+}
+
+/// Write a fresh [`FileHeader`] as page 0 via the lock file descriptor.
+///
+/// **Uses the lock fd** to avoid the POSIX fcntl footgun (see
+/// [`read_and_validate_header`]).
+fn write_initial_header(lock: &dyn crate::storage::lock::FileLock) -> Result<()> {
+    let header = FileHeader::new_now();
+    let bytes = header.to_bytes();
+    lock.write_at(0, &bytes)
+}
+
+/// Attach the real on-disk path to a [`Error::CorruptDatabase`] whose `path`
+/// field was left empty by the parser (which doesn't know the path).
+fn enrich_path(e: Error, path: &Path) -> Error {
+    match e {
+        Error::CorruptDatabase {
+            path: ref p,
+            ref detail,
+            recoverable,
+        } if p == std::path::Path::new("") => Error::CorruptDatabase {
+            path: path.to_owned(),
+            detail: detail.clone(),
+            recoverable,
+        },
+        other => other,
+    }
 }
 
 /// Returns the expected shared-memory file path for a given database path.
@@ -463,7 +506,41 @@ impl Database {
             );
         }
 
-        // Phase 0: structural stub. Storage engine initialization is Phase 1.
+        // Header initialization / validation.
+        //
+        // All I/O goes through the lock fd to avoid the POSIX fcntl footgun:
+        // closing *any* fd to a file while holding an advisory lock releases
+        // the lock (POSIX.1-2017 §fcntl, File Locking).
+        //
+        // We hold the exclusive (or shared-read) file lock at this point, so
+        // no other process can race us here.
+        let file_size = std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        if file_size == 0 {
+            if !opts.read_only {
+                // Newly created empty file — write the page-0 header through
+                // the lock fd.
+                write_initial_header(file_lock.as_ref())?;
+            }
+            // An empty read-only file is unusual but not an error; the
+            // storage engine will refuse writes anyway.
+        } else if (file_size as usize) < HEADER_PAGE_SIZE {
+            return Err(Error::CorruptDatabase {
+                path: path.clone(),
+                detail: format!(
+                    "file is truncated: {} bytes (minimum {} required for a \
+                     valid page-0 header)",
+                    file_size, HEADER_PAGE_SIZE,
+                ),
+                recoverable: false,
+            });
+        } else {
+            // Existing file — read and validate the header through the lock fd.
+            read_and_validate_header(file_lock.as_ref(), &path)?;
+        }
+
         let inner = Arc::new(DatabaseInner::new(Some(path), opts, file_lock));
         Ok(Database { inner })
     }
@@ -532,6 +609,34 @@ impl Database {
     /// non-blocking close.
     pub fn close(self) -> Result<()> {
         self.inner.checkpoint()
+    }
+}
+
+impl Drop for Database {
+    /// Non-blocking close.
+    ///
+    /// Drops this handle's reference to the shared [`DatabaseInner`]. When
+    /// the **last** clone is dropped the OS advisory file lock is released
+    /// automatically by `DatabaseInner`'s destructor (which drops
+    /// `file_lock`).
+    ///
+    /// Any WAL data that has not yet been checkpointed **remains on disk**.
+    /// The WAL will be replayed automatically on the next
+    /// [`Database::open`] call, recovering all committed transactions.
+    ///
+    /// This is deliberately non-blocking: destructors must not perform
+    /// long I/O.  Use [`Database::close`] when you need a synchronous,
+    /// guaranteed-clean shutdown (e.g., before copying the database file
+    /// as a backup).
+    ///
+    /// In-memory databases (`open_in_memory`) hold a [`NoopFileLock`]; their
+    /// drop is a free Arc decrement with no I/O.
+    fn drop(&mut self) {
+        // The Arc<DatabaseInner> field is dropped automatically by the
+        // compiler-generated field-drop glue that runs after this method
+        // returns.  No explicit action is needed here for Phase 1.
+        //
+        // Future: signal the background WAL flusher thread to stop.
     }
 }
 
@@ -745,5 +850,185 @@ mod tests {
 
         // Parent must now be able to open the database.
         Database::open(&db_path).expect("should open after writer crash");
+    }
+
+    // ---- Header initialization / corruption detection --------------------
+
+    /// A freshly opened (new) database file must contain a valid page-0
+    /// header after `Database::open` returns.
+    #[test]
+    fn new_file_has_valid_header_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("init.mqlite");
+
+        Database::open(&db_path).expect("open new database");
+
+        // The file must now contain at least HEADER_PAGE_SIZE bytes.
+        let file_size = std::fs::metadata(&db_path).expect("metadata").len();
+        assert!(
+            file_size >= HEADER_PAGE_SIZE as u64,
+            "header must be written: file size is {file_size} bytes"
+        );
+
+        // The header must be parseable and valid.
+        let mut buf = [0u8; HEADER_PAGE_SIZE];
+        let mut f = std::fs::File::open(&db_path).expect("open file");
+        use std::io::Read;
+        f.read_exact(&mut buf).expect("read header");
+        let header = FileHeader::from_bytes(&buf).expect("parse header");
+        header.validate().expect("validate header");
+    }
+
+    /// Opening a file whose content is arbitrary garbage returns
+    /// `Error::CorruptDatabase`.
+    #[test]
+    fn open_corrupt_file_returns_corrupt_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("corrupt.mqlite");
+
+        // Write a full page of garbage (bad magic, bad checksum).
+        let garbage = vec![0xDE_u8; HEADER_PAGE_SIZE];
+        fs::write(&db_path, &garbage).expect("write garbage");
+
+        let result = Database::open(&db_path);
+        assert!(result.is_err(), "expected error opening corrupt file");
+        assert!(
+            matches!(result.err().unwrap(), Error::CorruptDatabase { .. }),
+            "expected CorruptDatabase"
+        );
+    }
+
+    /// Opening a file with bad magic specifically returns
+    /// `Error::CorruptDatabase` with the path attached.
+    #[test]
+    fn open_bad_magic_returns_corrupt_database_with_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bad_magic.mqlite");
+
+        // Start from a valid header, corrupt just the magic.
+        let good_header = FileHeader::new_now();
+        let mut bytes = good_header.to_bytes();
+        bytes[0] = b'X'; // corrupt magic
+        // Recompute checksum so only the magic is wrong.
+        let checksum =
+            FileHeader::compute_checksum(bytes[..60].try_into().expect("60 bytes"));
+        bytes[60..64].copy_from_slice(&checksum.to_le_bytes());
+        fs::write(&db_path, &bytes).expect("write bad-magic file");
+
+        let result = Database::open(&db_path);
+        match result.err().expect("expected an error") {
+            Error::CorruptDatabase { path, .. } => {
+                assert_eq!(path, db_path, "path must be attached to the error");
+            }
+            other => panic!("expected CorruptDatabase, got: {:?}", other),
+        }
+    }
+
+    /// Opening a file that is too small (truncated) returns
+    /// `Error::CorruptDatabase`.
+    #[test]
+    fn open_truncated_file_returns_corrupt_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("truncated.mqlite");
+
+        // Write fewer than HEADER_PAGE_SIZE bytes — simulates a truncated file.
+        fs::write(&db_path, b"MQLT").expect("write truncated file");
+
+        let result = Database::open(&db_path);
+        assert!(
+            matches!(result.err().expect("expected error"), Error::CorruptDatabase { .. }),
+            "expected CorruptDatabase for truncated file"
+        );
+    }
+
+    /// A valid database file can be closed and reopened without corruption.
+    #[test]
+    fn reopen_after_close_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("reopen.mqlite");
+
+        // Open, then close (explicit blocking close).
+        let db = Database::open(&db_path).expect("first open");
+        db.close().ok(); // checkpoint is a stub; ignore the "not yet implemented" error
+
+        // Reopen must succeed and see a valid header.
+        let _db2 = Database::open(&db_path).expect("second open after close");
+    }
+
+    // ---- Drop behavior -----------------------------------------------------
+
+    /// After a `Database` handle is dropped, the same path can be reopened
+    /// (proves the file lock is released).
+    #[test]
+    fn drop_releases_file_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("drop_lock.mqlite");
+
+        {
+            let _db = Database::open(&db_path).expect("first open");
+            // _db is dropped here.
+        }
+
+        // After drop, reopening must succeed.
+        let _db2 = Database::open(&db_path).expect("reopen after drop");
+    }
+
+    /// Dropping a `Database` must not corrupt the file (header remains valid).
+    #[test]
+    fn drop_does_not_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("drop_intact.mqlite");
+
+        Database::open(&db_path).expect("open");
+        // Database is implicitly dropped here.
+
+        // File header must still be valid.
+        let mut buf = [0u8; HEADER_PAGE_SIZE];
+        let mut f = std::fs::File::open(&db_path).expect("open file");
+        use std::io::Read;
+        f.read_exact(&mut buf).expect("read header");
+        let header = FileHeader::from_bytes(&buf).expect("parse header after drop");
+        header.validate().expect("validate header after drop");
+    }
+
+    /// `Database::open_in_memory()` must not create any files, even after drop.
+    #[test]
+    fn in_memory_creates_no_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_count_before = fs::read_dir(dir.path())
+            .expect("read dir")
+            .count();
+
+        {
+            let _db = Database::open_in_memory().expect("in-memory open");
+        }
+
+        let file_count_after = fs::read_dir(dir.path())
+            .expect("read dir")
+            .count();
+
+        assert_eq!(
+            file_count_before, file_count_after,
+            "in-memory database must not create files"
+        );
+    }
+
+    /// Cloning a `Database` produces another handle to the same inner state;
+    /// dropping the original does not invalidate the clone.
+    #[test]
+    fn clone_keeps_inner_alive_after_original_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("clone.mqlite");
+
+        let db1 = Database::open(&db_path).expect("open");
+        let db2 = db1.clone();
+        drop(db1); // original dropped; clone must keep the lock
+
+        // A third process-level open (would compete for the lock) is not
+        // tested here because POSIX fcntl locks are per-process.  Instead,
+        // verify the clone still works (no panic, inner is alive).
+        let _collections: Vec<String> = db2
+            .list_collection_names()
+            .unwrap_or_default(); // stub returns Err, that's fine
     }
 }

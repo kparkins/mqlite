@@ -142,6 +142,26 @@ pub(crate) trait FileLock: Send + Sync {
     /// (the underlying file descriptor is closed).  Call this explicitly when
     /// you need the release to happen before the `FileLock` is dropped.
     fn release(&self) -> Result<()>;
+
+    /// Write `data` to the backing file at absolute byte offset `offset`.
+    ///
+    /// **Must use the lock file descriptor**, never open a new fd.
+    ///
+    /// ## POSIX footgun
+    ///
+    /// POSIX requires that closing *any* file descriptor for a file releases
+    /// *all* advisory locks the process holds on that file (see POSIX.1-2017
+    /// §fcntl, File Locking). Therefore any I/O that occurs while the advisory
+    /// lock is held **must** go through this method — not through a freshly
+    /// opened (and therefore soon-closed) file descriptor.
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
+
+    /// Read exactly `buf.len()` bytes from the backing file at absolute byte
+    /// offset `offset` into `buf`.
+    ///
+    /// Same POSIX footgun caveat as [`write_at`](FileLock::write_at) — use
+    /// this instead of opening a new fd while the lock is held.
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +185,20 @@ impl FileLock for NoopFileLock {
 
     fn release(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<()> {
+        // In-memory databases have no backing file to write.
+        Err(Error::Internal(
+            "NoopFileLock::write_at: no backing file (in-memory database)".into(),
+        ))
+    }
+
+    fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
+        // In-memory databases have no backing file to read.
+        Err(Error::Internal(
+            "NoopFileLock::read_exact_at: no backing file (in-memory database)".into(),
+        ))
     }
 }
 
@@ -283,6 +317,16 @@ impl PosixFileLock {
 
 #[cfg(unix)]
 impl FileLock for PosixFileLock {
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_all_at(data, offset).map_err(Error::Io)
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buf, offset).map_err(Error::Io)
+    }
+
     fn acquire_exclusive(&self, timeout: Duration) -> Result<bool> {
         self.acquire_with_timeout(
             libc::F_WRLCK as libc::c_short,
@@ -350,6 +394,20 @@ impl WindowsFileLock {
 
 #[cfg(windows)]
 impl FileLock for WindowsFileLock {
+    fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<()> {
+        // TODO (hq-dr9): implement using WriteFile at offset via OVERLAPPED.
+        Err(Error::Internal(
+            "WindowsFileLock::write_at: not yet implemented (hq-dr9)".into(),
+        ))
+    }
+
+    fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
+        // TODO (hq-dr9): implement using ReadFile at offset via OVERLAPPED.
+        Err(Error::Internal(
+            "WindowsFileLock::read_exact_at: not yet implemented (hq-dr9)".into(),
+        ))
+    }
+
     fn acquire_exclusive(&self, _timeout: Duration) -> Result<bool> {
         // TODO (hq-dr9): implement using LockFileEx() with LOCKFILE_EXCLUSIVE_LOCK.
         // The OVERLAPPED structure's Offset/OffsetHigh fields map to the byte
