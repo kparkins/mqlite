@@ -2,6 +2,27 @@
 
 All mqlite operations return `mqlite::Result<T>`, which is `Result<T, mqlite::Error>`.
 
+```rust
+use mqlite::{Database, Error};
+
+let db = Database::open("myapp.mqlite")?;
+let users = db.collection::<bson::Document>("users");
+
+match users.find_one(bson::doc! { "_id": "missing" }) {
+    Ok(Some(doc)) => println!("found: {doc:?}"),
+    Ok(None)      => println!("not found"),
+    Err(e)        => {
+        eprintln!("error: {e}");
+        // Access MongoDB-compatible error code if available:
+        if let Some(code) = e.code() {
+            eprintln!("MongoDB error code: {code}");
+        }
+    }
+}
+```
+
+---
+
 ## Error Variants
 
 ### `Error::Io`
@@ -9,18 +30,49 @@ All mqlite operations return `mqlite::Result<T>`, which is `Result<T, mqlite::Er
 An OS-level I/O error (permissions, disk full, file not found).
 
 **Common causes:**
-- Path to database directory does not exist
-- Process lacks write permission on the database file
+- Path to the database directory does not exist
+- Process lacks read/write permission on the database file or its directory
+- The underlying storage device was removed
 
-**Recovery:** Check file system permissions and available disk space.
+**Recovery:**
+```rust
+use mqlite::{Database, Error};
+use std::io::ErrorKind;
+
+match Database::open("myapp.mqlite") {
+    Err(Error::Io(e)) if e.kind() == ErrorKind::PermissionDenied => {
+        eprintln!("Permission denied — check file ownership and mode");
+    }
+    Err(Error::Io(e)) if e.kind() == ErrorKind::NotFound => {
+        eprintln!("Parent directory does not exist — create it first");
+    }
+    Err(Error::Io(e)) => eprintln!("I/O error: {e}"),
+    Ok(db) => { /* use db */ }
+    Err(e) => eprintln!("other error: {e}"),
+}
+```
 
 ---
 
 ### `Error::WriterBusy`
 
-Another writer process already holds the exclusive lock on the database file.
+Another writer is holding the exclusive write lock on the database file.
 
-mqlite uses a single-writer model: only one process may write at a time.
+**The single-writer model:** mqlite enforces one writer at a time via two
+cooperating locks:
+
+1. **OS advisory lock** (`fcntl`/`LockFileEx`) — prevents two *processes* from
+   writing simultaneously to the same `.mqlite` file.
+2. **In-process `Mutex`** — prevents two *threads within the same process* from
+   writing simultaneously (POSIX advisory locks are per-process, not per-thread).
+
+`WriterBusy` is returned when either lock cannot be acquired within the configured
+busy timeout.
+
+**Common causes:**
+- Another process has the database open for writing (check with `lsof myapp.mqlite`)
+- Two threads in the same process are both trying to write without coordination
+- The busy timeout is too short for your workload
 
 **Recovery options:**
 
@@ -28,23 +80,76 @@ mqlite uses a single-writer model: only one process may write at a time.
 use mqlite::{Database, OpenOptions};
 use std::time::Duration;
 
-// Option 1: set a busy timeout (blocks until lock is available or timeout)
+// ── Option 1: set a busy timeout ────────────────────────────────────────────
+// Block until the lock is available or the timeout expires.
+// Use this when you expect brief contention (e.g., background checkpoint).
 let db = Database::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_timeout(Duration::from_secs(5)),
 )?;
 
-// Option 2: custom busy handler
+// ── Option 2: custom busy handler ────────────────────────────────────────────
+// Called repeatedly while contended. Return true to retry, false to give up.
+// `attempts` counts how many times the handler has been called so far.
 let db = Database::open_with_options(
     "myapp.mqlite",
-    OpenOptions::new().busy_handler(|attempts| attempts < 10),
+    OpenOptions::new().busy_handler(|attempts| {
+        std::thread::sleep(Duration::from_millis(50));
+        attempts < 20  // retry up to 20 times (~1 second total)
+    }),
 )?;
 
-// Option 3: open read-only (does not need exclusive lock)
+// ── Option 3: immediate failure ───────────────────────────────────────────────
+// Use Duration::ZERO to fail immediately on contention (SQLite-style BUSY).
+let db = Database::open_with_options(
+    "myapp.mqlite",
+    OpenOptions::new().busy_timeout(Duration::ZERO),
+)?;
+
+// ── Option 4: open read-only ──────────────────────────────────────────────────
+// Readers never block writers. Multiple read-only opens are allowed concurrently.
 let db = Database::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().read_only(true),
 )?;
+# Ok::<(), mqlite::Error>(())
+```
+
+> **Note:** For multi-threaded write patterns, see [CONCURRENCY.md](CONCURRENCY.md).
+
+---
+
+### `Error::BsonSerialization`
+
+A Rust value could not be serialized to BSON.
+
+**Common causes:**
+- Using non-string map keys (BSON requires string keys)
+- Serializing a type that doesn't implement `Serialize`
+- A floating-point NaN or infinity (not valid in BSON)
+
+**Recovery:** Fix the data model. Ensure all map keys are `String` and all values
+are BSON-compatible.
+
+---
+
+### `Error::BsonDeserialization`
+
+BSON data retrieved from the database could not be deserialized into your Rust type.
+
+**Common causes:**
+- Schema mismatch: document has a field with a different type than your struct expects
+- Missing required fields in a document that predates a schema change
+- Using `Collection<MyStruct>` when the collection was written via `Collection<Document>`
+
+**Recovery:**
+```rust
+use mqlite::Database;
+use bson::Document;  // Use Document for schema-agnostic access
+
+let db = Database::open("myapp.mqlite")?;
+// Use Document instead of a struct when the schema is uncertain
+let col = db.collection::<Document>("users");
 # Ok::<(), mqlite::Error>(())
 ```
 
@@ -56,116 +161,345 @@ A write violated a unique index constraint.
 
 **MongoDB error code:** 11000
 
-**Recovery:** Either use a different key value or use `upsert` if you want to
-replace an existing document.
+**Common causes:**
+- Inserting a document whose `_id` already exists in the collection
+- Inserting a document that violates a user-defined unique index
+
+**Recovery:**
+
+```rust
+use mqlite::{Database, Error, doc};
+
+let db = Database::open_in_memory()?;
+let users = db.collection::<bson::Document>("users");
+
+let result = users.insert_one(&doc! { "_id": "alice", "name": "Alice" });
+match result {
+    Err(Error::DuplicateKey { detail }) => {
+        eprintln!("Duplicate key: {detail}");
+        // Either skip the insert or use upsert to replace the existing document
+    }
+    Ok(_) => {}
+    Err(e) => return Err(e),
+}
+
+// Use upsert to replace-or-insert in one operation:
+use mqlite::options::UpdateOptions;
+users.update_one_with_options(
+    doc! { "_id": "alice" },
+    doc! { "$set": { "name": "Alice Updated" } },
+    UpdateOptions::new().upsert(true),
+)?;
+# Ok::<(), mqlite::Error>(())
+```
 
 ---
 
 ### `Error::CorruptDatabase`
 
-The database file header is invalid, truncated, or has a bad checksum.
+The database file is structurally invalid: the header magic is wrong, the file
+is truncated, or a page checksum is bad.
+
+**When it occurs:** Usually at `Database::open()` time when the header is read.
+Can also occur mid-operation if storage pages are corrupted.
+
+**Fields:**
+- `path` — path to the corrupt file
+- `detail` — human-readable description of the corruption
+- `recoverable` — `true` if the last checkpointed pages may still be readable
 
 **Recovery options:**
-- Open in read-only mode to access the last checkpointed state
-- Restore from a backup
-- Phase 2 will add `Database::repair()`
+
+```rust
+use mqlite::{Database, Error, OpenOptions};
+
+match Database::open("myapp.mqlite") {
+    Err(Error::CorruptDatabase { path, detail, recoverable }) => {
+        eprintln!("Corrupt database at {path:?}: {detail}");
+        if recoverable {
+            // Try read-only mode to access the last good checkpoint
+            let db = Database::open_with_options(
+                &path,
+                OpenOptions::new().read_only(true),
+            )?;
+            // Export what you can, then restore from backup
+        } else {
+            eprintln!("Restore from backup required");
+        }
+    }
+    Ok(db) => { /* use db */ }
+    Err(e) => return Err(e),
+}
+# Ok::<(), mqlite::Error>(())
+```
+
+> **Phase 2:** `Database::repair()` for automated recovery is planned.
+
+---
+
+### `Error::DiskFull`
+
+A write operation failed because the filesystem has no space remaining.
+
+**Fields:**
+- `path` — path to the database file
+- `required_bytes` — bytes needed for the write
+- `available_bytes` — bytes currently available on the device
+- `suggestion` — human-readable remediation hint
+
+**Recovery:**
+
+```rust
+use mqlite::{Database, Error, doc};
+
+let db = Database::open("myapp.mqlite")?;
+let logs = db.collection::<bson::Document>("logs");
+
+match logs.insert_one(&doc! { "msg": "hello" }) {
+    Err(Error::DiskFull { required_bytes, available_bytes, .. }) => {
+        eprintln!(
+            "Disk full: need {required_bytes} bytes, only {available_bytes} available"
+        );
+        // Free disk space, then retry
+    }
+    Ok(_) => {}
+    Err(e) => return Err(e),
+}
+# Ok::<(), mqlite::Error>(())
+```
 
 ---
 
 ### `Error::SymlinkRejected`
 
 The database path points to a symlink. mqlite refuses to follow symlinks to
-prevent symlink attacks (see security.md threat #12).
+prevent symlink-based path traversal attacks (see WIRE-SECURITY.md §Threat 12).
 
 **MongoDB error code:** 2 (BAD_VALUE)
 
-**Recovery:** Open the real file path directly.
-
----
-
-### `Error::DiskFull`
-
-A write failed because the disk is full.
-
-The error includes:
-- `required_bytes` — bytes needed
-- `available_bytes` — bytes available
-
-**Recovery:** Free disk space, then retry.
-
----
-
-### `Error::UnsupportedOperator`
-
-A query filter or update used an operator not supported in Phase 1.
-
-**MongoDB error code:** 9
-
-See the [Compatibility Matrix](COMPATIBILITY.md) for the full list of supported operators.
-
----
-
-### `Error::UnsupportedIndexOption`
-
-`create_index` was called with an unsupported index type (TTL, text, geospatial, hashed).
-
-**MongoDB error code:** 67 (CannotCreateIndex)
-
-Supported types: single-field, compound, unique, sparse, multikey.
-
----
-
-### `Error::DocumentTooLarge`
-
-The document exceeds the 16MB BSON size limit.
-
-**MongoDB error code:** 10334
-
----
-
-### `Error::DocumentValidationFailure`
-
-The document failed structural validation (nesting too deep, too many fields, invalid field names).
-
-**MongoDB error code:** 121
-
----
-
-### `Error::CursorNotFound`
-
-The referenced cursor has expired or does not exist (wire protocol only).
-
-**MongoDB error code:** 43
+**Recovery:** Provide the real (non-symlink) path to the database file.
 
 ---
 
 ### `Error::CollectionNotFound`
 
-The referenced collection does not exist.
+A collection-level operation was attempted on a collection that doesn't exist.
 
-**MongoDB error code:** 26
+**MongoDB error code:** 26 (NamespaceNotFound)
+
+**When it occurs:** `drop_index`, or wire protocol commands that require the
+collection to exist. `insert_one` and `find` create the collection implicitly.
+
+**Recovery:**
+```rust
+use mqlite::{Database, Error};
+
+let db = Database::open_in_memory()?;
+let col = db.collection::<bson::Document>("events");
+
+match col.drop_index("myindex") {
+    Err(Error::CollectionNotFound { name }) => {
+        eprintln!("Collection '{name}' does not exist — skipping drop");
+    }
+    Ok(_) => {}
+    Err(e) => return Err(e),
+}
+# Ok::<(), mqlite::Error>(())
+```
+
+---
+
+### `Error::CursorNotFound`
+
+The cursor ID referenced by a `getMore` or `killCursors` command does not exist
+or has already expired. This error only occurs via the wire protocol.
+
+**MongoDB error code:** 43 (CursorNotFound)
+
+**Common causes:**
+- Cursor was already exhausted by a prior `getMore`
+- Cursor was explicitly killed with `killCursors`
+- Server restarted and in-memory cursor state was lost
+
+**Recovery:** Re-run the original `find` command to get a new cursor.
+
+---
+
+### `Error::UnsupportedOperator`
+
+A query filter or update document used an MQL operator not supported in Phase 1.
+
+**MongoDB error code:** 9
+
+**Common causes:**
+- Using `$text`, `$expr`, `$where`, or `$mod` in a filter
+- Using `$bit` in an update
+- Using positional operators (`$`, `$[]`) in an update
+
+**Recovery:**
+```rust
+use mqlite::{Database, Error, doc};
+
+let db = Database::open_in_memory()?;
+let col = db.collection::<bson::Document>("items");
+
+match col.find_one(doc! { "text": { "$text": { "$search": "hello" } } }) {
+    Err(Error::UnsupportedOperator { operator }) => {
+        eprintln!("Operator '{operator}' is not supported — see COMPATIBILITY.md");
+    }
+    Ok(result) => { /* ... */ }
+    Err(e) => return Err(e),
+}
+# Ok::<(), mqlite::Error>(())
+```
+
+See [COMPATIBILITY.md](COMPATIBILITY.md) for the complete list of supported operators.
+
+---
+
+### `Error::UnsupportedCommand`
+
+A wire protocol command is not supported by mqlite's Phase 1 implementation.
+Commands return error code 59 (CommandNotFound) to the driver.
+
+**Common causes:**
+- Using `aggregate`, `distinct`, `count`, or `explain` via the wire protocol
+- Using authentication commands (mqlite has no auth layer in Phase 1)
+
+**Recovery:** Use the mqlite native Rust API for operations not yet supported
+over the wire protocol.
+
+---
+
+### `Error::UnsupportedIndexOption`
+
+`create_index` was called with an unsupported index type or option.
+
+**MongoDB error code:** 67 (CannotCreateIndex)
+
+**Common causes:**
+- Requesting a TTL index (`expireAfterSeconds`)
+- Requesting a text, geospatial, or hashed index
+- Requesting a partial or wildcard index
+
+**Recovery:**
+```rust
+use mqlite::{Database, IndexModel, options::IndexOptions, doc};
+
+let db = Database::open_in_memory()?;
+let col = db.collection::<bson::Document>("users");
+
+// Supported: unique index on a field
+col.create_index(IndexModel {
+    keys: doc! { "email": 1 },
+    options: Some(IndexOptions::new().unique(true)),
+})?;
+# Ok::<(), mqlite::Error>(())
+```
+
+Supported index types: single-field, compound, unique, sparse, multikey.
+See [COMPATIBILITY.md](COMPATIBILITY.md#index-types).
+
+---
+
+### `Error::DocumentTooLarge`
+
+The document exceeds the 16,777,216 byte (16MB) BSON-serialized size limit.
+
+**MongoDB error code:** 10334
+
+**Fields:**
+- `size` — actual serialized size of the document in bytes
+- `max` — maximum allowed size (16,777,216)
+
+**Recovery:** Split large documents into smaller ones, or store large payloads
+in separate files and reference them by path or ID.
+
+---
+
+### `Error::DocumentValidationFailure`
+
+The document failed one of mqlite's structural validation checks.
+
+**MongoDB error code:** 121
+
+**What is checked:**
+- Nesting depth (maximum 100 levels)
+- Field count per document (maximum 100 fields at any level)
+- Field names must not begin with `$` at the top level of an update
+
+**Recovery:** Simplify deeply nested documents or split high-field-count documents.
 
 ---
 
 ### `Error::InvalidWireMessage`
 
-The wire protocol received a malformed message (wrong magic, size exceeds limit, unsupported opcode).
+The wire protocol received a message that is malformed, exceeds the maximum
+message size, or uses an unsupported opcode.
 
 **MongoDB error code:** 48 (IllegalOperation)
+
+**Common causes:**
+- Client sent OP_COMPRESSED (opcode 2012) — mqlite does not support compression
+- Message header magic bytes are wrong (not a MongoDB message)
+- Message size field exceeds the 48MB OP_MSG limit
+
+**Recovery:** Ensure the client uses an uncompressed connection. With pymongo:
+```python
+client = MongoClient(
+    "mongodb://localhost:27017",
+    directConnection=True,
+    compressors=[],  # disable compression
+)
+```
 
 ---
 
 ### `Error::Internal`
 
-An internal invariant was violated. This should not happen in correct usage.
+An internal invariant was violated. This indicates a bug in mqlite.
 
 **MongoDB error code:** 1
 
-If you encounter this, please file a bug report.
+This error should never occur during normal usage. If you encounter it, please
+file a bug report at https://github.com/kparkins/mqlite/issues with:
+- The full error message (including the internal detail string)
+- A minimal reproduction case
+
+---
+
+## Matching on `Error`
+
+`Error` is `#[non_exhaustive]`, so match arms should include a catch-all:
+
+```rust
+use mqlite::{Database, Error, doc};
+
+fn handle_write(db: &Database) -> mqlite::Result<()> {
+    let col = db.collection::<bson::Document>("items");
+    match col.insert_one(&doc! { "x": 1 }) {
+        Ok(_) => {}
+        Err(Error::WriterBusy) => {
+            eprintln!("Writer busy — retry with backoff");
+        }
+        Err(Error::DuplicateKey { detail }) => {
+            eprintln!("Duplicate: {detail}");
+        }
+        Err(Error::DiskFull { required_bytes, .. }) => {
+            eprintln!("Disk full — need {required_bytes} more bytes");
+        }
+        Err(e) => return Err(e),  // propagate other errors
+    }
+    Ok(())
+}
+```
+
+---
 
 ## MongoDB Error Codes
 
-mqlite maps errors to MongoDB error codes for wire protocol compatibility:
+mqlite maps errors to MongoDB error codes for wire protocol compatibility.
+Drivers that inspect the `code` field of the error response will receive these values.
 
 | Code | Constant | Variant |
 |------|----------|---------|
@@ -176,7 +510,20 @@ mqlite maps errors to MongoDB error codes for wire protocol compatibility:
 | 43 | `CURSOR_NOT_FOUND` | `Error::CursorNotFound` |
 | 48 | `ILLEGAL_OP` | `Error::InvalidWireMessage` |
 | 67 | `CANNOT_CREATE_INDEX` | `Error::UnsupportedIndexOption` |
-| 115 | `UNSUPPORTED_FORMAT` | — |
+| 115 | `UNSUPPORTED_FORMAT` | *(internal: bad database file format)* |
 | 121 | `DOCUMENT_VALIDATION_FAILURE` | `Error::DocumentValidationFailure` |
 | 10334 | `DOCUMENT_TOO_LARGE` | `Error::DocumentTooLarge` |
 | 11000 | `DUPLICATE_KEY` | `Error::DuplicateKey` |
+
+Use `error.code()` to retrieve the code from a Rust `Error` value:
+
+```rust
+use mqlite::Error;
+
+fn log_error(e: &Error) {
+    match e.code() {
+        Some(code) => eprintln!("mqlite error (code {code}): {e}"),
+        None        => eprintln!("mqlite error: {e}"),
+    }
+}
+```
