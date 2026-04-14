@@ -14,6 +14,12 @@ pub mod codes {
     pub const NAMESPACE_NOT_FOUND: i32 = 26;
     /// The database file format is not supported.
     pub const UNSUPPORTED_FORMAT: i32 = 115;
+    /// A document failed schema validation or structural constraints.
+    /// Matches MongoDB error code 121.
+    pub const DOCUMENT_VALIDATION_FAILURE: i32 = 121;
+    /// A document exceeds the maximum allowed size (16MB).
+    /// Matches MongoDB error code 10334.
+    pub const DOCUMENT_TOO_LARGE: i32 = 10334;
 }
 
 /// The primary error type for mqlite operations.
@@ -121,6 +127,35 @@ pub enum Error {
     /// An internal error occurred that should never happen in correct usage.
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// A document failed structural validation (nesting depth, field count, or field name
+    /// constraints). MongoDB error code 121.
+    #[error("Document failed validation: {detail}")]
+    DocumentValidationFailure {
+        /// Human-readable description of which constraint was violated.
+        detail: String,
+    },
+
+    /// A document exceeds the maximum allowed BSON-serialized size of 16,777,216 bytes.
+    /// MongoDB error code 10334.
+    #[error(
+        "Document too large: {size} bytes exceeds maximum {max} bytes \
+         (BSON-serialized document size)"
+    )]
+    DocumentTooLarge {
+        /// Serialized size of the document in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes (16,777,216 for mqlite).
+        max: usize,
+    },
+
+    /// The database path points to a symlink, which mqlite refuses to follow for
+    /// security reasons (symlink attack prevention).
+    #[error("Refusing to open symlink at path: {path:?}")]
+    SymlinkRejected {
+        /// The path that was detected as a symlink.
+        path: std::path::PathBuf,
+    },
 }
 
 impl Error {
@@ -131,6 +166,9 @@ impl Error {
             Error::CollectionNotFound { .. } => Some(codes::NAMESPACE_NOT_FOUND),
             Error::CursorNotFound { .. } => Some(codes::CURSOR_NOT_FOUND),
             Error::Internal(_) => Some(codes::INTERNAL_ERROR),
+            Error::DocumentValidationFailure { .. } => Some(codes::DOCUMENT_VALIDATION_FAILURE),
+            Error::DocumentTooLarge { .. } => Some(codes::DOCUMENT_TOO_LARGE),
+            Error::SymlinkRejected { .. } => Some(codes::BAD_VALUE),
             _ => None,
         }
     }

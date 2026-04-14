@@ -82,6 +82,7 @@ pub mod results;
 // Internal modules (not public API)
 mod query;
 mod storage;
+mod validation;
 mod wal;
 
 // Wire protocol shim (feature-gated)
