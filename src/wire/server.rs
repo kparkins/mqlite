@@ -31,6 +31,7 @@
 //! - OP_QUERY → OP_REPLY  (initial handshake only)
 //! - OP_MSG   → OP_MSG    (all subsequent commands)
 
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicI32, Ordering},
     Arc,
@@ -54,6 +55,119 @@ const OP_QUERY: i32 = 2004;
 
 /// OP_REPLY — legacy response opcode for OP_QUERY messages.
 const OP_REPLY: i32 = 1;
+
+// ---------------------------------------------------------------------------
+// Cursor idle timeout and per-connection cursor state
+// ---------------------------------------------------------------------------
+
+/// Cursors not accessed for longer than this duration are evicted.
+const CURSOR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A buffered cursor stored in the per-connection cursor map.
+#[allow(dead_code)] // cursor field used when data commands (getMore, killCursors) are added
+struct StoredCursor {
+    /// The buffered cursor data.
+    cursor: crate::Cursor<bson::Document>,
+    /// When this cursor was last accessed (used for idle eviction).
+    last_accessed: std::time::Instant,
+}
+
+/// Per-connection cursor state.
+///
+/// Tracks all open server-side cursors for one TCP connection.  When
+/// [`ConnectionCursors`] is dropped (i.e., when the connection closes),
+/// every stored cursor is released automatically — satisfying the
+/// acceptance criterion "connection close releases all associated cursors".
+struct ConnectionCursors {
+    /// Cursor ID → stored cursor.
+    cursors: HashMap<i64, StoredCursor>,
+    /// Monotonically increasing cursor ID counter.  Starts at 1; cursor ID 0
+    /// is reserved in the MongoDB wire protocol to mean "no cursor".
+    next_cursor_id: i64,
+}
+
+#[allow(dead_code)] // methods used when data commands (getMore, killCursors) are added
+impl ConnectionCursors {
+    fn new() -> Self {
+        ConnectionCursors {
+            cursors: HashMap::new(),
+            next_cursor_id: 1,
+        }
+    }
+
+    /// Store `cursor` and return its assigned cursor ID.
+    fn store(&mut self, cursor: crate::Cursor<bson::Document>) -> i64 {
+        let id = self.next_cursor_id;
+        // Cursor ID 0 is reserved; skip it on overflow.
+        self.next_cursor_id = self.next_cursor_id.wrapping_add(1).max(1);
+        self.cursors.insert(
+            id,
+            StoredCursor {
+                cursor,
+                last_accessed: std::time::Instant::now(),
+            },
+        );
+        id
+    }
+
+    /// Remove and return the cursor identified by `id`, if present.
+    fn remove(&mut self, id: i64) -> Option<crate::Cursor<bson::Document>> {
+        self.cursors.remove(&id).map(|e| e.cursor)
+    }
+
+    /// Return a mutable reference to the cursor for `id`, refreshing its
+    /// last-accessed timestamp.  Returns `None` if the cursor is not found.
+    fn get_mut(&mut self, id: i64) -> Option<&mut crate::Cursor<bson::Document>> {
+        self.cursors.get_mut(&id).map(|e| {
+            e.last_accessed = std::time::Instant::now();
+            &mut e.cursor
+        })
+    }
+
+    /// Evict cursors that have been idle for longer than `timeout`.
+    ///
+    /// Returns the number of cursors evicted.
+    fn evict_idle(&mut self, timeout: std::time::Duration) -> usize {
+        let before = self.cursors.len();
+        self.cursors
+            .retain(|_, entry| entry.last_accessed.elapsed() < timeout);
+        before - self.cursors.len()
+    }
+
+    /// Number of currently open cursors.
+    fn len(&self) -> usize {
+        self.cursors.len()
+    }
+}
+
+/// Background task: periodically evict idle cursors for one connection.
+///
+/// Sweeps every 60 seconds using [`CURSOR_IDLE_TIMEOUT`].  Exits when
+/// `shutdown_rx` resolves, which happens automatically when the corresponding
+/// sender is dropped (i.e., when the connection handler returns).
+async fn cursor_sweep_task(
+    cursors: Arc<std::sync::Mutex<ConnectionCursors>>,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let mut c = cursors.lock().unwrap_or_else(|e| e.into_inner());
+                let _evicted = c.evict_idle(CURSOR_IDLE_TIMEOUT);
+                #[cfg(feature = "tracing")]
+                if _evicted > 0 {
+                    tracing::debug!(
+                        target: "mqlite",
+                        evicted = _evicted,
+                        "mqlite::wire::cursor_evict"
+                    );
+                }
+            }
+            _ = &mut shutdown_rx => break,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -199,6 +313,18 @@ impl WireProtocol {
 
         let addr = addr.to_owned();
 
+        // Security: warn when binding to all interfaces — mqlite Phase 1 has
+        // no authentication, so 0.0.0.0 exposes the server to the entire
+        // network.  Default recommended bind is 127.0.0.1 (localhost only).
+        if addr.starts_with("0.0.0.0") {
+            eprintln!(
+                "mqlite WARNING: wire protocol server bound to {addr} — \
+                 accessible from all network interfaces. \
+                 Phase 1 has no authentication. \
+                 Use 127.0.0.1 for local-only access."
+            );
+        }
+
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -270,6 +396,15 @@ async fn accept_loop(listener: tokio::net::TcpListener, state: ServerState) {
 async fn handle_connection(mut stream: TcpStream, state: ServerState) {
     let connection_id = state.next_conn_id();
     let mut next_request_id: i32 = 1;
+
+    // Per-connection cursor map.  Dropped automatically when this function
+    // returns, releasing all cursors associated with this connection.
+    let cursors = Arc::new(std::sync::Mutex::new(ConnectionCursors::new()));
+
+    // Spawn a background task to evict idle cursors (600 s timeout, 60 s sweep).
+    // The task exits when `_sweep_shutdown` is dropped (end of this function).
+    let (_sweep_shutdown, sweep_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(cursor_sweep_task(Arc::clone(&cursors), sweep_rx));
 
     loop {
         // Read the 16-byte header to determine the opcode.
@@ -426,6 +561,59 @@ fn build_op_reply(request_id: i32, response_to: i32, body: &Document) -> Result<
 }
 
 // ---------------------------------------------------------------------------
+// $db validation helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the database name from an OP_QUERY body buffer.
+///
+/// OP_QUERY body layout (after the 16-byte `MsgHeader`):
+/// ```text
+/// flags             : int32
+/// fullCollectionName: cstring  (e.g. "admin.$cmd")
+/// numberToSkip      : int32
+/// numberToReturn    : int32
+/// query             : BSON document
+/// ```
+///
+/// Returns the part of `fullCollectionName` before the first `'.'` (the
+/// database name), or `None` if the buffer is too short or not valid UTF-8.
+fn parse_op_query_db_name(buf: &[u8]) -> Option<String> {
+    if buf.len() < 5 {
+        return None;
+    }
+    // Skip 4-byte flags field.
+    let after_flags = &buf[4..];
+    // Locate the null terminator of fullCollectionName.
+    let null_pos = after_flags.iter().position(|&b| b == 0)?;
+    let coll_name = std::str::from_utf8(&after_flags[..null_pos]).ok()?;
+    // Database name is the component before the first '.'.
+    Some(coll_name.split('.').next().unwrap_or("").to_owned())
+}
+
+/// Validate the `$db` field in an OP_MSG command body.
+///
+/// Returns `Some(error_doc)` when `$db` is present and does not match
+/// `server_db_name` or `"admin"` (which is always permitted for server-level
+/// commands such as `hello`, `ping`, `buildInfo`, etc.).
+///
+/// Returns `None` when the field is absent, not a string, empty, or valid.
+fn check_db_field(body: &Document, server_db_name: &str) -> Option<Document> {
+    let db = match body.get_str("$db") {
+        Ok(s) => s,
+        Err(_) => return None, // absent or wrong BSON type — allow
+    };
+    if db.is_empty() || db == "admin" || db == server_db_name {
+        return None; // valid
+    }
+    Some(doc! {
+        "ok": 0.0_f64,
+        "errmsg": format!("not authorized on {} to execute command", db),
+        "code": 13i32,
+        "codeName": "Unauthorized",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Command dispatch
 // ---------------------------------------------------------------------------
 
@@ -439,6 +627,20 @@ fn dispatch_op_query(
 ) -> Result<Vec<u8>> {
     // OP_QUERY body starts after the 16-byte header.
     let body_buf = &full_msg[MsgHeader::SIZE..];
+
+    // Validate database from fullCollectionName (e.g. "admin.$cmd").
+    if let Some(ref query_db) = parse_op_query_db_name(body_buf) {
+        if !query_db.is_empty() && query_db != "admin" && *query_db != state.db_name() {
+            let err = doc! {
+                "ok": 0.0_f64,
+                "errmsg": format!("not authorized on {} to execute command", query_db),
+                "code": 13i32,
+                "codeName": "Unauthorized",
+            };
+            return build_op_reply(request_id, response_to, &err);
+        }
+    }
+
     let doc = parse_op_query_body(body_buf)?;
     let command_name = doc
         .keys()
@@ -469,6 +671,11 @@ fn dispatch_op_msg(
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
             detail: "command body document is empty".into(),
         })?;
+    // Validate $db before routing.  Returns Unauthorized (code 13) when
+    // $db is present and does not match "admin" or the server's db name.
+    if let Some(err) = check_db_field(body, &state.db_name()) {
+        return OpMsg::build_response(request_id, response_to, &err);
+    }
     let response_body = route_command(command_name, body, state, connection_id);
     OpMsg::build_response(request_id, response_to, &response_body)
 }
@@ -1022,7 +1229,8 @@ mod tests {
     #[test]
     fn dispatch_op_msg_unknown_command() {
         let state = ServerState::default();
-        let req_buf = make_op_msg_request(7, &doc! { "aggregate": 1, "$db": "test" });
+        // Use $db: "admin" (always allowed) to test CommandNotFound, not Unauthorized.
+        let req_buf = make_op_msg_request(7, &doc! { "aggregate": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
         let resp_bytes = dispatch_op_msg(&msg, 16, msg.header.request_id, &state, 1).unwrap();
         let resp = OpMsg::parse(&resp_bytes).unwrap();
@@ -1030,6 +1238,195 @@ mod tests {
         assert_eq!(body.get_f64("ok").unwrap(), 0.0);
         assert_eq!(body.get_i32("code").unwrap(), 59);
         assert_eq!(body.get_str("codeName").unwrap(), "CommandNotFound");
+    }
+
+    // -----------------------------------------------------------------------
+    // $db field validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_db_field_missing_is_allowed() {
+        // No $db field → allowed (backward compat with older drivers)
+        let body = doc! { "ping": 1 };
+        assert!(check_db_field(&body, "myapp").is_none());
+    }
+
+    #[test]
+    fn check_db_field_admin_is_allowed() {
+        // $db: "admin" is always permitted for server-level commands.
+        let body = doc! { "ping": 1, "$db": "admin" };
+        assert!(check_db_field(&body, "myapp").is_none());
+    }
+
+    #[test]
+    fn check_db_field_matching_is_allowed() {
+        // $db matching the actual db name is allowed.
+        let body = doc! { "ping": 1, "$db": "myapp" };
+        assert!(check_db_field(&body, "myapp").is_none());
+    }
+
+    #[test]
+    fn check_db_field_mismatch_returns_unauthorized() {
+        let body = doc! { "ping": 1, "$db": "wrongdb" };
+        let err = check_db_field(&body, "myapp").expect("expected Unauthorized doc");
+        assert_eq!(err.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(err.get_i32("code").unwrap(), 13);
+        assert_eq!(err.get_str("codeName").unwrap(), "Unauthorized");
+        assert!(err.get_str("errmsg").is_ok());
+    }
+
+    #[test]
+    fn dispatch_op_msg_db_mismatch_returns_unauthorized() {
+        let state = ServerState::default(); // db_name() == "local"
+        // "wrongdb" != "admin" and "wrongdb" != "local" → Unauthorized
+        let req_buf = make_op_msg_request(20, &doc! { "ping": 1, "$db": "wrongdb" });
+        let msg = OpMsg::parse(&req_buf).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 40, msg.header.request_id, &state, 1).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        let body = resp.body().unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(body.get_i32("code").unwrap(), 13);
+        assert_eq!(body.get_str("codeName").unwrap(), "Unauthorized");
+    }
+
+    #[test]
+    fn dispatch_op_msg_db_admin_always_allowed() {
+        let state = ServerState::default();
+        let req_buf = make_op_msg_request(21, &doc! { "ping": 1, "$db": "admin" });
+        let msg = OpMsg::parse(&req_buf).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 41, msg.header.request_id, &state, 1).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        let body = resp.body().unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn dispatch_op_msg_db_matching_allowed() {
+        let state = ServerState::new(Some(std::path::PathBuf::from("/tmp/myapp.mqlite")));
+        let req_buf = make_op_msg_request(22, &doc! { "ping": 1, "$db": "myapp" });
+        let msg = OpMsg::parse(&req_buf).unwrap();
+        let resp_bytes =
+            dispatch_op_msg(&msg, 42, msg.header.request_id, &state, 1).unwrap();
+        let resp = OpMsg::parse(&resp_bytes).unwrap();
+        let body = resp.body().unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_op_query_db_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_op_query_db_name_admin_cmd() {
+        // Simulate OP_QUERY body with fullCollectionName = "admin.$cmd"
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&0i32.to_le_bytes()); // flags
+        buf.extend_from_slice(b"admin.$cmd\x00"); // fullCollectionName + NUL
+        buf.extend_from_slice(&0i32.to_le_bytes()); // numberToSkip
+        buf.extend_from_slice(&(-1i32).to_le_bytes()); // numberToReturn
+        assert_eq!(parse_op_query_db_name(&buf).as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn parse_op_query_db_name_custom_collection() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(b"myapp.users\x00");
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(parse_op_query_db_name(&buf).as_deref(), Some("myapp"));
+    }
+
+    #[test]
+    fn dispatch_op_query_db_mismatch_returns_unauthorized() {
+        let state = ServerState::default(); // db_name() == "local"
+        // "wrongdb.$cmd" → db = "wrongdb" ≠ "admin" and ≠ "local"
+        let req_buf = make_op_query_request(30, "wrongdb.$cmd", &doc! { "ismaster": 1 });
+        let resp_bytes = dispatch_op_query(&req_buf, 50, 30, &state, 1).unwrap();
+        // OP_REPLY: header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
+        let doc_start = 16 + 4 + 8 + 4 + 4;
+        let doc_size = i32::from_le_bytes(
+            resp_bytes[doc_start..doc_start + 4].try_into().unwrap(),
+        ) as usize;
+        let raw =
+            bson::RawDocumentBuf::from_bytes(resp_bytes[doc_start..doc_start + doc_size].to_vec())
+                .unwrap();
+        let body = bson::from_slice::<Document>(raw.as_bytes()).unwrap();
+        assert_eq!(body.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(body.get_i32("code").unwrap(), 13);
+        assert_eq!(body.get_str("codeName").unwrap(), "Unauthorized");
+    }
+
+    // -----------------------------------------------------------------------
+    // ConnectionCursors unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn connection_cursors_new_is_empty() {
+        let state = ConnectionCursors::new();
+        assert_eq!(state.len(), 0);
+    }
+
+    #[test]
+    fn connection_cursors_store_and_remove() {
+        let mut state = ConnectionCursors::new();
+        let cursor = crate::Cursor::<bson::Document>::empty();
+        let id = state.store(cursor);
+        assert_eq!(id, 1, "first cursor should get ID 1");
+        assert_eq!(state.len(), 1);
+
+        // Removing an existing cursor returns Some.
+        assert!(state.remove(id).is_some());
+        assert_eq!(state.len(), 0);
+
+        // Removing again returns None.
+        assert!(state.remove(id).is_none());
+    }
+
+    #[test]
+    fn connection_cursors_sequential_ids() {
+        let mut state = ConnectionCursors::new();
+        let id1 = state.store(crate::Cursor::<bson::Document>::empty());
+        let id2 = state.store(crate::Cursor::<bson::Document>::empty());
+        let id3 = state.store(crate::Cursor::<bson::Document>::empty());
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn connection_cursors_evict_zero_timeout_removes_all() {
+        let mut state = ConnectionCursors::new();
+        state.store(crate::Cursor::<bson::Document>::empty());
+        state.store(crate::Cursor::<bson::Document>::empty());
+        assert_eq!(state.len(), 2);
+
+        // Zero timeout: every cursor is "idle".
+        let evicted = state.evict_idle(std::time::Duration::from_secs(0));
+        assert_eq!(evicted, 2);
+        assert_eq!(state.len(), 0);
+    }
+
+    #[test]
+    fn connection_cursors_evict_long_timeout_keeps_all() {
+        let mut state = ConnectionCursors::new();
+        state.store(crate::Cursor::<bson::Document>::empty());
+        state.store(crate::Cursor::<bson::Document>::empty());
+
+        // Very long timeout: nothing evicted.
+        let evicted = state.evict_idle(std::time::Duration::from_secs(3600));
+        assert_eq!(evicted, 0);
+        assert_eq!(state.len(), 2);
+    }
+
+    #[test]
+    fn connection_cursors_get_mut_existing_and_missing() {
+        let mut state = ConnectionCursors::new();
+        let id = state.store(crate::Cursor::<bson::Document>::empty());
+        assert!(state.get_mut(id).is_some());
+        assert!(state.get_mut(999).is_none());
     }
 
     // -----------------------------------------------------------------------
