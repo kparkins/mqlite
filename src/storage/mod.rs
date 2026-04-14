@@ -14,6 +14,7 @@
 //! ## Phase 1 implementation tracking
 //!
 //! - hq-9vo: File format — header, page formats, ObjectId generation
+//! - hq-vk2: Buffer pool (CLOCK sweep eviction, pin/unpin)
 
 // Phase 0: storage engine structs and functions are defined but not yet wired
 // into the query/write paths (Phase 1). Allow dead_code for the whole module.
@@ -23,3 +24,4 @@ pub(crate) mod header;
 pub(crate) mod oid;
 #[allow(dead_code)]
 pub(crate) mod page;
+pub(crate) mod buffer_pool;
