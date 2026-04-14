@@ -140,6 +140,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // --- Insert ---
     pub fn insert_one(&self, doc: &T) -> Result<InsertOneResult>;
     pub fn insert_many(&self, docs: &[T]) -> Result<InsertManyResult>;
+    pub fn insert_many_with_options(&self, docs: &[T], opts: InsertManyOptions) -> Result<InsertManyResult>;
 
     // --- Find ---
     pub fn find_one(&self, filter: Document) -> Result<Option<T>>;
@@ -148,7 +149,9 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
 
     // --- Update ---
     pub fn update_one(&self, filter: Document, update: Document) -> Result<UpdateResult>;
+    pub fn update_one_with_options(&self, filter: Document, update: Document, opts: UpdateOptions) -> Result<UpdateResult>;
     pub fn update_many(&self, filter: Document, update: Document) -> Result<UpdateResult>;
+    pub fn update_many_with_options(&self, filter: Document, update: Document, opts: UpdateOptions) -> Result<UpdateResult>;
 
     // --- Delete ---
     pub fn delete_one(&self, filter: Document) -> Result<DeleteResult>;
@@ -184,6 +187,49 @@ pub struct FindOptions {
     pub batch_size: Option<u32>,         // Default: 101 (matches MongoDB)
 }
 ```
+
+### InsertManyOptions
+
+```rust
+pub struct InsertManyOptions {
+    /// If true (default), stop at the first error and report which documents were
+    /// successfully inserted. If false, attempt all inserts and report all errors
+    /// and all successes. Matches MongoDB 8.0 insert_many semantics (PRD R10).
+    pub ordered: Option<bool>,           // Default: true (matches MongoDB)
+}
+```
+
+`insert_many` behavior:
+- **Ordered (default)**: Stop at the first error. Return `InsertManyResult` with successfully inserted document IDs plus the error. Documents after the error are not attempted.
+- **Unordered**: Attempt all inserts. Return `InsertManyResult` with all successfully inserted document IDs and a `Vec<BulkWriteError>` for all failures.
+
+The `InsertManyResult` must support partial success reporting:
+
+```rust
+pub struct InsertManyResult {
+    pub inserted_ids: HashMap<usize, Bson>,
+    /// Errors encountered during insert (non-empty only for partial failures)
+    pub errors: Vec<BulkWriteError>,
+}
+
+pub struct BulkWriteError {
+    pub index: usize,           // Index in the original document array
+    pub code: i32,              // MongoDB error code (e.g., 11000 for duplicate key)
+    pub message: String,
+}
+```
+
+### UpdateOptions
+
+```rust
+pub struct UpdateOptions {
+    /// If true and no documents match the filter, insert a new document constructed
+    /// from the filter and update operators. Matches MongoDB 8.0 upsert behavior.
+    pub upsert: Option<bool>,            // Default: false
+}
+```
+
+Upsert is a common pattern required for real-world test suites and production workloads. When `upsert: true` and no document matches the filter, the update creates a new document by applying the update operators to a document derived from the filter's equality conditions. The generated `_id` (if not specified in the filter) is returned in `UpdateResult::upserted_id`.
 
 ### Cursor
 
@@ -221,6 +267,17 @@ pub struct IndexOptions {
     pub name: Option<String>,        // Auto-generated if omitted
     pub unique: Option<bool>,        // Default: false
     pub sparse: Option<bool>,        // Default: false
+}
+```
+
+**Unsupported index types**: `createIndex` requests specifying unsupported index options (TTL via `expireAfterSeconds`, text indexes, geospatial indexes via `2dsphere`/`2d`, partial indexes via `partialFilterExpression`, hashed indexes) must return an appropriate error. Use error code 67 (`CannotCreateIndex`) with a message naming the unsupported option and listing supported index types (single-field, compound, unique, sparse, multikey).
+
+```rust
+// Example error for unsupported index type
+Error::UnsupportedIndexOption {
+    option: "expireAfterSeconds".to_string(),
+    suggestion: "TTL indexes are not supported in mqlite Phase 1. \
+                 Supported index types: single-field, compound, unique, sparse, multikey.".to_string(),
 }
 ```
 
@@ -413,13 +470,13 @@ The wire protocol shim runs in a tokio runtime that is internal to the `wire` fe
 
 2. **Should `Database` implement `Drop` with WAL flush?** If `Drop` flushes the WAL, it may block. If it doesn't, data written since the last flush may be lost (but recoverable via WAL replay on next open). The recommended behavior: `Drop` does a non-blocking close. Explicit `db.close()` method for blocking flush. Document this clearly.
 
-3. **How does `insert_many` handle partial failures with `ordered: true`?** MongoDB stops at the first error in ordered mode and reports the error plus a list of successful inserts. mqlite should match this behavior. The `InsertManyResult` needs a way to report partial success.
+3. ~~**How does `insert_many` handle partial failures with `ordered: true`?**~~ **RESOLVED**: `InsertManyOptions { ordered: bool }` added. Ordered mode (default) stops at first error, reports successful inserts plus the error. Unordered mode attempts all, reports all errors and successes. `InsertManyResult` includes `errors: Vec<BulkWriteError>` for partial failure reporting. Matches MongoDB 8.0 behavior per PRD R10.
 
 4. **Should the wire protocol support OP_COMPRESSED?** This reduces network bandwidth for large documents but adds compression library dependencies (snappy, zlib, zstd). For localhost-only debugging use, compression overhead may exceed benefit. Recommend: defer to Phase 1.1.
 
 5. **What is the cursor timeout for idle cursors opened via wire protocol?** MongoDB defaults to 10 minutes. mqlite should implement cursor timeout to prevent resource leaks from abandoned cursors. Native API cursors are cleaned up by Rust's Drop.
 
-6. **Should `update_one`/`update_many` support upsert?** MongoDB's update commands support `upsert: true`. This is a common pattern that should be Phase 1 if feasible — it's required for many real-world test suites.
+6. ~~**Should `update_one`/`update_many` support upsert?**~~ **RESOLVED**: Yes, upsert is Phase 1. `UpdateOptions { upsert: bool }` added. When `upsert: true` and no documents match, a new document is created from the filter's equality conditions plus the update operators. The generated `_id` is returned in `UpdateResult::upserted_id`. Required for real-world test suites.
 
 7. **How does `serverStatus` report for an embedded database?** MongoDB's `serverStatus` returns extensive server metrics. mqlite should return a useful subset: uptime, connection count (wire protocol), storage stats (file size, WAL size, buffer pool usage), operation counters.
 

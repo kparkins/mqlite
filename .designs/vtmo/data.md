@@ -58,6 +58,10 @@ The most consequential data model decisions are: (1) BSON comparison ordering mu
 
 ## File Format Specification
 
+### File Format Versioning Policy
+
+The format version field (offset 4, uint32) starts at 1. **Backward-incompatible file format changes constitute semver-breaking changes** and require a mqlite major version bump (per PRD R9). Within a major version, mqlite must be able to read files created by any earlier minor/patch version. Forward compatibility (newer files opened by older library) is a non-goal — the library returns a clear error ("file format version N is not supported by this mqlite version") when encountering an unknown format version.
+
 ### File Header (Page 0 — 4KB)
 
 ```
@@ -327,11 +331,11 @@ If the process crashes, the WAL and SHM files persist. On next open, mqlite dete
 ### On Insert
 
 1. **Well-formedness**: BSON must parse without errors (handled by `bson` crate).
-2. **Size limit**: Document must not exceed 16MB (16,777,216 bytes) after serialization.
-3. **Nesting depth**: Maximum 100 levels (prevent stack overflow during recursive operations).
-4. **Field count**: Maximum 10,000 fields per document (prevent memory exhaustion).
-5. **Field name**: Maximum 1,024 bytes. No null bytes in field names.
-6. **_id field**: If absent, auto-generate an ObjectId. If present, validate uniqueness against the `_id` index. The `_id` value must be a valid BSON type that can be indexed.
+2. **Size limit**: Document must not exceed 16MB (16,777,216 bytes) after serialization. (PRD R2)
+3. **Nesting depth**: Maximum 100 levels (prevent stack overflow during recursive operations). (PRD R2)
+4. **Field count**: Maximum 10,000 fields per document (prevent memory exhaustion). **Note**: This is a mqlite-specific defensive limit not present in the PRD. MongoDB does not enforce a field count limit. This limit exists to prevent denial-of-service via pathologically wide documents.
+5. **Field name**: Maximum 1,024 bytes. No null bytes in field names. **Note**: This is a mqlite-specific defensive limit not present in the PRD. MongoDB limits field names to ~16MB (document size limit). This stricter limit is for safety.
+6. **_id field**: If absent, auto-generate an ObjectId. If present, validate uniqueness against the `_id` index. The `_id` value must be a valid BSON type that can be indexed. (PRD R2)
 
 ### ObjectId Generation
 
@@ -375,6 +379,21 @@ Buffer Pool:
 | Server | 256 MB | ~32000 | ~4000 |
 
 The buffer pool partitions frames by page size: 4KB frames for internal nodes, 32KB frames for leaf/overflow pages. The ratio is configurable but defaults to 25% internal / 75% leaf.
+
+## B+ Tree Property-Based Test Specification (PRD R12)
+
+Property-based testing (via `proptest` or `quickcheck`) must verify the following B+ tree invariants after arbitrary sequences of insert, update, and delete operations:
+
+1. **Ordering invariant**: All keys in a node are sorted according to BSON comparison ordering. For any internal node, all keys in the left subtree are less than the separator key, and all keys in the right subtree are greater than or equal to it.
+2. **Balance invariant**: All leaf nodes are at the same depth from the root. No path from root to leaf is shorter or longer than any other.
+3. **Parent-child consistency**: Every child pointer in an internal node points to a valid page of the correct type (internal or leaf, depending on level). No dangling pointers. No cycles.
+4. **Sibling pointer consistency**: Leaf-to-leaf sibling pointers form a doubly-linked list that covers all leaf pages exactly once. Following next pointers from the leftmost leaf visits every leaf in key order.
+5. **Key count invariants**: Internal nodes have between `ceil(fan_out/2)` and `fan_out` keys (except the root, which may have fewer). Leaf nodes have between `ceil(capacity/2)` and `capacity` entries (except the root leaf).
+6. **Overflow chain integrity**: Every overflow pointer in a leaf cell points to a valid overflow page chain. Following the chain reconstructs the complete document. No orphaned overflow pages.
+7. **Index-data consistency**: For secondary indexes, every index entry's `_id` reference points to a document that exists in the primary `_id` index. For multikey indexes, the number of index entries for a document matches the array length of the indexed field.
+8. **Checksum validity**: Every page's CRC32C checksum matches its content.
+
+Test strategy: Generate random sequences of (insert, update, delete) operations with random BSON documents. After each operation (or batch), verify all invariants hold. Use shrinking to minimize failing test cases.
 
 ## Constraints Identified
 

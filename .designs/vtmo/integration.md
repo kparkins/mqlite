@@ -269,6 +269,30 @@ wire = ["dep:tokio", "dep:tokio-util"]
 tracing = ["dep:tracing"]
 
 [dependencies]
+```
+
+### Tracing Span Specification (PRD R11)
+
+When the `tracing` feature flag is enabled, mqlite emits structured tracing spans and events for observability. The following operations emit spans:
+
+| Operation | Span Name | Key Fields | Level |
+|-----------|-----------|------------|-------|
+| Database open | `mqlite::open` | path, format_version | INFO |
+| WAL recovery | `mqlite::wal_recovery` | frames_replayed, duration_ms | WARN |
+| Collection CRUD | `mqlite::find`, `mqlite::insert`, etc. | collection, filter_hash, doc_count | DEBUG |
+| Index scan | `mqlite::index_scan` | index_name, bounds, docs_examined | DEBUG |
+| Collection scan | `mqlite::collection_scan` | collection, docs_examined | DEBUG |
+| WAL checkpoint | `mqlite::checkpoint` | pages_copied, duration_ms, wal_size_before | INFO |
+| Buffer pool eviction | `mqlite::eviction` | pages_evicted, dirty_pages_flushed | DEBUG |
+| Writer lock acquisition | `mqlite::writer_lock` | wait_duration_ms, acquired | DEBUG |
+| Wire protocol command | `mqlite::wire::command` | command_name, duration_ms, ok | DEBUG |
+
+Events (not spans):
+- `mqlite::disk_full` (ERROR): when ENOSPC encountered
+- `mqlite::corrupt_page` (ERROR): when CRC32C mismatch detected
+- `mqlite::unsupported_op` (WARN): when unsupported operator/command requested
+
+```toml
 bson = "2"
 thiserror = "1"
 crc32c = "0.6"               # Page checksums
@@ -420,6 +444,70 @@ For migrating data from MongoDB to mqlite:
 1. **mongodump/BSON files**: Write a utility that reads BSON dump files and inserts into mqlite via the native API. Not a Phase 1 deliverable but straightforward to build.
 2. **Via wire protocol**: Connect a migration script to MongoDB (source) and mqlite's wire protocol (destination). Read with pymongo, write with pymongo. Works with Phase 1 command set.
 3. **JSON import**: Parse JSON/Extended JSON documents, convert to BSON, insert via native API.
+
+## MQL Operator Implementation Matrix (PRD G2)
+
+Each operator must be implemented, tested against MongoDB 8.0 for correctness, and verified via both the native API and wire protocol paths.
+
+### Query Operators — Phase 1
+
+| Operator | Category | Implementation Status | Test Coverage | Notes |
+|----------|----------|----------------------|---------------|-------|
+| `$eq` | Comparison | Required | Unit + compat | Implicit in `{ field: value }` syntax |
+| `$ne` | Comparison | Required | Unit + compat | |
+| `$gt` | Comparison | Required | Unit + compat | Must handle cross-type comparison per BSON ordering |
+| `$gte` | Comparison | Required | Unit + compat | |
+| `$lt` | Comparison | Required | Unit + compat | |
+| `$lte` | Comparison | Required | Unit + compat | |
+| `$in` | Comparison | Required | Unit + compat | Array of values |
+| `$nin` | Comparison | Required | Unit + compat | |
+| `$and` | Logical | Required | Unit + compat | Implicit (multiple conditions) and explicit |
+| `$or` | Logical | Required | Unit + compat | |
+| `$not` | Logical | Required | Unit + compat | |
+| `$nor` | Logical | Required | Unit + compat | |
+| `$exists` | Element | Required | Unit + compat | |
+| `$type` | Element | Required | Unit + compat | Must support both string and numeric type identifiers |
+| `$elemMatch` | Array | Required | Unit + compat | Query position only (not projection) |
+| `$all` | Array | Required | Unit + compat | |
+| `$size` | Array | Required | Unit + compat | |
+| `$regex` | Evaluation | Required | Unit + compat | Rust `regex` crate only (no PCRE); document incompatibilities |
+
+### Update Operators — Phase 1
+
+| Operator | Category | Implementation Status | Test Coverage | Notes |
+|----------|----------|----------------------|---------------|-------|
+| `$set` | Field | Required | Unit + compat | |
+| `$unset` | Field | Required | Unit + compat | |
+| `$rename` | Field | Required | Unit + compat | |
+| `$inc` | Field | Required | Unit + compat | Numeric types only |
+| `$min` | Field | Required | Unit + compat | Cross-type BSON comparison |
+| `$max` | Field | Required | Unit + compat | Cross-type BSON comparison |
+| `$mul` | Field | Required | Unit + compat | Numeric types only |
+| `$currentDate` | Field | Required | Unit + compat | Date and Timestamp types |
+| `$setOnInsert` | Field | Required | Unit + compat | Only applies during upsert |
+| `$push` | Array | Required | Unit + compat | With modifiers: `$each`, `$position`, `$sort`, `$slice` |
+| `$pull` | Array | Required | Unit + compat | Supports query expressions |
+| `$addToSet` | Array | Required | Unit + compat | With `$each` modifier |
+| `$pop` | Array | Required | Unit + compat | First (-1) or last (1) |
+| `$pullAll` | Array | Required | Unit + compat | |
+
+### Projection — Phase 1
+
+| Feature | Implementation Status | Notes |
+|---------|----------------------|-------|
+| Field inclusion (`{ field: 1 }`) | Required | |
+| Field exclusion (`{ field: 0 }`) | Required | Cannot mix inclusion/exclusion (except `_id`) |
+| `_id` suppression (`{ _id: 0 }`) | Required | |
+
+## Performance Regression Detection (PRD G7)
+
+To satisfy PRD G7's acceptance criterion ("No operation regresses more than 2x between releases"), implement CI-based benchmark comparison:
+
+1. **Benchmark suite**: Use `criterion` crate for statistically rigorous benchmarks covering all G7 target operations.
+2. **Baseline storage**: Store benchmark results as JSON in the repository (`.benchmarks/` directory) keyed by git commit hash.
+3. **CI comparison**: On each PR/MR, run benchmarks and compare against the baseline from the merge target (master). Flag any operation that regresses more than 2x.
+4. **Noise tolerance**: Use criterion's statistical analysis (confidence intervals) to distinguish real regressions from measurement noise. Require 3 consecutive measurements above 2x threshold before flagging.
+5. **Reference hardware**: Define a CI runner specification (CPU, SSD type, RAM) as the reference. Document that targets are specific to this hardware.
 
 ## Compatibility Testing Strategy
 

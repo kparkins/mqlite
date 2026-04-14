@@ -386,6 +386,22 @@ Error: DiskFull {
 12. **Performance Tuning**: Buffer pool sizing, checkpoint frequency, durability vs. speed trade-offs.
 13. **File Format Specification**: For advanced users building backup tools, forensic analysis, or third-party readers.
 
+### Documentation as Implementation Tasks (PRD Phase 1 DoD #10)
+
+Documentation is a Phase 1 deliverable, not an afterthought. The following documentation tasks must be tracked as explicit work items in the implementation plan:
+
+| Doc | Phase | Depends On | Effort |
+|-----|-------|-----------|--------|
+| README / Quick Start | During API stabilization | Core CRUD API finalized | Low |
+| API Reference (docs.rs) | During implementation | Each module as it's built | Medium (ongoing) |
+| Compatibility Matrix | After query engine | All operators implemented | Low |
+| Error Guide | After error taxonomy | All error variants defined | Medium |
+| Concurrency Guide | After SWMR impl | WAL + writer lock working | Medium |
+| Migration Guide | After API stable | Full API surface finalized | Medium |
+| Wire Protocol Security Advisory | Before wire protocol release | Wire protocol working | Low |
+
+Each Tier 1 doc must be complete before Phase 1 is declared done. Tier 2 docs should be drafted during Phase 1 and finalized shortly after.
+
 ## Observability UX
 
 Developers debugging issues need visibility into mqlite's behavior:
