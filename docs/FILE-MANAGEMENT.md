@@ -139,18 +139,32 @@ fn checkpoint_backup(db: &Database, src: &str, dst: &str) -> mqlite::Result<()> 
 
 ---
 
-## Hot Backup (Phase 2)
+## Hot Backup
 
-`Database::backup(dest)` will produce a consistent snapshot of the database
-**while it is running**, without blocking writers. This is planned for Phase 2.
+`Database::backup(dest)` produces a consistent copy of the database **while it
+is running**.
 
 ```rust
-// Phase 2 — not yet available in Phase 1:
-// db.backup("backup.mqlite")?;
+use mqlite::Client;
+
+fn hot_backup(db: &mqlite::Database, dst: &str) -> mqlite::Result<()> {
+    // Acquires the writer lock, checkpoints, then copies the file.
+    // Writers are briefly paused during the copy; readers continue unaffected.
+    db.backup(dst)?;
+    println!("Hot backup written to {dst}");
+    Ok(())
+}
 ```
 
-In Phase 1, use the checkpoint-then-copy approach for running databases, or
-cold backup (close then copy) when a brief pause is acceptable.
+Implementation notes:
+- Acquires the in-process writer lock before copying, so the backup sees a
+  fully consistent committed state.
+- Checkpoints all dirty pages to the main file before copying.
+- Reads through the existing lock file descriptor to avoid releasing the
+  OS advisory lock (POSIX footgun prevention).
+- Destination file is created with `0600` permissions on Unix.
+- Backup to the same file as the source is rejected with an error.
+- Backup of an in-memory database is not supported (returns an error).
 
 ---
 

@@ -620,10 +620,90 @@ impl ClientInner {
         self.file_lock.sync()
     }
 
-    pub(crate) fn backup(&self, _dest: &Path) -> Result<()> {
-        Err(Error::Internal(
-            "backup: not yet implemented (Phase 2)".into(),
-        ))
+    pub(crate) fn backup(&self, dest: &Path) -> Result<()> {
+        // Backup of an in-memory database is not supported.
+        let src_path = match &self.path {
+            Some(p) => p.as_path(),
+            None => {
+                return Err(Error::Internal(
+                    "backup: in-memory databases cannot be backed up to a file".into(),
+                ));
+            }
+        };
+
+        // Security: reject symlinks at the destination path.
+        reject_symlink(dest)?;
+
+        // Reject backup-to-self: canonicalize both paths if dest already
+        // exists.  If dest does not exist yet, it cannot be the same file.
+        if dest.exists() {
+            let dest_canon = std::fs::canonicalize(dest).unwrap_or_default();
+            let src_canon = std::fs::canonicalize(src_path).unwrap_or_default();
+            if !dest_canon.as_os_str().is_empty()
+                && !src_canon.as_os_str().is_empty()
+                && dest_canon == src_canon
+            {
+                return Err(Error::Internal(
+                    "backup: destination is the same file as the source".into(),
+                ));
+            }
+        }
+
+        // Acquire the in-process writer lock so no writes can interleave with
+        // our checkpoint and copy.
+        let _guard = self.acquire_writer_lock()?;
+
+        // Checkpoint: flush all dirty buffer-pool pages to the main database
+        // file.  After this, the on-disk file contains the complete committed
+        // state and is safe to copy.
+        self.engine.checkpoint()?;
+
+        // Determine the byte length of the database file.
+        let file_size = std::fs::metadata(src_path)?.len();
+
+        // Copy the database file to dest using the *existing* file_lock fd
+        // for reads.  We must NOT open a new file descriptor to the source
+        // while the advisory lock is held: POSIX guarantees that closing ANY
+        // fd to a file releases ALL advisory locks the process holds on that
+        // file (the "POSIX advisory lock footgun").
+        let mut dest_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dest)
+            .map_err(Error::Io)?;
+
+        // Create the destination file with restricted permissions (0600) on
+        // Unix, matching the behaviour of Client::open for new database files.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            dest_file
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(Error::Io)?;
+        }
+
+        // Stream the source file contents in 64 KB chunks through the lock fd.
+        use std::io::Write;
+        const CHUNK: usize = 64 * 1024;
+        let mut buf = vec![0u8; CHUNK];
+        let mut offset: u64 = 0;
+
+        while offset < file_size {
+            let remaining = (file_size - offset) as usize;
+            let read_len = remaining.min(CHUNK);
+            let chunk = &mut buf[..read_len];
+
+            self.file_lock.read_exact_at(offset, chunk)?;
+            dest_file.write_all(chunk).map_err(Error::Io)?;
+
+            offset += read_len as u64;
+        }
+
+        // Flush the destination file's data to the OS page cache.
+        dest_file.flush().map_err(Error::Io)?;
+
+        Ok(())
     }
 }
 
@@ -1321,5 +1401,152 @@ mod tests {
             .count_documents(bson::doc! {})
             .expect("count");
         assert_eq!(count, 80, "all 80 documents from 8 writers must be present");
+    }
+
+    // -----------------------------------------------------------------------
+    // R4.4: Database::backup — consistent hot copy
+    // -----------------------------------------------------------------------
+
+    /// Basic hot backup: insert data, backup, reopen the copy, verify data.
+    #[test]
+    fn backup_produces_consistent_copy() {
+        use bson::doc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_path = dir.path().join("src.mqlite");
+        let dst_path = dir.path().join("dst.mqlite");
+
+        // Seed the source database.
+        {
+            let client = Client::open(&src_path).expect("open source");
+            let col = client
+                .database("mydb")
+                .collection::<bson::Document>("items");
+            for i in 0..100i32 {
+                col.insert_one(&doc! { "n": i }).expect("insert");
+            }
+            // Hot backup while the database is open.
+            client.backup(&dst_path).expect("backup");
+        }
+
+        // Reopen the backup and verify the document count.
+        {
+            let client = Client::open(&dst_path).expect("open backup");
+            let count = client
+                .database("mydb")
+                .collection::<bson::Document>("items")
+                .count_documents(doc! {})
+                .expect("count");
+            assert_eq!(count, 100, "backup must contain all 100 documents");
+        }
+    }
+
+    /// backup() on an in-memory database must return an error.
+    #[test]
+    fn backup_in_memory_returns_error() {
+        let client = Client::open_in_memory().expect("open");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dst = dir.path().join("dst.mqlite");
+        let result = client.backup(&dst);
+        assert!(
+            result.is_err(),
+            "backup of in-memory database must fail, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::Internal(_)),
+            "expected Internal error, got: {:?}",
+            err
+        );
+    }
+
+    /// backup() to the same path as the source must return an error.
+    #[test]
+    fn backup_to_self_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db.mqlite");
+        let client = Client::open(&path).expect("open");
+        let result = client.backup(&path);
+        assert!(
+            result.is_err(),
+            "backup to self must fail, got: {:?}",
+            result
+        );
+    }
+
+    /// backup() to a symlink destination must be rejected.
+    #[test]
+    #[cfg(unix)]
+    fn backup_symlink_dest_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_path = dir.path().join("src.mqlite");
+        let real_dst = dir.path().join("real.mqlite");
+        let sym_dst = dir.path().join("link.mqlite");
+
+        fs::write(&real_dst, b"").expect("create real dst");
+        std::os::unix::fs::symlink(&real_dst, &sym_dst).expect("create symlink");
+
+        let client = Client::open(&src_path).expect("open source");
+        let result = client.backup(&sym_dst);
+        assert!(
+            matches!(result, Err(Error::SymlinkRejected { .. })),
+            "expected SymlinkRejected, got: {:?}",
+            result
+        );
+    }
+
+    /// backup() overwrites an existing destination file.
+    #[test]
+    fn backup_overwrites_existing_dest() {
+        use bson::doc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_path = dir.path().join("src.mqlite");
+        let dst_path = dir.path().join("dst.mqlite");
+
+        // Seed source.
+        let client = Client::open(&src_path).expect("open source");
+        let col = client
+            .database("db")
+            .collection::<bson::Document>("col");
+        col.insert_one(&doc! { "x": 1i32 }).expect("insert");
+
+        // First backup.
+        client.backup(&dst_path).expect("first backup");
+        // Second backup — must overwrite the first without error.
+        col.insert_one(&doc! { "x": 2i32 }).expect("insert again");
+        client.backup(&dst_path).expect("second backup");
+
+        // Verify both docs are in the second backup.
+        let bkup = Client::open(&dst_path).expect("open backup");
+        let count = bkup
+            .database("db")
+            .collection::<bson::Document>("col")
+            .count_documents(doc! {})
+            .expect("count");
+        assert_eq!(count, 2, "second backup must contain both documents");
+    }
+
+    /// backup() destination file must have 0600 permissions on Unix.
+    #[test]
+    #[cfg(unix)]
+    fn backup_dest_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_path = dir.path().join("src.mqlite");
+        let dst_path = dir.path().join("dst.mqlite");
+
+        let client = Client::open(&src_path).expect("open source");
+        client.backup(&dst_path).expect("backup");
+
+        let meta = fs::metadata(&dst_path).expect("metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "backup file must have mode 0600, got {:o}",
+            mode
+        );
     }
 }
