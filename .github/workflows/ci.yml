@@ -264,6 +264,38 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ---------------------------------------------------------------------------
+  # Wire Protocol Integration — pymongo 4.x compatibility (hq-krdx)
+  #
+  # Builds the mqlite wire server, selects a free port dynamically, starts
+  # the server, installs pymongo 4.x via pip, runs the full pymongo
+  # compatibility test suite, and tears down the server on completion or
+  # failure.
+  #
+  # All orchestration (port selection, server startup poll, teardown trap)
+  # lives in tests/run_wire_ci.sh.
+  # ---------------------------------------------------------------------------
+  wire-integration:
+    name: Wire Protocol Integration (pymongo 4.x)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run wire protocol integration tests
+        run: bash tests/run_wire_ci.sh
+
+  # ---------------------------------------------------------------------------
   # Cross-platform file format compatibility (x86_64 ↔ aarch64)
   # ---------------------------------------------------------------------------
   #
