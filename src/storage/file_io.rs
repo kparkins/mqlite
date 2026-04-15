@@ -182,6 +182,11 @@ mod tests {
             buf.copy_from_slice(&data[start..end]);
             Ok(())
         }
+
+        fn sync(&self) -> Result<()> {
+            // In-memory mock has no backing file to sync.
+            Ok(())
+        }
     }
 
     fn make_io() -> (Arc<MemFileLock>, FilePageIo) {

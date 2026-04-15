@@ -27,8 +27,8 @@ use crate::{
     error::{Error, Result},
     index::{IndexInfo, IndexModel},
     options::{
-        FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
-        InsertManyOptions, OpenOptions, UpdateOptions,
+        DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions,
+        FindOneAndUpdateOptions, FindOptions, InsertManyOptions, OpenOptions, UpdateOptions,
     },
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
     storage::{
@@ -259,6 +259,9 @@ impl ClientInner {
             // original `_id`.  This is a pre-existing limitation.
             _ => crate::storage::oid::ObjectIdGenerator::generate(),
         };
+        // MF-5: FullSync guarantees data survives a process crash after this
+        // call returns.  Flush dirty pages then fsync.
+        self.flush_and_sync_if_fullsync()?;
         Ok(InsertOneResult { inserted_id: oid })
     }
 
@@ -315,6 +318,9 @@ impl ClientInner {
             }
         }
 
+        // MF-5: FullSync guarantees all successfully inserted documents
+        // survive a process crash after this call returns.
+        self.flush_and_sync_if_fullsync()?;
         Ok(InsertManyResult {
             inserted_ids,
             errors,
@@ -537,6 +543,22 @@ impl ClientInner {
         // `snapshot_bytes()` returns `None` for the B+ tree engine; the legacy
         // BSON-blob path is no longer used.
         self.engine.checkpoint()
+    }
+
+    /// Flush dirty pages to disk and, if configured for `FullSync`, call
+    /// `fsync(2)` to ensure data reaches the storage device.
+    ///
+    /// Called after every write operation when
+    /// [`DurabilityMode::FullSync`] is active.  This is the MF-5 guarantee:
+    /// after this method returns, the written data survives a process crash.
+    fn flush_and_sync_if_fullsync(&self) -> Result<()> {
+        if self.opts.durability != DurabilityMode::FullSync {
+            return Ok(());
+        }
+        // Flush all dirty pages to the OS page cache.
+        self.engine.checkpoint()?;
+        // fsync: push OS page-cache to the storage device.
+        self.file_lock.sync()
     }
 
     pub(crate) fn backup(&self, _dest: &Path) -> Result<()> {

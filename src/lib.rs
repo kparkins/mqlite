@@ -144,6 +144,11 @@ mod wal;
 #[cfg(all(test, unix))]
 mod crash_recovery_tests;
 
+// Crash recovery through the public API (hq-n9ci): R3.2.
+// Unix-only; uses fork()/SIGKILL/pipe for process-crash simulation.
+#[cfg(all(test, unix))]
+mod crash_recovery_public_api_tests;
+
 // Native API compatibility and persistence tests (hq-2yk).
 #[cfg(test)]
 mod compat_tests;
