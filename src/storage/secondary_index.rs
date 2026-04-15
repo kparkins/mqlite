@@ -8,7 +8,8 @@
 //!   values followed by the document's `_id`, all encoded as a memcmp-sortable
 //!   compound key.  Including `_id` guarantees uniqueness within the tree even
 //!   for non-unique indexes.
-//! - **Value**: empty (`&[]`) — all information is in the key.
+//! - **Value**: BSON-serialized `{"_id": doc_id}` — enables the index scan to
+//!   retrieve the document's `_id` without parsing the compound key.
 //!
 //! ## Key formats
 //!
@@ -289,8 +290,12 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
         check_unique_constraint(index_tree, &index_entry.key_pattern, &field_values, doc_id)?;
     }
 
+    // Serialize _id once; reused for every key (multikey may have several).
+    let id_bytes = bson::to_vec(&bson::doc! { "_id": doc_id.clone() })
+        .map_err(Error::BsonSerialization)?;
+
     for key in &keys {
-        match index_tree.insert(key, &[]) {
+        match index_tree.insert(key, &id_bytes) {
             Ok(()) => {}
             // Duplicate array elements produce the same compound key; silently skip.
             Err(Error::DuplicateKey { .. }) if is_multikey => {}

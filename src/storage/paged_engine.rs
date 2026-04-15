@@ -16,10 +16,18 @@
 //! Its root page number is persisted to [`FileHeader::catalog_root_page`] after every
 //! catalog mutation, so the catalog can be located on reopen.
 //!
-//! ## COLLSCAN
+//! ## Query execution
 //!
-//! `find` / `update` / `delete` traverse all leaf pages of the data tree, deserialise
-//! each document, and apply [`eval_filter`].  Index-accelerated seeks are Phase 1.4.
+//! `find` / `update` / `delete` first ask the query planner ([`select_plan`]) whether
+//! a secondary index can accelerate the query.  When a suitable index is found the
+//! engine performs an [`IndexScan`] — a range scan on the secondary B+ tree whose
+//! values contain the serialised `_id` of the matching document, followed by a point
+//! lookup in the primary data tree.  When no index matches the engine falls back to a
+//! full [`CollScan`].
+//!
+//! [`IndexScan`]: crate::query::planner::ScanPlan::IndexScan
+//! [`CollScan`]: crate::query::planner::ScanPlan::CollScan
+//! [`select_plan`]: crate::query::planner::select_plan
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -29,19 +37,23 @@ use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
 use crate::index::{IndexInfo, IndexModel};
-use crate::key_encoding::encode_key;
+use crate::key_encoding::{encode_compound_key, encode_key, COMPOUND_SEP};
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
     ReturnDocument, UpdateOptions,
 };
+use crate::query::planner::{select_plan, IndexCondition, IndexMeta, ScanPlan};
 use crate::query::{eval_filter, get_nested_field};
 use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::{BTree, BTreePageStore, CellValue, MemPageStore};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::catalog::Catalog;
+use crate::storage::catalog::{Catalog, IndexEntry};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::oid::ObjectIdGenerator;
-use crate::storage::secondary_index::generate_index_name;
+use crate::storage::secondary_index::{
+    build_index, generate_index_name, update_index_on_delete, update_index_on_insert,
+    update_index_on_update,
+};
 use crate::storage_engine::StorageEngine;
 use crate::update_operators::{apply_update, is_operator_update, upsert_base_from_filter};
 use crate::validation::validate_document;
@@ -530,6 +542,331 @@ impl BpBackend {
         }
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Secondary index maintenance helpers (R1.4)
+    // -----------------------------------------------------------------------
+
+    /// Persist updated root/level and multikey flag for an index entry.
+    ///
+    /// Only writes to the catalog if something actually changed.
+    fn sync_index_entry(
+        &mut self,
+        orig: &IndexEntry,
+        new_root: u32,
+        new_level: u8,
+        new_multikey: bool,
+    ) -> Result<()> {
+        let root_changed = new_root != orig.root_page || new_level != orig.root_level;
+        let multikey_changed = new_multikey && !orig.multikey;
+        if !root_changed && !multikey_changed {
+            return Ok(());
+        }
+        let mut updated = orig.clone();
+        if root_changed {
+            updated.root_page = new_root;
+            updated.root_level = new_level;
+        }
+        if multikey_changed {
+            updated.multikey = true;
+        }
+        self.catalog.update_index(&updated)?;
+        self.sync_catalog_root()
+    }
+
+    /// Retrieve the serialised `_id` value stored in an index tree entry.
+    ///
+    /// Index values are `{"_id": <bson>}` documents written by
+    /// [`update_index_on_insert`].
+    fn index_entry_id(handle: &Arc<crate::storage::handle::BufferPoolHandle>, cv: CellValue) -> Result<Bson> {
+        let bytes = match cv {
+            CellValue::Inline(b) => b,
+            CellValue::Overflow {
+                first_page,
+                total_length,
+            } => {
+                // Re-open a temporary tree handle to read overflow pages.
+                let tmp_store = BufferPoolPageStore::new(Arc::clone(handle));
+                let tmp_tree = BTree::open(tmp_store, 1, 0);
+                tmp_tree.read_overflow(first_page, total_length)?
+            }
+        };
+        // Empty value means this entry was written before R1.4 (old format).
+        // Return Null as a safe fallback; the caller will skip the lookup.
+        if bytes.is_empty() {
+            return Ok(Bson::Null);
+        }
+        let doc: Document =
+            bson::from_slice(&bytes).map_err(Error::BsonDeserialization)?;
+        Ok(doc.get("_id").cloned().unwrap_or(Bson::Null))
+    }
+
+    /// Maintain all secondary indexes after a document insert.
+    ///
+    /// Skips the implicit `_id_` index (the data tree is already keyed by `_id`).
+    fn maintain_secondary_on_insert(
+        &mut self,
+        ns: &str,
+        doc: &Document,
+        doc_id: &Bson,
+    ) -> Result<()> {
+        let entries = self.catalog.list_indexes(ns)?;
+        for entry in entries {
+            if entry.name == "_id_" {
+                continue;
+            }
+            let store = self.new_store();
+            let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+            let is_multikey = update_index_on_insert(doc, doc_id, &mut idx_tree, &entry)?;
+            self.sync_index_entry(
+                &entry,
+                idx_tree.root_page,
+                idx_tree.root_level,
+                is_multikey,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Maintain all secondary indexes after a document delete.
+    fn maintain_secondary_on_delete(
+        &mut self,
+        ns: &str,
+        doc: &Document,
+        doc_id: &Bson,
+    ) -> Result<()> {
+        let entries = self.catalog.list_indexes(ns)?;
+        for entry in entries {
+            if entry.name == "_id_" {
+                continue;
+            }
+            let store = self.new_store();
+            let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+            update_index_on_delete(doc, doc_id, &mut idx_tree, &entry)?;
+            self.sync_index_entry(
+                &entry,
+                idx_tree.root_page,
+                idx_tree.root_level,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Maintain all secondary indexes when a document is replaced.
+    fn maintain_secondary_on_update(
+        &mut self,
+        ns: &str,
+        old_doc: &Document,
+        new_doc: &Document,
+        old_id: &Bson,
+        new_id: &Bson,
+    ) -> Result<()> {
+        let entries = self.catalog.list_indexes(ns)?;
+        for entry in entries {
+            if entry.name == "_id_" {
+                continue;
+            }
+            let store = self.new_store();
+            let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+            let is_multikey =
+                update_index_on_update(old_doc, new_doc, old_id, new_id, &mut idx_tree, &entry)?;
+            self.sync_index_entry(
+                &entry,
+                idx_tree.root_page,
+                idx_tree.root_level,
+                is_multikey,
+            )?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Index scan executor (R1.4)
+    // -----------------------------------------------------------------------
+
+    /// Build the [start, end] range for a secondary index B+ tree scan.
+    ///
+    /// The secondary index key format for an ascending single-field is:
+    /// `encode_key(field_val) | 0x01 | encode_key(_id)`
+    ///
+    /// Returns `(start, end)` suitable for `BTree::range_scan`.
+    /// `None` means unbounded in that direction.
+    /// A return of `(None, None)` with `condition == In` is a sentinel asking
+    /// the caller to perform multiple equality scans.
+    fn index_bounds(
+        condition: &IndexCondition,
+        ascending: bool,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        /// Prefix bytes: `encode_compound_key([(val, ascending)]) + COMPOUND_SEP`.
+        /// All secondary-index keys with `field == val` start with this prefix
+        /// (followed by more bytes for the `_id` component).
+        fn prefix(val: &Bson, asc: bool) -> Vec<u8> {
+            let mut p = encode_compound_key(&[(val, asc)]);
+            p.push(COMPOUND_SEP); // 0x01
+            p
+        }
+        /// One past the prefix: prefix with last byte incremented (0x01 → 0x02).
+        /// Since COMPOUND_SEP < 0x02, every real key with `field == val` sorts
+        /// before this, so this byte sequence acts as an exclusive upper bound.
+        fn prefix_next(val: &Bson, asc: bool) -> Vec<u8> {
+            let mut p = prefix(val, asc);
+            *p.last_mut().unwrap() += 1; // COMPOUND_SEP + 1 = 0x02, safe
+            p
+        }
+
+        match condition {
+            // Exact equality: range [prefix(v), prefix_next(v)].
+            IndexCondition::Eq(v) => (Some(prefix(v, ascending)), Some(prefix_next(v, ascending))),
+
+            // Full scan through the secondary index (pass-through to the full filter).
+            IndexCondition::Any => (None, None),
+
+            // Multi-point: caller handles `In` with multiple equality sweeps.
+            IndexCondition::In(_) => (None, None),
+
+            IndexCondition::Range { gt, gte, lt, lte } => {
+                if ascending {
+                    // Ascending field: larger values have larger encoded keys.
+                    let start = match (gte.as_ref(), gt.as_ref()) {
+                        (Some(v), _) => Some(prefix(v, true)),        // field >= v
+                        (None, Some(v)) => Some(prefix_next(v, true)), // field >  v
+                        _ => None,
+                    };
+                    let end = match (lte.as_ref(), lt.as_ref()) {
+                        (Some(v), _) => Some(prefix_next(v, true)), // field <= v
+                        (None, Some(v)) => Some(prefix(v, true)),     // field <  v
+                        _ => None,
+                    };
+                    (start, end)
+                } else {
+                    // Descending field: encoding is inverted so range semantics
+                    // are mirrored.  $gt on field → smaller encoded prefix.
+                    let start = match (lte.as_ref(), lt.as_ref()) {
+                        (Some(v), _) => Some(prefix(v, false)),        // field <= v → encoded >=
+                        (None, Some(v)) => Some(prefix_next(v, false)), // field <  v → encoded >
+                        _ => None,
+                    };
+                    let end = match (gte.as_ref(), gt.as_ref()) {
+                        (Some(v), _) => Some(prefix_next(v, false)), // field >= v → encoded <=
+                        (None, Some(v)) => Some(prefix(v, false)),     // field >  v → encoded <
+                        _ => None,
+                    };
+                    (start, end)
+                }
+            }
+        }
+    }
+
+    /// Execute an index scan on `ns` for `filter` in the buffered backend.
+    ///
+    /// Returns `Some(docs)` when an index was used, `None` when the planner
+    /// decided a full collection scan is better (or when no indexes exist).
+    ///
+    /// When `Some` is returned the caller must still apply `find_opts` (sort,
+    /// skip, limit, projection) but does **not** need to re-apply the filter
+    /// because the full filter is evaluated here against every candidate doc.
+    fn try_index_scan(
+        &mut self,
+        ns: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<Document>>> {
+        // Build IndexMeta list from catalog.
+        let entries = self.catalog.list_indexes(ns)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let index_metas: Vec<IndexMeta<'_>> = entries
+            .iter()
+            .filter(|e| e.name != "_id_")
+            .map(|e| IndexMeta {
+                name: &e.name,
+                keys: &e.key_pattern,
+            })
+            .collect();
+        if index_metas.is_empty() {
+            return Ok(None);
+        }
+
+        // Ask the planner for a plan.
+        let plan = select_plan(filter, &index_metas);
+        let (index_name, primary_field, condition) = match plan {
+            ScanPlan::CollScan => return Ok(None),
+            ScanPlan::IndexScan {
+                index_name,
+                primary_field,
+                condition,
+            } => (index_name, primary_field, condition),
+        };
+
+        // Find the index entry.
+        let idx_entry = entries
+            .iter()
+            .find(|e| e.name == index_name)
+            .cloned()
+            .ok_or_else(|| Error::Internal(format!("index '{}' not in catalog", index_name)))?;
+
+        // Determine the scan direction of the primary field.
+        let ascending = idx_entry
+            .key_pattern
+            .get(&primary_field)
+            .map(|v| !matches!(v, Bson::Int32(-1) | Bson::Int64(-1)))
+            .unwrap_or(true);
+
+        // Collect candidate _id values from the secondary index tree.
+        let handle = Arc::clone(&self.handle);
+        let id_bsons: Vec<Bson> = if let IndexCondition::In(vals) = &condition {
+            // Multi-point: run one equality scan per value and union.
+            let mut results = Vec::new();
+            for v in vals {
+                let mut p = encode_compound_key(&[(v, ascending)]);
+                p.push(COMPOUND_SEP);
+                let mut p_next = p.clone();
+                *p_next.last_mut().unwrap() += 1;
+                let idx_store = self.new_store();
+                let idx_tree =
+                    BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
+                for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
+                    let id = Self::index_entry_id(&handle, cv)?;
+                    if !matches!(id, Bson::Null) {
+                        results.push(id);
+                    }
+                }
+            }
+            results
+        } else {
+            let (start, end) = Self::index_bounds(&condition, ascending);
+            let idx_store = self.new_store();
+            let idx_tree = BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
+            idx_tree
+                .range_scan(start.as_deref(), end.as_deref())?
+                .into_iter()
+                .filter_map(|(_, cv)| {
+                    Self::index_entry_id(&handle, cv)
+                        .ok()
+                        .filter(|id| !matches!(id, Bson::Null))
+                })
+                .collect()
+        };
+
+        // Look up documents in the data tree and apply the full filter.
+        let mut docs = Vec::new();
+        for id_bson in id_bsons {
+            let data_key = encode_key(&id_bson);
+            let data_tree_opt = self.tree(ns)?;
+            if let Some(data_tree) = data_tree_opt {
+                if let Some(cv) = data_tree.search(&data_key)? {
+                    let doc_bytes = resolve_cell(data_tree, cv)?;
+                    let doc: Document =
+                        bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
+                    if eval_filter(&doc, filter)? {
+                        docs.push(doc);
+                    }
+                }
+            }
+        }
+        Ok(Some(docs))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -599,10 +936,15 @@ impl StorageEngine for PagedEngine {
                 btree_insert_doc(tree, &mut doc, &unique_specs)
             }
             DocBackend::Buffered(bp) => {
-                let unique_specs = bp.unique_specs(ns)?;
+                // Insert into the primary (data) tree.  Unique-constraint
+                // checking for secondary indexes happens below after the
+                // secondary index trees are maintained.
                 let tree = bp.tree_or_create(ns)?;
-                let id = btree_insert_doc(tree, &mut doc, &unique_specs)?;
+                let id = btree_insert_doc(tree, &mut doc, &[])?;
                 bp.sync_data_root(ns)?;
+                // Maintain secondary indexes (includes unique-constraint
+                // enforcement via the index B+ trees themselves).
+                bp.maintain_secondary_on_insert(ns, &doc, &id)?;
                 Ok(id)
             }
         }
@@ -624,13 +966,20 @@ impl StorageEngine for PagedEngine {
                     .map(|(_, doc)| doc)
                     .collect()
             }
-            DocBackend::Buffered(bp) => match bp.tree(ns)? {
-                None => return Ok(Vec::new()),
-                Some(tree) => btree_collscan(tree, filter)?
-                    .into_iter()
-                    .map(|(_, doc)| doc)
-                    .collect(),
-            },
+            DocBackend::Buffered(bp) => {
+                // Try an index scan first; fall back to a full collection scan.
+                if let Some(docs) = bp.try_index_scan(ns, filter)? {
+                    docs
+                } else {
+                    match bp.tree(ns)? {
+                        None => return Ok(Vec::new()),
+                        Some(tree) => btree_collscan(tree, filter)?
+                            .into_iter()
+                            .map(|(_, doc)| doc)
+                            .collect(),
+                    }
+                }
+            }
         };
         Ok(apply_find_opts(matched, opts))
     }
@@ -720,10 +1069,12 @@ impl StorageEngine for PagedEngine {
         for (key, mut doc) in pairs_to_process {
             matched_count += 1;
             let before = doc.clone();
+            let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
             apply_update(&mut doc, update, false)?;
             if doc != before {
                 modified_count += 1;
-                // Re-serialize and replace in the tree.
+                let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+                // Re-serialize and replace in the data tree.
                 let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
                 match &mut *inner {
                     DocBackend::Memory(m) => {
@@ -733,6 +1084,10 @@ impl StorageEngine for PagedEngine {
                         }
                     }
                     DocBackend::Buffered(bp) => {
+                        // Maintain secondary indexes for the updated document.
+                        bp.maintain_secondary_on_update(
+                            ns, &before, &doc, &before_id, &new_id,
+                        )?;
                         if let Some(tree) = bp.tree_mut(ns)? {
                             tree.delete(&key)?;
                             tree.insert(&key, &new_bytes)?;
@@ -757,17 +1112,17 @@ impl StorageEngine for PagedEngine {
     fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
         let mut inner = self.inner.lock().unwrap();
 
-        // Collect keys to delete.
-        let keys_to_delete: Vec<Vec<u8>> = match &mut *inner {
+        // Collect (key, doc) pairs to delete; we need the doc for index maintenance.
+        let pairs_to_delete: Vec<(Vec<u8>, Document)> = match &mut *inner {
             DocBackend::Memory(m) => {
                 let Some(tree) = m.tree(ns) else {
                     return Ok(DeleteResult { deleted_count: 0 });
                 };
                 let pairs = btree_collscan(tree, filter)?;
                 if many {
-                    pairs.into_iter().map(|(k, _)| k).collect()
+                    pairs
                 } else {
-                    pairs.into_iter().take(1).map(|(k, _)| k).collect()
+                    pairs.into_iter().take(1).collect()
                 }
             }
             DocBackend::Buffered(bp) => match bp.tree(ns)? {
@@ -775,17 +1130,18 @@ impl StorageEngine for PagedEngine {
                 Some(tree) => {
                     let pairs = btree_collscan(tree, filter)?;
                     if many {
-                        pairs.into_iter().map(|(k, _)| k).collect()
+                        pairs
                     } else {
-                        pairs.into_iter().take(1).map(|(k, _)| k).collect()
+                        pairs.into_iter().take(1).collect()
                     }
                 }
             },
         };
 
-        let deleted_count = keys_to_delete.len() as u64;
+        let deleted_count = pairs_to_delete.len() as u64;
 
-        for key in &keys_to_delete {
+        for (key, doc) in &pairs_to_delete {
+            let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             match &mut *inner {
                 DocBackend::Memory(m) => {
                     if let Some(tree) = m.tree_mut(ns) {
@@ -793,6 +1149,8 @@ impl StorageEngine for PagedEngine {
                     }
                 }
                 DocBackend::Buffered(bp) => {
+                    // Maintain secondary indexes before removing from data tree.
+                    bp.maintain_secondary_on_delete(ns, doc, &doc_id)?;
                     if let Some(tree) = bp.tree_mut(ns)? {
                         tree.delete(key)?;
                     }
@@ -883,7 +1241,9 @@ impl StorageEngine for PagedEngine {
 
         let (key, mut doc) = matched.remove(0);
         let before = doc.clone();
+        let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
         apply_update(&mut doc, update, false)?;
+        let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
         let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
         match &mut *inner {
@@ -894,6 +1254,7 @@ impl StorageEngine for PagedEngine {
                 }
             }
             DocBackend::Buffered(bp) => {
+                bp.maintain_secondary_on_update(ns, &before, &doc, &before_id, &new_id)?;
                 if let Some(tree) = bp.tree_mut(ns)? {
                     tree.delete(&key)?;
                     tree.insert(&key, &new_bytes)?;
@@ -941,6 +1302,7 @@ impl StorageEngine for PagedEngine {
         }
 
         let (key, doc) = matched.remove(0);
+        let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
         match &mut *inner {
             DocBackend::Memory(m) => {
@@ -949,6 +1311,7 @@ impl StorageEngine for PagedEngine {
                 }
             }
             DocBackend::Buffered(bp) => {
+                bp.maintain_secondary_on_delete(ns, &doc, &doc_id)?;
                 if let Some(tree) = bp.tree_mut(ns)? {
                     tree.delete(&key)?;
                 }
@@ -1026,6 +1389,13 @@ impl StorageEngine for PagedEngine {
                 }
             }
             DocBackend::Buffered(bp) => {
+                bp.maintain_secondary_on_update(
+                    ns,
+                    &old_doc,
+                    &new_doc,
+                    &original_id,
+                    &original_id,
+                )?;
                 if let Some(tree) = bp.tree_mut(ns)? {
                     tree.delete(&old_key)?;
                     tree.insert(&new_key, &new_bytes)?;
@@ -1086,11 +1456,42 @@ impl StorageEngine for PagedEngine {
                 if bp.catalog.get_index(ns, &name)?.is_some() {
                     return Ok(name);
                 }
+                // Allocate a root page and register the index in the catalog.
                 let idx_root = bp.catalog.create_index(ns, model, &name)?;
                 bp.sync_catalog_root()?;
-                // Initialise the index tree leaf page.
+                // Initialise the index tree's leaf root page.
                 let idx_store = bp.new_store();
                 BTree::create_at(idx_store, idx_root)?;
+
+                // Build the index by scanning all documents already in the
+                // data tree ("online index build").
+                let idx_entry = bp
+                    .catalog
+                    .get_index(ns, &name)?
+                    .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
+
+                // Open data tree (read-only scan); if the collection is empty
+                // this is a no-op.
+                if let Some(data_entry) = bp.catalog.get_collection(ns)? {
+                    let data_store = bp.new_store();
+                    let data_tree = BTree::open(
+                        data_store,
+                        data_entry.data_root_page,
+                        data_entry.data_root_level,
+                    );
+                    let idx_build_store = bp.new_store();
+                    let mut idx_tree =
+                        BTree::open(idx_build_store, idx_entry.root_page, idx_entry.root_level);
+                    let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
+
+                    // Persist the (possibly updated) index root and multikey flag.
+                    bp.sync_index_entry(
+                        &idx_entry,
+                        idx_tree.root_page,
+                        idx_tree.root_level,
+                        any_multikey,
+                    )?;
+                }
                 Ok(name)
             }
         }
@@ -1898,6 +2299,306 @@ mod tests {
         assert!(
             page_count_after_recreate <= page_count_after_create + 4,
             "pages should be recycled after drop; before={page_count_after_create} after={page_count_after_recreate}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R1.4: Secondary index maintenance + index scan tests (buffered mode)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `create_index` builds the secondary B+ tree from existing
+    /// documents ("online" index build).
+    #[test]
+    fn buffered_create_index_builds_from_existing_docs() {
+        let (e, _io) = buffered_engine();
+
+        // Insert documents BEFORE creating the index.
+        e.insert(
+            "test.items",
+            doc! { "sku": "A", "price": 10i32 },
+        )
+        .unwrap();
+        e.insert(
+            "test.items",
+            doc! { "sku": "B", "price": 20i32 },
+        )
+        .unwrap();
+        e.insert(
+            "test.items",
+            doc! { "sku": "C", "price": 30i32 },
+        )
+        .unwrap();
+
+        // Create an index on "sku".
+        let idx = IndexModel::builder()
+            .keys(doc! { "sku": 1 })
+            .build()
+            .unwrap();
+        let name = e.create_index("test.items", &idx).unwrap();
+        assert_eq!(name, "sku_1");
+
+        // Query using the indexed field; must return the correct document.
+        let found = e
+            .find_one("test.items", &doc! { "sku": "B" })
+            .unwrap()
+            .expect("document B must be found via index");
+        assert_eq!(found.get_i32("price").unwrap(), 20);
+    }
+
+    /// Verify that the index is maintained when new documents are inserted
+    /// after the index was created.
+    #[test]
+    fn buffered_index_maintained_on_insert() {
+        let (e, _io) = buffered_engine();
+
+        let idx = IndexModel::builder()
+            .keys(doc! { "email": 1 })
+            .build()
+            .unwrap();
+        e.create_index("test.users", &idx).unwrap();
+
+        // Insert after index creation.
+        e.insert("test.users", doc! { "email": "alice@test.com", "role": "admin" })
+            .unwrap();
+        e.insert("test.users", doc! { "email": "bob@test.com", "role": "user" })
+            .unwrap();
+
+        // Both documents must be found via the index.
+        let alice = e
+            .find_one("test.users", &doc! { "email": "alice@test.com" })
+            .unwrap()
+            .expect("alice must be found");
+        assert_eq!(alice.get_str("role").unwrap(), "admin");
+
+        let bob = e
+            .find_one("test.users", &doc! { "email": "bob@test.com" })
+            .unwrap()
+            .expect("bob must be found");
+        assert_eq!(bob.get_str("role").unwrap(), "user");
+    }
+
+    /// Verify that deleting a document removes its secondary index entry,
+    /// so subsequent queries no longer find it.
+    #[test]
+    fn buffered_index_maintained_on_delete() {
+        let (e, _io) = buffered_engine();
+
+        let idx = IndexModel::builder()
+            .keys(doc! { "email": 1 })
+            .build()
+            .unwrap();
+        e.create_index("test.users", &idx).unwrap();
+
+        e.insert("test.users", doc! { "email": "charlie@test.com" })
+            .unwrap();
+
+        // Delete the document.
+        let r = e
+            .delete("test.users", &doc! { "email": "charlie@test.com" }, false)
+            .unwrap();
+        assert_eq!(r.deleted_count, 1);
+
+        // Must not be found via index scan.
+        let found = e
+            .find_one("test.users", &doc! { "email": "charlie@test.com" })
+            .unwrap();
+        assert!(found.is_none(), "deleted doc must not be returned");
+    }
+
+    /// Verify that updating a document replaces its old secondary index entry
+    /// with a new one.
+    #[test]
+    fn buffered_index_maintained_on_update() {
+        let (e, _io) = buffered_engine();
+
+        let idx = IndexModel::builder()
+            .keys(doc! { "email": 1 })
+            .build()
+            .unwrap();
+        e.create_index("test.users", &idx).unwrap();
+
+        e.insert("test.users", doc! { "email": "old@test.com" })
+            .unwrap();
+
+        // Update the indexed field.
+        e.update(
+            "test.users",
+            &doc! { "email": "old@test.com" },
+            &doc! { "$set": { "email": "new@test.com" } },
+            &UpdateOptions::default(),
+            false,
+        )
+        .unwrap();
+
+        // Old entry must be gone.
+        assert!(
+            e.find_one("test.users", &doc! { "email": "old@test.com" })
+                .unwrap()
+                .is_none(),
+            "old email must not be found after update"
+        );
+        // New entry must be present.
+        assert!(
+            e.find_one("test.users", &doc! { "email": "new@test.com" })
+                .unwrap()
+                .is_some(),
+            "new email must be found after update"
+        );
+    }
+
+    /// Verify that the index scan finds documents using a range condition.
+    #[test]
+    fn buffered_index_scan_range_gt() {
+        let (e, _io) = buffered_engine();
+
+        let idx = IndexModel::builder()
+            .keys(doc! { "score": 1 })
+            .build()
+            .unwrap();
+        e.create_index("test.players", &idx).unwrap();
+
+        for i in 0i32..10 {
+            e.insert("test.players", doc! { "name": format!("p{i}"), "score": i })
+                .unwrap();
+        }
+
+        // Use $gt — only scores > 7 should be returned.
+        let results = e
+            .find(
+                "test.players",
+                &doc! { "score": { "$gt": 7i32 } },
+                &FindOptions::new(),
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2, "scores 8 and 9 should match");
+        for d in &results {
+            assert!(d.get_i32("score").unwrap() > 7);
+        }
+    }
+
+    /// Verify that the index scan handles `$in` queries correctly.
+    #[test]
+    fn buffered_index_scan_in_query() {
+        let (e, _io) = buffered_engine();
+
+        let idx = IndexModel::builder()
+            .keys(doc! { "status": 1 })
+            .build()
+            .unwrap();
+        e.create_index("test.orders", &idx).unwrap();
+
+        e.insert("test.orders", doc! { "status": "pending", "amount": 10i32 })
+            .unwrap();
+        e.insert("test.orders", doc! { "status": "active",  "amount": 20i32 })
+            .unwrap();
+        e.insert("test.orders", doc! { "status": "closed",  "amount": 30i32 })
+            .unwrap();
+
+        let results = e
+            .find(
+                "test.orders",
+                &doc! { "status": { "$in": ["pending", "active"] } },
+                &FindOptions::new(),
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for d in &results {
+            let s = d.get_str("status").unwrap();
+            assert!(s == "pending" || s == "active");
+        }
+    }
+
+    /// Verify that a unique secondary index rejects duplicate values.
+    #[test]
+    fn buffered_unique_secondary_index_rejects_duplicates() {
+        let (e, _io) = buffered_engine();
+
+        use crate::options::IndexOptions;
+        let idx = IndexModel::builder()
+            .keys(doc! { "email": 1 })
+            .options(IndexOptions::new().unique(true))
+            .build()
+            .unwrap();
+        e.create_index("test.users", &idx).unwrap();
+
+        e.insert("test.users", doc! { "email": "dup@test.com" })
+            .unwrap();
+        let result = e.insert("test.users", doc! { "email": "dup@test.com" });
+        assert!(
+            matches!(result, Err(Error::DuplicateKey { .. })),
+            "unique index must reject duplicate email"
+        );
+    }
+
+    /// Verify that a compound index can be created and used for lookups.
+    #[test]
+    fn buffered_compound_index_lookup() {
+        let (e, _io) = buffered_engine();
+
+        let idx = IndexModel::builder()
+            .keys(doc! { "category": 1, "price": 1 })
+            .build()
+            .unwrap();
+        e.create_index("test.products", &idx).unwrap();
+
+        e.insert(
+            "test.products",
+            doc! { "category": "books", "price": 15i32, "title": "Rust Programming" },
+        )
+        .unwrap();
+        e.insert(
+            "test.products",
+            doc! { "category": "books", "price": 25i32, "title": "Database Design" },
+        )
+        .unwrap();
+        e.insert(
+            "test.products",
+            doc! { "category": "tools", "price": 50i32, "title": "Hammer" },
+        )
+        .unwrap();
+
+        // Equality on the leftmost field — planner selects the compound index.
+        let results = e
+            .find(
+                "test.products",
+                &doc! { "category": "books" },
+                &FindOptions::new(),
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2, "two books should be found");
+        for d in &results {
+            assert_eq!(d.get_str("category").unwrap(), "books");
+        }
+    }
+
+    /// Verify that an index survives a checkpoint + reopen cycle.
+    #[test]
+    fn buffered_index_survives_reopen() {
+        let (e, io) = buffered_engine();
+
+        let idx = IndexModel::builder()
+            .keys(doc! { "username": 1 })
+            .build()
+            .unwrap();
+        e.create_index("test.accounts", &idx).unwrap();
+
+        e.insert("test.accounts", doc! { "username": "alice" })
+            .unwrap();
+        e.insert("test.accounts", doc! { "username": "bob" })
+            .unwrap();
+
+        e.checkpoint().unwrap();
+        drop(e);
+
+        let e2 = reopen_engine(&io);
+
+        // After reopen, index scan must still work.
+        let found = e2
+            .find_one("test.accounts", &doc! { "username": "alice" })
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "alice must be found via index after reopen"
         );
     }
 }
