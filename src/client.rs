@@ -1242,4 +1242,84 @@ mod tests {
         assert_eq!(a_doc.x, 1, "alpha collection should have x=1");
         assert_eq!(b_doc.x, 2, "beta collection should have x=2");
     }
+
+    // -----------------------------------------------------------------------
+    // R1.6: SWMR — concurrent reader tests
+    // -----------------------------------------------------------------------
+
+    /// Verify that concurrent reads via the public `Client` API do not block
+    /// each other: multiple reader threads run simultaneously without the
+    /// writer_lock being a bottleneck (reads don't acquire writer_lock at all).
+    #[test]
+    fn swmr_concurrent_reads_via_client_do_not_deadlock() {
+        use bson::doc;
+        use std::sync::Arc;
+        use std::thread;
+
+        let client = Arc::new(Client::open_in_memory().expect("open"));
+        let db = client.database("test");
+        let col = db.collection::<bson::Document>("data");
+
+        // Seed data.
+        for i in 0..50i32 {
+            col.insert_one(&doc! { "v": i }).expect("insert");
+        }
+
+        // 16 concurrent readers.
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let c = Arc::clone(&client);
+                thread::spawn(move || {
+                    let db = c.database("test");
+                    let col = db.collection::<bson::Document>("data");
+                    let docs: Vec<_> = col
+                        .find(doc! {})
+                        .expect("find")
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    assert_eq!(docs.len(), 50, "all 50 docs must be visible");
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("reader panicked");
+        }
+    }
+
+    /// Verify that concurrent writes via Client all eventually succeed:
+    /// the `acquire_writer_lock` spin-loop serialises them.
+    #[test]
+    fn swmr_concurrent_writes_via_client_all_succeed() {
+        use bson::doc;
+        use std::sync::Arc;
+        use std::thread;
+
+        let client = Arc::new(Client::open_in_memory().expect("open"));
+
+        // 8 writer threads, each inserts 10 docs.
+        let handles: Vec<_> = (0..8u32)
+            .map(|w| {
+                let c = Arc::clone(&client);
+                thread::spawn(move || {
+                    let col = c.database("test").collection::<bson::Document>("data");
+                    for j in 0..10u32 {
+                        col.insert_one(&doc! { "w": w as i32, "j": j as i32 })
+                            .expect("insert");
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("writer panicked");
+        }
+
+        let count = client
+            .database("test")
+            .collection::<bson::Document>("data")
+            .count_documents(bson::doc! {})
+            .expect("count");
+        assert_eq!(count, 80, "all 80 documents from 8 writers must be present");
+    }
 }

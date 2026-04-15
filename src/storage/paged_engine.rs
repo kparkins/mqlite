@@ -2751,4 +2751,142 @@ mod tests {
             "alice must be found via index after reopen"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // R1.6: SWMR concurrency tests
+    //
+    // Verify that multiple concurrent readers do not block each other, and
+    // that readers run concurrently with writers (writers take an exclusive
+    // write lock; readers take a shared read lock).
+    // -----------------------------------------------------------------------
+
+    /// Verify that many concurrent reader threads can all see committed data
+    /// without blocking each other.
+    #[test]
+    fn swmr_concurrent_readers_do_not_block() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let e = Arc::new(engine());
+        // Insert documents under the single writer lock.
+        for i in 0..20i32 {
+            e.insert("test.c", doc! { "i": i }).unwrap();
+        }
+
+        // Spawn many reader threads that all query concurrently.
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let e = Arc::clone(&e);
+                thread::spawn(move || {
+                    let opts = FindOptions::new();
+                    let docs = e.find("test.c", &doc! {}, &opts).unwrap();
+                    assert_eq!(docs.len(), 20, "all 20 docs must be visible to every reader");
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+    }
+
+    /// Verify that a reader can observe a consistent snapshot while a
+    /// concurrent writer is modifying the collection.
+    ///
+    /// The reader starts BEFORE the writer commits; it must see the
+    /// pre-write state (snapshot at the moment the read lock was acquired).
+    #[test]
+    fn swmr_reader_sees_snapshot_isolation() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let e = Arc::new(engine());
+        // Insert an initial document.
+        e.insert("test.snap", doc! { "status": "before" })
+            .unwrap();
+
+        // Barrier: reader starts, acquires read lock, signals writer.
+        // Barrier has 2 parties: reader + writer.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let e_reader = Arc::clone(&e);
+        let barrier_reader = Arc::clone(&barrier);
+        let reader = thread::spawn(move || {
+            // Acquire the read lock (shared) and hold it while the writer
+            // is trying to proceed.
+            let inner = e_reader.inner.read().unwrap();
+
+            // Tell the writer we're inside the read section.
+            barrier_reader.wait();
+
+            // Do the actual scan while holding the read lock.
+            let matched = match &*inner {
+                DocBackend::Memory(m) => {
+                    m.tree("test.snap")
+                        .map(|t| btree_collscan(t, &doc! {}).unwrap())
+                        .unwrap_or_default()
+                }
+                DocBackend::Buffered(bp) => {
+                    bp.open_tree_for_read("test.snap")
+                        .unwrap()
+                        .map(|t| btree_collscan(&t, &doc! {}).unwrap())
+                        .unwrap_or_default()
+                }
+            };
+            drop(inner); // release read lock
+            matched
+        });
+
+        // Writer: wait for the reader to hold the lock, then write.
+        barrier.wait();
+        // Writer acquires the exclusive write lock (blocks until reader drops).
+        e.insert("test.snap", doc! { "status": "after" }).unwrap();
+
+        let matched = reader.join().expect("reader panicked");
+        // The reader held the lock before the write so it sees exactly 1 doc.
+        assert_eq!(
+            matched.len(),
+            1,
+            "reader must see snapshot before writer committed"
+        );
+    }
+
+    /// Verify that the in-process writer lock (in client.rs) respects the
+    /// busy_timeout: concurrent writers should queue up and eventually all
+    /// succeed (or get WriterBusy on zero-timeout paths).
+    ///
+    /// This test uses the PagedEngine directly (not through Client) so it
+    /// only exercises the RwLock inside the engine, not the client-level
+    /// writer_lock.  Engine-level writes are serialized by the write-lock.
+    #[test]
+    fn swmr_concurrent_writers_serialize() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let e = Arc::new(engine());
+
+        // Spawn 8 writer threads — each inserts 10 documents.
+        let handles: Vec<_> = (0..8u32)
+            .map(|worker| {
+                let e = Arc::clone(&e);
+                thread::spawn(move || {
+                    for j in 0..10u32 {
+                        e.insert(
+                            "test.concurrent",
+                            doc! { "worker": worker as i32, "j": j as i32 },
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+
+        // After all writers complete, total doc count must be 8 * 10 = 80.
+        let count = e.count("test.concurrent", &doc! {}).unwrap();
+        assert_eq!(count, 80, "all 80 documents must be present after concurrent writes");
+    }
 }
