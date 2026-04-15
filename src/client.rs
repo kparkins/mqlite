@@ -14,7 +14,7 @@
 //! hold a clone of the same `Arc<ClientInner>`, so they are cheap to create
 //! and share the same underlying state.
 
-use bson::Document;
+use bson::{Bson, Document};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -35,7 +35,9 @@ use crate::{
     storage::{
         header::{FileHeader, HEADER_PAGE_SIZE},
         lock::{self, FileLock, NoopFileLock},
+        paged_engine::PagedEngine,
     },
+    storage_engine::StorageEngine,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,6 +157,13 @@ fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
 ///
 /// Callers acquiring both locks must always take `writer_lock` *after*
 /// `file_lock` to avoid deadlocks.
+///
+/// ## Storage engine
+///
+/// `engine` is a `Box<dyn StorageEngine>` — the concrete type is always
+/// [`PagedEngine`] in Phase 1, but `ClientInner` never knows this.  This
+/// abstraction lets future phases swap in a different engine without changing
+/// the public API layer.
 #[allow(dead_code)]
 pub(crate) struct ClientInner {
     /// Path to the database file. `None` for in-memory databases.
@@ -162,11 +171,16 @@ pub(crate) struct ClientInner {
     /// Configuration options.
     pub opts: OpenOptions,
     /// In-process writer mutex — one write at a time within this process.
+    ///
+    /// `PagedEngine` already serialises all access via its own `Mutex`, but
+    /// `writer_lock` provides an extra guarantee: multi-step operations in
+    /// `ClientInner` (e.g., `insert_many`) are atomic at the process level.
+    /// This will be revisited in Phase 1.6 (SWMR).
     writer_lock: Mutex<()>,
     /// Cross-process OS advisory file lock.
     file_lock: Box<dyn FileLock>,
-    /// Phase 1b in-memory storage engine.
-    pub(crate) engine: Mutex<EngineState>,
+    /// Storage engine.  All CRUD operations are dispatched through this trait.
+    pub(crate) engine: Box<dyn StorageEngine>,
 }
 
 impl ClientInner {
@@ -176,7 +190,7 @@ impl ClientInner {
             opts,
             writer_lock: Mutex::new(()),
             file_lock,
-            engine: Mutex::new(EngineState::new()),
+            engine: Box::new(PagedEngine::new()),
         }
     }
 
@@ -191,13 +205,18 @@ impl ClientInner {
             opts,
             writer_lock: Mutex::new(()),
             file_lock,
-            engine: Mutex::new(engine),
+            engine: Box::new(PagedEngine::from_state(engine)),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
 // ClientInner CRUD method implementations
+// ---------------------------------------------------------------------------
+//
+// All storage operations are routed through `self.engine` (a `Box<dyn
+// StorageEngine>`).  `ClientInner` owns the serialisation / deserialisation
+// layer (generic `T` parameters) on top of the Document-level trait.
 // ---------------------------------------------------------------------------
 
 impl ClientInner {
@@ -209,8 +228,17 @@ impl ClientInner {
         #[cfg(feature = "tracing")]
         tracing::debug!(target: "mqlite", collection = name, doc_count = 1u64, "mqlite::insert");
 
+        let bson_doc = bson::to_document(doc).map_err(Error::BsonSerialization)?;
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().insert_one(name, doc)
+        let id = self.engine.insert(name, bson_doc)?;
+        let oid = match id {
+            Bson::ObjectId(o) => o,
+            // For non-ObjectId _id values, generate a surrogate ObjectId to
+            // satisfy the `InsertOneResult` type.  The document retains its
+            // original `_id`.  This is a pre-existing limitation.
+            _ => crate::storage::oid::ObjectIdGenerator::generate(),
+        };
+        Ok(InsertOneResult { inserted_id: oid })
     }
 
     pub(crate) fn insert_many<T: serde::Serialize>(
@@ -219,6 +247,9 @@ impl ClientInner {
         docs: &[T],
         opts: InsertManyOptions,
     ) -> Result<InsertManyResult> {
+        use crate::results::BulkWriteError;
+        use std::collections::HashMap;
+
         #[cfg(feature = "tracing")]
         tracing::debug!(
             target: "mqlite",
@@ -228,7 +259,45 @@ impl ClientInner {
         );
 
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().insert_many(name, docs, opts)
+        let mut inserted_ids: HashMap<usize, Bson> = HashMap::new();
+        let mut errors: Vec<BulkWriteError> = Vec::new();
+
+        'outer: for (i, doc) in docs.iter().enumerate() {
+            let bson_doc = match bson::to_document(doc).map_err(Error::BsonSerialization) {
+                Ok(d) => d,
+                Err(e) => {
+                    errors.push(BulkWriteError {
+                        index: i,
+                        code: e.code().unwrap_or(1),
+                        message: e.to_string(),
+                    });
+                    if opts.ordered {
+                        break 'outer;
+                    }
+                    continue;
+                }
+            };
+            match self.engine.insert(name, bson_doc) {
+                Ok(id) => {
+                    inserted_ids.insert(i, id);
+                }
+                Err(e) => {
+                    errors.push(BulkWriteError {
+                        index: i,
+                        code: e.code().unwrap_or(1),
+                        message: e.to_string(),
+                    });
+                    if opts.ordered {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        Ok(InsertManyResult {
+            inserted_ids,
+            errors,
+        })
     }
 
     pub(crate) fn find_one<T: DeserializeOwned>(
@@ -251,7 +320,12 @@ impl ClientInner {
                 "mqlite::find"
             );
         }
-        self.engine.lock().unwrap().find_one(name, filter)
+        match self.engine.find_one(name, &filter)? {
+            None => Ok(None),
+            Some(doc) => bson::from_document(doc)
+                .map(Some)
+                .map_err(Error::BsonDeserialization),
+        }
     }
 
     pub(crate) fn find<T: DeserializeOwned>(
@@ -275,7 +349,9 @@ impl ClientInner {
                 "mqlite::find"
             );
         }
-        self.engine.lock().unwrap().find(name, filter, opts)
+        let docs = self.engine.find(name, &filter, &opts)?;
+        let docs_examined = docs.len() as u64;
+        Ok(Cursor::new(docs, docs_examined))
     }
 
     pub(crate) fn update_one(
@@ -286,10 +362,7 @@ impl ClientInner {
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .update_one(name, filter, update, opts)
+        self.engine.update(name, &filter, &update, &opts, false)
     }
 
     pub(crate) fn update_many(
@@ -300,20 +373,17 @@ impl ClientInner {
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .update_many(name, filter, update, opts)
+        self.engine.update(name, &filter, &update, &opts, true)
     }
 
     pub(crate) fn delete_one(&self, name: &str, filter: Document) -> Result<DeleteResult> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().delete_one(name, filter)
+        self.engine.delete(name, &filter, false)
     }
 
     pub(crate) fn delete_many(&self, name: &str, filter: Document) -> Result<DeleteResult> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().delete_many(name, filter)
+        self.engine.delete(name, &filter, true)
     }
 
     pub(crate) fn find_one_and_update<T: Serialize + DeserializeOwned>(
@@ -322,11 +392,8 @@ impl ClientInner {
         filter: Document,
         update: Document,
     ) -> Result<Option<T>> {
-        let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .find_one_and_update(name, filter, update)
+        let opts = FindOneAndUpdateOptions::new();
+        self.find_one_and_update_with_options(name, filter, update, opts)
     }
 
     pub(crate) fn find_one_and_update_with_options<T: Serialize + DeserializeOwned>(
@@ -337,10 +404,12 @@ impl ClientInner {
         opts: FindOneAndUpdateOptions,
     ) -> Result<Option<T>> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .find_one_and_update_with_options(name, filter, update, opts)
+        match self.engine.find_one_and_update_doc(name, &filter, &update, &opts)? {
+            None => Ok(None),
+            Some(doc) => bson::from_document(doc)
+                .map(Some)
+                .map_err(Error::BsonDeserialization),
+        }
     }
 
     pub(crate) fn find_one_and_delete<T: DeserializeOwned>(
@@ -348,11 +417,8 @@ impl ClientInner {
         name: &str,
         filter: Document,
     ) -> Result<Option<T>> {
-        let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .find_one_and_delete(name, filter)
+        let opts = FindOneAndDeleteOptions::new();
+        self.find_one_and_delete_with_options(name, filter, opts)
     }
 
     pub(crate) fn find_one_and_delete_with_options<T: DeserializeOwned>(
@@ -362,10 +428,12 @@ impl ClientInner {
         opts: FindOneAndDeleteOptions,
     ) -> Result<Option<T>> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .find_one_and_delete_with_options(name, filter, opts)
+        match self.engine.find_one_and_delete_doc(name, &filter, &opts)? {
+            None => Ok(None),
+            Some(doc) => bson::from_document(doc)
+                .map(Some)
+                .map_err(Error::BsonDeserialization),
+        }
     }
 
     pub(crate) fn find_one_and_replace<T: Serialize + DeserializeOwned>(
@@ -374,11 +442,8 @@ impl ClientInner {
         filter: Document,
         replacement: &T,
     ) -> Result<Option<T>> {
-        let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .find_one_and_replace(name, filter, replacement)
+        let opts = FindOneAndReplaceOptions::new();
+        self.find_one_and_replace_with_options(name, filter, replacement, opts)
     }
 
     pub(crate) fn find_one_and_replace_with_options<T: Serialize + DeserializeOwned>(
@@ -388,47 +453,55 @@ impl ClientInner {
         replacement: &T,
         opts: FindOneAndReplaceOptions,
     ) -> Result<Option<T>> {
+        let replacement_doc =
+            bson::to_document(replacement).map_err(Error::BsonSerialization)?;
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine
-            .lock()
-            .unwrap()
-            .find_one_and_replace_with_options(name, filter, replacement, opts)
+        match self
+            .engine
+            .find_one_and_replace_doc(name, &filter, &replacement_doc, &opts)?
+        {
+            None => Ok(None),
+            Some(doc) => bson::from_document(doc)
+                .map(Some)
+                .map_err(Error::BsonDeserialization),
+        }
     }
 
     pub(crate) fn estimated_document_count(&self, name: &str) -> Result<u64> {
-        self.engine.lock().unwrap().estimated_document_count(name)
+        // Estimated count = exact count for the stub engine.
+        self.engine.count(name, &Document::new())
     }
 
     pub(crate) fn count_documents(&self, name: &str, filter: Document) -> Result<u64> {
-        self.engine.lock().unwrap().count_documents(name, filter)
+        self.engine.count(name, &filter)
     }
 
     pub(crate) fn create_index(&self, name: &str, model: IndexModel) -> Result<String> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().create_index(name, model)
+        self.engine.create_index(name, &model)
     }
 
     pub(crate) fn drop_index(&self, name: &str, index_name: &str) -> Result<()> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().drop_index(name, index_name)
+        self.engine.drop_index(name, index_name)
     }
 
     pub(crate) fn list_indexes(&self, name: &str) -> Result<Vec<IndexInfo>> {
-        self.engine.lock().unwrap().list_indexes(name)
+        self.engine.list_indexes(name)
     }
 
     pub(crate) fn list_collection_names(&self) -> Result<Vec<String>> {
-        self.engine.lock().unwrap().list_collection_names()
+        self.engine.list_namespaces()
     }
 
     pub(crate) fn drop_collection(&self, name: &str) -> Result<()> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().drop_collection(name)
+        self.engine.drop_namespace(name)
     }
 
     pub(crate) fn create_collection(&self, name: &str) -> Result<()> {
         let _guard = self.writer_lock.lock().unwrap();
-        self.engine.lock().unwrap().create_collection(name)
+        self.engine.create_namespace(name)
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
@@ -436,8 +509,13 @@ impl ClientInner {
             return Ok(());
         }
 
-        let snapshot = self.engine.lock().unwrap().to_bson_bytes()?;
-        self.file_lock.write_at(HEADER_PAGE_SIZE as u64, &snapshot)?;
+        // Phase 0.x legacy path: write a BSON-blob snapshot to the file.
+        // `PagedEngine::snapshot_bytes()` returns `Some(bytes)` during this
+        // phase.  Phase 1.5 (WAL integration) replaces this with a real
+        // WAL checkpoint and `snapshot_bytes()` will return `None`.
+        if let Some(snapshot) = self.engine.snapshot_bytes()? {
+            self.file_lock.write_at(HEADER_PAGE_SIZE as u64, &snapshot)?;
+        }
         Ok(())
     }
 

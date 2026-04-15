@@ -105,6 +105,23 @@ impl EngineState {
     // Insert
     // ---------------------------------------------------------------------------
 
+    /// Insert a pre-serialised [`Document`] and return the inserted `_id` as [`Bson`].
+    ///
+    /// Unlike [`Self::insert_one`] this method works directly with `Document` without
+    /// an additional serialisation step.  Used by [`crate::storage::paged_engine::PagedEngine`]
+    /// to implement [`crate::storage_engine::StorageEngine::insert`].
+    pub(crate) fn insert_doc(&mut self, name: &str, mut doc: Document) -> Result<Bson> {
+        validate_document(&doc)?;
+        let id_bson = Self::ensure_id(&mut doc);
+        {
+            let coll = self.get_or_create(name);
+            Self::check_unique_constraints(coll, &doc)?;
+        }
+        let coll = self.get_or_create(name);
+        coll.docs.push(doc);
+        Ok(id_bson)
+    }
+
     pub(crate) fn insert_one<T: Serialize>(
         &mut self,
         name: &str,

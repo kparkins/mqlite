@@ -132,6 +132,7 @@ pub mod results;
 mod engine;
 mod query;
 mod storage;
+mod storage_engine;
 mod update_operators;
 mod validation;
 // Phase 1: WAL module — not yet wired into the main read/write paths.

@@ -34,5 +34,7 @@ pub(crate) mod lock;
 pub(crate) mod oid;
 #[allow(dead_code)]
 pub(crate) mod page;
+/// Phase 1 `StorageEngine` implementation (currently a stub).
+pub(crate) mod paged_engine;
 #[allow(dead_code)]
 pub(crate) mod secondary_index;
