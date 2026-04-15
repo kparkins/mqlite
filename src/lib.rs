@@ -17,14 +17,15 @@
 //! ```
 //!
 //! ```no_run
-//! use mqlite::{Database, doc};
+//! use mqlite::{Client, doc};
 //! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Config { key: String, value: String }
 //!
 //! fn main() -> mqlite::Result<()> {
-//!     let db = Database::open("myapp.mqlite")?;
+//!     let client = Client::open("myapp.mqlite")?;
+//!     let db = client.database("myapp");
 //!     let configs = db.collection::<Config>("config");
 //!
 //!     configs.insert_one(&Config {
@@ -56,12 +57,13 @@
 //!
 //! | Type | `Send` | `Sync` | Notes |
 //! |------|--------|--------|-------|
-//! | [`Database`] | ✅ | ✅ | Clone and share across threads freely |
-//! | [`Collection<T>`] | ✅ | ✅ | Same shared state as `Database` |
+//! | [`Client`] | ✅ | ✅ | Clone and share across threads freely |
+//! | [`Database`] | ✅ | ✅ | Lightweight handle, same inner state as `Client` |
+//! | [`Collection<T>`] | ✅ | ✅ | Same shared state as `Client`/`Database` |
 //! | [`Cursor<T>`] | ✅ | ❌ | Move to another thread; use `Mutex` for concurrent access |
 //! | [`Error`] | ✅ | ✅ | — |
 //!
-//! `Database` and `Collection<T>` can be cloned and sent to other threads without
+//! `Client`, `Database`, and `Collection<T>` can be cloned and sent to other threads without
 //! any additional synchronization. mqlite serializes concurrent writes internally
 //! with a `Mutex`. Reads are also serialized through the engine `Mutex` in Phase 1.
 //!
@@ -71,18 +73,18 @@
 //! # File Lifecycle
 //!
 //! ```text
-//! Database::open("myapp.mqlite")
+//! Client::open("myapp.mqlite")
 //!   ├─ Creates myapp.mqlite        (main database file)
 //!   ├─ Creates myapp.mqlite-wal    (write-ahead log; accumulates writes)
 //!   └─ Creates myapp.mqlite-shm   (WAL shared-memory index; deleted on clean close)
 //!
-//! Database::close(self)           (blocking flush + checkpoint)
+//! Client::close(self)             (blocking flush + checkpoint)
 //!   └─ myapp.mqlite-wal is checkpointed into myapp.mqlite and removed
 //!      → "single file" state
 //!
-//! drop(db)                        (non-blocking)
+//! drop(client)                    (non-blocking)
 //!   └─ myapp.mqlite-wal remains on disk
-//!      → Replayed automatically on next Database::open
+//!      → Replayed automatically on next Client::open
 //! ```
 //!
 //! The `close()` method is the recommended shutdown path when you need a guaranteed-clean
@@ -107,11 +109,13 @@
 
 /// BSON re-exports for ergonomic use without a direct `bson` dependency.
 pub mod bson_compat;
+/// Client entry point: `Client::open(path)` → `client.database(name)` → `db.collection::<T>(name)`.
+pub mod client;
 /// Typed collection handles for CRUD operations.
 pub mod collection;
 /// Lazy cursor for iterating query results.
 pub mod cursor;
-/// The database entry point: open, clone, and manage the database.
+/// Lightweight database-namespace handle (returned by `Client::database`).
 pub mod database;
 /// Error types and MongoDB-compatible error codes.
 pub mod error;
@@ -152,6 +156,7 @@ pub mod wire;
 // ---------------------------------------------------------------------------
 
 // Core entry points
+pub use client::Client;
 pub use collection::Collection;
 pub use cursor::{Cursor, ExplainResult};
 pub use database::Database;

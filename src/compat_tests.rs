@@ -16,7 +16,7 @@
 //! 6. Error code verification — each error condition returns the MongoDB-
 //!    compatible error code defined in `error::codes`.
 //!
-//! Tests 1–3 and 5–6 use `Database::open_in_memory()` for speed.
+//! Tests 1–3 and 5–6 use `Client::open_in_memory()` for speed.
 //! Test 4 uses a real on-disk file via `tempfile`.
 //!
 //! # Organisational note
@@ -25,15 +25,16 @@
 //! $lt, $lte, $in, $all, $elemMatch, $regex) is already covered by the
 //! engine-level tests in `src/engine.rs`.  This module adds the `$ne` case
 //! (always COLLSCAN, with or without an index) and verifies consistency
-//! through the public `Database`/`Collection` API.
+//! through the public `Client`/`Database`/`Collection` API.
 
 #[cfg(test)]
 mod tests {
     use crate::{
+        client::Client,
         doc,
         error::{codes, Error},
         options::{FindOneAndUpdateOptions, InsertManyOptions, ReturnDocument, UpdateOptions},
-        Database, IndexModel, IndexOptions,
+        IndexModel, IndexOptions,
     };
     use bson::{Bson, Document};
 
@@ -50,7 +51,8 @@ mod tests {
     ///   mode stops at first error).
     #[test]
     fn insert_many_ordered_behavioral_contract() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("items");
 
         // Create unique index on "x".
@@ -128,7 +130,8 @@ mod tests {
     /// - `errors` has exactly 1 entry with index 2 and code 11000.
     #[test]
     fn insert_many_unordered_behavioral_contract() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("items");
 
         let model = IndexModel::builder()
@@ -195,7 +198,8 @@ mod tests {
     /// DB is updated.
     #[test]
     fn find_one_and_update_returns_pre_modification() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("docs");
 
         col.insert_one(&doc! { "a": 1i32 }).unwrap();
@@ -225,7 +229,8 @@ mod tests {
     /// `return_document=After`: returned doc reflects post-update state.
     #[test]
     fn find_one_and_update_return_document_after() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("docs");
 
         col.insert_one(&doc! { "b": 1i32 }).unwrap();
@@ -259,7 +264,8 @@ mod tests {
     ///   both `email: "a@b.com"` and `name: "Alice"`.
     #[test]
     fn upsert_behavioral_contract() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("users");
 
         // Collection is empty — upsert must insert.
@@ -312,7 +318,8 @@ mod tests {
         let reference_email = "user42@example.com";
 
         {
-            let db = Database::open(&db_path).expect("open new database");
+            let client = crate::client::Client::open(&db_path).expect("open new database");
+            let db = client.database("app");
             let col = db.collection::<Document>("users");
 
             // Insert 1 000 documents.
@@ -351,7 +358,8 @@ mod tests {
 
         // ---- Phase 2: reopen and verify ----------------------------------
         {
-            let db = Database::open(&db_path).expect("reopen database");
+            let client = crate::client::Client::open(&db_path).expect("reopen database");
+            let db = client.database("app");
             let col = db.collection::<Document>("users");
 
             // Assert count == 1 000.
@@ -403,7 +411,8 @@ mod tests {
     /// queried field.
     #[test]
     fn index_vs_scan_consistency_ne() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("scores");
 
         // Insert 10 documents with scores 0–9.
@@ -471,7 +480,8 @@ mod tests {
     /// return error code 11000.
     #[test]
     fn error_code_duplicate_key() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("u");
 
         let model = IndexModel::builder()
@@ -503,7 +513,8 @@ mod tests {
     /// return error code 9.
     #[test]
     fn error_code_unsupported_operator() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("u");
         col.insert_one(&doc! { "x": 1i32 }).unwrap();
 
@@ -531,7 +542,8 @@ mod tests {
     /// `text`) must return error code 67.
     #[test]
     fn error_code_unsupported_index_option() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("u");
 
         // A text index is not supported in Phase 1.
@@ -558,7 +570,8 @@ mod tests {
     /// 10334.
     #[test]
     fn error_code_document_too_large() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("u");
 
         // Build a document that exceeds the 16 MB limit.
@@ -593,7 +606,7 @@ mod tests {
         std::fs::write(&real_file, b"").expect("create real file");
         std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
 
-        let err = Database::open(&symlink_path)
+        let err = crate::client::Client::open(&symlink_path)
             .err()
             .expect("opening symlink must return Err");
 
@@ -617,7 +630,8 @@ mod tests {
     /// collection is not an error.
     #[test]
     fn collection_not_found_returns_empty() {
-        let db = Database::open_in_memory().unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let db = client.database("test");
         let col = db.collection::<Document>("nonexistent");
 
         let count = col.count_documents(doc! {}).unwrap();

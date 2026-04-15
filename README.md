@@ -16,10 +16,11 @@ serde = { version = "1", features = ["derive"] }
 **Untyped documents:**
 
 ```rust
-use mqlite::{Database, doc};
+use mqlite::{Client, doc};
 
 fn main() -> mqlite::Result<()> {
-    let db = Database::open("myapp.mqlite")?;
+    let client = Client::open("myapp.mqlite")?;
+    let db = client.database("myapp");
     let events = db.collection::<mqlite::Document>("events");
     events.insert_one(&doc! { "action": "login", "user": "alice" })?;
     let event = events.find_one(doc! { "user": "alice" })?;
@@ -31,14 +32,15 @@ fn main() -> mqlite::Result<()> {
 **Typed structs (serde):**
 
 ```rust
-use mqlite::{Database, doc};
+use mqlite::{Client, doc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config { key: String, value: String }
 
 fn main() -> mqlite::Result<()> {
-    let db = Database::open("myapp.mqlite")?;
+    let client = Client::open("myapp.mqlite")?;
+    let db = client.database("myapp");
     let configs = db.collection::<Config>("config");
     configs.insert_one(&Config { key: "theme".into(), value: "dark".into() })?;
     let theme = configs.find_one(doc! { "key": "theme" })?;
@@ -62,7 +64,7 @@ fn main() -> mqlite::Result<()> {
 | `myapp.mqlite-wal` | During write activity | Write-ahead log (WAL); safe to leave — replayed on next open |
 | `myapp.mqlite-shm` | While database is open | Shared-memory WAL index; deleted on clean close |
 
-A "single-file database" means a single file **after a clean close** (`Database::close()`).
+A "single-file database" means a single file **after a clean close** (`Client::close()` or `Database::close()`).
 Dropping the handle is non-blocking and leaves the WAL on disk; the next open recovers it.
 
 ## Documentation

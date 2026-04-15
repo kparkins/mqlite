@@ -2131,4 +2131,33 @@ mod tests {
         assert!(explain.full_scan);
         assert!(explain.index_used.is_none());
     }
+
+    /// Verify that collection names with dots (qualified namespaces like `"db.collection"`) survive
+    /// the BSON persistence round-trip used by `ClientInner::checkpoint`.
+    #[test]
+    fn dotted_collection_key_survives_bson_roundtrip() {
+        let mut eng = engine();
+        eng.insert_one("app.users", &doc! {"name": "Alice", "score": 42i32}).unwrap();
+        
+        // Create an index on the qualified namespace.
+        let model = crate::index::IndexModel::builder()
+            .keys(doc! { "name": 1i32 })
+            .options(crate::options::IndexOptions::new().name("name_1".to_string()))
+            .build()
+            .unwrap();
+        eng.create_index("app.users", model).unwrap();
+
+        let bytes = eng.to_bson_bytes().unwrap();
+        let restored = EngineState::from_bson_bytes(&bytes).unwrap();
+
+        // Document must be findable under the qualified name.
+        let found: Option<Document> = restored.find_one("app.users", doc! {}).unwrap();
+        assert!(found.is_some(), "doc must survive round-trip under qualified name 'app.users'");
+
+        // Index must be restored.
+        let indexes = restored.list_indexes("app.users").unwrap();
+        assert_eq!(indexes.len(), 1, "one index should survive round-trip");
+        assert_eq!(indexes[0].name, "name_1");
+    }
 }
+

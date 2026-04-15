@@ -41,7 +41,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use bson::{doc, Bson, Document};
-use mqlite::{Database, WireProtocol};
+use mqlite::{Client, WireProtocol};
 
 // ---------------------------------------------------------------------------
 // Wire protocol constants
@@ -55,19 +55,19 @@ const OP_REPLY: i32 = 1;
 // Test helper: spin up a wire server on a random port
 // ---------------------------------------------------------------------------
 
-/// Spin up a `WireProtocol` server backed by an in-memory database.
+/// Spin up a `WireProtocol` server backed by an in-memory client.
 ///
-/// Returns `(server, addr)`.  The server runs in the background until dropped.
+/// Returns `(client, server, addr)`.  The server runs in the background until dropped.
 /// The address is a random loopback port chosen by the OS.
-fn start_server() -> (Database, WireProtocol, std::net::SocketAddr) {
+fn start_server() -> (Client, WireProtocol, std::net::SocketAddr) {
     // Grab a random ephemeral port.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let db = Database::open_in_memory().unwrap();
-    let server = WireProtocol::bind(&db, &addr.to_string()).unwrap();
-    (db, server, addr)
+    let client = Client::open_in_memory().unwrap();
+    let server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
+    (client, server, addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,7 +1335,8 @@ fn format_parity_list_indexes() {
 /// Native API → wire: insert via native API, read via wire protocol.
 #[test]
 fn bson_roundtrip_native_write_wire_read() {
-    let db = Database::open_in_memory().unwrap();
+    let client = Client::open_in_memory().unwrap();
+    let db = client.database("local");
     let coll = db.collection::<Document>("items");
 
     // Insert via native API.
@@ -1355,7 +1356,7 @@ fn bson_roundtrip_native_write_wire_read() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let _srv = WireProtocol::bind(&db, &addr.to_string()).unwrap();
+    let _srv = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
     let mut s = connect(addr);
     let find_body = round_trip(
@@ -1395,14 +1396,15 @@ fn bson_roundtrip_native_write_wire_read() {
 /// Wire → native API: insert via wire, read via native API.
 #[test]
 fn bson_roundtrip_wire_write_native_read() {
-    let db = Database::open_in_memory().unwrap();
+    let client = Client::open_in_memory().unwrap();
+    let db = client.database("local");
     let coll = db.collection::<Document>("items");
 
     // Bind the wire server.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let _srv = WireProtocol::bind(&db, &addr.to_string()).unwrap();
+    let _srv = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
     // Insert via wire protocol.
     let mut s = connect(addr);
@@ -1435,7 +1437,8 @@ fn bson_roundtrip_wire_write_native_read() {
 /// BSON round-trip: ObjectId preserved across wire.
 #[test]
 fn bson_roundtrip_object_id_preserved() {
-    let db = Database::open_in_memory().unwrap();
+    let client = Client::open_in_memory().unwrap();
+    let db = client.database("local");
     let coll = db.collection::<Document>("oids");
 
     let oid = bson::oid::ObjectId::new();
@@ -1444,7 +1447,7 @@ fn bson_roundtrip_object_id_preserved() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let _srv = WireProtocol::bind(&db, &addr.to_string()).unwrap();
+    let _srv = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
     let mut s = connect(addr);
     let find_body = round_trip(

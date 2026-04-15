@@ -4,7 +4,7 @@
 //! correctly. They mirror the examples verbatim (with minor adaptations for
 //! in-memory mode) so that any future API breakage is immediately caught in CI.
 
-use mqlite::{Database, doc};
+use mqlite::{Client, doc};
 use serde::{Deserialize, Serialize};
 
 /// README example 1: untyped Document access.
@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 /// not need a direct `bson` dependency.
 #[test]
 fn readme_untyped_document_example() {
-    let db = Database::open_in_memory().expect("open in-memory db");
+    let client = Client::open_in_memory().expect("open in-memory client");
+    let db = client.database("test");
     let events = db.collection::<mqlite::Document>("events");
 
     events
@@ -47,7 +48,8 @@ struct Config {
 
 #[test]
 fn readme_typed_struct_example() {
-    let db = Database::open_in_memory().expect("open in-memory db");
+    let client = Client::open_in_memory().expect("open in-memory client");
+    let db = client.database("test");
     let configs = db.collection::<Config>("config");
 
     configs
@@ -72,16 +74,18 @@ fn readme_typed_struct_example() {
 #[test]
 fn readme_crate_root_imports() {
     // These types must be accessible at the crate root per the README.
+    let _: mqlite::Client;
     let _: mqlite::Database;
     let _doc: mqlite::Document = doc! { "key": "value" };
     let _bson: mqlite::Bson = mqlite::Bson::String("hello".into());
     let _ = mqlite::ObjectId::new();
 }
 
-/// Verify `Database::open_in_memory()` — shown in README as the test-double pattern.
+/// Verify `Client::open_in_memory()` — the test-double pattern.
 #[test]
 fn readme_in_memory_test_double() {
-    let db = Database::open_in_memory().expect("open in-memory db");
+    let client = Client::open_in_memory().expect("open in-memory client");
+    let db = client.database("test");
     let col = db.collection::<mqlite::Document>("things");
     col.insert_one(&doc! { "x": 1 }).expect("insert");
     let doc = col.find_one(doc! { "x": 1 }).expect("find_one");

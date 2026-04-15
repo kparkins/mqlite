@@ -9,9 +9,9 @@ use crate::error::{Error, Result};
 ///
 /// # Example
 /// ```no_run
-/// # use mqlite::{Database, doc};
+/// # use mqlite::{Client, doc};
 /// # fn main() -> mqlite::Result<()> {
-/// # let db = Database::open_in_memory()?;
+/// # let client = Client::open_in_memory()?; let db = client.database("test");
 /// # let col = db.collection::<bson::Document>("orders");
 /// let cursor = col.find(doc! { "status": "pending" })?;
 /// let plan = cursor.explain()?;
@@ -47,9 +47,9 @@ pub struct ExplainResult {
 /// `Cursor<T>` implements [`Iterator`] so it can be used in `for` loops:
 ///
 /// ```no_run
-/// # use mqlite::{Database, doc};
+/// # use mqlite::{Client, doc};
 /// # fn main() -> mqlite::Result<()> {
-/// # let db = Database::open_in_memory()?;
+/// # let client = Client::open_in_memory()?; let db = client.database("test");
 /// # let collection = db.collection::<bson::Document>("users");
 /// let cursor = collection.find(doc! {})?;
 /// for result in cursor {
@@ -183,9 +183,9 @@ impl<T> Cursor<T> {
     ///
     /// # Example
     /// ```no_run
-    /// # use mqlite::{Database, doc};
+    /// # use mqlite::{Client, doc};
     /// # fn main() -> mqlite::Result<()> {
-    /// # let db = Database::open_in_memory()?;
+    /// # let client = Client::open_in_memory()?; let db = client.database("test");
     /// # let col = db.collection::<bson::Document>("logs");
     /// let cursor = col.find(doc! { "level": "error" })?;
     /// let plan = cursor.explain()?;

@@ -11,10 +11,10 @@
 //!
 //! # Example
 //! ```no_run
-//! use mqlite::{Database, WireProtocol};
+//! use mqlite::{Client, WireProtocol};
 //!
-//! let db = Database::open("myapp.mqlite")?;
-//! let _server = WireProtocol::bind(&db, "127.0.0.1:27017")?;
+//! let client = Client::open("myapp.mqlite")?;
+//! let _server = WireProtocol::bind(&client, "127.0.0.1:27017")?;
 //! println!("Connect with: mongosh mongodb://localhost:27017");
 //! // Server runs in background until `_server` is dropped
 //! # Ok::<(), mqlite::Error>(())

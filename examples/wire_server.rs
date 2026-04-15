@@ -16,13 +16,13 @@
 //!
 //! The server runs until you press Ctrl-C.
 
-use mqlite::{Database, WireProtocol};
+use mqlite::{Client, WireProtocol};
 
 fn main() -> mqlite::Result<()> {
-    let db = Database::open_in_memory()?;
+    let client = Client::open_in_memory()?;
     let addr = "127.0.0.1:27017";
     println!("mqlite wire server starting on {}", addr);
-    let _server = WireProtocol::bind(&db, addr)?;
+    let _server = WireProtocol::bind(&client, addr)?;
     println!("Listening on mongodb://{}/?directConnection=true", addr);
     println!("Press Ctrl-C to stop.");
 

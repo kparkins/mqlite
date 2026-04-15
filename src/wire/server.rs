@@ -43,7 +43,7 @@ use tokio::net::TcpStream;
 use bson::{doc, oid::ObjectId, DateTime, Document};
 
 use crate::{
-    database::{Database, DatabaseInner},
+    client::{Client, ClientInner},
     error::Result,
     options::{FindOneAndDeleteOptions, FindOneAndUpdateOptions, FindOptions, InsertManyOptions, ReturnDocument, UpdateOptions},
 };
@@ -200,46 +200,46 @@ struct ServerState {
     /// server start and included in every `hello` / `isMaster` response.
     topology_process_id: ObjectId,
 
-    /// Shared database inner state — used by CRUD command handlers.
-    database: Arc<DatabaseInner>,
+    /// Shared client inner state — used by CRUD command handlers.
+    database: Arc<ClientInner>,
 }
 
 impl Default for ServerState {
     fn default() -> Self {
-        let db = Database::open_in_memory().expect("in-memory database never fails");
+        let client = Client::open_in_memory().expect("in-memory client never fails");
         ServerState {
             start_time: Arc::new(std::time::Instant::now()),
             next_connection_id: Arc::new(AtomicI32::new(1)),
             db_path: None,
             topology_process_id: ObjectId::new(),
-            database: Arc::clone(&db.inner),
+            database: Arc::clone(&client.inner),
         }
     }
 }
 
 impl ServerState {
-    /// Create state for a database at the given path (in-memory DB for non-CRUD state).
+    /// Create state for a client at the given path (in-memory client for non-CRUD state).
     fn new(db_path: Option<std::path::PathBuf>) -> Self {
-        let db = Database::open_in_memory().expect("in-memory database never fails");
+        let client = Client::open_in_memory().expect("in-memory client never fails");
         ServerState {
             start_time: Arc::new(std::time::Instant::now()),
             next_connection_id: Arc::new(AtomicI32::new(1)),
             db_path,
             topology_process_id: ObjectId::new(),
-            database: Arc::clone(&db.inner),
+            database: Arc::clone(&client.inner),
         }
     }
 
-    /// Create state backed by a real [`Database`] instance.
+    /// Create state backed by a real [`Client`] instance.
     ///
-    /// Used by [`WireProtocol::bind`] to wire CRUD handlers to the actual DB.
-    fn new_with_db(db: &Database) -> Self {
+    /// Used by [`WireProtocol::bind`] to wire CRUD handlers to the actual client.
+    fn new_with_db(client: &Client) -> Self {
         ServerState {
             start_time: Arc::new(std::time::Instant::now()),
             next_connection_id: Arc::new(AtomicI32::new(1)),
-            db_path: db.inner.path.clone(),
+            db_path: client.inner.path.clone(),
             topology_process_id: ObjectId::new(),
-            database: Arc::clone(&db.inner),
+            database: Arc::clone(&client.inner),
         }
     }
 
@@ -286,6 +286,14 @@ impl ServerState {
             .map(|s| s.to_owned())
             .unwrap_or_else(|| "local".to_owned())
     }
+
+    /// Fully-qualify a collection name as `<db_name>.<coll_name>`.
+    ///
+    /// This matches the engine's internal namespace format established by
+    /// `Collection<T>` and `Database` handles in R0.1.
+    fn qualified_coll(&self, coll_name: &str) -> String {
+        format!("{}.{}", self.db_name(), coll_name)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -299,10 +307,10 @@ impl ServerState {
 ///
 /// # Example
 /// ```no_run
-/// use mqlite::{Database, WireProtocol};
+/// use mqlite::{Client, WireProtocol};
 ///
-/// let db = Database::open_in_memory()?;
-/// let server = WireProtocol::bind(&db, "127.0.0.1:27017")?;
+/// let client = Client::open_in_memory()?;
+/// let server = WireProtocol::bind(&client, "127.0.0.1:27017")?;
 /// // Server is running. Connect with:
 /// //   mongosh "mongodb://localhost:27017/?directConnection=true"
 /// //   MongoClient("mongodb://localhost:27017/?directConnection=true")
@@ -325,14 +333,14 @@ impl WireProtocol {
     ///
     /// Returns `Err` if the TCP listener cannot be bound (port in use, bad
     /// address, permissions, etc.).
-    pub fn bind(db: &Database, addr: &str) -> Result<WireProtocol> {
+    pub fn bind(client: &Client, addr: &str) -> Result<WireProtocol> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Channel to report bind success/failure back to the caller synchronously.
         let (bind_tx, bind_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
 
-        // Capture the database reference for CRUD command handlers.
-        let state = ServerState::new_with_db(db);
+        // Capture the client reference for CRUD command handlers.
+        let state = ServerState::new_with_db(client);
 
         let addr = addr.to_owned();
 
@@ -1082,7 +1090,7 @@ fn handle_insert(body: &Document, state: &ServerState) -> Document {
     let ordered = body.get_bool("ordered").unwrap_or(true);
     let opts = InsertManyOptions { ordered };
 
-    match state.database.insert_many(&coll_name, &docs, opts) {
+    match state.database.insert_many(&state.qualified_coll(&coll_name), &docs, opts) {
         Ok(result) => {
             let n = result.inserted_ids.len() as i32;
             if result.errors.is_empty() {
@@ -1154,7 +1162,7 @@ fn handle_find(
         .map(|n| if n <= 0 { 101usize } else { n as usize })
         .unwrap_or(101);
 
-    let cursor = match state.database.find::<Document>(&coll_name, filter, opts) {
+    let cursor = match state.database.find::<Document>(&state.qualified_coll(&coll_name), filter, opts) {
         Ok(c) => c,
         Err(e) => return err_from_mqlite(e),
     };
@@ -1254,9 +1262,9 @@ fn handle_update(body: &Document, state: &ServerState) -> Document {
         let opts = UpdateOptions { upsert };
 
         let result = if multi {
-            state.database.update_many(&coll_name, filter, update_doc, opts)
+            state.database.update_many(&state.qualified_coll(&coll_name), filter, update_doc, opts)
         } else {
-            state.database.update_one(&coll_name, filter, update_doc, opts)
+            state.database.update_one(&state.qualified_coll(&coll_name), filter, update_doc, opts)
         };
 
         match result {
@@ -1338,9 +1346,9 @@ fn handle_delete(body: &Document, state: &ServerState) -> Document {
         let limit = get_i64(spec, "limit").unwrap_or(1);
 
         let result = if limit == 0 {
-            state.database.delete_many(&coll_name, filter)
+            state.database.delete_many(&state.qualified_coll(&coll_name), filter)
         } else {
-            state.database.delete_one(&coll_name, filter)
+            state.database.delete_one(&state.qualified_coll(&coll_name), filter)
         };
 
         match result {
@@ -1406,7 +1414,7 @@ fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
         let opts = FindOneAndDeleteOptions { sort };
         match state
             .database
-            .find_one_and_delete_with_options::<Document>(&coll_name, filter, opts)
+            .find_one_and_delete_with_options::<Document>(&state.qualified_coll(&coll_name), filter, opts)
         {
             Ok(Some(doc)) => doc! {
                 "value": bson::Bson::Document(doc),
@@ -1444,7 +1452,7 @@ fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
 
         match state
             .database
-            .find_one_and_update_with_options::<Document>(&coll_name, filter, update_doc, opts)
+            .find_one_and_update_with_options::<Document>(&state.qualified_coll(&coll_name), filter, update_doc, opts)
         {
             Ok(Some(doc)) => {
                 // A document was returned.
@@ -1619,7 +1627,7 @@ fn handle_create(body: &Document, state: &ServerState) -> Document {
         Err(_) => return err_bad_value("create requires a collection name string"),
     };
 
-    match state.database.create_collection(&coll_name) {
+    match state.database.create_collection(&state.qualified_coll(&coll_name)) {
         Ok(_) => doc! { "ok": 1.0_f64 },
         Err(e) => err_from_mqlite(e),
     }
@@ -1640,7 +1648,7 @@ fn handle_drop(body: &Document, state: &ServerState) -> Document {
         Err(_) => return err_bad_value("drop requires a collection name string"),
     };
 
-    match state.database.drop_collection(&coll_name) {
+    match state.database.drop_collection(&state.qualified_coll(&coll_name)) {
         Ok(_) => doc! { "ok": 1.0_f64 },
         Err(e) => err_from_mqlite(e),
     }
@@ -1663,12 +1671,23 @@ fn handle_list_collections(body: &Document, state: &ServerState) -> Document {
         .and_then(|f| f.get_str("name").ok())
         .map(|s| s.to_owned());
 
-    let names = match state.database.list_collection_names() {
+    let all_names = match state.database.list_collection_names() {
         Ok(n) => n,
         Err(e) => return err_from_mqlite(e),
     };
 
+    // Filter to collections in this database (strip the "<db>." prefix).
     let db_name = state.db_name();
+    let db_prefix = format!("{}", db_name);
+    let names: Vec<String> = all_names
+        .into_iter()
+        .filter_map(|n| {
+            // Names are stored as "db.collection" — strip the db prefix.
+            let prefix = format!("{db_prefix}.");
+            n.strip_prefix(&prefix).map(|s| s.to_owned())
+        })
+        .collect();
+
     let first_batch: bson::Array = names
         .into_iter()
         .filter(|name| {
@@ -1735,7 +1754,7 @@ fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
     // Add 1 for the always-present synthetic `_id_` index.
     let num_before = state
         .database
-        .list_indexes(&coll_name)
+        .list_indexes(&state.qualified_coll(&coll_name))
         .map(|idxs| idxs.len() as i32 + 1)
         .unwrap_or(1);
 
@@ -1762,7 +1781,7 @@ fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
         }
 
         let model = crate::index::IndexModel { keys: key, options: opts };
-        if let Err(e) = state.database.create_index(&coll_name, model) {
+        if let Err(e) = state.database.create_index(&state.qualified_coll(&coll_name), model) {
             return err_from_mqlite(e);
         }
     }
@@ -1770,7 +1789,7 @@ fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
     // Count user-created indexes after creation (+1 for synthetic `_id_`).
     let num_after = state
         .database
-        .list_indexes(&coll_name)
+        .list_indexes(&state.qualified_coll(&coll_name))
         .map(|idxs| idxs.len() as i32 + 1)
         .unwrap_or(1);
 
@@ -1801,12 +1820,12 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
     match body.get("index") {
         Some(bson::Bson::String(name)) if name == "*" => {
             // Drop all user-created indexes.
-            let indexes = match state.database.list_indexes(&coll_name) {
+            let indexes = match state.database.list_indexes(&state.qualified_coll(&coll_name)) {
                 Ok(idxs) => idxs,
                 Err(e) => return err_from_mqlite(e),
             };
             for idx in &indexes {
-                if let Err(e) = state.database.drop_index(&coll_name, &idx.name) {
+                if let Err(e) = state.database.drop_index(&state.qualified_coll(&coll_name), &idx.name) {
                     return err_from_mqlite(e);
                 }
             }
@@ -1814,7 +1833,7 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
         }
         Some(bson::Bson::String(name)) => {
             // Drop a specific index by name.
-            match state.database.drop_index(&coll_name, name) {
+            match state.database.drop_index(&state.qualified_coll(&coll_name), name) {
                 Ok(_) => doc! { "ok": 1.0_f64 },
                 Err(e) => err_from_mqlite(e),
             }
@@ -1822,12 +1841,12 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
         Some(bson::Bson::Document(key_doc)) => {
             // Drop by key pattern — find the index whose key matches.
             let key_doc = key_doc.clone();
-            let indexes = match state.database.list_indexes(&coll_name) {
+            let indexes = match state.database.list_indexes(&state.qualified_coll(&coll_name)) {
                 Ok(idxs) => idxs,
                 Err(e) => return err_from_mqlite(e),
             };
             match indexes.iter().find(|idx| idx.keys == key_doc) {
-                Some(idx) => match state.database.drop_index(&coll_name, &idx.name.clone()) {
+                Some(idx) => match state.database.drop_index(&state.qualified_coll(&coll_name), &idx.name.clone()) {
                     Ok(_) => doc! { "ok": 1.0_f64 },
                     Err(e) => err_from_mqlite(e),
                 },
@@ -1860,7 +1879,7 @@ fn handle_list_indexes(body: &Document, state: &ServerState) -> Document {
         Err(_) => return err_bad_value("listIndexes requires a collection name string"),
     };
 
-    let indexes = match state.database.list_indexes(&coll_name) {
+    let indexes = match state.database.list_indexes(&state.qualified_coll(&coll_name)) {
         Ok(idxs) => idxs,
         Err(e) => return err_from_mqlite(e),
     };
@@ -2556,8 +2575,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let db = Database::open_in_memory().unwrap();
-        let _server = WireProtocol::bind(&db, &addr.to_string()).unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let _server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client
@@ -2604,8 +2623,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let db = Database::open_in_memory().unwrap();
-        let _server = WireProtocol::bind(&db, &addr.to_string()).unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let _server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client
@@ -2668,8 +2687,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let db = Database::open_in_memory().unwrap();
-        let _server = WireProtocol::bind(&db, &addr.to_string()).unwrap();
+        let client = Client::open_in_memory().unwrap();
+        let _server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         client
