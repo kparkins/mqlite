@@ -1071,16 +1071,26 @@ impl StorageEngine for PagedEngine {
             DocBackend::Buffered(bp) => {
                 // Ensure the collection exists in the catalog first.
                 if bp.catalog.get_collection(ns)?.is_none() {
-                    bp.catalog
+                    let (data_root, id_root) = bp
+                        .catalog
                         .create_collection(ns, bson::doc! {}, now_millis())?;
                     bp.sync_catalog_root()?;
+                    // Initialise both allocated tree pages so they have valid headers.
+                    let data_store = bp.new_store();
+                    let data_tree = BTree::create_at(data_store, data_root)?;
+                    bp.data_trees.insert(ns.to_owned(), data_tree);
+                    let id_store = bp.new_store();
+                    BTree::create_at(id_store, id_root)?;
                 }
                 // Idempotent: return existing index name.
                 if bp.catalog.get_index(ns, &name)?.is_some() {
                     return Ok(name);
                 }
-                bp.catalog.create_index(ns, model, &name)?;
+                let idx_root = bp.catalog.create_index(ns, model, &name)?;
                 bp.sync_catalog_root()?;
+                // Initialise the index tree leaf page.
+                let idx_store = bp.new_store();
+                BTree::create_at(idx_store, idx_root)?;
                 Ok(name)
             }
         }
@@ -1181,14 +1191,19 @@ impl StorageEngine for PagedEngine {
                 if bp.catalog.get_collection(ns)?.is_some() {
                     return Ok(());
                 }
-                let (data_root, _) =
+                let (data_root, id_root) =
                     bp.catalog
                         .create_collection(ns, bson::doc! {}, now_millis())?;
                 bp.sync_catalog_root()?;
-                // Pre-warm the cached tree; initialise the pre-allocated leaf page.
+                // Initialise the data tree leaf page and cache it for fast first access.
                 let store = bp.new_store();
                 let tree = BTree::create_at(store, data_root)?;
                 bp.data_trees.insert(ns.to_owned(), tree);
+                // Initialise the _id index leaf page so it has a valid header.
+                // We do not cache index trees, but the page must be written
+                // before it can be parsed (e.g., during drop_namespace page freeing).
+                let id_store = bp.new_store();
+                BTree::create_at(id_store, id_root)?;
                 Ok(())
             }
         }
@@ -1207,10 +1222,53 @@ impl StorageEngine for PagedEngine {
                 Ok(())
             }
             DocBackend::Buffered(bp) => {
-                bp.data_trees.remove(ns);
+                // Collect page-root info from the catalog before removing entries.
+                // We need this to free the B+ tree pages after the catalog entries
+                // are gone (catalog.drop_collection removes both the collection and
+                // all its index entries).
+                let maybe_coll = bp.catalog.get_collection(ns)?;
+                let index_roots: Vec<(u32, u8)> = if maybe_coll.is_some() {
+                    bp.catalog
+                        .list_indexes(ns)?
+                        .into_iter()
+                        .map(|e| (e.root_page, e.root_level))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Remove the cached data tree (if any) — we own it after this.
+                let cached_tree = bp.data_trees.remove(ns);
+
+                // Drop catalog entries first so no references to these pages exist.
                 if bp.catalog.drop_collection(ns)? {
                     bp.sync_catalog_root()?;
                 }
+
+                // Free the data-tree pages.
+                if let Some(coll) = maybe_coll {
+                    let (root_page, root_level) = match &cached_tree {
+                        // If the tree was cached use its current root (may differ
+                        // from catalog if sync_data_root was skipped on a dry run;
+                        // in practice R1.2 always syncs before dropping).
+                        Some(t) => (t.root_page, t.root_level),
+                        None => (coll.data_root_page, coll.data_root_level),
+                    };
+                    // Drop the cached handle first to release its Arc reference,
+                    // then open a fresh tree over the same pages for the walk.
+                    drop(cached_tree);
+                    let store = bp.new_store();
+                    let data_tree = BTree::open(store, root_page, root_level);
+                    data_tree.free_all_pages()?;
+                }
+
+                // Free each index tree's pages.
+                for (idx_root, idx_level) in index_roots {
+                    let store = bp.new_store();
+                    let idx_tree = BTree::open(store, idx_root, idx_level);
+                    idx_tree.free_all_pages()?;
+                }
+
                 Ok(())
             }
         }
@@ -1528,5 +1586,318 @@ mod tests {
             .unwrap();
         assert!(d.is_some());
         assert_eq!(e.count("test.c", &doc! {}).unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // R1.3: Buffered-mode (catalog namespace registry) tests
+    //
+    // These tests exercise PagedEngine in DocBackend::Buffered mode, using
+    // an in-memory mock I/O layer so they remain hermetic and fast.
+    // -----------------------------------------------------------------------
+
+    use crate::storage::buffer_pool::{default_sizes, BufferPool, PageIo, PageSize};
+    use crate::storage::header::FileHeader;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// Minimal in-memory `PageIo` for buffered-mode engine tests.
+    #[derive(Default)]
+    struct MockIo {
+        pages: StdMutex<HashMap<u32, Vec<u8>>>,
+    }
+
+    struct ArcIo(Arc<MockIo>);
+
+    impl PageIo for ArcIo {
+        fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
+            let pages = self.0.pages.lock().unwrap();
+            if let Some(data) = pages.get(&pn) {
+                let n = buf.len().min(data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                if n < buf.len() {
+                    buf[n..].fill(0);
+                }
+            } else {
+                buf.fill(0);
+            }
+            Ok(())
+        }
+        fn write_page(&self, pn: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
+            self.0.pages.lock().unwrap().insert(pn, buf.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Create a buffered `PagedEngine` backed by an in-memory `MockIo`.
+    ///
+    /// Returns `(engine, io)` so callers can inspect or re-use the backing store.
+    fn buffered_engine() -> (PagedEngine, Arc<MockIo>) {
+        let io = Arc::new(MockIo::default());
+        let pool = Arc::new(BufferPool::new(
+            default_sizes::DESKTOP,
+            Box::new(ArcIo(Arc::clone(&io))),
+        ));
+        let header = FileHeader::new_now();
+        let handle = Arc::new(BufferPoolHandle::new(pool, header));
+        let engine = PagedEngine::new_buffered(handle, 0, 0)
+            .expect("create buffered engine");
+        (engine, io)
+    }
+
+    /// Reconstruct a buffered engine by reading back the catalog root from
+    /// the mock I/O layer.  Simulates closing and reopening a database file.
+    ///
+    /// Reads page 0 (the file header) from `io`, extracts the persisted
+    /// `catalog_root_page` and `catalog_root_level`, and opens a new engine.
+    fn reopen_engine(io: &Arc<MockIo>) -> PagedEngine {
+        // Read the header page from backing store.
+        let pages = io.pages.lock().unwrap();
+        let hdr_bytes = pages
+            .get(&0)
+            .expect("header page 0 must have been flushed")
+            .clone();
+        drop(pages); // release lock before creating new pool
+
+        use crate::storage::header::HEADER_PAGE_SIZE;
+        let mut buf = [0u8; HEADER_PAGE_SIZE];
+        let n = buf.len().min(hdr_bytes.len());
+        buf[..n].copy_from_slice(&hdr_bytes[..n]);
+        let header = FileHeader::from_bytes(&buf).expect("parse header");
+
+        let catalog_root_page = header.catalog_root_page;
+        let catalog_root_level = header.catalog_root_level;
+
+        let pool = Arc::new(BufferPool::new(
+            default_sizes::DESKTOP,
+            Box::new(ArcIo(Arc::clone(io))),
+        ));
+        let handle = Arc::new(BufferPoolHandle::new(pool, header));
+        PagedEngine::new_buffered(handle, catalog_root_page, catalog_root_level)
+            .expect("reopen buffered engine")
+    }
+
+    // --- create_namespace wires into catalog ---
+
+    #[test]
+    fn buffered_create_namespace_appears_in_list() {
+        let (e, _io) = buffered_engine();
+        e.create_namespace("mydb.users").unwrap();
+        e.create_namespace("mydb.orders").unwrap();
+
+        let mut ns = e.list_namespaces().unwrap();
+        ns.sort();
+        assert_eq!(ns, ["mydb.orders", "mydb.users"]);
+    }
+
+    #[test]
+    fn buffered_create_namespace_idempotent() {
+        let (e, _io) = buffered_engine();
+        e.create_namespace("mydb.users").unwrap();
+        // Second call must not error (namespace already exists).
+        e.create_namespace("mydb.users").unwrap();
+        assert_eq!(e.list_namespaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn buffered_namespace_supports_db_dot_coll_format() {
+        let (e, _io) = buffered_engine();
+        // Namespace keys MUST be in 'db.collection' multi-database format.
+        e.create_namespace("analytics.events").unwrap();
+        e.create_namespace("billing.invoices").unwrap();
+
+        let mut ns = e.list_namespaces().unwrap();
+        ns.sort();
+        assert!(ns.contains(&"analytics.events".to_owned()));
+        assert!(ns.contains(&"billing.invoices".to_owned()));
+    }
+
+    // --- drop_namespace removes catalog entries AND frees pages ---
+
+    #[test]
+    fn buffered_drop_namespace_removes_from_catalog() {
+        let (e, _io) = buffered_engine();
+        e.create_namespace("mydb.users").unwrap();
+        e.create_namespace("mydb.orders").unwrap();
+
+        e.drop_namespace("mydb.users").unwrap();
+
+        let ns = e.list_namespaces().unwrap();
+        assert!(!ns.contains(&"mydb.users".to_owned()));
+        assert!(ns.contains(&"mydb.orders".to_owned()));
+    }
+
+    #[test]
+    fn buffered_drop_namespace_frees_pages_for_reuse() {
+        let (e, _io) = buffered_engine();
+        e.create_namespace("mydb.users").unwrap();
+
+        // Insert enough docs to allocate multiple leaf pages.
+        for i in 0..20i32 {
+            e.insert("mydb.users", doc! { "i": i }).unwrap();
+        }
+
+        // Checkpoint so allocator state is stable.
+        e.checkpoint().unwrap();
+
+        // Record total page count before drop.
+        let total_before = {
+            let inner = e.inner.lock().unwrap();
+            match &*inner {
+                DocBackend::Buffered(bp) => bp
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.total_page_count)
+                    .unwrap(),
+                _ => panic!("expected buffered backend"),
+            }
+        };
+
+        e.drop_namespace("mydb.users").unwrap();
+
+        // Free page count should have increased (pages returned to free list).
+        let free_after = {
+            let inner = e.inner.lock().unwrap();
+            match &*inner {
+                DocBackend::Buffered(bp) => bp
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.free_page_count_32k + h.free_page_count_4k)
+                    .unwrap(),
+                _ => panic!("expected buffered backend"),
+            }
+        };
+
+        // After drop the free page count must be > 0 (at least the data leaf
+        // and _id-index leaf were reclaimed).
+        assert!(
+            free_after > 0,
+            "pages must be returned to free list after drop; total_before={total_before}, free_after={free_after}"
+        );
+    }
+
+    #[test]
+    fn buffered_drop_nonexistent_namespace_is_ok() {
+        let (e, _io) = buffered_engine();
+        // Dropping a namespace that never existed must not panic or error.
+        e.drop_namespace("mydb.ghost").unwrap();
+    }
+
+    // --- list_namespaces reads from catalog ---
+
+    #[test]
+    fn buffered_list_namespaces_empty_on_new_database() {
+        let (e, _io) = buffered_engine();
+        assert!(e.list_namespaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn buffered_list_namespaces_returns_all() {
+        let (e, _io) = buffered_engine();
+        for name in &["a.x", "a.y", "b.z"] {
+            e.create_namespace(name).unwrap();
+        }
+        let mut ns = e.list_namespaces().unwrap();
+        ns.sort();
+        assert_eq!(ns, ["a.x", "a.y", "b.z"]);
+    }
+
+    // --- on-open: catalog discovery ---
+
+    #[test]
+    fn buffered_catalog_survives_reopen() {
+        let (e, io) = buffered_engine();
+
+        e.create_namespace("prod.users").unwrap();
+        e.create_namespace("prod.orders").unwrap();
+        e.insert("prod.users", doc! { "name": "Alice" }).unwrap();
+
+        // Flush the catalog + data to the mock backing store.
+        e.checkpoint().unwrap();
+        drop(e);
+
+        // Reopen using the persisted catalog root from the header.
+        let e2 = reopen_engine(&io);
+
+        // list_namespaces must discover the previously-created collections
+        // by reading the catalog from disk.
+        let mut ns = e2.list_namespaces().unwrap();
+        ns.sort();
+        assert_eq!(
+            ns,
+            ["prod.orders", "prod.users"],
+            "catalog must survive close/reopen"
+        );
+    }
+
+    #[test]
+    fn buffered_data_survives_reopen() {
+        let (e, io) = buffered_engine();
+
+        e.create_namespace("prod.users").unwrap();
+        e.insert("prod.users", doc! { "name": "Bob", "age": 42 })
+            .unwrap();
+        e.checkpoint().unwrap();
+        drop(e);
+
+        let e2 = reopen_engine(&io);
+        let found = e2
+            .find_one("prod.users", &doc! { "name": "Bob" })
+            .unwrap();
+        assert!(
+            found.is_some(),
+            "document inserted before checkpoint must be visible after reopen"
+        );
+        assert_eq!(found.unwrap().get_i32("age").unwrap(), 42);
+    }
+
+    #[test]
+    fn buffered_drop_and_create_reuses_pages() {
+        let (e, _io) = buffered_engine();
+
+        e.create_namespace("test.c").unwrap();
+        for i in 0..10i32 {
+            e.insert("test.c", doc! { "i": i }).unwrap();
+        }
+        e.checkpoint().unwrap();
+
+        let page_count_after_create = {
+            let inner = e.inner.lock().unwrap();
+            match &*inner {
+                DocBackend::Buffered(bp) => bp
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.total_page_count)
+                    .unwrap(),
+                _ => panic!("expected buffered"),
+            }
+        };
+
+        e.drop_namespace("test.c").unwrap();
+
+        // Create the namespace again and insert the same data.
+        e.create_namespace("test.c").unwrap();
+        for i in 0..10i32 {
+            e.insert("test.c", doc! { "i": i }).unwrap();
+        }
+        e.checkpoint().unwrap();
+
+        let page_count_after_recreate = {
+            let inner = e.inner.lock().unwrap();
+            match &*inner {
+                DocBackend::Buffered(bp) => bp
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.total_page_count)
+                    .unwrap(),
+                _ => panic!("expected buffered"),
+            }
+        };
+
+        // After drop + recreate, pages should be recycled — total page count
+        // must not keep growing without bound.
+        assert!(
+            page_count_after_recreate <= page_count_after_create + 4,
+            "pages should be recycled after drop; before={page_count_after_create} after={page_count_after_recreate}"
+        );
     }
 }

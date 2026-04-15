@@ -673,6 +673,37 @@ fn free_overflow_chain<S: BTreePageStore>(store: &mut S, first_page: u32) -> Res
     Ok(())
 }
 
+/// Recursively free all pages in the B+ tree subtree rooted at `page` at `level`.
+///
+/// Level 0 = leaf page; levels > 0 = internal node at that height.
+/// For leaf pages, all overflow chains referenced by cells are freed first.
+/// For internal pages, all children are freed recursively before the parent.
+fn free_subtree<S: BTreePageStore>(store: &mut S, page: u32, level: u8) -> Result<()> {
+    if level == 0 {
+        // Leaf node: free any overflow chains, then free the leaf page.
+        // We do NOT follow `next_leaf_page` here — the parent's child-pointer
+        // traversal already enumerates every leaf exactly once.
+        let buf = store.read_leaf(page)?;
+        let node = LeafNode::parse(&buf[..])?;
+        for cell in &node.cells {
+            if let CellValue::Overflow { first_page, .. } = cell.value {
+                free_overflow_chain(store, first_page)?;
+            }
+        }
+        store.free_leaf(page)?;
+    } else {
+        // Internal node: recurse into each child, then free this page.
+        let buf = store.read_internal(page)?;
+        let node = InternalNode::parse(&buf[..])?;
+        for &(_, child) in &node.entries {
+            free_subtree(store, child, level - 1)?;
+        }
+        free_subtree(store, node.rightmost_child, level - 1)?;
+        store.free_internal(page)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Split result type
 // ---------------------------------------------------------------------------
@@ -763,6 +794,19 @@ impl<S: BTreePageStore> BTree<S> {
             root_page,
             root_level,
         }
+    }
+
+    /// Free every page occupied by this B+ tree, returning them to the allocator.
+    ///
+    /// Traverses the complete tree and calls `free_internal` / `free_leaf` on
+    /// every internal node, leaf node, and overflow chain.  After this call the
+    /// `BTree` is consumed and must not be used again.
+    ///
+    /// Callers must have already removed the tree's root-page reference from
+    /// the catalog or file header before (or after) calling this, to prevent
+    /// the freed pages from being referenced again.
+    pub(crate) fn free_all_pages(mut self) -> Result<()> {
+        free_subtree(&mut self.store, self.root_page, self.root_level)
     }
 
     // -----------------------------------------------------------------------
