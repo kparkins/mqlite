@@ -24,7 +24,6 @@ use std::{
 use crate::{
     cursor::Cursor,
     database::Database,
-    engine::EngineState,
     error::{Error, Result},
     index::{IndexInfo, IndexModel},
     options::{
@@ -208,21 +207,27 @@ impl ClientInner {
         }
     }
 
-    fn new_with_engine(
+    fn new_with_buffer_pool(
         path: Option<PathBuf>,
         opts: OpenOptions,
         file_lock: Arc<dyn FileLock>,
-        engine: EngineState,
-        buffer_pool: Option<Arc<BufferPoolHandle>>,
-    ) -> Self {
-        ClientInner {
+        buffer_pool: Arc<BufferPoolHandle>,
+        catalog_root_page: u32,
+        catalog_root_level: u8,
+    ) -> Result<Self> {
+        let engine = PagedEngine::new_buffered(
+            Arc::clone(&buffer_pool),
+            catalog_root_page,
+            catalog_root_level,
+        )?;
+        Ok(ClientInner {
             path,
             opts,
             writer_lock: Mutex::new(()),
             file_lock,
-            buffer_pool,
-            engine: Box::new(PagedEngine::from_state(engine)),
-        }
+            buffer_pool: Some(buffer_pool),
+            engine: Box::new(engine),
+        })
     }
 }
 
@@ -525,14 +530,11 @@ impl ClientInner {
             return Ok(());
         }
 
-        // Phase 0.x legacy path: write a BSON-blob snapshot to the file.
-        // `PagedEngine::snapshot_bytes()` returns `Some(bytes)` during this
-        // phase.  Phase 1.5 (WAL integration) replaces this with a real
-        // WAL checkpoint and `snapshot_bytes()` will return `None`.
-        if let Some(snapshot) = self.engine.snapshot_bytes()? {
-            self.file_lock.write_at(HEADER_PAGE_SIZE as u64, &snapshot)?;
-        }
-        Ok(())
+        // R1.2: Delegate to the engine's checkpoint, which flushes the buffer
+        // pool (all dirty B+ tree pages + updated file header) to disk.
+        // `snapshot_bytes()` returns `None` for the B+ tree engine; the legacy
+        // BSON-blob path is no longer used.
+        self.engine.checkpoint()
     }
 
     pub(crate) fn backup(&self, _dest: &Path) -> Result<()> {
@@ -685,26 +687,15 @@ impl Client {
             read_and_validate_header(file_lock.as_ref(), &path)?;
         }
 
-        // Restore persisted engine state if a snapshot is present.
-        let engine = if file_size > HEADER_PAGE_SIZE as u64 {
-            let snapshot_len = (file_size as usize) - HEADER_PAGE_SIZE;
-            let mut snapshot_buf = vec![0u8; snapshot_len];
-            match file_lock.read_exact_at(HEADER_PAGE_SIZE as u64, &mut snapshot_buf) {
-                Ok(()) => EngineState::from_bson_bytes(&snapshot_buf).unwrap_or_default(),
-                Err(_) => EngineState::default(),
-            }
-        } else {
-            EngineState::default()
-        };
-
-        // R1.1: Construct the buffer pool handle wired to the database file.
+        // R1.2: Construct the buffer pool handle wired to the database file and
+        // create a B+ tree engine backed by it.
         //
         // The pool is backed by FilePageIo which shares the lock fd (Arc clone)
         // to avoid the POSIX advisory-lock footgun.  OpenOptions::buffer_pool_size
         // controls the total byte budget split between 4 KB and 32 KB partitions.
         //
-        // The header is read fresh here (or a new header is used for empty files).
-        // R1.2+ will use `buffer_pool` as the B+ tree's page store.
+        // For an existing file, the catalog root page is read from the file header.
+        // For a new file, catalog_root_page == 0 means a fresh catalog is created.
         let file_header = if file_size == 0 {
             FileHeader::new_now()
         } else {
@@ -712,19 +703,23 @@ impl Client {
             file_lock.read_exact_at(0, &mut hdr_buf)?;
             FileHeader::from_bytes(&hdr_buf).unwrap_or_else(|_| FileHeader::new_now())
         };
+        let catalog_root_page = file_header.catalog_root_page;
+        let catalog_root_level = file_header.catalog_root_level;
         let pool = Arc::new(BufferPool::new(
             opts.buffer_pool_size,
             Box::new(FilePageIo::new(Arc::clone(&file_lock))),
         ));
-        let buffer_pool = Some(Arc::new(BufferPoolHandle::new(pool, file_header)));
+        let buffer_pool = Arc::new(BufferPoolHandle::new(pool, file_header));
 
-        let inner = Arc::new(ClientInner::new_with_engine(
+        let inner = Arc::new(ClientInner::new_with_buffer_pool(
             Some(path.clone()),
             opts,
             file_lock,
-            engine,
             buffer_pool,
-        ));
+            catalog_root_page,
+            catalog_root_level,
+        )?);
+        let _ = file_size; // used above, suppress warning
         #[cfg(feature = "tracing")]
         tracing::info!(
             target: "mqlite",

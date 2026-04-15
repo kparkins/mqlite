@@ -129,7 +129,14 @@ pub(crate) struct FileHeader {
     /// Used as a fallback if the primary catalog root page fails checksum
     /// validation on open.
     pub catalog_root_backup: u32,
-    // offsets 76–127: reserved, zero-filled
+    // offset 76
+    /// Root-level byte of the catalog B+ tree (0 = leaf-only; >0 = internal at that level).
+    ///
+    /// Stored at offset 76 in the reserved region.  Together with
+    /// [`catalog_root_page`](Self::catalog_root_page) this lets R1.2+ reopen the
+    /// catalog without a full tree scan.
+    pub catalog_root_level: u8,
+    // offsets 77–127: reserved, zero-filled
     // offsets 128–4095: unused padding
 }
 
@@ -159,6 +166,7 @@ impl FileHeader {
             wal_salt1,
             wal_salt2,
             catalog_root_backup: 0,
+            catalog_root_level: 0,
         }
     }
 
@@ -305,6 +313,7 @@ impl FileHeader {
             wal_salt1: u32::from_le_bytes(buf[64..68].try_into().expect("4 bytes")),
             wal_salt2: u32::from_le_bytes(buf[68..72].try_into().expect("4 bytes")),
             catalog_root_backup: u32::from_le_bytes(buf[72..76].try_into().expect("4 bytes")),
+            catalog_root_level: buf[76],
         })
     }
 
@@ -363,7 +372,8 @@ impl FileHeader {
         buf[64..68].copy_from_slice(&self.wal_salt1.to_le_bytes());
         buf[68..72].copy_from_slice(&self.wal_salt2.to_le_bytes());
         buf[72..76].copy_from_slice(&self.catalog_root_backup.to_le_bytes());
-        // offsets 76–127: reserved, already zero-filled by array init
+        buf[76] = self.catalog_root_level;
+        // offsets 77–127: reserved, already zero-filled by array init
         // offsets 128–4095: padding, already zero-filled
     }
 }

@@ -732,6 +732,28 @@ impl<S: BTreePageStore> BTree<S> {
         })
     }
 
+    /// Initialise a pre-allocated page as an empty leaf root and return a new tree.
+    ///
+    /// Use this when the page was already allocated (e.g. by the catalog's
+    /// `create_collection`) but not yet written.  Writing an empty leaf header
+    /// at `root_page` makes the tree ready for insertions without allocating
+    /// an additional page.
+    pub(crate) fn create_at(mut store: S, root_page: u32) -> Result<Self> {
+        let node = LeafNode {
+            flags: 0,
+            next_leaf_page: 0,
+            prev_leaf_page: 0,
+            cells: Vec::new(),
+        };
+        let buf = node.encode()?;
+        store.write_leaf(root_page, &buf)?;
+        Ok(BTree {
+            store,
+            root_page,
+            root_level: 0,
+        })
+    }
+
     /// Wrap an existing `store` with a known `root_page` and `root_level`.
     ///
     /// Use this when opening an existing tree that was persisted to a file header.
