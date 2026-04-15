@@ -254,7 +254,7 @@ impl InternalNode {
         }
 
         // Write header.
-        let mut hdr = InternalPageHeader {
+        let hdr = InternalPageHeader {
             page_type: PAGE_TYPE_INTERNAL,
             level: self.level,
             key_count: self.entries.len() as u16,
@@ -552,7 +552,7 @@ impl LeafNode {
         } else {
             self.flags & !LEAF_FLAG_HAS_OVERFLOW
         };
-        let mut hdr = LeafPageHeader {
+        let hdr = LeafPageHeader {
             page_type: PAGE_TYPE_LEAF,
             flags,
             entry_count: n as u16,

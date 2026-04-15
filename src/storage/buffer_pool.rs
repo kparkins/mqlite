@@ -8,15 +8,11 @@
 //!
 //! ## Usage pattern
 //!
-//! ```ignore
-//! // Obtain a mutable handle to a page (auto-unpins on drop).
-//! let mut page = pool.pin(page_number, PageSize::Large32k)?;
-//! page.data_mut()[0] = 0xFF;           // marks page dirty automatically
-//! drop(page);                           // unpin; dirty bit persists until flush
-//!
-//! // Explicit flush before checkpoint / close:
-//! pool.flush()?;
-//! ```
+//! Call [`BufferPool::pin`] to obtain a [`PinnedPage`] guard for a given page
+//! number and size.  Writing through [`PinnedPage::data_mut`] automatically
+//! marks the page dirty.  The page is unpinned when the guard is dropped.
+//! Call [`BufferPool::flush`] before a checkpoint or close to write all dirty
+//! pages to disk.
 //!
 //! ## Thread safety
 //!
@@ -340,11 +336,13 @@ impl<'pool> PinnedPage<'pool> {
     }
 
     /// Explicitly mark this page as modified without writing any bytes.
+    #[allow(dead_code)]
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
     /// The page number this handle refers to.
+    #[allow(dead_code)]
     pub(crate) fn page_number(&self) -> u32 {
         self.page_number
     }
@@ -369,17 +367,13 @@ impl Drop for PinnedPage<'_> {
 /// - 25 % → 4 KB frames (internal nodes)
 /// - 75 % → 32 KB frames (leaf / overflow / header pages)
 ///
-/// # Example
+/// # Usage
 ///
-/// ```ignore
-/// let pool = BufferPool::new(64 * 1024 * 1024, Box::new(file_io));
-/// let mut page = pool.pin(root_page, PageSize::Large32k)?;
-/// let leaf_hdr = LeafPageHeader::from_bytes(page.data())?;
-/// // ... modify ...
-/// page.mark_dirty();
-/// drop(page);   // unpin
-/// pool.flush()?; // write dirty pages before checkpoint
-/// ```
+/// Create the pool with [`BufferPool::new`], specifying the total byte budget
+/// and a [`PageIo`] backend.  Pin pages with [`BufferPool::pin`], read or
+/// write them via [`PinnedPage::data`] / [`PinnedPage::data_mut`], then drop
+/// the guard to unpin.  Call [`BufferPool::flush`] before a checkpoint or
+/// close to write all dirty pages to disk.
 pub(crate) struct BufferPool {
     inner_4k: Mutex<Partition>,
     inner_32k: Mutex<Partition>,
@@ -483,6 +477,7 @@ impl BufferPool {
 // ---------------------------------------------------------------------------
 
 /// Recommended buffer pool byte sizes for common deployment tiers.
+#[allow(dead_code)]
 pub(crate) mod default_sizes {
     /// IoT / edge devices: 4 MiB.
     pub const IOT: usize = 4 * 1024 * 1024;

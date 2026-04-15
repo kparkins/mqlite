@@ -40,16 +40,19 @@ use crate::{
 // Per-collection state
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct IndexRecord {
     model: IndexModel,
     name: String,
 }
 
+#[allow(dead_code)]
 struct CollectionState {
     docs: Vec<Document>,
     indexes: Vec<IndexRecord>,
 }
 
+#[allow(dead_code)]
 impl CollectionState {
     fn new() -> Self {
         CollectionState {
@@ -63,10 +66,12 @@ impl CollectionState {
 // Engine state
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub(crate) struct EngineState {
     collections: HashMap<String, CollectionState>,
 }
 
+#[allow(dead_code)]
 impl EngineState {
     pub(crate) fn new() -> Self {
         EngineState {
@@ -81,6 +86,7 @@ impl Default for EngineState {
     }
 }
 
+#[allow(dead_code)]
 impl EngineState {
     // Lazily create a collection on first access.
     fn get_or_create(&mut self, name: &str) -> &mut CollectionState {
@@ -620,7 +626,7 @@ impl EngineState {
             // No collection — handle upsert.
             if opts.upsert {
                 Self::ensure_id(&mut replacement_doc);
-                let id = replacement_doc.get("_id").cloned().unwrap();
+                let _id = replacement_doc.get("_id").cloned().unwrap();
                 let coll = self.get_or_create(name);
                 coll.docs.push(replacement_doc.clone());
                 if opts.return_document == ReturnDocument::After {
@@ -967,6 +973,7 @@ impl EngineState {
 /// TTL and partial indexes are expressed through [`IndexOptions`] fields that
 /// are not yet present in the Phase 1 Rust API; those are rejected at the wire
 /// protocol layer.
+#[allow(dead_code)]
 fn validate_index_keys(keys: &Document) -> crate::error::Result<()> {
     const SUGGESTION: &str =
         "Phase 1 supports single-field, compound, unique, sparse, and multikey \
@@ -999,6 +1006,7 @@ fn validate_index_keys(keys: &Document) -> crate::error::Result<()> {
 ///
 /// If `sort` is given, the full set of matching documents is sorted and the
 /// index of the winner in the **original** slice is returned.
+#[allow(dead_code)]
 fn find_matching_index(
     docs: &[Document],
     filter: &Document,
@@ -1027,10 +1035,12 @@ fn find_matching_index(
 /// Sort a slice of documents by a sort specification document.
 ///
 /// Keys map to `1` (ascending) or `-1` (descending).
+#[allow(dead_code)]
 fn sort_documents(docs: &mut Vec<Document>, sort: &Document) {
     docs.sort_by(|a, b| compare_documents(a, b, sort));
 }
 
+#[allow(dead_code)]
 fn compare_documents(a: &Document, b: &Document, sort: &Document) -> std::cmp::Ordering {
     use crate::key_encoding::encode_key;
 
@@ -1053,6 +1063,7 @@ fn compare_documents(a: &Document, b: &Document, sort: &Document) -> std::cmp::O
 /// Handles inclusion projections (`{field: 1}`) and exclusion projections
 /// (`{field: 0}`).  The `_id` field is always included unless explicitly
 /// excluded.
+#[allow(dead_code)]
 fn apply_projection(mut doc: Document, proj: &Document) -> Document {
     // Determine mode: first non-_id key with value 1 → inclusion; 0 → exclusion.
     let is_inclusion = proj

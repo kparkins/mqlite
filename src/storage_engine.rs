@@ -195,6 +195,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// After `close()` returns, the engine must not be used again.  Calling
     /// any method on a closed engine is undefined behaviour.
+    #[allow(dead_code)]
     fn close(&self) -> Result<()>;
 
     // -------------------------------------------------------------------------
@@ -211,6 +212,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns `Ok(None)` when the engine does not use blob-based persistence
     /// (i.e., once Phase 1.5 is in place).
+    #[allow(dead_code)]
     fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }

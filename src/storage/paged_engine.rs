@@ -510,6 +510,7 @@ impl BpBackend {
     }
 
     /// Return `(name, fields, sparse)` tuples for all unique indexes of `ns`.
+    #[allow(dead_code)]
     fn unique_specs(&self, ns: &str) -> Result<Vec<(String, Vec<String>, bool)>> {
         let entries = self.catalog.list_indexes(ns)?;
         Ok(entries
@@ -903,6 +904,7 @@ impl BpBackend {
     /// When `Some` is returned the caller must still apply `find_opts` (sort,
     /// skip, limit, projection) but does **not** need to re-apply the filter
     /// because the full filter is evaluated here against every candidate doc.
+    #[allow(dead_code)]
     fn try_index_scan(
         &mut self,
         ns: &str,

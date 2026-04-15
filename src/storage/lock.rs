@@ -141,6 +141,7 @@ pub(crate) trait FileLock: Send + Sync {
     /// Locks are also released automatically when the `FileLock` is dropped
     /// (the underlying file descriptor is closed).  Call this explicitly when
     /// you need the release to happen before the `FileLock` is dropped.
+    #[allow(dead_code)]
     fn release(&self) -> Result<()>;
 
     /// Write `data` to the backing file at absolute byte offset `offset`.

@@ -206,6 +206,7 @@ fn extract_operator_condition(ops: &Document) -> Option<IndexCondition> {
 /// predicate) are fine — the full predicate is always applied afterwards.
 ///
 /// `field_value` is `None` when the document does not contain the indexed field.
+#[allow(dead_code)]
 pub(crate) fn index_condition_matches(
     field_value: Option<&Bson>,
     condition: &IndexCondition,
@@ -247,6 +248,7 @@ pub(crate) fn index_condition_matches(
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn range_check(
     val: &Bson,
     gt: Option<&Bson>,
@@ -280,6 +282,7 @@ fn range_check(
 
 /// Compare two BSON values using the B+ tree key encoding (cross-type numeric
 /// equality and MongoDB canonical type ordering).
+#[allow(dead_code)]
 fn bson_key_eq(a: &Bson, b: &Bson) -> bool {
     encode_key(a) == encode_key(b)
 }
