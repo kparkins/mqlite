@@ -33,6 +33,9 @@ use crate::{
     },
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
     storage::{
+        buffer_pool::BufferPool,
+        file_io::FilePageIo,
+        handle::BufferPoolHandle,
         header::{FileHeader, HEADER_PAGE_SIZE},
         lock::{self, FileLock, NoopFileLock},
         paged_engine::PagedEngine,
@@ -177,19 +180,30 @@ pub(crate) struct ClientInner {
     /// `ClientInner` (e.g., `insert_many`) are atomic at the process level.
     /// This will be revisited in Phase 1.6 (SWMR).
     writer_lock: Mutex<()>,
-    /// Cross-process OS advisory file lock.
-    file_lock: Box<dyn FileLock>,
+    /// OS advisory file lock.
+    ///
+    /// Stored as `Arc` so the same fd can be shared with the `FilePageIo`
+    /// backing the buffer pool.  Opening a second fd would release the POSIX
+    /// advisory lock when the second fd is closed (POSIX footgun).
+    file_lock: Arc<dyn FileLock>,
+    /// Buffer pool handle — file I/O infrastructure wired in by R1.1.
+    ///
+    /// `None` for in-memory clients.  File-backed clients always have `Some`.
+    /// R1.2+ beads use this to route B+ tree operations through the pool.
+    #[allow(dead_code)]
+    pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
     /// Storage engine.  All CRUD operations are dispatched through this trait.
     pub(crate) engine: Box<dyn StorageEngine>,
 }
 
 impl ClientInner {
-    fn new(path: Option<PathBuf>, opts: OpenOptions, file_lock: Box<dyn FileLock>) -> Self {
+    fn new(path: Option<PathBuf>, opts: OpenOptions, file_lock: Arc<dyn FileLock>) -> Self {
         ClientInner {
             path,
             opts,
             writer_lock: Mutex::new(()),
             file_lock,
+            buffer_pool: None,
             engine: Box::new(PagedEngine::new()),
         }
     }
@@ -197,14 +211,16 @@ impl ClientInner {
     fn new_with_engine(
         path: Option<PathBuf>,
         opts: OpenOptions,
-        file_lock: Box<dyn FileLock>,
+        file_lock: Arc<dyn FileLock>,
         engine: EngineState,
+        buffer_pool: Option<Arc<BufferPoolHandle>>,
     ) -> Self {
         ClientInner {
             path,
             opts,
             writer_lock: Mutex::new(()),
             file_lock,
+            buffer_pool,
             engine: Box::new(PagedEngine::from_state(engine)),
         }
     }
@@ -618,7 +634,8 @@ impl Client {
         }
 
         // Acquire OS advisory file lock.
-        let file_lock = lock::open_file_lock(&path)?;
+        // Store as Arc so the same fd can be shared with FilePageIo.
+        let file_lock: Arc<dyn FileLock> = Arc::from(lock::open_file_lock(&path)?);
         let busy_timeout = opts.busy_timeout;
         #[cfg(feature = "tracing")]
         let _lock_t = std::time::Instant::now();
@@ -680,11 +697,33 @@ impl Client {
             EngineState::default()
         };
 
+        // R1.1: Construct the buffer pool handle wired to the database file.
+        //
+        // The pool is backed by FilePageIo which shares the lock fd (Arc clone)
+        // to avoid the POSIX advisory-lock footgun.  OpenOptions::buffer_pool_size
+        // controls the total byte budget split between 4 KB and 32 KB partitions.
+        //
+        // The header is read fresh here (or a new header is used for empty files).
+        // R1.2+ will use `buffer_pool` as the B+ tree's page store.
+        let file_header = if file_size == 0 {
+            FileHeader::new_now()
+        } else {
+            let mut hdr_buf = [0u8; HEADER_PAGE_SIZE];
+            file_lock.read_exact_at(0, &mut hdr_buf)?;
+            FileHeader::from_bytes(&hdr_buf).unwrap_or_else(|_| FileHeader::new_now())
+        };
+        let pool = Arc::new(BufferPool::new(
+            opts.buffer_pool_size,
+            Box::new(FilePageIo::new(Arc::clone(&file_lock))),
+        ));
+        let buffer_pool = Some(Arc::new(BufferPoolHandle::new(pool, file_header)));
+
         let inner = Arc::new(ClientInner::new_with_engine(
             Some(path.clone()),
             opts,
             file_lock,
             engine,
+            buffer_pool,
         ));
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -703,7 +742,7 @@ impl Client {
     ///
     /// File locking is a no-op for in-memory databases (there is no file to lock).
     pub fn open_in_memory() -> Result<Client> {
-        let noop_lock: Box<dyn FileLock> = Box::new(NoopFileLock);
+        let noop_lock: Arc<dyn FileLock> = Arc::new(NoopFileLock);
         let inner = Arc::new(ClientInner::new(None, OpenOptions::new(), noop_lock));
         Ok(Client { inner })
     }

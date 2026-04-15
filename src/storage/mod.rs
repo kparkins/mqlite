@@ -17,16 +17,27 @@
 //! - hq-9vo: File format — header, page formats, ObjectId generation
 //! - hq-vk2: Buffer pool (CLOCK sweep eviction, pin/unpin)
 //! - hq-1t3: Page allocator (dual free lists for 4KB/32KB pages)
+//! - hq-bhon: Buffer pool + page allocator + file I/O wiring (R1.1)
 
-// Phase 0: storage engine structs and functions are defined but not yet wired
-// into the query/write paths (Phase 1). Allow dead_code for the whole module.
+// Phase 0/1: storage engine structs and functions.
+// Allow dead_code during the Phase 1 transition — each bead wires more
+// of this infrastructure into the live query path.
 #[allow(dead_code)]
 pub(crate) mod allocator;
 #[allow(dead_code)]
 pub(crate) mod btree;
+/// R1.1: BTreePageStore adapter that bridges BTree and BufferPool (RISK-01).
+#[allow(dead_code)]
+pub(crate) mod btree_store;
 pub(crate) mod buffer_pool;
 #[allow(dead_code)]
 pub(crate) mod catalog;
+/// R1.1: File-backed PageIo implementation.
+#[allow(dead_code)]
+pub(crate) mod file_io;
+/// R1.1: BufferPoolHandle — high-level page I/O (fetch_page / alloc_page / free_page / flush).
+#[allow(dead_code)]
+pub(crate) mod handle;
 #[allow(dead_code)]
 pub(crate) mod header;
 pub(crate) mod lock;

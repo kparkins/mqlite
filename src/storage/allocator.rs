@@ -38,6 +38,8 @@
 //! When extending the file would cause `total_page_count` to overflow a `u32`,
 //! [`Error::DiskFull`] is returned with `available_bytes: 0`.
 
+use std::sync::{Arc, Mutex};
+
 use crate::error::{Error, Result};
 use crate::storage::buffer_pool::{PageIo, PageSize};
 use crate::storage::header::FileHeader;
@@ -239,6 +241,189 @@ impl<'a> PageAllocator<'a> {
         let mut buf = vec![0u8; size.bytes()];
         buf[0..4].copy_from_slice(&next.to_le_bytes());
         self.io.write_page(page_number, size, &buf)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AllocatorHandle — owned-state allocator for concurrent use
+// ---------------------------------------------------------------------------
+
+/// Owned state for the [`AllocatorHandle`].
+struct AllocatorState {
+    header: FileHeader,
+    header_dirty: bool,
+}
+
+/// A `Clone`-able, `Arc`-wrapped allocator handle that owns the
+/// [`FileHeader`] rather than borrowing it.
+///
+/// Resolves **RISK-03** from the Phase 1 reconciliation plan: the original
+/// [`PageAllocator`] holds `header: &'a mut FileHeader`, which makes it
+/// impossible to use concurrently from multiple threads or to store in an
+/// `Arc`-shared struct like `DatabaseInner`.
+///
+/// `AllocatorHandle` wraps the header in `Arc<Mutex<AllocatorState>>`.  All
+/// allocations and deallocations lock the mutex, perform the operation via a
+/// short-lived [`PageAllocator`], and release the lock.
+///
+/// After any allocation or free, the in-memory header is marked dirty.  Call
+/// [`flush_header`](AllocatorHandle::flush_header) to persist the updated
+/// header to page 0 through a `PageIo`.
+#[derive(Clone)]
+pub(crate) struct AllocatorHandle {
+    state: Arc<Mutex<AllocatorState>>,
+}
+
+impl AllocatorHandle {
+    /// Create an `AllocatorHandle` from an existing [`FileHeader`].
+    ///
+    /// The header is placed in clean state (not dirty).  Call
+    /// [`flush_header`](Self::flush_header) after any allocations to persist
+    /// changes.
+    pub(crate) fn new(header: FileHeader) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AllocatorState {
+                header,
+                header_dirty: false,
+            })),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Allocation
+    // -----------------------------------------------------------------------
+
+    /// Allocate a 4 KB internal-node page.
+    ///
+    /// Updates the in-memory free list and marks the header dirty.  The
+    /// caller must call [`flush_header`](Self::flush_header) (or flush the
+    /// buffer pool) to persist the change to disk.
+    pub(crate) fn alloc_4k(&self, io: &dyn PageIo) -> Result<u32> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut alloc = PageAllocator::new(&mut state.header, io);
+        let page_no = alloc.allocate_4k()?;
+        state.header_dirty = true;
+        Ok(page_no)
+    }
+
+    /// Allocate a 32 KB leaf / overflow page.
+    ///
+    /// Updates the in-memory free list and marks the header dirty.
+    pub(crate) fn alloc_32k(&self, io: &dyn PageIo) -> Result<u32> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut alloc = PageAllocator::new(&mut state.header, io);
+        let page_no = alloc.allocate_32k()?;
+        state.header_dirty = true;
+        Ok(page_no)
+    }
+
+    // -----------------------------------------------------------------------
+    // Deallocation
+    // -----------------------------------------------------------------------
+
+    /// Return a 4 KB page to the free list.
+    ///
+    /// Marks the header dirty.  The freed page's first 4 bytes are
+    /// overwritten with the free-list head pointer via `io`.
+    pub(crate) fn free_4k(&self, page_number: u32, io: &dyn PageIo) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut alloc = PageAllocator::new(&mut state.header, io);
+        alloc.free_4k(page_number)?;
+        state.header_dirty = true;
+        Ok(())
+    }
+
+    /// Return a 32 KB page to the free list.
+    ///
+    /// Marks the header dirty.  The freed page's first 4 bytes are
+    /// overwritten with the free-list head pointer via `io`.
+    pub(crate) fn free_32k(&self, page_number: u32, io: &dyn PageIo) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut alloc = PageAllocator::new(&mut state.header, io);
+        alloc.free_32k(page_number)?;
+        state.header_dirty = true;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Header access
+    // -----------------------------------------------------------------------
+
+    /// Read the current in-memory file header.
+    ///
+    /// The closure receives a shared reference to the header; its return
+    /// value is returned from this method.
+    pub(crate) fn with_header<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&FileHeader) -> R,
+    {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        Ok(f(&state.header))
+    }
+
+    /// Mutate the in-memory file header and mark it dirty.
+    ///
+    /// Use this to update fields such as `catalog_root_page` after a B+ tree
+    /// root split, without going through the allocation path.
+    pub(crate) fn update_header<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut FileHeader),
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        f(&mut state.header);
+        state.header_dirty = true;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Flush
+    // -----------------------------------------------------------------------
+
+    /// Write the in-memory header back to page 0 via `io` if it is dirty.
+    ///
+    /// Clears the dirty flag on success.  If the header is clean, this is a
+    /// no-op.
+    ///
+    /// Typically called after all B+ tree operations in a transaction are
+    /// complete, before the WAL commit frame is written.
+    pub(crate) fn flush_header(&self, io: &dyn PageIo) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        if state.header_dirty {
+            let bytes = state.header.to_bytes();
+            io.write_page(0, PageSize::Small4k, &bytes)?;
+            state.header_dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Return `true` if the in-memory header has been modified since the
+    /// last [`flush_header`](Self::flush_header) call.
+    pub(crate) fn is_header_dirty(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.header_dirty)
+            .unwrap_or(false)
     }
 }
 
@@ -714,5 +899,140 @@ mod tests {
             alloc.allocate_32k().unwrap()
         };
         assert_eq!(recycled, page_number);
+    }
+
+    // -----------------------------------------------------------------------
+    // AllocatorHandle tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_alloc_4k_returns_correct_page() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        let page = handle.alloc_4k(&io).unwrap();
+        assert_eq!(page, 1, "first alloc must be page 1");
+    }
+
+    #[test]
+    fn handle_alloc_32k_returns_correct_page() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        let page = handle.alloc_32k(&io).unwrap();
+        assert_eq!(page, 1);
+    }
+
+    #[test]
+    fn handle_sequential_allocs_return_consecutive_pages() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        let a = handle.alloc_4k(&io).unwrap();
+        let b = handle.alloc_32k(&io).unwrap();
+        let c = handle.alloc_4k(&io).unwrap();
+
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+        assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn handle_marks_header_dirty_after_alloc() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        assert!(!handle.is_header_dirty(), "header should be clean on create");
+        handle.alloc_4k(&io).unwrap();
+        assert!(handle.is_header_dirty(), "header must be dirty after alloc");
+    }
+
+    #[test]
+    fn handle_flush_header_writes_to_page_0() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        handle.alloc_4k(&io).unwrap();
+        handle.flush_header(&io).unwrap();
+
+        assert!(!handle.is_header_dirty(), "header must be clean after flush");
+        // Page 0 must have been written.
+        let raw = io.get_raw(0).expect("page 0 must be written on flush");
+        assert_eq!(raw.len(), PageSize::Small4k.bytes());
+    }
+
+    #[test]
+    fn handle_flush_header_noop_when_clean() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        // No allocations — header is clean.
+        handle.flush_header(&io).unwrap();
+
+        assert!(
+            io.get_raw(0).is_none(),
+            "flush_header must not write page 0 when header is clean"
+        );
+    }
+
+    #[test]
+    fn handle_free_and_realloc_recycles_page() {
+        let io = MockIo::new();
+        let mut hdr = fresh_header();
+        hdr.total_page_count = 3; // pretend pages 1 and 2 exist
+        let handle = AllocatorHandle::new(hdr);
+
+        handle.free_4k(1, &io).unwrap();
+        let recycled = handle.alloc_4k(&io).unwrap();
+        assert_eq!(recycled, 1, "freed page must be recycled");
+    }
+
+    #[test]
+    fn handle_with_header_reads_total_page_count() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        handle.alloc_4k(&io).unwrap();
+        handle.alloc_32k(&io).unwrap();
+
+        let count = handle.with_header(|h| h.total_page_count).unwrap();
+        assert_eq!(count, 3, "two allocs from page 1 = total 3");
+    }
+
+    #[test]
+    fn handle_update_header_marks_dirty_and_persists() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        handle
+            .update_header(|h| h.catalog_root_page = 42)
+            .unwrap();
+
+        assert!(handle.is_header_dirty());
+        let root = handle.with_header(|h| h.catalog_root_page).unwrap();
+        assert_eq!(root, 42);
+    }
+
+    #[test]
+    fn handle_is_clone_and_shares_state() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+        let handle2 = handle.clone();
+
+        // Alloc through clone 1.
+        handle.alloc_4k(&io).unwrap();
+
+        // Clone 2 sees the updated state.
+        let count = handle2.with_header(|h| h.total_page_count).unwrap();
+        assert_eq!(count, 2, "clone must share underlying state");
     }
 }
