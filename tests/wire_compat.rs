@@ -200,16 +200,26 @@ fn mongosh_smoke_op_query_ismaster_handshake() {
 }
 
 /// mongosh step 1: `show dbs` → listDatabases.
+///
+/// R2.1: listDatabases only shows databases that have at least one collection.
+/// Insert a document first so that a database is visible.
 #[test]
 fn mongosh_smoke_show_dbs() {
     let (_db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
-    let body = round_trip(&mut s, 1, &doc! { "listDatabases": 1i32, "$db": "admin" });
+    // Insert a document to create the "local" database namespace.
+    round_trip(
+        &mut s,
+        1,
+        &doc! { "insert": "col", "documents": [{"x": 1i32}], "$db": "local" },
+    );
+
+    let body = round_trip(&mut s, 2, &doc! { "listDatabases": 1i32, "$db": "admin" });
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0, "listDatabases ok");
     let dbs = body.get_array("databases").unwrap();
-    assert_eq!(dbs.len(), 1, "exactly one database");
+    assert!(!dbs.is_empty(), "at least one database must appear after insert");
     let db_entry = dbs[0].as_document().unwrap();
     assert!(db_entry.contains_key("name"), "database entry has name");
     assert!(db_entry.contains_key("sizeOnDisk"), "database entry has sizeOnDisk");
@@ -854,15 +864,25 @@ fn format_parity_server_status() {
 }
 
 /// Format parity: listDatabases response.
+///
+/// R2.1: databases only appear after a write.  Insert first, then verify format.
 #[test]
 fn format_parity_list_databases() {
     let (_db, _srv, addr) = start_server();
     let mut s = connect(addr);
-    let body = round_trip(&mut s, 1, &doc! { "listDatabases": 1i32, "$db": "admin" });
+
+    // Seed a document so that "fmtdb" appears in listDatabases.
+    round_trip(
+        &mut s,
+        1,
+        &doc! { "insert": "col", "documents": [{"x": 1i32}], "$db": "fmtdb" },
+    );
+
+    let body = round_trip(&mut s, 2, &doc! { "listDatabases": 1i32, "$db": "admin" });
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0);
     let dbs = body.get_array("databases").unwrap();
-    assert_eq!(dbs.len(), 1);
+    assert!(!dbs.is_empty(), "at least one database must appear after insert");
     let db_entry = dbs[0].as_document().unwrap();
     assert!(db_entry.get_str("name").is_ok(), "name: string");
     // sizeOnDisk must be numeric (i64 or f64).

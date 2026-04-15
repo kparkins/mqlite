@@ -274,26 +274,33 @@ impl ServerState {
             .saturating_sub(1)
     }
 
-    /// Derive the logical database name from the file path.
-    ///
-    /// For `/path/to/myapp.mqlite` returns `"myapp"`.
-    /// For in-memory databases returns `"local"`.
-    fn db_name(&self) -> String {
-        self.db_path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| "local".to_owned())
-    }
+}
 
-    /// Fully-qualify a collection name as `<db_name>.<coll_name>`.
-    ///
-    /// This matches the engine's internal namespace format established by
-    /// `Collection<T>` and `Database` handles in R0.1.
-    fn qualified_coll(&self, coll_name: &str) -> String {
-        format!("{}.{}", self.db_name(), coll_name)
-    }
+// ---------------------------------------------------------------------------
+// $db routing helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the database name from a command body's `$db` field.
+///
+/// Falls back to `"test"` when the field is absent — this matches mongosh's
+/// default database (i.e., `use mydb` in mongosh sends subsequent commands
+/// with `$db: "mydb"`).  Any non-empty string is accepted; there is no
+/// server-side database name restriction in the multi-database wire protocol.
+fn extract_db_name(body: &Document) -> String {
+    body.get_str("$db")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("test")
+        .to_owned()
+}
+
+/// Fully-qualify a collection name as `<db_name>.<coll_name>` using the
+/// `$db` field from the command body.
+///
+/// This matches the engine's internal namespace format (`Database` and
+/// `Collection<T>` handles store collections as `"db.collection"`).
+fn qualified_coll(body: &Document, coll_name: &str) -> String {
+    format!("{}.{}", extract_db_name(body), coll_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -623,25 +630,13 @@ fn parse_op_query_db_name(buf: &[u8]) -> Option<String> {
 
 /// Validate the `$db` field in an OP_MSG command body.
 ///
-/// Returns `Some(error_doc)` when `$db` is present and does not match
-/// `server_db_name` or `"admin"` (which is always permitted for server-level
-/// commands such as `hello`, `ping`, `buildInfo`, etc.).
-///
-/// Returns `None` when the field is absent, not a string, empty, or valid.
-fn check_db_field(body: &Document, server_db_name: &str) -> Option<Document> {
-    let db = match body.get_str("$db") {
-        Ok(s) => s,
-        Err(_) => return None, // absent or wrong BSON type — allow
-    };
-    if db.is_empty() || db == "admin" || db == server_db_name {
-        return None; // valid
-    }
-    Some(doc! {
-        "ok": 0.0_f64,
-        "errmsg": format!("not authorized on {} to execute command", db),
-        "code": 13i32,
-        "codeName": "Unauthorized",
-    })
+/// In the multi-database wire protocol (R2.1) any non-empty `$db` value is
+/// accepted — the database is created on first write ("use mydb" semantics).
+/// This function is retained for backward compatibility and always returns
+/// `None` (i.e., no error).
+#[allow(dead_code)]
+fn check_db_field(_body: &Document, _server_db_name: &str) -> Option<Document> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -659,18 +654,10 @@ fn dispatch_op_query(
     // OP_QUERY body starts after the 16-byte header.
     let body_buf = &full_msg[MsgHeader::SIZE..];
 
-    // Validate database from fullCollectionName (e.g. "admin.$cmd").
-    if let Some(ref query_db) = parse_op_query_db_name(body_buf) {
-        if !query_db.is_empty() && query_db != "admin" && *query_db != state.db_name() {
-            let err = doc! {
-                "ok": 0.0_f64,
-                "errmsg": format!("not authorized on {} to execute command", query_db),
-                "code": 13i32,
-                "codeName": "Unauthorized",
-            };
-            return build_op_reply(request_id, response_to, &err);
-        }
-    }
+    // In the multi-database wire protocol (R2.1) any database is accepted.
+    // No Unauthorized check here — the fullCollectionName db prefix is used only
+    // to identify which database the OP_QUERY targets (legacy handshake only).
+    let _ = parse_op_query_db_name(body_buf); // keep fn reachable for tests
 
     let doc = parse_op_query_body(body_buf)?;
     let command_name = doc
@@ -700,11 +687,8 @@ fn dispatch_op_msg(
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
             detail: "command message has no Kind-0 body section".into(),
         })?;
-    // Validate $db before routing.  Returns Unauthorized (code 13) when
-    // $db is present and does not match "admin" or the server's db name.
-    if let Some(err) = check_db_field(body, &state.db_name()) {
-        return OpMsg::build_response(request_id, response_to, &err);
-    }
+    // In the multi-database wire protocol (R2.1) any $db value is accepted.
+    // No Unauthorized check — $db is used for routing, not access control.
     // Merge Kind-1 document sequences (e.g. pymongo bulk inserts) into the
     // body so handlers always see a complete document regardless of framing.
     let merged_body = merge_doc_sequences_into_body(body, &msg.sections);
@@ -939,24 +923,36 @@ fn handle_server_status(state: &ServerState) -> Document {
 
 /// `listDatabases` — enumerate available databases.
 ///
-/// mqlite is single-database per file.  The database name is derived from the
-/// file stem of the `.mqlite` path (e.g., `myapp.mqlite` → `"myapp"`).
-/// In-memory databases are named `"local"`.
+/// Enumerates all unique database namespaces that have at least one collection.
+/// The database names are the prefixes of the `"db.collection"` keys stored
+/// in the engine.  An empty mqlite instance (no writes yet) returns an empty
+/// list, matching the MongoDB 8.0 behaviour where databases only appear after
+/// the first write (`use mydb` semantics).
 fn handle_list_databases(state: &ServerState) -> Document {
-    let db_name = state.db_name();
+    // Collect unique database names from all "db.collection" collection names.
+    let all_names = state.database.list_collection_names().unwrap_or_default();
+    let mut db_set: std::collections::BTreeSet<String> = all_names
+        .into_iter()
+        .filter_map(|n| n.split('.').next().map(|db| db.to_owned()))
+        .collect();
+    // Remove internal engine namespaces that are not user databases.
+    db_set.remove("$");
 
-    // Approximate size: WAL file size is a proxy for recent write activity.
-    // Actual on-disk size requires stat() on the main file, which is best-effort.
     let size_on_disk = state.wal_file_size() as i64;
 
-    doc! {
-        "databases": [
-            {
-                "name": &db_name,
+    let databases: bson::Array = db_set
+        .into_iter()
+        .map(|name| {
+            bson::Bson::Document(doc! {
+                "name": &name,
                 "sizeOnDisk": size_on_disk,
                 "empty": false,
-            }
-        ],
+            })
+        })
+        .collect();
+
+    doc! {
+        "databases": databases,
         "totalSize": size_on_disk,
         "totalSizeMb": bson::Bson::Int64(size_on_disk / (1024 * 1024)),
         "ok": 1.0_f64,
@@ -1090,7 +1086,7 @@ fn handle_insert(body: &Document, state: &ServerState) -> Document {
     let ordered = body.get_bool("ordered").unwrap_or(true);
     let opts = InsertManyOptions { ordered };
 
-    match state.database.insert_many(&state.qualified_coll(&coll_name), &docs, opts) {
+    match state.database.insert_many(&qualified_coll(body, &coll_name), &docs, opts) {
         Ok(result) => {
             let n = result.inserted_ids.len() as i32;
             if result.errors.is_empty() {
@@ -1162,7 +1158,7 @@ fn handle_find(
         .map(|n| if n <= 0 { 101usize } else { n as usize })
         .unwrap_or(101);
 
-    let cursor = match state.database.find::<Document>(&state.qualified_coll(&coll_name), filter, opts) {
+    let cursor = match state.database.find::<Document>(&qualified_coll(body, &coll_name), filter, opts) {
         Ok(c) => c,
         Err(e) => return err_from_mqlite(e),
     };
@@ -1195,7 +1191,7 @@ fn handle_find(
             .store(remaining_cursor)
     };
 
-    let ns = format!("{}.{}", state.db_name(), coll_name);
+    let ns = format!("{}.{}", extract_db_name(body), coll_name);
     doc! {
         "cursor": {
             "firstBatch": first_batch,
@@ -1262,9 +1258,9 @@ fn handle_update(body: &Document, state: &ServerState) -> Document {
         let opts = UpdateOptions { upsert };
 
         let result = if multi {
-            state.database.update_many(&state.qualified_coll(&coll_name), filter, update_doc, opts)
+            state.database.update_many(&qualified_coll(body, &coll_name), filter, update_doc, opts)
         } else {
-            state.database.update_one(&state.qualified_coll(&coll_name), filter, update_doc, opts)
+            state.database.update_one(&qualified_coll(body, &coll_name), filter, update_doc, opts)
         };
 
         match result {
@@ -1346,9 +1342,9 @@ fn handle_delete(body: &Document, state: &ServerState) -> Document {
         let limit = get_i64(spec, "limit").unwrap_or(1);
 
         let result = if limit == 0 {
-            state.database.delete_many(&state.qualified_coll(&coll_name), filter)
+            state.database.delete_many(&qualified_coll(body, &coll_name), filter)
         } else {
-            state.database.delete_one(&state.qualified_coll(&coll_name), filter)
+            state.database.delete_one(&qualified_coll(body, &coll_name), filter)
         };
 
         match result {
@@ -1414,7 +1410,7 @@ fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
         let opts = FindOneAndDeleteOptions { sort };
         match state
             .database
-            .find_one_and_delete_with_options::<Document>(&state.qualified_coll(&coll_name), filter, opts)
+            .find_one_and_delete_with_options::<Document>(&qualified_coll(body, &coll_name), filter, opts)
         {
             Ok(Some(doc)) => doc! {
                 "value": bson::Bson::Document(doc),
@@ -1452,7 +1448,7 @@ fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
 
         match state
             .database
-            .find_one_and_update_with_options::<Document>(&state.qualified_coll(&coll_name), filter, update_doc, opts)
+            .find_one_and_update_with_options::<Document>(&qualified_coll(body, &coll_name), filter, update_doc, opts)
         {
             Ok(Some(doc)) => {
                 // A document was returned.
@@ -1504,7 +1500,7 @@ fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
 /// is removed from the per-connection map.
 fn handle_get_more(
     body: &Document,
-    state: &ServerState,
+    _state: &ServerState,
     cursors: &Arc<std::sync::Mutex<ConnectionCursors>>,
 ) -> Document {
     let cursor_id = match get_i64(body, "getMore") {
@@ -1557,7 +1553,7 @@ fn handle_get_more(
         cursor_id
     };
 
-    let ns = format!("{}.{}", state.db_name(), coll_name);
+    let ns = format!("{}.{}", extract_db_name(body), coll_name);
     doc! {
         "cursor": {
             "nextBatch": next_batch,
@@ -1627,7 +1623,7 @@ fn handle_create(body: &Document, state: &ServerState) -> Document {
         Err(_) => return err_bad_value("create requires a collection name string"),
     };
 
-    match state.database.create_collection(&state.qualified_coll(&coll_name)) {
+    match state.database.create_collection(&qualified_coll(body, &coll_name)) {
         Ok(_) => doc! { "ok": 1.0_f64 },
         Err(e) => err_from_mqlite(e),
     }
@@ -1648,7 +1644,7 @@ fn handle_drop(body: &Document, state: &ServerState) -> Document {
         Err(_) => return err_bad_value("drop requires a collection name string"),
     };
 
-    match state.database.drop_collection(&state.qualified_coll(&coll_name)) {
+    match state.database.drop_collection(&qualified_coll(body, &coll_name)) {
         Ok(_) => doc! { "ok": 1.0_f64 },
         Err(e) => err_from_mqlite(e),
     }
@@ -1676,15 +1672,14 @@ fn handle_list_collections(body: &Document, state: &ServerState) -> Document {
         Err(e) => return err_from_mqlite(e),
     };
 
-    // Filter to collections in this database (strip the "<db>." prefix).
-    let db_name = state.db_name();
-    let db_prefix = format!("{}", db_name);
+    // Filter to collections in the database named by `$db`.
+    let db_name = extract_db_name(body);
+    let db_prefix = format!("{db_name}.");
     let names: Vec<String> = all_names
         .into_iter()
         .filter_map(|n| {
             // Names are stored as "db.collection" — strip the db prefix.
-            let prefix = format!("{db_prefix}.");
-            n.strip_prefix(&prefix).map(|s| s.to_owned())
+            n.strip_prefix(&db_prefix).map(|s| s.to_owned())
         })
         .collect();
 
@@ -1754,7 +1749,7 @@ fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
     // Add 1 for the always-present synthetic `_id_` index.
     let num_before = state
         .database
-        .list_indexes(&state.qualified_coll(&coll_name))
+        .list_indexes(&qualified_coll(body, &coll_name))
         .map(|idxs| idxs.len() as i32 + 1)
         .unwrap_or(1);
 
@@ -1781,7 +1776,7 @@ fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
         }
 
         let model = crate::index::IndexModel { keys: key, options: opts };
-        if let Err(e) = state.database.create_index(&state.qualified_coll(&coll_name), model) {
+        if let Err(e) = state.database.create_index(&qualified_coll(body, &coll_name), model) {
             return err_from_mqlite(e);
         }
     }
@@ -1789,7 +1784,7 @@ fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
     // Count user-created indexes after creation (+1 for synthetic `_id_`).
     let num_after = state
         .database
-        .list_indexes(&state.qualified_coll(&coll_name))
+        .list_indexes(&qualified_coll(body, &coll_name))
         .map(|idxs| idxs.len() as i32 + 1)
         .unwrap_or(1);
 
@@ -1820,12 +1815,12 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
     match body.get("index") {
         Some(bson::Bson::String(name)) if name == "*" => {
             // Drop all user-created indexes.
-            let indexes = match state.database.list_indexes(&state.qualified_coll(&coll_name)) {
+            let indexes = match state.database.list_indexes(&qualified_coll(body, &coll_name)) {
                 Ok(idxs) => idxs,
                 Err(e) => return err_from_mqlite(e),
             };
             for idx in &indexes {
-                if let Err(e) = state.database.drop_index(&state.qualified_coll(&coll_name), &idx.name) {
+                if let Err(e) = state.database.drop_index(&qualified_coll(body, &coll_name), &idx.name) {
                     return err_from_mqlite(e);
                 }
             }
@@ -1833,7 +1828,7 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
         }
         Some(bson::Bson::String(name)) => {
             // Drop a specific index by name.
-            match state.database.drop_index(&state.qualified_coll(&coll_name), name) {
+            match state.database.drop_index(&qualified_coll(body, &coll_name), name) {
                 Ok(_) => doc! { "ok": 1.0_f64 },
                 Err(e) => err_from_mqlite(e),
             }
@@ -1841,12 +1836,12 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
         Some(bson::Bson::Document(key_doc)) => {
             // Drop by key pattern — find the index whose key matches.
             let key_doc = key_doc.clone();
-            let indexes = match state.database.list_indexes(&state.qualified_coll(&coll_name)) {
+            let indexes = match state.database.list_indexes(&qualified_coll(body, &coll_name)) {
                 Ok(idxs) => idxs,
                 Err(e) => return err_from_mqlite(e),
             };
             match indexes.iter().find(|idx| idx.keys == key_doc) {
-                Some(idx) => match state.database.drop_index(&state.qualified_coll(&coll_name), &idx.name.clone()) {
+                Some(idx) => match state.database.drop_index(&qualified_coll(body, &coll_name), &idx.name.clone()) {
                     Ok(_) => doc! { "ok": 1.0_f64 },
                     Err(e) => err_from_mqlite(e),
                 },
@@ -1879,7 +1874,7 @@ fn handle_list_indexes(body: &Document, state: &ServerState) -> Document {
         Err(_) => return err_bad_value("listIndexes requires a collection name string"),
     };
 
-    let indexes = match state.database.list_indexes(&state.qualified_coll(&coll_name)) {
+    let indexes = match state.database.list_indexes(&qualified_coll(body, &coll_name)) {
         Ok(idxs) => idxs,
         Err(e) => return err_from_mqlite(e),
     };
@@ -1908,7 +1903,7 @@ fn handle_list_indexes(body: &Document, state: &ServerState) -> Document {
         first_batch.push(bson::Bson::Document(idx_doc));
     }
 
-    let ns = format!("{}.{}", state.db_name(), coll_name);
+    let ns = format!("{}.{}", extract_db_name(body), coll_name);
     doc! {
         "cursor": {
             "firstBatch": first_batch,
@@ -2227,7 +2222,16 @@ mod tests {
 
     #[test]
     fn dispatch_op_msg_list_databases() {
+        // Insert a document so the database is visible in listDatabases (R2.1).
         let state = ServerState::default();
+        let cursors = dummy_cursors();
+        let ins_req = make_op_msg_request(
+            5,
+            &doc! { "insert": "col", "documents": [{"x": 1i32}], "$db": "testdb" },
+        );
+        let ins_msg = OpMsg::parse(&ins_req).unwrap();
+        dispatch_op_msg(&ins_msg, 14, ins_msg.header.request_id, &state, 1, &cursors).unwrap();
+
         let req_buf =
             make_op_msg_request(6, &doc! { "listDatabases": 1, "$db": "admin" });
         let msg = OpMsg::parse(&req_buf).unwrap();
@@ -2235,12 +2239,14 @@ mod tests {
         let resp = OpMsg::parse(&resp_bytes).unwrap();
         let body = resp.body().unwrap();
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
-        // Must contain exactly one database entry.
+        // After the insert, "testdb" must appear.
         let dbs = body.get_array("databases").unwrap();
-        assert_eq!(dbs.len(), 1);
-        // The entry must have a "name" field.
-        let db_doc = dbs[0].as_document().unwrap();
-        assert!(db_doc.contains_key("name"));
+        assert!(!dbs.is_empty(), "at least one database must appear after insert");
+        let names: Vec<&str> = dbs
+            .iter()
+            .map(|d| d.as_document().unwrap().get_str("name").unwrap())
+            .collect();
+        assert!(names.contains(&"testdb"), "testdb must appear in listDatabases");
     }
 
     #[test]
@@ -2258,77 +2264,61 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // $db field validation
+    // $db field routing (R2.1 multi-database — any $db is accepted)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn check_db_field_missing_is_allowed() {
-        // No $db field → allowed (backward compat with older drivers)
-        let body = doc! { "ping": 1 };
-        assert!(check_db_field(&body, "myapp").is_none());
+    fn check_db_field_always_returns_none() {
+        // Multi-database: any $db value is accepted — check_db_field is a no-op.
+        assert!(check_db_field(&doc! { "ping": 1 }, "myapp").is_none());
+        assert!(check_db_field(&doc! { "ping": 1, "$db": "admin" }, "myapp").is_none());
+        assert!(check_db_field(&doc! { "ping": 1, "$db": "myapp" }, "myapp").is_none());
+        assert!(check_db_field(&doc! { "ping": 1, "$db": "wrongdb" }, "myapp").is_none(),
+            "any $db must be accepted in multi-database mode");
     }
 
     #[test]
-    fn check_db_field_admin_is_allowed() {
-        // $db: "admin" is always permitted for server-level commands.
-        let body = doc! { "ping": 1, "$db": "admin" };
-        assert!(check_db_field(&body, "myapp").is_none());
-    }
-
-    #[test]
-    fn check_db_field_matching_is_allowed() {
-        // $db matching the actual db name is allowed.
-        let body = doc! { "ping": 1, "$db": "myapp" };
-        assert!(check_db_field(&body, "myapp").is_none());
-    }
-
-    #[test]
-    fn check_db_field_mismatch_returns_unauthorized() {
-        let body = doc! { "ping": 1, "$db": "wrongdb" };
-        let err = check_db_field(&body, "myapp").expect("expected Unauthorized doc");
-        assert_eq!(err.get_f64("ok").unwrap(), 0.0);
-        assert_eq!(err.get_i32("code").unwrap(), 13);
-        assert_eq!(err.get_str("codeName").unwrap(), "Unauthorized");
-        assert!(err.get_str("errmsg").is_ok());
-    }
-
-    #[test]
-    fn dispatch_op_msg_db_mismatch_returns_unauthorized() {
-        let state = ServerState::default(); // db_name() == "local"
-        // "wrongdb" != "admin" and "wrongdb" != "local" → Unauthorized
-        let req_buf = make_op_msg_request(20, &doc! { "ping": 1, "$db": "wrongdb" });
-        let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes =
-            dispatch_op_msg(&msg, 40, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
-        let resp = OpMsg::parse(&resp_bytes).unwrap();
-        let body = resp.body().unwrap();
-        assert_eq!(body.get_f64("ok").unwrap(), 0.0);
-        assert_eq!(body.get_i32("code").unwrap(), 13);
-        assert_eq!(body.get_str("codeName").unwrap(), "Unauthorized");
-    }
-
-    #[test]
-    fn dispatch_op_msg_db_admin_always_allowed() {
+    fn dispatch_op_msg_any_db_is_allowed() {
+        // R2.1: arbitrary $db values must succeed (no Unauthorized for unknown db).
         let state = ServerState::default();
-        let req_buf = make_op_msg_request(21, &doc! { "ping": 1, "$db": "admin" });
-        let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes =
-            dispatch_op_msg(&msg, 41, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
-        let resp = OpMsg::parse(&resp_bytes).unwrap();
-        let body = resp.body().unwrap();
-        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        for db in &["admin", "local", "mydb", "arbitrarydb", "test"] {
+            let req_buf = make_op_msg_request(20, &doc! { "ping": 1, "$db": db });
+            let msg = OpMsg::parse(&req_buf).unwrap();
+            let resp_bytes =
+                dispatch_op_msg(&msg, 40, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
+            let resp = OpMsg::parse(&resp_bytes).unwrap();
+            let body = resp.body().unwrap();
+            assert_eq!(body.get_f64("ok").unwrap(), 1.0,
+                "$db='{}' should succeed but got: {:?}", db, body);
+        }
     }
 
     #[test]
-    fn dispatch_op_msg_db_matching_allowed() {
-        let state = ServerState::new(Some(std::path::PathBuf::from("/tmp/myapp.mqlite")));
-        let req_buf = make_op_msg_request(22, &doc! { "ping": 1, "$db": "myapp" });
-        let msg = OpMsg::parse(&req_buf).unwrap();
-        let resp_bytes =
-            dispatch_op_msg(&msg, 42, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
-        let resp = OpMsg::parse(&resp_bytes).unwrap();
-        let body = resp.body().unwrap();
-        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+    fn dispatch_op_msg_db_routes_to_correct_namespace() {
+        // Documents inserted with $db: "foo" must not appear in $db: "bar".
+        let state = ServerState::default();
+        let cursors = dummy_cursors();
+        handle_insert(
+            &doc! { "insert": "things", "documents": [{"x": 1i32}], "$db": "foo" },
+            &state,
+        );
+        // find in same db — must return 1 doc.
+        let find_foo = handle_find(
+            &doc! { "find": "things", "filter": {}, "$db": "foo" },
+            &state,
+            &cursors,
+        );
+        let batch_foo = find_foo.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        assert_eq!(batch_foo.len(), 1, "find in same db must return the document");
+
+        // find in different db — must return 0 docs.
+        let find_bar = handle_find(
+            &doc! { "find": "things", "filter": {}, "$db": "bar" },
+            &state,
+            &cursors,
+        );
+        let batch_bar = find_bar.get_document("cursor").unwrap().get_array("firstBatch").unwrap();
+        assert!(batch_bar.is_empty(), "find in different db must return no documents");
     }
 
     // -----------------------------------------------------------------------
@@ -2357,12 +2347,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_op_query_db_mismatch_returns_unauthorized() {
-        let state = ServerState::default(); // db_name() == "local"
-        // "wrongdb.$cmd" → db = "wrongdb" ≠ "admin" and ≠ "local"
-        let req_buf = make_op_query_request(30, "wrongdb.$cmd", &doc! { "ismaster": 1 });
+    fn dispatch_op_query_any_db_is_allowed() {
+        // R2.1: OP_QUERY from any database must succeed (isMaster handshake).
+        let state = ServerState::default();
+        let req_buf = make_op_query_request(30, "anydb.$cmd", &doc! { "ismaster": 1 });
         let resp_bytes = dispatch_op_query(&req_buf, 50, 30, &state, 1).unwrap();
-        // OP_REPLY: header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
+        // Parse OP_REPLY body.
         let doc_start = 16 + 4 + 8 + 4 + 4;
         let doc_size = i32::from_le_bytes(
             resp_bytes[doc_start..doc_start + 4].try_into().unwrap(),
@@ -2371,9 +2361,9 @@ mod tests {
             bson::RawDocumentBuf::from_bytes(resp_bytes[doc_start..doc_start + doc_size].to_vec())
                 .unwrap();
         let body = bson::from_slice::<Document>(raw.as_bytes()).unwrap();
-        assert_eq!(body.get_f64("ok").unwrap(), 0.0);
-        assert_eq!(body.get_i32("code").unwrap(), 13);
-        assert_eq!(body.get_str("codeName").unwrap(), "Unauthorized");
+        // Must succeed — any $db is valid in multi-database mode.
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0,
+            "OP_QUERY from any db must succeed, got: {:?}", body);
     }
 
     // -----------------------------------------------------------------------
@@ -2528,40 +2518,76 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // listDatabases — spec compliance
+    // listDatabases — spec compliance (R2.1 multi-database)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn list_databases_single_entry() {
+    fn list_databases_empty_when_no_collections() {
+        // Empty server — no collections yet — must report no databases.
         let state = ServerState::default();
         let body = handle_list_databases(&state);
         assert_eq!(body.get_f64("ok").unwrap(), 1.0);
         let dbs = body.get_array("databases").unwrap();
-        assert_eq!(dbs.len(), 1, "mqlite must list exactly one database");
+        assert!(dbs.is_empty(), "empty server must report no databases");
+    }
+
+    #[test]
+    fn list_databases_shows_db_after_insert() {
+        // After inserting into "mydb", listDatabases must include "mydb".
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "col", "documents": [{"x": 1i32}], "$db": "mydb" },
+            &state,
+        );
+        let body = handle_list_databases(&state);
+        assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+        let dbs = body.get_array("databases").unwrap();
+        assert_eq!(dbs.len(), 1);
         let db_doc = dbs[0].as_document().unwrap();
-        assert!(db_doc.contains_key("name"), "database entry must have a name");
+        assert_eq!(db_doc.get_str("name").unwrap(), "mydb");
         assert!(db_doc.contains_key("sizeOnDisk"), "database entry must have sizeOnDisk");
         assert!(db_doc.contains_key("empty"), "database entry must have empty");
     }
 
     #[test]
-    fn list_databases_name_from_path() {
-        // When a db_path is provided the name should be the file stem.
-        let state = ServerState::new(Some(std::path::PathBuf::from("/tmp/myapp.mqlite")));
+    fn list_databases_multiple_databases() {
+        // Multiple $db namespaces are each reported as a separate database.
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "a", "documents": [{"x": 1i32}], "$db": "alpha" },
+            &state,
+        );
+        handle_insert(
+            &doc! { "insert": "b", "documents": [{"y": 2i32}], "$db": "beta" },
+            &state,
+        );
         let body = handle_list_databases(&state);
         let dbs = body.get_array("databases").unwrap();
-        let db_doc = dbs[0].as_document().unwrap();
-        assert_eq!(db_doc.get_str("name").unwrap(), "myapp");
+        assert_eq!(dbs.len(), 2);
+        let names: Vec<&str> = dbs
+            .iter()
+            .map(|d| d.as_document().unwrap().get_str("name").unwrap())
+            .collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
     }
 
     #[test]
-    fn list_databases_in_memory_name() {
-        // In-memory (no path) returns "local".
-        let state = ServerState::new(None);
+    fn list_databases_same_db_different_collections_counted_once() {
+        // Two collections in "shared" — should appear as one entry.
+        let state = ServerState::default();
+        handle_insert(
+            &doc! { "insert": "c1", "documents": [{"v": 1i32}], "$db": "shared" },
+            &state,
+        );
+        handle_insert(
+            &doc! { "insert": "c2", "documents": [{"v": 2i32}], "$db": "shared" },
+            &state,
+        );
         let body = handle_list_databases(&state);
         let dbs = body.get_array("databases").unwrap();
-        let db_doc = dbs[0].as_document().unwrap();
-        assert_eq!(db_doc.get_str("name").unwrap(), "local");
+        assert_eq!(dbs.len(), 1);
+        assert_eq!(dbs[0].as_document().unwrap().get_str("name").unwrap(), "shared");
     }
 
     // -----------------------------------------------------------------------
