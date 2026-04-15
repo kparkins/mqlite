@@ -40,14 +40,14 @@ Two locks work together to enforce the "one writer at a time" rule:
 
 ### 1. OS Advisory Lock (cross-process)
 
-At `Database::open()` time, mqlite acquires an OS-level advisory lock on the
+At `Client::open()` time, mqlite acquires an OS-level advisory lock on the
 `.mqlite` file:
 
 - **Unix**: `fcntl(F_SETLK)` exclusive lock
 - **Windows**: `LockFileEx` exclusive lock
 
 This prevents two separate **processes** from writing simultaneously. The lock
-is held for the lifetime of the `Database` handle and released when the last
+is held for the lifetime of the `Client` handle and released when the last
 clone is dropped.
 
 > **Important:** POSIX advisory locks are **per-process**, not per-thread. Two
@@ -85,20 +85,20 @@ but may be **stale** if the application requires seeing the latest write.
 **Example of snapshot behavior:**
 
 ```rust
-use mqlite::{Database, doc};
-use std::sync::Arc;
+use mqlite::{Client, doc};
 use std::thread;
 
-let db = Arc::new(Database::open_in_memory()?);
+let client = Client::open_in_memory()?;
+let db = client.database("mydb");
 let users = db.collection::<bson::Document>("users");
 
 // Insert initial data
 users.insert_one(&doc! { "_id": 1, "status": "active" })?;
 
 // Thread A: long-running read (holds snapshot at T₁)
-let db_a = Arc::clone(&db);
+let client_a = client.clone();
 let reader = thread::spawn(move || {
-    let users_a = db_a.collection::<bson::Document>("users");
+    let users_a = client_a.database("mydb").collection::<bson::Document>("users");
     // This read sees "active" — the snapshot when the read started
     users_a.find_one(doc! { "_id": 1 })
 });
@@ -137,23 +137,23 @@ By default, mqlite waits up to **5 seconds** for the writer lock before
 returning `Error::WriterBusy`. Adjust this based on your workload:
 
 ```rust
-use mqlite::{Database, OpenOptions};
+use mqlite::{Client, OpenOptions};
 use std::time::Duration;
 
 // High-throughput application: longer timeout to ride out bursts
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_timeout(Duration::from_secs(30)),
 )?;
 
 // Latency-sensitive application: fail fast, retry at app level
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_timeout(Duration::from_millis(50)),
 )?;
 
 // Zero timeout: fail immediately on contention (SQLite-style BUSY)
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_timeout(Duration::ZERO),
 )?;
@@ -165,10 +165,10 @@ let db = Database::open_with_options(
 For more control, use a callback that is called each time the lock is contended:
 
 ```rust
-use mqlite::{Database, OpenOptions};
+use mqlite::{Client, OpenOptions};
 use std::time::Duration;
 
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_handler(|attempts| {
         // `attempts` = number of retries so far (starts at 0)
@@ -202,7 +202,7 @@ to it via a channel. This is the most natural pattern for high-throughput
 write workloads.
 
 ```rust
-use mqlite::{Database, doc};
+use mqlite::{Client, doc};
 use bson::Document;
 use std::sync::mpsc;
 use std::thread;
@@ -212,13 +212,13 @@ enum WriteRequest {
     Shutdown,
 }
 
-let db = Database::open("myapp.mqlite")?;
+let client = Client::open("myapp.mqlite")?;
 let (tx, rx) = mpsc::channel::<WriteRequest>();
 
 // Spawn the writer thread
-let writer_db = db.clone();
+let writer_client = client.clone();
 let writer = thread::spawn(move || {
-    let col = writer_db.collection::<Document>("events");
+    let col = writer_client.database("mydb").collection::<Document>("events");
     for req in rx {
         match req {
             WriteRequest::Insert(doc) => {
@@ -256,22 +256,22 @@ writer mutex already serializes them, but this pattern lets you batch
 application-level logic atomically.
 
 ```rust
-use mqlite::{Database, doc};
+use mqlite::{Client, doc};
 use bson::Document;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-// Database is already cheaply clonable (Arc inside)
-let db = Database::open("myapp.mqlite")?;
+// Client is already cheaply clonable (Arc-backed)
+let client = Client::open("myapp.mqlite")?;
 
 // For application-level atomic batches, add your own Mutex
 let write_lock = Arc::new(Mutex::new(()));
 
 let handles: Vec<_> = (0..4).map(|i| {
-    let db = db.clone();
+    let client = client.clone();
     let lock = Arc::clone(&write_lock);
     thread::spawn(move || {
-        let col = db.collection::<Document>("items");
+        let col = client.database("mydb").collection::<Document>("items");
         // Hold app mutex for the duration of the logical operation
         let _guard = lock.lock().unwrap();
         col.insert_one(&doc! { "worker": i, "ts": bson::DateTime::now() })
@@ -295,16 +295,18 @@ process and multiple read-only processes:
 
 ```rust
 // Process A: writer (e.g., data ingestion service)
-use mqlite::Database;
-let writer_db = Database::open("shared.mqlite")?;
+use mqlite::Client;
+let writer = Client::open("shared.mqlite")?;
+let db = writer.database("mydb");
 // ... perform writes
 
 // Process B, C, D: readers (e.g., query services)
-use mqlite::{Database, OpenOptions};
-let reader_db = Database::open_with_options(
+use mqlite::{Client, OpenOptions};
+let reader = Client::open_with_options(
     "shared.mqlite",
     OpenOptions::new().read_only(true),
 )?;
+let db = reader.database("mydb");
 // ... read-only queries
 ```
 
@@ -319,12 +321,11 @@ mqlite's core API is synchronous. In an async context, wrap write operations
 in `spawn_blocking` to avoid blocking the async executor:
 
 ```rust
-use mqlite::{Database, doc};
-use std::sync::Arc;
+use mqlite::{Client, doc};
 
-async fn insert_event(db: Arc<Database>, user: String) -> mqlite::Result<()> {
+async fn insert_event(client: Client, user: String) -> mqlite::Result<()> {
     tokio::task::spawn_blocking(move || {
-        let col = db.collection::<bson::Document>("events");
+        let col = client.database("mydb").collection::<bson::Document>("events");
         col.insert_one(&doc! { "user": user, "ts": bson::DateTime::now() })?;
         Ok(())
     })
@@ -337,14 +338,13 @@ For read-heavy async workloads, reads are also synchronous but cheaper (no
 exclusive lock). Still wrap them in `spawn_blocking` for correctness:
 
 ```rust
-use mqlite::{Database, doc};
-use std::sync::Arc;
+use mqlite::{Client, doc};
 
-async fn get_user(db: Arc<Database>, id: &str) -> mqlite::Result<Option<bson::Document>> {
+async fn get_user(client: Client, id: &str) -> mqlite::Result<Option<bson::Document>> {
     let id = id.to_owned();
     tokio::task::spawn_blocking(move || {
-        let col = db.collection::<bson::Document>("users");
-        col.find_one(doc! { "_id": id })
+        client.database("mydb").collection::<bson::Document>("users")
+            .find_one(doc! { "_id": id })
     })
     .await
     .expect("spawn_blocking panicked")
@@ -352,8 +352,8 @@ async fn get_user(db: Arc<Database>, id: &str) -> mqlite::Result<Option<bson::Do
 ```
 
 > **Rayon:** The same `spawn_blocking` pattern applies when using Rayon thread
-> pools. The mqlite `Database` handle is `Send + Sync` and can be shared across
-> Rayon tasks.
+> pools. The mqlite `Client` handle is `Send + Sync` and can be cloned freely
+> across Rayon tasks.
 
 ---
 
@@ -361,7 +361,7 @@ async fn get_user(db: Arc<Database>, id: &str) -> mqlite::Result<Option<bson::Do
 
 **Q: Can I open the same `.mqlite` file from multiple threads?**
 
-Yes. `Database` is `Clone`, `Send`, and `Sync`. Clone it and share across
+Yes. `Client` is `Clone`, `Send`, and `Sync`. Clone it and share across
 threads freely. The internal writer mutex serializes writes automatically.
 
 **Q: Can I open the same `.mqlite` file from multiple processes?**
@@ -400,7 +400,7 @@ Multi-document transaction support is planned for Phase 2.
 
 | Want to… | Use |
 |----------|-----|
-| Share database across threads | `db.clone()` (it's already `Arc`-backed) |
+| Share database across threads | `client.clone()` (it's already `Arc`-backed) |
 | Serialize writes | mqlite does this automatically |
 | Read without blocking writes | `read_only(true)` or just `find_one` |
 | Wait for writer lock | `busy_timeout(Duration::from_secs(N))` |

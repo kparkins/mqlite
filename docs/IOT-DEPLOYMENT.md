@@ -24,11 +24,11 @@ Default settings are tuned for server hardware (64 MB buffer pool, 100 MB WAL
 cap). On a Raspberry Pi or similar device, tune these down:
 
 ```rust
-use mqlite::{Database, OpenOptions, DurabilityMode};
+use mqlite::{Client, OpenOptions, DurabilityMode};
 use std::time::Duration;
 
-fn open_for_iot(path: &str) -> mqlite::Result<Database> {
-    Database::open_with_options(
+fn open_for_iot(path: &str) -> mqlite::Result<Client> {
+    Client::open_with_options(
         path,
         OpenOptions::new()
             // 4 MB buffer pool — suitable for Raspberry Pi and similar SBCs.
@@ -70,14 +70,15 @@ strategies:
 Use when data loss is unacceptable (medical sensors, financial meters):
 
 ```rust
-use mqlite::{Database, OpenOptions, DurabilityMode};
+use mqlite::{Client, OpenOptions, DurabilityMode};
 
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "sensor.mqlite",
     OpenOptions::new()
         .buffer_pool_size(4 * 1024 * 1024)
         .durability(DurabilityMode::FullSync),
 )?;
+let db = client.database("iot");
 ```
 
 Each committed write triggers one fsync. On a Class 10 SD card this is
@@ -88,10 +89,10 @@ typically 5–20 ms and accelerates wear.
 Use when a short data-loss window is acceptable (telemetry, log data):
 
 ```rust
-use mqlite::{Database, OpenOptions, DurabilityMode};
+use mqlite::{Client, OpenOptions, DurabilityMode};
 use std::time::Duration;
 
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "sensor.mqlite",
     OpenOptions::new()
         .buffer_pool_size(4 * 1024 * 1024)
@@ -99,6 +100,7 @@ let db = Database::open_with_options(
         // A power cut can lose at most ~1 second of committed data.
         .durability(DurabilityMode::Interval(Duration::from_secs(1))),
 )?;
+let db = client.database("iot");
 ```
 
 ### Trade-off summary
@@ -124,9 +126,9 @@ Embedded devices often have small storage. A disk-full condition returns
 consistent; no data is lost from previously committed records.
 
 ```rust
-use mqlite::{Database, Error, doc};
+use mqlite::{Error, doc};
 
-fn insert_reading(db: &Database, sensor_id: &str, value: f64) -> mqlite::Result<()> {
+fn insert_reading(db: &mqlite::Database, sensor_id: &str, value: f64) -> mqlite::Result<()> {
     let readings = db.collection::<mqlite::Document>("readings");
 
     match readings.insert_one(&doc! { "sensor": sensor_id, "value": value }) {
@@ -150,7 +152,7 @@ fn insert_reading(db: &Database, sensor_id: &str, value: f64) -> mqlite::Result<
     }
 }
 
-fn prune_oldest_readings(db: &Database, count: u64) -> mqlite::Result<()> {
+fn prune_oldest_readings(db: &mqlite::Database, count: u64) -> mqlite::Result<()> {
     use mqlite::options::FindOptions;
 
     let readings = db.collection::<mqlite::Document>("readings");
@@ -181,12 +183,12 @@ retry. This is the standard ring-buffer pattern for sensor data storage.
 mqlite uses a Write-Ahead Log (WAL). When power is cut mid-write:
 
 1. The partially-written transaction is discarded (it was never committed).
-2. On the next `Database::open()`, the WAL is replayed automatically.
+2. On the next `Client::open()`, the WAL is replayed automatically.
 3. All transactions that completed before the power cut are fully restored.
 
 ```rust
 // After power loss, just open normally — WAL replay is automatic.
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "sensor.mqlite",
     OpenOptions::new().buffer_pool_size(4 * 1024 * 1024),
 )?;
@@ -215,10 +217,10 @@ read-only mount for forensics), open the database in read-only mode for
 inspection:
 
 ```rust
-use mqlite::{Database, OpenOptions};
+use mqlite::{Client, OpenOptions};
 
-fn open_readonly_for_rescue(path: &str) -> mqlite::Result<Database> {
-    Database::open_with_options(
+fn open_readonly_for_rescue(path: &str) -> mqlite::Result<Client> {
+    Client::open_with_options(
         path,
         OpenOptions::new()
             .read_only(true)
@@ -325,11 +327,11 @@ See [FILE-MANAGEMENT.md](FILE-MANAGEMENT.md) for multi-process safety rules.
 All resource limits are configurable at open time via `OpenOptions`:
 
 ```rust
-use mqlite::{Database, OpenOptions, DurabilityMode};
+use mqlite::{Client, OpenOptions, DurabilityMode};
 use std::time::Duration;
 
 // Raspberry Pi Zero (512 MB RAM, Class 10 SD card):
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "/data/sensor.mqlite",
     OpenOptions::new()
         .buffer_pool_size(2 * 1024 * 1024)           // 2 MB
@@ -341,11 +343,12 @@ let db = Database::open_with_options(
             Duration::from_secs(1)                    // fsync once per second
         )),
 )?;
+let db = client.database("iot");
 ```
 
 ```rust
 // Raspberry Pi 4 (4 GB RAM, fast SD or NVMe):
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "/data/sensor.mqlite",
     OpenOptions::new()
         .buffer_pool_size(64 * 1024 * 1024)          // 64 MB (default)
@@ -355,6 +358,7 @@ let db = Database::open_with_options(
             Duration::from_millis(100)                // default
         )),
 )?;
+let db = client.database("iot");
 ```
 
 | Resource | `OpenOptions` method | Default | Minimum |

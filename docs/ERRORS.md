@@ -3,10 +3,10 @@
 All mqlite operations return `mqlite::Result<T>`, which is `Result<T, mqlite::Error>`.
 
 ```rust
-use mqlite::{Database, Error};
+use mqlite::{Client, Error};
 
-let db = Database::open("myapp.mqlite")?;
-let users = db.collection::<bson::Document>("users");
+let client = Client::open("myapp.mqlite")?;
+let users = client.database("myapp").collection::<bson::Document>("users");
 
 match users.find_one(bson::doc! { "_id": "missing" }) {
     Ok(Some(doc)) => println!("found: {doc:?}"),
@@ -36,10 +36,10 @@ An OS-level I/O error (permissions, disk full, file not found).
 
 **Recovery:**
 ```rust
-use mqlite::{Database, Error};
+use mqlite::{Client, Error};
 use std::io::ErrorKind;
 
-match Database::open("myapp.mqlite") {
+match Client::open("myapp.mqlite") {
     Err(Error::Io(e)) if e.kind() == ErrorKind::PermissionDenied => {
         eprintln!("Permission denied — check file ownership and mode");
     }
@@ -47,7 +47,7 @@ match Database::open("myapp.mqlite") {
         eprintln!("Parent directory does not exist — create it first");
     }
     Err(Error::Io(e)) => eprintln!("I/O error: {e}"),
-    Ok(db) => { /* use db */ }
+    Ok(client) => { /* use client.database("name") */ }
     Err(e) => eprintln!("other error: {e}"),
 }
 ```
@@ -77,13 +77,13 @@ busy timeout.
 **Recovery options:**
 
 ```rust
-use mqlite::{Database, OpenOptions};
+use mqlite::{Client, OpenOptions};
 use std::time::Duration;
 
 // ── Option 1: set a busy timeout ────────────────────────────────────────────
 // Block until the lock is available or the timeout expires.
 // Use this when you expect brief contention (e.g., background checkpoint).
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_timeout(Duration::from_secs(5)),
 )?;
@@ -91,7 +91,7 @@ let db = Database::open_with_options(
 // ── Option 2: custom busy handler ────────────────────────────────────────────
 // Called repeatedly while contended. Return true to retry, false to give up.
 // `attempts` counts how many times the handler has been called so far.
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_handler(|attempts| {
         std::thread::sleep(Duration::from_millis(50));
@@ -101,17 +101,17 @@ let db = Database::open_with_options(
 
 // ── Option 3: immediate failure ───────────────────────────────────────────────
 // Use Duration::ZERO to fail immediately on contention (SQLite-style BUSY).
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_timeout(Duration::ZERO),
 )?;
 
 // ── Option 4: open read-only ──────────────────────────────────────────────────
 // Readers never block writers. Multiple read-only opens are allowed concurrently.
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().read_only(true),
-)?;
+)?
 # Ok::<(), mqlite::Error>(())
 ```
 
@@ -144,12 +144,12 @@ BSON data retrieved from the database could not be deserialized into your Rust t
 
 **Recovery:**
 ```rust
-use mqlite::Database;
+use mqlite::Client;
 use bson::Document;  // Use Document for schema-agnostic access
 
-let db = Database::open("myapp.mqlite")?;
+let client = Client::open("myapp.mqlite")?;
 // Use Document instead of a struct when the schema is uncertain
-let col = db.collection::<Document>("users");
+let col = client.database("myapp").collection::<Document>("users");
 # Ok::<(), mqlite::Error>(())
 ```
 
@@ -168,10 +168,10 @@ A write violated a unique index constraint.
 **Recovery:**
 
 ```rust
-use mqlite::{Database, Error, doc};
+use mqlite::{Client, Error, doc};
 
-let db = Database::open_in_memory()?;
-let users = db.collection::<bson::Document>("users");
+let client = Client::open_in_memory()?;
+let users = client.database("test").collection::<bson::Document>("users");
 
 let result = users.insert_one(&doc! { "_id": "alice", "name": "Alice" });
 match result {
@@ -200,7 +200,7 @@ users.update_one_with_options(
 The database file is structurally invalid: the header magic is wrong, the file
 is truncated, or a page checksum is bad.
 
-**When it occurs:** Usually at `Database::open()` time when the header is read.
+**When it occurs:** Usually at `Client::open()` time when the header is read.
 Can also occur mid-operation if storage pages are corrupted.
 
 **Fields:**
@@ -211,14 +211,14 @@ Can also occur mid-operation if storage pages are corrupted.
 **Recovery options:**
 
 ```rust
-use mqlite::{Database, Error, OpenOptions};
+use mqlite::{Client, Error, OpenOptions};
 
-match Database::open("myapp.mqlite") {
+match Client::open("myapp.mqlite") {
     Err(Error::CorruptDatabase { path, detail, recoverable }) => {
         eprintln!("Corrupt database at {path:?}: {detail}");
         if recoverable {
             // Try read-only mode to access the last good checkpoint
-            let db = Database::open_with_options(
+            let client = Client::open_with_options(
                 &path,
                 OpenOptions::new().read_only(true),
             )?;
@@ -227,13 +227,13 @@ match Database::open("myapp.mqlite") {
             eprintln!("Restore from backup required");
         }
     }
-    Ok(db) => { /* use db */ }
+    Ok(client) => { /* use client.database("name") */ }
     Err(e) => return Err(e),
 }
 # Ok::<(), mqlite::Error>(())
 ```
 
-> **Phase 2:** `Database::repair()` for automated recovery is planned.
+> **Phase 2:** `client.repair()` for automated recovery is planned.
 
 ---
 
@@ -250,10 +250,10 @@ A write operation failed because the filesystem has no space remaining.
 **Recovery:**
 
 ```rust
-use mqlite::{Database, Error, doc};
+use mqlite::{Client, Error, doc};
 
-let db = Database::open("myapp.mqlite")?;
-let logs = db.collection::<bson::Document>("logs");
+let client = Client::open("myapp.mqlite")?;
+let logs = client.database("myapp").collection::<bson::Document>("logs");
 
 match logs.insert_one(&doc! { "msg": "hello" }) {
     Err(Error::DiskFull { required_bytes, available_bytes, .. }) => {
@@ -292,10 +292,10 @@ collection to exist. `insert_one` and `find` create the collection implicitly.
 
 **Recovery:**
 ```rust
-use mqlite::{Database, Error};
+use mqlite::{Client, Error};
 
-let db = Database::open_in_memory()?;
-let col = db.collection::<bson::Document>("events");
+let client = Client::open_in_memory()?;
+let col = client.database("test").collection::<bson::Document>("events");
 
 match col.drop_index("myindex") {
     Err(Error::CollectionNotFound { name }) => {
@@ -338,10 +338,10 @@ A query filter or update document used an MQL operator not supported in Phase 1.
 
 **Recovery:**
 ```rust
-use mqlite::{Database, Error, doc};
+use mqlite::{Client, Error, doc};
 
-let db = Database::open_in_memory()?;
-let col = db.collection::<bson::Document>("items");
+let client = Client::open_in_memory()?;
+let col = client.database("test").collection::<bson::Document>("items");
 
 match col.find_one(doc! { "text": { "$text": { "$search": "hello" } } }) {
     Err(Error::UnsupportedOperator { operator }) => {
@@ -384,10 +384,10 @@ over the wire protocol.
 
 **Recovery:**
 ```rust
-use mqlite::{Database, IndexModel, options::IndexOptions, doc};
+use mqlite::{Client, IndexModel, options::IndexOptions, doc};
 
-let db = Database::open_in_memory()?;
-let col = db.collection::<bson::Document>("users");
+let client = Client::open_in_memory()?;
+let col = client.database("test").collection::<bson::Document>("users");
 
 // Supported: unique index on a field
 col.create_index(IndexModel {
@@ -473,9 +473,9 @@ file a bug report at https://github.com/kparkins/mqlite/issues with:
 `Error` is `#[non_exhaustive]`, so match arms should include a catch-all:
 
 ```rust
-use mqlite::{Database, Error, doc};
+use mqlite::{Error, doc};
 
-fn handle_write(db: &Database) -> mqlite::Result<()> {
+fn handle_write(db: &mqlite::Database) -> mqlite::Result<()> {
     let col = db.collection::<bson::Document>("items");
     match col.insert_one(&doc! { "x": 1 }) {
         Ok(_) => {}

@@ -9,23 +9,23 @@ no temp directories.
 
 | | MongoDB in tests | mqlite in tests |
 |-|-----------------|-----------------|
-| **Startup** | Docker pull + container start (seconds) | `Database::open_in_memory()` (nanoseconds) |
-| **Isolation** | Shared container or per-test client | Each test gets its own `Database` |
+| **Startup** | Docker pull + container start (seconds) | `Client::open_in_memory()` (nanoseconds) |
+| **Isolation** | Shared container or per-test client | Each test gets its own `Client` |
 | **Cleanup** | `db.drop()` or container teardown | Automatic on `Drop` — no cleanup code |
 | **CI** | Requires Docker daemon | Zero external dependencies |
 | **Parallelism** | Shared state unless isolated carefully | `open_in_memory()` is always isolated |
 | **Wire compatibility** | Full MongoDB | Phase 1 operator set (see [Compatibility Matrix](COMPATIBILITY.md)) |
 
-mqlite's `Database::open_in_memory()` is designed for exactly this use case.
+mqlite's `Client::open_in_memory()` is designed for exactly this use case.
 Every call returns a fresh, empty database backed entirely by process memory.
-When the handle is dropped the memory is freed — there is nothing to clean up.
+When the last `Client` clone is dropped the memory is freed — there is nothing to clean up.
 
 ---
 
 ## Basic Test Setup
 
 ```rust
-use mqlite::{Database, doc};
+use mqlite::{Client, doc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -38,7 +38,8 @@ struct User {
 #[test]
 fn user_lookup_by_email() {
     // Open a fresh in-memory database — no files, no ports, no cleanup.
-    let db = Database::open_in_memory().expect("in-memory database never fails");
+    let client = Client::open_in_memory().expect("in-memory database never fails");
+    let db = client.database("test");
     let users = db.collection::<User>("users");
 
     users.insert_one(&User {
@@ -59,24 +60,24 @@ fn user_lookup_by_email() {
   Use `.expect("in-memory database never fails")` — the expect message is only
   for documentation; it will not trigger in practice.
 - No `#[teardown]`, no temp directory, no `after_each` hook.
-- The `Collection<T>` type borrows the `Database` via an `Arc`, so you can
-  move it into closures or helper functions freely.
+- `Client`, `Database`, and `Collection<T>` are all `Clone + Send + Sync` — move
+  them into closures or helper functions freely.
 
 ---
 
 ## Drop as the Cleanup Hook
 
-In-memory databases clean up automatically when the last `Database` clone is
+In-memory databases clean up automatically when the last `Client` clone is
 dropped. There is no action required:
 
 ```rust
 #[test]
 fn database_is_self_cleaning() {
-    let db = Database::open_in_memory().unwrap();
-    let col = db.collection::<mqlite::Document>("items");
+    let client = Client::open_in_memory().unwrap();
+    let col = client.database("test").collection::<mqlite::Document>("items");
     col.insert_one(&doc! { "x": 1 }).unwrap();
-    // `col` and `db` are dropped at the end of the block.
-    // No files on disk, no `db.close()` needed.
+    // `col` and `client` are dropped at the end of the block.
+    // No files on disk, no `client.close()` needed.
 }
 ```
 
@@ -95,8 +96,8 @@ For small fixture sets, embed data directly in the test:
 ```rust
 #[test]
 fn order_totals_are_correct() {
-    let db = Database::open_in_memory().unwrap();
-    let orders = db.collection::<mqlite::Document>("orders");
+    let client = Client::open_in_memory().unwrap();
+    let orders = client.database("test").collection::<mqlite::Document>("orders");
 
     orders.insert_many(&[
         doc! { "customer": "alice", "amount": 120_i32, "status": "paid" },
@@ -124,9 +125,9 @@ at compile time:
 ```
 
 ```rust
-use mqlite::{Database, Document};
+use mqlite::{Client, Document};
 
-fn load_fixture(db: &Database, collection: &str, json: &str) {
+fn load_fixture(db: &mqlite::Database, collection: &str, json: &str) {
     let docs: Vec<Document> = serde_json::from_str::<Vec<serde_json::Value>>(json)
         .expect("fixture is valid JSON")
         .into_iter()
@@ -139,7 +140,8 @@ fn load_fixture(db: &Database, collection: &str, json: &str) {
 
 #[test]
 fn low_stock_query() {
-    let db = Database::open_in_memory().unwrap();
+    let client = Client::open_in_memory().unwrap();
+    let db = client.database("test");
     load_fixture(&db, "products", include_str!("fixtures/products.json"));
 
     let products = db.collection::<Document>("products");
@@ -157,7 +159,7 @@ changing the fixture file triggers a recompile.
 If your fixtures are stored as BSON (e.g., exported with `mongoexport --type bson`):
 
 ```rust
-fn load_bson_fixture(db: &Database, collection: &str, bytes: &[u8]) {
+fn load_bson_fixture(db: &mqlite::Database, collection: &str, bytes: &[u8]) {
     let mut reader = bson::de::Deserializer::new(std::io::Cursor::new(bytes));
     let mut docs = Vec::new();
     while let Ok(doc) = Document::from_reader(&mut std::io::Cursor::new(bytes)) {
@@ -184,24 +186,24 @@ tests need no synchronization at all:
 
 #[test]
 fn test_a() {
-    let db = Database::open_in_memory().unwrap();
-    let col = db.collection::<mqlite::Document>("items");
+    let client = Client::open_in_memory().unwrap();
+    let col = client.database("test").collection::<mqlite::Document>("items");
     col.insert_one(&doc! { "key": "a" }).unwrap();
     assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
 }
 
 #[test]
 fn test_b() {
-    let db = Database::open_in_memory().unwrap();
-    let col = db.collection::<mqlite::Document>("items");
+    let client = Client::open_in_memory().unwrap();
+    let col = client.database("test").collection::<mqlite::Document>("items");
     // Zero documents — test_a's insert is invisible here.
     assert_eq!(col.count_documents(doc! {}).unwrap(), 0);
 }
 
 #[test]
 fn test_c() {
-    let db = Database::open_in_memory().unwrap();
-    let col = db.collection::<mqlite::Document>("items");
+    let client = Client::open_in_memory().unwrap();
+    let col = client.database("test").collection::<mqlite::Document>("items");
     col.insert_many(&[
         doc! { "val": 1_i32 },
         doc! { "val": 2_i32 },
@@ -280,8 +282,8 @@ pub struct MqliteUserStore {
 
 impl MqliteUserStore {
     pub fn new() -> Self {
-        let db = Database::open_in_memory().unwrap();
-        MqliteUserStore { col: db.collection("users") }
+        let client = Client::open_in_memory().unwrap();
+        MqliteUserStore { col: client.database("test").collection("users") }
     }
 }
 
@@ -300,7 +302,7 @@ impl UserStore for MqliteUserStore {
 | MongoDB driver | mqlite |
 |----------------|--------|
 | `async/await` throughout | Synchronous — no `.await` |
-| `Client::with_uri_str(uri).await?` | `Database::open_in_memory()?` |
+| `Client::with_uri_str(uri).await?` | `Client::open_in_memory()?` |
 | `db.collection::<T>("name")` | Same |
 | `col.find_one(filter, None).await?` | `col.find_one(filter)?` (no `None`, no await) |
 | `col.insert_one(doc, None).await?` | `col.insert_one(&doc)?` |
@@ -321,7 +323,7 @@ These are time-based and non-deterministic. For snapshot tests or tests that
 assert on `_id` values, assign them explicitly:
 
 ```rust
-use mqlite::{Database, ObjectId, doc};
+use mqlite::{Client, ObjectId, doc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -333,8 +335,8 @@ struct Item {
 
 #[test]
 fn deterministic_id_assignment() {
-    let db = Database::open_in_memory().unwrap();
-    let items = db.collection::<Item>("items");
+    let client = Client::open_in_memory().unwrap();
+    let items = client.database("test").collection::<Item>("items");
 
     // Construct predictable ObjectId values from hex strings.
     let id1 = ObjectId::parse_str("000000000000000000000001").unwrap();

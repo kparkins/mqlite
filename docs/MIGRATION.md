@@ -14,8 +14,8 @@ directly, what needs adaptation, and what is not available in Phase 1.
 | **API style** | Async (`async/await`) | Synchronous |
 | **Connection model** | Remote server + connection pool | Embedded (in-process), one file |
 | **Dependencies** | `tokio`, `mongodb` | `mqlite` (no runtime required) |
-| **Entry point** | `Client::with_uri_str(uri).await?` | `Database::open("myapp.mqlite")?` |
-| **Collection selector** | `client.database("mydb").collection("col")` | `db.collection("col")` |
+| **Entry point** | `Client::with_uri_str(uri).await?` | `Client::open("myapp.mqlite")?` |
+| **Collection selector** | `client.database("mydb").collection("col")` | `client.database("mydb").collection("col")` |
 | **BSON types** | `bson::doc!`, `bson::Document` | Same (mqlite re-exports from `bson`) |
 | **Write concern** | Configurable (`w`, `j`, `wtimeout`) | Ignored (all writes committed) |
 | **Read concern** | Configurable (`local`, `majority`) | Ignored (MVCC snapshot per read) |
@@ -50,15 +50,15 @@ async fn main() -> mongodb::error::Result<()> {
 ### mqlite (sync)
 
 ```rust
-use mqlite::{Database, OpenOptions, DurabilityMode};
+use mqlite::{Client, OpenOptions, DurabilityMode};
 use std::time::Duration;
 
 fn main() -> mqlite::Result<()> {
     // Simple open (creates file if it doesn't exist)
-    let db = Database::open("myapp.mqlite")?;
+    let client = Client::open("myapp.mqlite")?;
 
     // With options:
-    let db = Database::open_with_options(
+    let client = Client::open_with_options(
         "myapp.mqlite",
         OpenOptions::new()
             .busy_timeout(Duration::from_secs(10))
@@ -66,7 +66,7 @@ fn main() -> mqlite::Result<()> {
     )?;
 
     // In-memory (useful for tests):
-    let db = Database::open_in_memory()?;
+    let client = Client::open_in_memory()?;
 
     Ok(())
 }
@@ -75,8 +75,8 @@ fn main() -> mqlite::Result<()> {
 **What's different:**
 - No `async/await` — the open is synchronous
 - The connection string is replaced by a file path
-- There is no connection pool — `Database` is a handle to a local file
-- `Database` is cheaply clonable (`Clone`, `Send`, `Sync`); share it across threads
+- There is no connection pool — `Client` is a handle to a local file
+- `Client` is cheaply clonable (`Clone`, `Send`, `Sync`); share it across threads
 
 ---
 
@@ -104,11 +104,12 @@ async fn setup() -> mongodb::error::Result<()> {
 ### mqlite
 
 ```rust
-use mqlite::{Database, Collection};
+use mqlite::{Client, Collection};
 use bson::Document;
 
 fn setup() -> mqlite::Result<()> {
-    let db = Database::open("myapp.mqlite")?;
+    let client = Client::open("myapp.mqlite")?;
+    let db = client.database("mydb");
 
     // Typed collection
     let users = db.collection::<User>("users");
@@ -121,8 +122,8 @@ fn setup() -> mqlite::Result<()> {
 ```
 
 **What's different:**
-- No `client.database("mydb")` selector — mqlite has one database per file
-- Otherwise identical: `collection::<T>(name)` is the same API shape
+- The `client.database("mydb")` selector is the same API shape as the MongoDB driver
+- Each `.mqlite` file supports multiple named database namespaces
 
 ---
 
@@ -418,12 +419,11 @@ async while mqlite is synchronous.
 ### Strategy 1: `spawn_blocking` (recommended for async apps)
 
 ```rust
-use mqlite::Database;
-use std::sync::Arc;
+use mqlite::Client;
 
-async fn find_user(db: Arc<Database>, email: String) -> mqlite::Result<Option<bson::Document>> {
+async fn find_user(client: Client, email: String) -> mqlite::Result<Option<bson::Document>> {
     tokio::task::spawn_blocking(move || {
-        let col = db.collection::<bson::Document>("users");
+        let col = client.database("mydb").collection::<bson::Document>("users");
         col.find_one(bson::doc! { "email": email })
     })
     .await
@@ -436,19 +436,19 @@ async fn find_user(db: Arc<Database>, email: String) -> mqlite::Result<Option<bs
 Centralize the `spawn_blocking` calls in a single module:
 
 ```rust
-use mqlite::{Database, doc};
-use std::sync::Arc;
+use mqlite::{Client, doc};
 
 pub struct UserStore {
-    db: Arc<Database>,
+    client: Client,
 }
 
 impl UserStore {
     pub async fn get_by_email(&self, email: &str) -> mqlite::Result<Option<bson::Document>> {
-        let db = Arc::clone(&self.db);
+        let client = self.client.clone();
         let email = email.to_owned();
         tokio::task::spawn_blocking(move || {
-            db.collection::<bson::Document>("users")
+            client.database("mydb")
+                .collection::<bson::Document>("users")
                 .find_one(doc! { "email": email })
         })
         .await
@@ -509,6 +509,7 @@ These patterns work identically in both the MongoDB driver and mqlite:
 - Upsert pattern (`update_one_with_options` + `UpdateOptions::upsert(true)`)
 - `find_one_and_update` / `find_one_and_delete` / `find_one_and_replace`
 - Index creation (single-field, compound, unique, sparse)
+- Object model hierarchy: `Client::open(path)` → `client.database(name)` → `db.collection::<T>(name)`
 
 ---
 
@@ -517,8 +518,8 @@ These patterns work identically in both the MongoDB driver and mqlite:
 | Feature | MongoDB Rust driver | mqlite |
 |---------|---------------------|--------|
 | API style | `async/await` | Synchronous |
-| Entry point | `Client::with_uri_str(uri)` | `Database::open(path)` |
-| Database selector | `client.database("mydb")` | *(no selector — one database per file)* |
+| Entry point | `Client::with_uri_str(uri)` | `Client::open(path)` |
+| Database selector | `client.database("mydb")` | `client.database("mydb")` |
 | Options parameter | Always present (even `None`) | Only `*_with_options` variants |
 | `insert_one` argument | Owned value | Reference (`&T`) |
 | `find` result iteration | `cursor.try_next().await?` | `for doc in cursor` (sync Iterator) |

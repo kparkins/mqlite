@@ -28,10 +28,10 @@ Phase 2.
 The recommended bind address is `127.0.0.1` (localhost):
 
 ```rust
-use mqlite::{Database, WireProtocol};
+use mqlite::{Client, WireProtocol};
 
-let db = Database::open("myapp.mqlite")?;
-let _server = WireProtocol::bind(&db, "127.0.0.1:27017")?;
+let client = Client::open("myapp.mqlite")?;
+let _server = WireProtocol::bind(&client, "127.0.0.1:27017")?;
 # Ok::<(), mqlite::Error>(())
 ```
 
@@ -72,8 +72,8 @@ TLS support is planned for Phase 2.
 
 ```rust
 // Safe: localhost only, ephemeral in-memory database
-let db = Database::open_in_memory()?;
-let _server = WireProtocol::bind(&db, "127.0.0.1:27017")?;
+let client = Client::open_in_memory()?;
+let _server = WireProtocol::bind(&client, "127.0.0.1:27017")?;
 # Ok::<(), mqlite::Error>(())
 ```
 

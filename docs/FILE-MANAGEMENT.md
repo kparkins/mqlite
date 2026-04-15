@@ -21,7 +21,7 @@ myapp.mqlite-shm      ← WAL shared-memory index (present while any handle is o
 |------|-------------|------|
 | `myapp.mqlite` | Always | Persistent B-tree pages. The "real" database. |
 | `myapp.mqlite-wal` | After any write, until checkpointed | Uncommitted and unmerged write pages. |
-| `myapp.mqlite-shm` | While a `Database` handle is open | In-memory WAL index, memory-mapped from this file. Deleted on clean close. |
+| `myapp.mqlite-shm` | While a `Client` handle is open | In-memory WAL index, memory-mapped from this file. Deleted on clean close. |
 
 **During normal operation** all three files form a single logical unit. Never
 copy or move them individually — always treat the `.mqlite`, `-wal`, and `-shm`
@@ -31,7 +31,7 @@ files as a group.
 
 ## Clean Close
 
-`Database::close()` performs a **blocking checkpoint + flush**:
+`Client::close()` performs a **blocking checkpoint + flush**:
 
 1. All committed WAL pages are merged into `myapp.mqlite`.
 2. The WAL file is removed.
@@ -42,20 +42,20 @@ After `close()` returns, `myapp.mqlite` is the sole file on disk and can be
 copied safely.
 
 ```rust
-use mqlite::Database;
+use mqlite::Client;
 
 fn write_and_close() -> mqlite::Result<()> {
-    let db = Database::open("myapp.mqlite")?;
-    let col = db.collection::<mqlite::Document>("events");
+    let client = Client::open("myapp.mqlite")?;
+    let col = client.database("myapp").collection::<mqlite::Document>("events");
     col.insert_one(&mqlite::doc! { "type": "shutdown" })?;
 
     // Blocking flush + checkpoint. After this line, myapp.mqlite is the sole file.
-    db.close()?;
+    client.close()?;
     Ok(())
 }
 ```
 
-> **`Drop` vs `close()`:** Dropping a `Database` handle is non-blocking. It
+> **`Drop` vs `close()`:** Dropping a `Client` handle is non-blocking. It
 > releases the OS lock but does **not** checkpoint the WAL. The WAL and SHM
 > files remain on disk. This is safe — the next `open()` replays the WAL
 > automatically — but it means `Drop` does not produce a single-file state.
@@ -78,13 +78,13 @@ $ cp myapp.mqlite backup-$(date +%Y%m%d).mqlite
 In Rust:
 
 ```rust
-use mqlite::Database;
+use mqlite::Client;
 use std::fs;
 
 fn cold_backup(src: &str, dst: &str) -> mqlite::Result<()> {
     // Open, force a clean close, then copy.
-    let db = Database::open(src)?;
-    db.close()?; // checkpoint + remove WAL/SHM
+    let client = Client::open(src)?;
+    client.close()?; // checkpoint + remove WAL/SHM
 
     fs::copy(src, dst)?;
     println!("Backup written to {dst}");
@@ -113,13 +113,13 @@ If closing the database is not an option (e.g., the app is running), you can
 checkpoint the WAL into the main file without closing:
 
 ```rust
-use mqlite::Database;
+use mqlite::{Client, Database};
 use std::fs;
 
-fn checkpoint_backup(db: &Database, src: &str, dst: &str) -> mqlite::Result<()> {
+fn checkpoint_backup(client: &Client, src: &str, dst: &str) -> mqlite::Result<()> {
     // Flush all committed WAL pages to the main file.
     // After this, myapp.mqlite contains all committed data.
-    db.checkpoint()?;
+    client.checkpoint()?;
 
     // Safe to copy IF no concurrent writers are active.
     // For single-process apps (the common case), this is always true here
@@ -141,16 +141,16 @@ fn checkpoint_backup(db: &Database, src: &str, dst: &str) -> mqlite::Result<()> 
 
 ## Hot Backup
 
-`Database::backup(dest)` produces a consistent copy of the database **while it
+`client.backup(dest)` produces a consistent copy of the database **while it
 is running**.
 
 ```rust
 use mqlite::Client;
 
-fn hot_backup(db: &mqlite::Database, dst: &str) -> mqlite::Result<()> {
+fn hot_backup(client: &Client, dst: &str) -> mqlite::Result<()> {
     // Acquires the writer lock, checkpoints, then copies the file.
     // Writers are briefly paused during the copy; readers continue unaffected.
-    db.backup(dst)?;
+    client.backup(dst)?;
     println!("Hot backup written to {dst}");
     Ok(())
 }
@@ -208,7 +208,7 @@ fn report_db_size(path: &str) {
 ## After a Crash: Automatic WAL Recovery
 
 If the process is killed or the host crashes while mqlite is open, the WAL
-and SHM files remain on disk. The next `Database::open()` automatically:
+and SHM files remain on disk. The next `Client::open()` automatically:
 
 1. Detects the leftover WAL.
 2. Replays committed transactions from the WAL into memory.
@@ -219,7 +219,7 @@ No manual intervention is required.
 
 ```rust
 // After a crash, just open normally — recovery is automatic.
-let db = Database::open("myapp.mqlite")?;
+let client = mqlite::Client::open("myapp.mqlite")?;
 // All committed data is available.
 ```
 
@@ -240,13 +240,14 @@ If the main file is corrupt but the WAL is intact, or if you need to inspect
 a database without risking further damage, open it in read-only mode:
 
 ```rust
-use mqlite::{Database, OpenOptions};
+use mqlite::{Client, OpenOptions};
 
-fn forensic_open(path: &str) -> mqlite::Result<Database> {
-    Database::open_with_options(
+fn forensic_open(path: &str) -> mqlite::Result<mqlite::Database> {
+    let client = Client::open_with_options(
         path,
         OpenOptions::new().read_only(true),
-    )
+    )?;
+    Ok(client.database("mydb"))
 }
 ```
 
@@ -290,26 +291,27 @@ mqlite uses OS advisory locks to coordinate between processes:
 
 ```rust
 // Process A (writer):
-let db_a = Database::open("shared.mqlite")?;
-db_a.collection::<mqlite::Document>("log").insert_one(&mqlite::doc! { "msg": "hello" })?;
-// db_a holds the exclusive write lock while inserting.
+let client_a = mqlite::Client::open("shared.mqlite")?;
+client_a.database("mydb").collection::<mqlite::Document>("log")
+    .insert_one(&mqlite::doc! { "msg": "hello" })?;
+// client_a holds the exclusive write lock while inserting.
 
 // Process B (reader) — can open concurrently:
-let db_b = Database::open_with_options(
+let client_b = mqlite::Client::open_with_options(
     "shared.mqlite",
     mqlite::OpenOptions::new().read_only(true),
 )?;
-// db_b sees a consistent snapshot; it never blocks db_a.
+// client_b sees a consistent snapshot; it never blocks client_a.
 ```
 
 For multiple writer processes competing for the same file, configure a
 `busy_timeout` so they back off gracefully:
 
 ```rust
-use mqlite::{Database, OpenOptions};
+use mqlite::{Client, OpenOptions};
 use std::time::Duration;
 
-let db = Database::open_with_options(
+let client = Client::open_with_options(
     "shared.mqlite",
     OpenOptions::new().busy_timeout(Duration::from_secs(5)),
 )?;
