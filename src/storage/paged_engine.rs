@@ -30,7 +30,7 @@
 //! [`select_plan`]: crate::query::planner::select_plan
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bson::{Bson, Document};
@@ -758,6 +758,143 @@ impl BpBackend {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Read-only helpers (R1.6 SWMR)
+    // -----------------------------------------------------------------------
+
+    /// Open a data tree for reading without mutating the cache.
+    ///
+    /// If the tree is already cached (placed there by a previous write), the
+    /// cached root page/level is used (it reflects the latest committed
+    /// state).  Otherwise the catalog is consulted, which also reflects the
+    /// last committed state.
+    ///
+    /// The returned tree is an independent handle — it does **not** affect
+    /// the write cache in `data_trees`.  Takes `&self` so it can be called
+    /// while holding an `RwLock` read guard.
+    fn open_tree_for_read(&self, ns: &str) -> Result<Option<BTree<BufferPoolPageStore>>> {
+        // Prefer the in-memory cache: it holds the current root after the
+        // latest write (may be ahead of what is flushed to catalog on disk).
+        if let Some(cached) = self.data_trees.get(ns) {
+            let store = self.new_store();
+            return Ok(Some(BTree::open(store, cached.root_page, cached.root_level)));
+        }
+        // Not cached — fall back to the catalog (reads only, &self OK).
+        if let Some(entry) = self.catalog.get_collection(ns)? {
+            let store = self.new_store();
+            Ok(Some(BTree::open(
+                store,
+                entry.data_root_page,
+                entry.data_root_level,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read-only variant of [`try_index_scan`] that takes `&self`.
+    ///
+    /// Used by read operations that hold an `RwLock` read guard.  Does not
+    /// mutate the data-tree cache.  All B+ trees (index and data) are opened
+    /// as fresh, independent handles via [`open_tree_for_read`].
+    fn try_index_scan_ro(
+        &self,
+        ns: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<Document>>> {
+        let entries = self.catalog.list_indexes(ns)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let index_metas: Vec<IndexMeta<'_>> = entries
+            .iter()
+            .filter(|e| e.name != "_id_")
+            .map(|e| IndexMeta {
+                name: &e.name,
+                keys: &e.key_pattern,
+            })
+            .collect();
+        if index_metas.is_empty() {
+            return Ok(None);
+        }
+
+        let plan = select_plan(filter, &index_metas);
+        let (index_name, primary_field, condition) = match plan {
+            ScanPlan::CollScan => return Ok(None),
+            ScanPlan::IndexScan {
+                index_name,
+                primary_field,
+                condition,
+            } => (index_name, primary_field, condition),
+        };
+
+        let idx_entry = entries
+            .iter()
+            .find(|e| e.name == index_name)
+            .cloned()
+            .ok_or_else(|| Error::Internal(format!("index '{}' not in catalog", index_name)))?;
+
+        let ascending = idx_entry
+            .key_pattern
+            .get(&primary_field)
+            .map(|v| !matches!(v, Bson::Int32(-1) | Bson::Int64(-1)))
+            .unwrap_or(true);
+
+        let handle = Arc::clone(&self.handle);
+        let id_bsons: Vec<Bson> = if let IndexCondition::In(vals) = &condition {
+            let mut results = Vec::new();
+            for v in vals {
+                let mut p = encode_compound_key(&[(v, ascending)]);
+                p.push(COMPOUND_SEP);
+                let mut p_next = p.clone();
+                *p_next.last_mut().unwrap() += 1;
+                let idx_store = self.new_store();
+                let idx_tree =
+                    BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
+                for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
+                    let id = Self::index_entry_id(&handle, cv)?;
+                    if !matches!(id, Bson::Null) {
+                        results.push(id);
+                    }
+                }
+            }
+            results
+        } else {
+            let (start, end) = Self::index_bounds(&condition, ascending);
+            let idx_store = self.new_store();
+            let idx_tree = BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
+            idx_tree
+                .range_scan(start.as_deref(), end.as_deref())?
+                .into_iter()
+                .filter_map(|(_, cv)| {
+                    Self::index_entry_id(&handle, cv)
+                        .ok()
+                        .filter(|id| !matches!(id, Bson::Null))
+                })
+                .collect()
+        };
+
+        // Look up documents using the read-only tree handle.
+        let mut docs = Vec::new();
+        if !id_bsons.is_empty() {
+            // Open the data tree once (outside the loop) for efficiency.
+            if let Some(data_tree) = self.open_tree_for_read(ns)? {
+                for id_bson in id_bsons {
+                    let data_key = encode_key(&id_bson);
+                    if let Some(cv) = data_tree.search(&data_key)? {
+                        let doc_bytes = resolve_cell(&data_tree, cv)?;
+                        let doc: Document =
+                            bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
+                        if eval_filter(&doc, filter)? {
+                            docs.push(doc);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(docs))
+    }
+
     /// Execute an index scan on `ns` for `filter` in the buffered backend.
     ///
     /// Returns `Some(docs)` when an index was used, `None` when the planner
@@ -883,8 +1020,18 @@ enum DocBackend {
 // ---------------------------------------------------------------------------
 
 /// Phase 1 storage engine: B+ tree per namespace, through the buffer pool.
+///
+/// ## Concurrency
+///
+/// `inner` is protected by an `RwLock` to implement Single-Writer Multiple-Reader
+/// (SWMR) snapshot isolation (R1.6):
+///
+/// - **Readers** (`find`, `find_one`, `count`, `list_indexes`, etc.) acquire a
+///   shared read lock — any number of readers can run concurrently.
+/// - **Writers** (`insert`, `update`, `delete`, `create_index`, etc.) acquire an
+///   exclusive write lock — one writer at a time, writers never block readers.
 pub(crate) struct PagedEngine {
-    inner: Mutex<DocBackend>,
+    inner: RwLock<DocBackend>,
 }
 
 impl PagedEngine {
@@ -893,7 +1040,7 @@ impl PagedEngine {
     /// Used by [`Client::open_in_memory`].
     pub(crate) fn new() -> Self {
         PagedEngine {
-            inner: Mutex::new(DocBackend::Memory(MemBackend::new())),
+            inner: RwLock::new(DocBackend::Memory(MemBackend::new())),
         }
     }
 
@@ -908,7 +1055,7 @@ impl PagedEngine {
     ) -> Result<Self> {
         let backend = BpBackend::new(handle, catalog_root_page, catalog_root_level)?;
         Ok(PagedEngine {
-            inner: Mutex::new(DocBackend::Buffered(backend)),
+            inner: RwLock::new(DocBackend::Buffered(backend)),
         })
     }
 }
@@ -923,7 +1070,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn insert(&self, ns: &str, mut doc: Document) -> Result<Bson> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         match &mut *inner {
             DocBackend::Memory(m) => {
                 // Collect unique specs before mutably borrowing the tree.
@@ -955,8 +1102,9 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn find(&self, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>> {
-        let mut inner = self.inner.lock().unwrap();
-        let matched: Vec<Document> = match &mut *inner {
+        // Read-only: acquire a shared read lock so concurrent readers don't block.
+        let inner = self.inner.read().unwrap();
+        let matched: Vec<Document> = match &*inner {
             DocBackend::Memory(m) => {
                 let Some(tree) = m.tree(ns) else {
                     return Ok(Vec::new());
@@ -968,12 +1116,12 @@ impl StorageEngine for PagedEngine {
             }
             DocBackend::Buffered(bp) => {
                 // Try an index scan first; fall back to a full collection scan.
-                if let Some(docs) = bp.try_index_scan(ns, filter)? {
+                if let Some(docs) = bp.try_index_scan_ro(ns, filter)? {
                     docs
                 } else {
-                    match bp.tree(ns)? {
+                    match bp.open_tree_for_read(ns)? {
                         None => return Ok(Vec::new()),
-                        Some(tree) => btree_collscan(tree, filter)?
+                        Some(tree) => btree_collscan(&tree, filter)?
                             .into_iter()
                             .map(|(_, doc)| doc)
                             .collect(),
@@ -990,6 +1138,7 @@ impl StorageEngine for PagedEngine {
 
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         let opts = FindOptions::new();
+        // find() already acquires a read lock internally.
         let mut results = self.find(ns, filter, &opts)?;
         Ok(if results.is_empty() {
             None
@@ -1018,7 +1167,7 @@ impl StorageEngine for PagedEngine {
             ));
         }
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let (matched_pairs, tree_exists): (Vec<(Vec<u8>, Document)>, bool) = match &mut *inner {
             DocBackend::Memory(m) => {
                 let Some(tree) = m.tree(ns) else {
@@ -1110,7 +1259,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
 
         // Collect (key, doc) pairs to delete; we need the doc for index maintenance.
         let pairs_to_delete: Vec<(Vec<u8>, Document)> = match &mut *inner {
@@ -1167,8 +1316,9 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
-        let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
+        // Read-only: shared read lock for concurrent reader support.
+        let inner = self.inner.read().unwrap();
+        match &*inner {
             DocBackend::Memory(m) => {
                 let Some(tree) = m.tree(ns) else {
                     return Ok(0);
@@ -1176,10 +1326,10 @@ impl StorageEngine for PagedEngine {
                 let pairs = btree_collscan(tree, filter)?;
                 Ok(pairs.len() as u64)
             }
-            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+            DocBackend::Buffered(bp) => match bp.open_tree_for_read(ns)? {
                 None => Ok(0),
                 Some(tree) => {
-                    let pairs = btree_collscan(tree, filter)?;
+                    let pairs = btree_collscan(&tree, filter)?;
                     Ok(pairs.len() as u64)
                 }
             },
@@ -1203,7 +1353,7 @@ impl StorageEngine for PagedEngine {
             ));
         }
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let mut matched: Vec<(Vec<u8>, Document)> = match &mut *inner {
             DocBackend::Memory(m) => {
                 let Some(tree) = m.tree(ns) else {
@@ -1279,7 +1429,7 @@ impl StorageEngine for PagedEngine {
         filter: &Document,
         opts: &FindOneAndDeleteOptions,
     ) -> Result<Option<Document>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let mut matched: Vec<(Vec<u8>, Document)> = match &mut *inner {
             DocBackend::Memory(m) => {
                 let Some(tree) = m.tree(ns) else {
@@ -1333,7 +1483,7 @@ impl StorageEngine for PagedEngine {
         replacement: &Document,
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let mut matched: Vec<(Vec<u8>, Document)> = match &mut *inner {
             DocBackend::Memory(m) => {
                 let Some(tree) = m.tree(ns) else {
@@ -1422,7 +1572,7 @@ impl StorageEngine for PagedEngine {
             .clone()
             .unwrap_or_else(|| generate_index_name(&model.keys));
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         match &mut *inner {
             DocBackend::Memory(m) => {
                 let meta = m
@@ -1502,7 +1652,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn drop_index(&self, ns: &str, name: &str) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         match &mut *inner {
             DocBackend::Memory(m) => {
                 if let Some(meta) = m.collections.get_mut(ns) {
@@ -1537,7 +1687,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         match &*inner {
             DocBackend::Memory(m) => {
                 let Some(meta) = m.collections.get(ns) else {
@@ -1574,7 +1724,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn create_namespace(&self, ns: &str) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         match &mut *inner {
             DocBackend::Memory(m) => {
                 m.collections
@@ -1615,7 +1765,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn drop_namespace(&self, ns: &str) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         match &mut *inner {
             DocBackend::Memory(m) => {
                 m.data_trees.remove(ns);
@@ -1680,7 +1830,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_namespaces(&self) -> Result<Vec<String>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         match &*inner {
             DocBackend::Memory(m) => Ok(m.collections.keys().cloned().collect()),
             DocBackend::Buffered(bp) => {
@@ -1695,7 +1845,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn checkpoint(&self) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         match &*inner {
             DocBackend::Memory(_) => Ok(()), // nothing to persist
             DocBackend::Buffered(bp) => {
@@ -1739,7 +1889,7 @@ impl PagedEngine {
         let mut new_doc = upsert_base_from_filter(filter);
         apply_update(&mut new_doc, update, true)?;
         let id = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.write().unwrap();
             match &mut *inner {
                 DocBackend::Memory(m) => {
                     let tree = m.tree_or_create(ns)?;
@@ -1773,7 +1923,7 @@ impl PagedEngine {
         apply_update(&mut new_doc, update, true)?;
         let inserted = new_doc.clone();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.write().unwrap();
             match &mut *inner {
                 DocBackend::Memory(m) => {
                     let tree = m.tree_or_create(ns)?;
@@ -1802,7 +1952,7 @@ impl PagedEngine {
         let mut new_doc = replacement.clone();
         let inserted = new_doc.clone();
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.write().unwrap();
             match &mut *inner {
                 DocBackend::Memory(m) => {
                     let tree = m.tree_or_create(ns)?;
@@ -2142,7 +2292,7 @@ mod tests {
 
         // Record total page count before drop.
         let total_before = {
-            let inner = e.inner.lock().unwrap();
+            let inner = e.inner.read().unwrap();
             match &*inner {
                 DocBackend::Buffered(bp) => bp
                     .handle
@@ -2157,7 +2307,7 @@ mod tests {
 
         // Free page count should have increased (pages returned to free list).
         let free_after = {
-            let inner = e.inner.lock().unwrap();
+            let inner = e.inner.read().unwrap();
             match &*inner {
                 DocBackend::Buffered(bp) => bp
                     .handle
@@ -2262,7 +2412,7 @@ mod tests {
         e.checkpoint().unwrap();
 
         let page_count_after_create = {
-            let inner = e.inner.lock().unwrap();
+            let inner = e.inner.read().unwrap();
             match &*inner {
                 DocBackend::Buffered(bp) => bp
                     .handle
@@ -2283,7 +2433,7 @@ mod tests {
         e.checkpoint().unwrap();
 
         let page_count_after_recreate = {
-            let inner = e.inner.lock().unwrap();
+            let inner = e.inner.read().unwrap();
             match &*inner {
                 DocBackend::Buffered(bp) => bp
                     .handle

@@ -19,6 +19,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use crate::{
@@ -241,6 +242,64 @@ impl ClientInner {
 // ---------------------------------------------------------------------------
 
 impl ClientInner {
+    /// Acquire the in-process writer lock, respecting the configured
+    /// `busy_timeout` and `busy_handler`.
+    ///
+    /// Uses a spin-loop with `try_lock()` instead of a blocking `lock()` so
+    /// that reader threads (which hold no writer lock) are never delayed by
+    /// this wait.  Writer threads spin briefly, then return
+    /// [`Error::WriterBusy`] on timeout.
+    fn acquire_writer_lock(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        // Fast path: try without any spin first.
+        match self.writer_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                return Err(Error::Internal(format!("writer_lock poisoned: {e}")));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+
+        let timeout = self.opts.busy_timeout;
+
+        // If a custom busy handler is configured, delegate to it.
+        if let Some(handler) = &self.opts.busy_handler {
+            let mut attempts: u32 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                match self.writer_lock.try_lock() {
+                    Ok(guard) => return Ok(guard),
+                    Err(std::sync::TryLockError::Poisoned(e)) => {
+                        return Err(Error::Internal(format!("writer_lock poisoned: {e}")));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                }
+                if !handler.0(attempts) {
+                    return Err(Error::WriterBusy);
+                }
+                attempts = attempts.saturating_add(1);
+            }
+        }
+
+        // Default: spin until busy_timeout expires.
+        if timeout.is_zero() {
+            return Err(Error::WriterBusy);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            match self.writer_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    return Err(Error::Internal(format!("writer_lock poisoned: {e}")));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::WriterBusy);
+            }
+        }
+    }
+
     pub(crate) fn insert_one<T: serde::Serialize>(
         &self,
         name: &str,
@@ -250,7 +309,7 @@ impl ClientInner {
         tracing::debug!(target: "mqlite", collection = name, doc_count = 1u64, "mqlite::insert");
 
         let bson_doc = bson::to_document(doc).map_err(Error::BsonSerialization)?;
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         let id = self.engine.insert(name, bson_doc)?;
         let oid = match id {
             Bson::ObjectId(o) => o,
@@ -282,7 +341,7 @@ impl ClientInner {
             "mqlite::insert"
         );
 
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         let mut inserted_ids: HashMap<usize, Bson> = HashMap::new();
         let mut errors: Vec<BulkWriteError> = Vec::new();
 
@@ -388,7 +447,7 @@ impl ClientInner {
         update: Document,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.update(name, &filter, &update, &opts, false)
     }
 
@@ -399,17 +458,17 @@ impl ClientInner {
         update: Document,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.update(name, &filter, &update, &opts, true)
     }
 
     pub(crate) fn delete_one(&self, name: &str, filter: Document) -> Result<DeleteResult> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.delete(name, &filter, false)
     }
 
     pub(crate) fn delete_many(&self, name: &str, filter: Document) -> Result<DeleteResult> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.delete(name, &filter, true)
     }
 
@@ -430,7 +489,7 @@ impl ClientInner {
         update: Document,
         opts: FindOneAndUpdateOptions,
     ) -> Result<Option<T>> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         match self
             .engine
             .find_one_and_update_doc(name, &filter, &update, &opts)?
@@ -457,7 +516,7 @@ impl ClientInner {
         filter: Document,
         opts: FindOneAndDeleteOptions,
     ) -> Result<Option<T>> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         match self.engine.find_one_and_delete_doc(name, &filter, &opts)? {
             None => Ok(None),
             Some(doc) => bson::from_document(doc)
@@ -484,7 +543,7 @@ impl ClientInner {
         opts: FindOneAndReplaceOptions,
     ) -> Result<Option<T>> {
         let replacement_doc = bson::to_document(replacement).map_err(Error::BsonSerialization)?;
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         match self
             .engine
             .find_one_and_replace_doc(name, &filter, &replacement_doc, &opts)?
@@ -506,12 +565,12 @@ impl ClientInner {
     }
 
     pub(crate) fn create_index(&self, name: &str, model: IndexModel) -> Result<String> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.create_index(name, &model)
     }
 
     pub(crate) fn drop_index(&self, name: &str, index_name: &str) -> Result<()> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.drop_index(name, index_name)
     }
 
@@ -524,12 +583,12 @@ impl ClientInner {
     }
 
     pub(crate) fn drop_collection(&self, name: &str) -> Result<()> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.drop_namespace(name)
     }
 
     pub(crate) fn create_collection(&self, name: &str) -> Result<()> {
-        let _guard = self.writer_lock.lock().unwrap();
+        let _guard = self.acquire_writer_lock()?;
         self.engine.create_namespace(name)
     }
 
