@@ -114,7 +114,8 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
 
     /// Find all documents matching `filter`. Returns a [`Cursor`] over the results.
     pub fn find(&self, filter: Document) -> Result<Cursor<T>> {
-        self.inner.find(&self.namespace(), filter, FindOptions::new())
+        self.inner
+            .find(&self.namespace(), filter, FindOptions::new())
     }
 
     /// Find all documents matching `filter` with options (sort, limit, skip, projection).
@@ -139,7 +140,8 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
         update: Document,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        self.inner.update_one(&self.namespace(), filter, update, opts)
+        self.inner
+            .update_one(&self.namespace(), filter, update, opts)
     }
 
     /// Update all documents matching `filter`.
@@ -155,7 +157,8 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
         update: Document,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        self.inner.update_many(&self.namespace(), filter, update, opts)
+        self.inner
+            .update_many(&self.namespace(), filter, update, opts)
     }
 
     // -------------------------------------------------------------------------
@@ -179,7 +182,8 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// Atomically find the first document matching `filter`, apply `update`, and return the
     /// original document (before the update). Returns `None` if no document matched.
     pub fn find_one_and_update(&self, filter: Document, update: Document) -> Result<Option<T>> {
-        self.inner.find_one_and_update(&self.namespace(), filter, update)
+        self.inner
+            .find_one_and_update(&self.namespace(), filter, update)
     }
 
     /// Atomically find the first document matching `filter`, apply `update` with options.

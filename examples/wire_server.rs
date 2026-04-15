@@ -73,7 +73,10 @@ fn parse_port() -> u16 {
         if let Ok(p) = env_val.parse::<u16>() {
             return p;
         }
-        eprintln!("wire_server: invalid MQLITE_PORT {:?}, using default", env_val);
+        eprintln!(
+            "wire_server: invalid MQLITE_PORT {:?}, using default",
+            env_val
+        );
     }
 
     27017

@@ -420,10 +420,7 @@ impl AllocatorHandle {
     /// Return `true` if the in-memory header has been modified since the
     /// last [`flush_header`](Self::flush_header) call.
     pub(crate) fn is_header_dirty(&self) -> bool {
-        self.state
-            .lock()
-            .map(|s| s.header_dirty)
-            .unwrap_or(false)
+        self.state.lock().map(|s| s.header_dirty).unwrap_or(false)
     }
 }
 
@@ -946,7 +943,10 @@ mod tests {
         let hdr = fresh_header();
         let handle = AllocatorHandle::new(hdr);
 
-        assert!(!handle.is_header_dirty(), "header should be clean on create");
+        assert!(
+            !handle.is_header_dirty(),
+            "header should be clean on create"
+        );
         handle.alloc_4k(&io).unwrap();
         assert!(handle.is_header_dirty(), "header must be dirty after alloc");
     }
@@ -960,7 +960,10 @@ mod tests {
         handle.alloc_4k(&io).unwrap();
         handle.flush_header(&io).unwrap();
 
-        assert!(!handle.is_header_dirty(), "header must be clean after flush");
+        assert!(
+            !handle.is_header_dirty(),
+            "header must be clean after flush"
+        );
         // Page 0 must have been written.
         let raw = io.get_raw(0).expect("page 0 must be written on flush");
         assert_eq!(raw.len(), PageSize::Small4k.bytes());
@@ -1012,9 +1015,7 @@ mod tests {
         let hdr = fresh_header();
         let handle = AllocatorHandle::new(hdr);
 
-        handle
-            .update_header(|h| h.catalog_root_page = 42)
-            .unwrap();
+        handle.update_header(|h| h.catalog_root_page = 42).unwrap();
 
         assert!(handle.is_header_dirty());
         let root = handle.with_header(|h| h.catalog_root_page).unwrap();

@@ -133,7 +133,11 @@ impl BufferPoolHandle {
     /// The returned guard **automatically unpins the page on drop**.  Call
     /// [`PinnedPage::data_mut`] or [`PinnedPage::mark_dirty`] to modify the
     /// page and mark it for write-back on the next [`flush`](Self::flush).
-    pub(crate) fn fetch_page<'a>(&'a self, page_number: u32, size: PageSize) -> Result<PinnedPage<'a>> {
+    pub(crate) fn fetch_page<'a>(
+        &'a self,
+        page_number: u32,
+        size: PageSize,
+    ) -> Result<PinnedPage<'a>> {
         self.pool.pin(page_number, size)
     }
 
@@ -329,7 +333,10 @@ mod tests {
         handle.alloc_page(PageSize::Large32k).unwrap();
         handle.alloc_page(PageSize::Small4k).unwrap();
 
-        let count = handle.allocator().with_header(|h| h.total_page_count).unwrap();
+        let count = handle
+            .allocator()
+            .with_header(|h| h.total_page_count)
+            .unwrap();
         assert_eq!(count, 3);
     }
 

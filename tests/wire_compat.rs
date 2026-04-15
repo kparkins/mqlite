@@ -101,7 +101,10 @@ fn read_op_msg_body(stream: &mut TcpStream) -> Document {
     let header = read_exact_bytes(stream, 16);
     let msg_len = i32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
     let op_code = i32::from_le_bytes(header[12..16].try_into().unwrap());
-    assert_eq!(op_code, OP_MSG, "expected OP_MSG response, got opCode={op_code}");
+    assert_eq!(
+        op_code, OP_MSG,
+        "expected OP_MSG response, got opCode={op_code}"
+    );
 
     let rest = read_exact_bytes(stream, msg_len - 16);
     // rest = flagBits(4) + kind(1) + bson_doc
@@ -120,8 +123,7 @@ fn read_op_reply_body(stream: &mut TcpStream) -> Document {
     let rest = read_exact_bytes(stream, msg_len - 16);
     // OP_REPLY body: responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + docs
     let doc_start = 20;
-    let doc_size =
-        i32::from_le_bytes(rest[doc_start..doc_start + 4].try_into().unwrap()) as usize;
+    let doc_size = i32::from_le_bytes(rest[doc_start..doc_start + 4].try_into().unwrap()) as usize;
     bson::from_slice(&rest[doc_start..doc_start + doc_size]).expect("BSON decode")
 }
 
@@ -182,20 +184,26 @@ fn mongosh_smoke_op_query_ismaster_handshake() {
     let (_db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
-    let frame = build_op_query(
-        1,
-        "admin.$cmd",
-        &doc! { "ismaster": 1, "helloOk": true },
-    );
+    let frame = build_op_query(1, "admin.$cmd", &doc! { "ismaster": 1, "helloOk": true });
     s.write_all(&frame).unwrap();
     let body = read_op_reply_body(&mut s);
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0, "isMaster ok");
-    assert!(body.get_bool("isWritablePrimary").unwrap(), "isWritablePrimary");
+    assert!(
+        body.get_bool("isWritablePrimary").unwrap(),
+        "isWritablePrimary"
+    );
     assert!(body.get_bool("helloOk").unwrap(), "helloOk echoed");
-    assert_eq!(body.get_i32("maxWireVersion").unwrap(), 21, "maxWireVersion=21");
+    assert_eq!(
+        body.get_i32("maxWireVersion").unwrap(),
+        21,
+        "maxWireVersion=21"
+    );
     // topologyVersion and connectionId must be present (pymongo checks them).
-    assert!(body.contains_key("topologyVersion"), "topologyVersion present");
+    assert!(
+        body.contains_key("topologyVersion"),
+        "topologyVersion present"
+    );
     assert!(body.contains_key("connectionId"), "connectionId present");
 }
 
@@ -219,13 +227,21 @@ fn mongosh_smoke_show_dbs() {
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0, "listDatabases ok");
     let dbs = body.get_array("databases").unwrap();
-    assert!(!dbs.is_empty(), "at least one database must appear after insert");
+    assert!(
+        !dbs.is_empty(),
+        "at least one database must appear after insert"
+    );
     let db_entry = dbs[0].as_document().unwrap();
     assert!(db_entry.contains_key("name"), "database entry has name");
-    assert!(db_entry.contains_key("sizeOnDisk"), "database entry has sizeOnDisk");
+    assert!(
+        db_entry.contains_key("sizeOnDisk"),
+        "database entry has sizeOnDisk"
+    );
     assert!(db_entry.contains_key("empty"), "database entry has empty");
-    assert!(body.contains_key("totalSize") || body.contains_key("totalSizeMb"),
-        "listDatabases response includes total size field");
+    assert!(
+        body.contains_key("totalSize") || body.contains_key("totalSizeMb"),
+        "listDatabases response includes total size field"
+    );
 }
 
 /// mongosh step 2: `show collections` → listCollections (empty db).
@@ -238,7 +254,11 @@ fn mongosh_smoke_show_collections_empty() {
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0, "listCollections ok");
     let cursor_doc = body.get_document("cursor").unwrap();
-    assert_eq!(cursor_doc.get_i64("id").unwrap(), 0, "exhausted cursor id=0");
+    assert_eq!(
+        cursor_doc.get_i64("id").unwrap(),
+        0,
+        "exhausted cursor id=0"
+    );
     assert!(
         cursor_doc.get_array("firstBatch").unwrap().is_empty(),
         "empty db → firstBatch=[]"
@@ -264,7 +284,10 @@ fn mongosh_smoke_insert_one() {
     assert_eq!(body.get_f64("ok").unwrap(), 1.0, "insertOne ok");
     assert_eq!(body.get_i32("n").unwrap(), 1, "n=1");
     // No writeErrors on success.
-    assert!(!body.contains_key("writeErrors"), "no writeErrors on success");
+    assert!(
+        !body.contains_key("writeErrors"),
+        "no writeErrors on success"
+    );
 }
 
 /// mongosh step 4: `db.col.find({})` — returns inserted docs.
@@ -393,11 +416,7 @@ fn pymongo_compat_handshake_sequence() {
     let mut s = connect(addr);
 
     // Step 1: OP_QUERY isMaster (pymongo sends this before it knows wire version).
-    let frame = build_op_query(
-        1,
-        "admin.$cmd",
-        &doc! { "ismaster": 1, "helloOk": true },
-    );
+    let frame = build_op_query(1, "admin.$cmd", &doc! { "ismaster": 1, "helloOk": true });
     s.write_all(&frame).unwrap();
     let reply = read_op_reply_body(&mut s);
     assert_eq!(reply.get_f64("ok").unwrap(), 1.0, "OP_QUERY handshake ok");
@@ -421,8 +440,14 @@ fn pymongo_compat_build_info() {
     assert_eq!(body.get_f64("ok").unwrap(), 1.0, "buildInfo ok");
     // Fields required by pymongo's server info inspection.
     assert!(body.get_str("version").is_ok(), "version field present");
-    assert!(body.get_str("gitVersion").is_ok(), "gitVersion field present");
-    assert!(!body.get_str("version").unwrap().is_empty(), "version non-empty");
+    assert!(
+        body.get_str("gitVersion").is_ok(),
+        "gitVersion field present"
+    );
+    assert!(
+        !body.get_str("version").unwrap().is_empty(),
+        "version non-empty"
+    );
 }
 
 /// pymongo: ping.
@@ -461,10 +486,7 @@ fn pymongo_compat_insert_one_find() {
         .get_array("firstBatch")
         .unwrap();
     assert_eq!(batch.len(), 1);
-    assert_eq!(
-        batch[0].as_document().unwrap().get_i32("x").unwrap(),
-        42
-    );
+    assert_eq!(batch[0].as_document().unwrap().get_i32("x").unwrap(), 42);
 }
 
 /// pymongo: update_one.
@@ -545,14 +567,21 @@ fn pymongo_compat_find_one_and_update() {
     );
     assert_eq!(fam.get_f64("ok").unwrap(), 1.0);
     // CRITICAL: MongoDB 8.0 uses `value`, not `document`.
-    assert!(fam.contains_key("value"), "findAndModify response must have 'value' field");
+    assert!(
+        fam.contains_key("value"),
+        "findAndModify response must have 'value' field"
+    );
     assert!(
         !fam.contains_key("document"),
         "findAndModify must NOT have 'document' field"
     );
     let value_doc = fam.get_document("value").unwrap();
     assert_eq!(value_doc.get_str("name").unwrap(), "Alice");
-    assert_eq!(value_doc.get_i32("score").unwrap(), 10, "pre-update value returned");
+    assert_eq!(
+        value_doc.get_i32("score").unwrap(),
+        10,
+        "pre-update value returned"
+    );
     // lastErrorObject is required by pymongo.
     let leo = fam.get_document("lastErrorObject").unwrap();
     assert_eq!(leo.get_i32("n").unwrap(), 1);
@@ -603,11 +632,7 @@ fn pymongo_compat_find_and_modify_no_match_null_value() {
         },
     );
     assert_eq!(fam.get_f64("ok").unwrap(), 1.0);
-    assert_eq!(
-        fam.get("value"),
-        Some(&Bson::Null),
-        "no match → value:null"
-    );
+    assert_eq!(fam.get("value"), Some(&Bson::Null), "no match → value:null");
 }
 
 /// pymongo: create_index, then list_indexes.
@@ -649,11 +674,7 @@ fn pymongo_compat_create_index_list_indexes() {
         "_id_ + email_1 after"
     );
 
-    let li = round_trip(
-        &mut s,
-        2,
-        &doc! { "listIndexes": "users", "$db": "local" },
-    );
+    let li = round_trip(&mut s, 2, &doc! { "listIndexes": "users", "$db": "local" });
     assert_eq!(li.get_f64("ok").unwrap(), 1.0, "listIndexes ok");
     let batch = li
         .get_document("cursor")
@@ -747,7 +768,10 @@ fn pymongo_compat_cursor_get_more() {
     );
     assert_eq!(gm2.get_f64("ok").unwrap(), 1.0);
     let gm2_cursor = gm2.get_document("cursor").unwrap();
-    assert!(gm2_cursor.contains_key("nextBatch"), "final getMore uses nextBatch");
+    assert!(
+        gm2_cursor.contains_key("nextBatch"),
+        "final getMore uses nextBatch"
+    );
     assert_eq!(gm2_cursor.get_array("nextBatch").unwrap().len(), 1);
     assert_eq!(
         gm2_cursor.get_i64("id").unwrap(),
@@ -804,11 +828,17 @@ fn format_parity_hello() {
     let body = round_trip(&mut s, 1, &doc! { "hello": 1i32, "$db": "admin" });
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0);
-    assert!(body.get_bool("isWritablePrimary").is_ok(), "isWritablePrimary");
+    assert!(
+        body.get_bool("isWritablePrimary").is_ok(),
+        "isWritablePrimary"
+    );
     assert!(body.get_bool("helloOk").is_ok(), "helloOk");
     assert!(body.get_i32("maxWireVersion").is_ok(), "maxWireVersion");
     assert!(body.get_i32("minWireVersion").is_ok(), "minWireVersion");
-    assert!(body.get_str("localTime").is_err(), "localTime is DateTime not string");
+    assert!(
+        body.get_str("localTime").is_err(),
+        "localTime is DateTime not string"
+    );
     assert!(body.contains_key("localTime"), "localTime present");
     assert!(body.contains_key("connectionId"), "connectionId");
     assert!(body.contains_key("topologyVersion"), "topologyVersion");
@@ -882,7 +912,10 @@ fn format_parity_list_databases() {
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0);
     let dbs = body.get_array("databases").unwrap();
-    assert!(!dbs.is_empty(), "at least one database must appear after insert");
+    assert!(
+        !dbs.is_empty(),
+        "at least one database must appear after insert"
+    );
     let db_entry = dbs[0].as_document().unwrap();
     assert!(db_entry.get_str("name").is_ok(), "name: string");
     // sizeOnDisk must be numeric (i64 or f64).
@@ -965,14 +998,21 @@ fn format_parity_insert_write_errors() {
     );
     assert_eq!(body.get_f64("ok").unwrap(), 1.0, "partial success ok=1");
     // CRITICAL: writeErrors must be an array with one entry.
-    assert!(body.contains_key("writeErrors"), "writeErrors must be present on partial failure");
+    assert!(
+        body.contains_key("writeErrors"),
+        "writeErrors must be present on partial failure"
+    );
     let write_errors = body.get_array("writeErrors").unwrap();
     assert_eq!(write_errors.len(), 1, "exactly one write error");
     let err_entry = write_errors[0].as_document().unwrap();
     // index field identifies which doc failed.
     assert!(err_entry.contains_key("index"), "writeError.index field");
     // code must be 11000 (DuplicateKey).
-    assert_eq!(err_entry.get_i32("code").unwrap(), 11000, "DuplicateKey=11000");
+    assert_eq!(
+        err_entry.get_i32("code").unwrap(),
+        11000,
+        "DuplicateKey=11000"
+    );
     // errmsg must be a string.
     assert!(err_entry.get_str("errmsg").is_ok(), "errmsg: string");
 }
@@ -993,7 +1033,11 @@ fn format_parity_find_empty_first_batch() {
     // CRITICAL: empty result must be cursor.firstBatch = [].
     let batch = cursor_doc.get_array("firstBatch").unwrap();
     assert!(batch.is_empty(), "empty collection → firstBatch=[]");
-    assert_eq!(cursor_doc.get_i64("id").unwrap(), 0, "cursor id=0 when exhausted");
+    assert_eq!(
+        cursor_doc.get_i64("id").unwrap(),
+        0,
+        "cursor id=0 when exhausted"
+    );
     // ns is always present.
     assert!(cursor_doc.get_str("ns").is_ok(), "ns field present");
 }
@@ -1023,7 +1067,10 @@ fn format_parity_update() {
     assert_eq!(body.get_f64("ok").unwrap(), 1.0);
     // n and nModified must be Int64 in MongoDB 8.0 wire format.
     assert!(body.get_i64("n").is_ok(), "n must be Int64 or coercible");
-    assert!(body.get_i64("nModified").is_ok(), "nModified must be present");
+    assert!(
+        body.get_i64("nModified").is_ok(),
+        "nModified must be present"
+    );
     assert_eq!(body.get_i64("n").unwrap(), 1);
     assert_eq!(body.get_i64("nModified").unwrap(), 1);
     // upserted must NOT appear when no upsert happened.
@@ -1112,8 +1159,14 @@ fn format_parity_find_and_modify() {
 
     assert_eq!(body.get_f64("ok").unwrap(), 1.0);
     // CRITICAL: must use `value` not `document`.
-    assert!(body.contains_key("value"), "'value' field required by MongoDB 8.0");
-    assert!(!body.contains_key("document"), "'document' field must NOT appear");
+    assert!(
+        body.contains_key("value"),
+        "'value' field required by MongoDB 8.0"
+    );
+    assert!(
+        !body.contains_key("document"),
+        "'document' field must NOT appear"
+    );
     // lastErrorObject must be present.
     let leo = body.get_document("lastErrorObject").unwrap();
     assert!(leo.contains_key("n"), "lastErrorObject.n present");
@@ -1140,11 +1193,7 @@ fn format_parity_get_more_next_batch() {
         2,
         &doc! { "find": "g", "filter": {}, "batchSize": 1i32, "$db": "local" },
     );
-    let cursor_id = find
-        .get_document("cursor")
-        .unwrap()
-        .get_i64("id")
-        .unwrap();
+    let cursor_id = find.get_document("cursor").unwrap().get_i64("id").unwrap();
 
     let gm = round_trip(
         &mut s,
@@ -1167,7 +1216,10 @@ fn format_parity_get_more_next_batch() {
         "getMore must NOT have firstBatch"
     );
     // cursor ns must be present.
-    assert!(cursor_doc.get_str("ns").is_ok(), "ns present in getMore cursor");
+    assert!(
+        cursor_doc.get_str("ns").is_ok(),
+        "ns present in getMore cursor"
+    );
 }
 
 /// Format parity: killCursors response.
@@ -1200,8 +1252,14 @@ fn format_parity_kill_cursors() {
     );
     assert_eq!(kc.get_f64("ok").unwrap(), 1.0);
     // MongoDB 8.0 format: cursorsKilled and cursorsNotFound arrays.
-    assert!(kc.contains_key("cursorsKilled"), "cursorsKilled array required");
-    assert!(kc.contains_key("cursorsNotFound"), "cursorsNotFound array required");
+    assert!(
+        kc.contains_key("cursorsKilled"),
+        "cursorsKilled array required"
+    );
+    assert!(
+        kc.contains_key("cursorsNotFound"),
+        "cursorsNotFound array required"
+    );
     let killed = kc.get_array("cursorsKilled").unwrap();
     assert_eq!(killed.len(), 1, "one cursor killed");
     let not_found = kc.get_array("cursorsNotFound").unwrap();
@@ -1255,7 +1313,11 @@ fn format_parity_list_collections() {
     // MongoDB 8.0 listCollections entry format.
     let entry = batch[0].as_document().unwrap();
     assert_eq!(entry.get_str("name").unwrap(), "mycoll", "name field");
-    assert_eq!(entry.get_str("type").unwrap(), "collection", "type='collection'");
+    assert_eq!(
+        entry.get_str("type").unwrap(),
+        "collection",
+        "type='collection'"
+    );
     assert!(entry.contains_key("options"), "options subdoc");
     assert!(entry.contains_key("idIndex"), "idIndex subdoc");
     let id_index = entry.get_document("idIndex").unwrap();
@@ -1394,10 +1456,25 @@ fn bson_roundtrip_native_write_wire_read() {
 
     let returned_doc = batch[0].as_document().unwrap();
     // Verify BSON types are preserved.
-    assert_eq!(returned_doc.get_str("str").unwrap(), "hello", "string preserved");
-    assert_eq!(returned_doc.get_i32("int32").unwrap(), 42, "Int32 preserved");
-    assert_eq!(returned_doc.get_i64("int64").unwrap(), 9999999, "Int64 preserved");
-    assert!((returned_doc.get_f64("double").unwrap() - 3.14).abs() < 1e-9, "Double preserved");
+    assert_eq!(
+        returned_doc.get_str("str").unwrap(),
+        "hello",
+        "string preserved"
+    );
+    assert_eq!(
+        returned_doc.get_i32("int32").unwrap(),
+        42,
+        "Int32 preserved"
+    );
+    assert_eq!(
+        returned_doc.get_i64("int64").unwrap(),
+        9999999,
+        "Int64 preserved"
+    );
+    assert!(
+        (returned_doc.get_f64("double").unwrap() - 3.14).abs() < 1e-9,
+        "Double preserved"
+    );
     assert!(returned_doc.get_bool("bool").unwrap(), "Bool preserved");
     assert_eq!(
         returned_doc.get("null_field"),
@@ -1407,7 +1484,11 @@ fn bson_roundtrip_native_write_wire_read() {
     let arr = returned_doc.get_array("array").unwrap();
     assert_eq!(arr.len(), 3, "Array length preserved");
     assert_eq!(
-        returned_doc.get_document("nested").unwrap().get_str("key").unwrap(),
+        returned_doc
+            .get_document("nested")
+            .unwrap()
+            .get_str("key")
+            .unwrap(),
         "value",
         "Nested document preserved"
     );
@@ -1446,7 +1527,11 @@ fn bson_roundtrip_wire_write_native_read() {
     let found = coll.find_one(doc! { "str": "wire_inserted" }).unwrap();
     assert!(found.is_some(), "native API finds wire-inserted document");
     let doc = found.unwrap();
-    assert_eq!(doc.get_i32("num").unwrap(), 777, "Int32 preserved in native read");
+    assert_eq!(
+        doc.get_i32("num").unwrap(),
+        777,
+        "Int32 preserved in native read"
+    );
     assert_eq!(
         doc.get_document("nested").unwrap().get_str("a").unwrap(),
         "b",
@@ -1462,7 +1547,8 @@ fn bson_roundtrip_object_id_preserved() {
     let coll = db.collection::<Document>("oids");
 
     let oid = bson::oid::ObjectId::new();
-    coll.insert_one(&doc! { "_id": oid, "label": "oid-test" }).unwrap();
+    coll.insert_one(&doc! { "_id": oid, "label": "oid-test" })
+        .unwrap();
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1502,11 +1588,7 @@ fn unsupported_command_aggregate_returns_command_not_found() {
     let (_db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
-    let body = round_trip(
-        &mut s,
-        1,
-        &doc! { "aggregate": "coll", "$db": "local" },
-    );
+    let body = round_trip(&mut s, 1, &doc! { "aggregate": "coll", "$db": "local" });
 
     assert_eq!(body.get_f64("ok").unwrap(), 0.0, "aggregate must fail");
     assert_eq!(
@@ -1535,7 +1617,11 @@ fn unsupported_command_unknown_returns_command_not_found() {
         &doc! { "doesNotExistCommand": 1i32, "$db": "local" },
     );
 
-    assert_eq!(body.get_f64("ok").unwrap(), 0.0, "unknown command must fail");
+    assert_eq!(
+        body.get_f64("ok").unwrap(),
+        0.0,
+        "unknown command must fail"
+    );
     assert_eq!(body.get_i32("code").unwrap(), 59, "code=59");
     assert_eq!(body.get_str("codeName").unwrap(), "CommandNotFound");
 }
@@ -1546,11 +1632,7 @@ fn unsupported_command_map_reduce_not_found() {
     let (_db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
-    let body = round_trip(
-        &mut s,
-        1,
-        &doc! { "mapReduce": "coll", "$db": "local" },
-    );
+    let body = round_trip(&mut s, 1, &doc! { "mapReduce": "coll", "$db": "local" });
 
     assert_eq!(body.get_i32("code").unwrap(), 59);
 }
@@ -1689,7 +1771,11 @@ fn session_list_collections_after_inserts() {
         );
     }
 
-    let list = round_trip(&mut s, 10, &doc! { "listCollections": 1i32, "$db": "local" });
+    let list = round_trip(
+        &mut s,
+        10,
+        &doc! { "listCollections": 1i32, "$db": "local" },
+    );
     let batch = list
         .get_document("cursor")
         .unwrap()

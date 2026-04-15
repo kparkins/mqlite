@@ -179,12 +179,8 @@ fn sort_docs(docs: &mut Vec<Document>, sort: &Document) {
 fn compare_docs(a: &Document, b: &Document, sort: &Document) -> std::cmp::Ordering {
     for (field, dir) in sort {
         let ascending = !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
-        let av = get_nested_field(a, field)
-            .cloned()
-            .unwrap_or(Bson::Null);
-        let bv = get_nested_field(b, field)
-            .cloned()
-            .unwrap_or(Bson::Null);
+        let av = get_nested_field(a, field).cloned().unwrap_or(Bson::Null);
+        let bv = get_nested_field(b, field).cloned().unwrap_or(Bson::Null);
         let ord = encode_key(&av).cmp(&encode_key(&bv));
         if ord == std::cmp::Ordering::Equal {
             continue;
@@ -200,9 +196,9 @@ fn apply_projection_to_doc(mut doc: Document, proj: &Document) -> Document {
         .filter(|(k, _)| k.as_str() != "_id")
         .any(|(_, v)| !matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false)));
 
-    let explicit_id_excl = proj.get("_id").is_some_and(|v| {
-        matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false))
-    });
+    let explicit_id_excl = proj
+        .get("_id")
+        .is_some_and(|v| matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false)));
 
     if is_inclusion {
         let mut result = Document::new();
@@ -271,8 +267,7 @@ fn btree_collscan<S: BTreePageStore>(
     let mut result = Vec::new();
     for (key, cv) in pairs {
         let bson_bytes = resolve_cell(tree, cv)?;
-        let doc: Document =
-            bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
+        let doc: Document = bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
         if eval_filter(&doc, filter)? {
             result.push((key, doc));
         }
@@ -456,7 +451,8 @@ impl BpBackend {
             } else {
                 // Lazily create the collection in the catalog.
                 let (data_root, _id_root) =
-                    self.catalog.create_collection(ns, bson::doc! {}, now_millis())?;
+                    self.catalog
+                        .create_collection(ns, bson::doc! {}, now_millis())?;
                 self.sync_catalog_root()?;
                 (data_root, 0u8, true)
             };
@@ -478,8 +474,7 @@ impl BpBackend {
         if !self.data_trees.contains_key(ns) {
             if let Some(entry) = self.catalog.get_collection(ns)? {
                 let store = self.new_store();
-                let tree =
-                    BTree::open(store, entry.data_root_page, entry.data_root_level);
+                let tree = BTree::open(store, entry.data_root_page, entry.data_root_level);
                 self.data_trees.insert(ns.to_owned(), tree);
             } else {
                 return Ok(None);
@@ -493,8 +488,7 @@ impl BpBackend {
         if !self.data_trees.contains_key(ns) {
             if let Some(entry) = self.catalog.get_collection(ns)? {
                 let store = self.new_store();
-                let tree =
-                    BTree::open(store, entry.data_root_page, entry.data_root_level);
+                let tree = BTree::open(store, entry.data_root_page, entry.data_root_level);
                 self.data_trees.insert(ns.to_owned(), tree);
             } else {
                 return Ok(None);
@@ -630,15 +624,13 @@ impl StorageEngine for PagedEngine {
                     .map(|(_, doc)| doc)
                     .collect()
             }
-            DocBackend::Buffered(bp) => {
-                match bp.tree(ns)? {
-                    None => return Ok(Vec::new()),
-                    Some(tree) => btree_collscan(tree, filter)?
-                        .into_iter()
-                        .map(|(_, doc)| doc)
-                        .collect(),
-                }
-            }
+            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+                None => return Ok(Vec::new()),
+                Some(tree) => btree_collscan(tree, filter)?
+                    .into_iter()
+                    .map(|(_, doc)| doc)
+                    .collect(),
+            },
         };
         Ok(apply_find_opts(matched, opts))
     }
@@ -693,22 +685,20 @@ impl StorageEngine for PagedEngine {
                 };
                 (btree_collscan(tree, filter)?, true)
             }
-            DocBackend::Buffered(bp) => {
-                match bp.tree(ns)? {
-                    None => {
-                        if opts.upsert {
-                            drop(inner);
-                            return self.do_upsert_update(ns, filter, update);
-                        }
-                        return Ok(UpdateResult {
-                            matched_count: 0,
-                            modified_count: 0,
-                            upserted_id: None,
-                        });
+            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+                None => {
+                    if opts.upsert {
+                        drop(inner);
+                        return self.do_upsert_update(ns, filter, update);
                     }
-                    Some(tree) => (btree_collscan(tree, filter)?, true),
+                    return Ok(UpdateResult {
+                        matched_count: 0,
+                        modified_count: 0,
+                        upserted_id: None,
+                    });
                 }
-            }
+                Some(tree) => (btree_collscan(tree, filter)?, true),
+            },
         };
 
         let _ = tree_exists;
@@ -734,8 +724,7 @@ impl StorageEngine for PagedEngine {
             if doc != before {
                 modified_count += 1;
                 // Re-serialize and replace in the tree.
-                let new_bytes =
-                    bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
+                let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
                 match &mut *inner {
                     DocBackend::Memory(m) => {
                         if let Some(tree) = m.tree_mut(ns) {
@@ -1110,7 +1099,8 @@ impl StorageEngine for PagedEngine {
                     meta.indexes.retain(|(n, _)| n != name);
                     if meta.indexes.len() == before {
                         return Err(Error::Internal(format!(
-                            "index '{}' not found on '{}'" , name, ns
+                            "index '{}' not found on '{}'",
+                            name, ns
                         )));
                     }
                 }
@@ -1123,7 +1113,8 @@ impl StorageEngine for PagedEngine {
                     Ok(())
                 } else {
                     Err(Error::Internal(format!(
-                        "index '{}' not found on '{}'", name, ns
+                        "index '{}' not found on '{}'",
+                        name, ns
                     )))
                 }
             }
@@ -1175,9 +1166,11 @@ impl StorageEngine for PagedEngine {
         let mut inner = self.inner.lock().unwrap();
         match &mut *inner {
             DocBackend::Memory(m) => {
-                m.collections.entry(ns.to_owned()).or_insert_with(|| MemCollMeta {
-                    indexes: Vec::new(),
-                });
+                m.collections
+                    .entry(ns.to_owned())
+                    .or_insert_with(|| MemCollMeta {
+                        indexes: Vec::new(),
+                    });
                 if !m.data_trees.contains_key(ns) {
                     let tree = BTree::create(MemPageStore::new())?;
                     m.data_trees.insert(ns.to_owned(), tree);
@@ -1189,7 +1182,8 @@ impl StorageEngine for PagedEngine {
                     return Ok(());
                 }
                 let (data_root, _) =
-                    bp.catalog.create_collection(ns, bson::doc! {}, now_millis())?;
+                    bp.catalog
+                        .create_collection(ns, bson::doc! {}, now_millis())?;
                 bp.sync_catalog_root()?;
                 // Pre-warm the cached tree; initialise the pre-allocated leaf page.
                 let store = bp.new_store();
@@ -1387,9 +1381,7 @@ mod tests {
         let e = engine();
         e.insert("test.users", doc! { "name": "Alice", "age": 30 })
             .unwrap();
-        let found = e
-            .find_one("test.users", &doc! { "name": "Alice" })
-            .unwrap();
+        let found = e.find_one("test.users", &doc! { "name": "Alice" }).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().get_str("name").unwrap(), "Alice");
     }
@@ -1397,9 +1389,7 @@ mod tests {
     #[test]
     fn insert_missing_namespace_returns_empty_find() {
         let e = engine();
-        let found = e
-            .find("test.users", &doc! {}, &FindOptions::new())
-            .unwrap();
+        let found = e.find("test.users", &doc! {}, &FindOptions::new()).unwrap();
         assert!(found.is_empty());
     }
 
@@ -1530,7 +1520,11 @@ mod tests {
         let e = engine();
         e.insert("test.c", doc! { "x": 42 }).unwrap();
         let d = e
-            .find_one_and_delete_doc("test.c", &doc! { "x": 42 }, &FindOneAndDeleteOptions::default())
+            .find_one_and_delete_doc(
+                "test.c",
+                &doc! { "x": 42 },
+                &FindOneAndDeleteOptions::default(),
+            )
             .unwrap();
         assert!(d.is_some());
         assert_eq!(e.count("test.c", &doc! {}).unwrap(), 0);

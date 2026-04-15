@@ -82,7 +82,6 @@ impl Default for EngineState {
 }
 
 impl EngineState {
-
     // Lazily create a collection on first access.
     fn get_or_create(&mut self, name: &str) -> &mut CollectionState {
         self.collections
@@ -802,9 +801,7 @@ impl EngineState {
 
             // Sparse index: skip when all indexed fields are null/absent.
             let null_encoded = encode_key(&Bson::Null);
-            if idx_record.model.options.sparse
-                && new_encoded.iter().all(|v| v == &null_encoded)
-            {
+            if idx_record.model.options.sparse && new_encoded.iter().all(|v| v == &null_encoded) {
                 continue;
             }
 
@@ -847,7 +844,11 @@ impl EngineState {
         let mut collections_doc = Document::new();
 
         for (name, coll) in &self.collections {
-            let docs: Vec<Bson> = coll.docs.iter().map(|d| Bson::Document(d.clone())).collect();
+            let docs: Vec<Bson> = coll
+                .docs
+                .iter()
+                .map(|d| Bson::Document(d.clone()))
+                .collect();
 
             let indexes: Vec<Bson> = coll
                 .indexes
@@ -2154,8 +2155,9 @@ mod tests {
     #[test]
     fn dotted_collection_key_survives_bson_roundtrip() {
         let mut eng = engine();
-        eng.insert_one("app.users", &doc! {"name": "Alice", "score": 42i32}).unwrap();
-        
+        eng.insert_one("app.users", &doc! {"name": "Alice", "score": 42i32})
+            .unwrap();
+
         // Create an index on the qualified namespace.
         let model = crate::index::IndexModel::builder()
             .keys(doc! { "name": 1i32 })
@@ -2169,7 +2171,10 @@ mod tests {
 
         // Document must be findable under the qualified name.
         let found: Option<Document> = restored.find_one("app.users", doc! {}).unwrap();
-        assert!(found.is_some(), "doc must survive round-trip under qualified name 'app.users'");
+        assert!(
+            found.is_some(),
+            "doc must survive round-trip under qualified name 'app.users'"
+        );
 
         // Index must be restored.
         let indexes = restored.list_indexes("app.users").unwrap();
@@ -2177,4 +2182,3 @@ mod tests {
         assert_eq!(indexes[0].name, "name_1");
     }
 }
-

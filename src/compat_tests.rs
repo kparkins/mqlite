@@ -118,8 +118,14 @@ mod tests {
         // Docs 3 and 4 must be absent (ordered mode stopped at index 2).
         let doc3 = col.find_one(doc! { "x": "c" }).unwrap();
         let doc4 = col.find_one(doc! { "x": "d" }).unwrap();
-        assert!(doc3.is_none(), "doc3 (x=c) must not be in DB after ordered stop");
-        assert!(doc4.is_none(), "doc4 (x=d) must not be in DB after ordered stop");
+        assert!(
+            doc3.is_none(),
+            "doc3 (x=c) must not be in DB after ordered stop"
+        );
+        assert!(
+            doc4.is_none(),
+            "doc4 (x=d) must not be in DB after ordered stop"
+        );
     }
 
     /// ordered=false: same 5-doc batch with the same unique-index violation.
@@ -163,14 +169,26 @@ mod tests {
             "ordered=false: expected 4 inserted docs, got {}",
             res.inserted_ids.len()
         );
-        assert!(res.inserted_ids.contains_key(&0), "index 0 must be in inserted_ids");
-        assert!(res.inserted_ids.contains_key(&1), "index 1 must be in inserted_ids");
+        assert!(
+            res.inserted_ids.contains_key(&0),
+            "index 0 must be in inserted_ids"
+        );
+        assert!(
+            res.inserted_ids.contains_key(&1),
+            "index 1 must be in inserted_ids"
+        );
         assert!(
             !res.inserted_ids.contains_key(&2),
             "index 2 must NOT be in inserted_ids (it failed)"
         );
-        assert!(res.inserted_ids.contains_key(&3), "index 3 must be in inserted_ids");
-        assert!(res.inserted_ids.contains_key(&4), "index 4 must be in inserted_ids");
+        assert!(
+            res.inserted_ids.contains_key(&3),
+            "index 3 must be in inserted_ids"
+        );
+        assert!(
+            res.inserted_ids.contains_key(&4),
+            "index 4 must be in inserted_ids"
+        );
 
         // Exactly one error at index 2.
         assert_eq!(
@@ -183,7 +201,10 @@ mod tests {
         assert_eq!(res.errors[0].code, codes::DUPLICATE_KEY);
 
         // Doc 2 absent, others present.
-        assert!(col.find_one(doc! { "x": "dup", "label": "doc2" }).unwrap().is_none());
+        assert!(col
+            .find_one(doc! { "x": "dup", "label": "doc2" })
+            .unwrap()
+            .is_none());
         assert!(col.find_one(doc! { "x": "a" }).unwrap().is_some());
         assert!(col.find_one(doc! { "x": "b" }).unwrap().is_some());
         assert!(col.find_one(doc! { "x": "c" }).unwrap().is_some());
@@ -491,7 +512,8 @@ mod tests {
             .unwrap();
         col.create_index(model).unwrap();
 
-        col.insert_one(&doc! { "email": "alice@example.com" }).unwrap();
+        col.insert_one(&doc! { "email": "alice@example.com" })
+            .unwrap();
         let err = col
             .insert_one(&doc! { "email": "alice@example.com" })
             .unwrap_err();
@@ -638,6 +660,9 @@ mod tests {
         assert_eq!(count, 0, "empty collection count must be 0");
 
         let found: Option<Document> = col.find_one(doc! {}).unwrap();
-        assert!(found.is_none(), "find_one on empty collection must return None");
+        assert!(
+            found.is_none(),
+            "find_one on empty collection must return None"
+        );
     }
 }

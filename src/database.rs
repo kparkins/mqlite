@@ -21,11 +21,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::{path::Path, sync::Arc};
 
-use crate::{
-    client::ClientInner,
-    collection::Collection,
-    error::Result,
-};
+use crate::{client::ClientInner, collection::Collection, error::Result};
 
 // ---------------------------------------------------------------------------
 // Database — lightweight namespace handle

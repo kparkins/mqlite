@@ -148,8 +148,8 @@ impl BTreePageStore for BufferPoolPageStore {
 mod tests {
     use super::*;
     use crate::storage::btree::{BTree, BTreePageStore};
-    use crate::storage::buffer_pool::{BufferPool, PageIo, PageSize};
     use crate::storage::buffer_pool::default_sizes;
+    use crate::storage::buffer_pool::{BufferPool, PageIo, PageSize};
     use crate::storage::header::FileHeader;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
@@ -193,10 +193,7 @@ mod tests {
 
     fn make_store() -> BufferPoolPageStore {
         let io = MockIo::new();
-        let pool = Arc::new(BufferPool::new(
-            default_sizes::DESKTOP,
-            Box::new(ArcIo(io)),
-        ));
+        let pool = Arc::new(BufferPool::new(default_sizes::DESKTOP, Box::new(ArcIo(io))));
         let header = FileHeader::new_now();
         let handle = Arc::new(BufferPoolHandle::new(pool, header));
         BufferPoolPageStore::new(handle)

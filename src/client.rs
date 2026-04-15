@@ -425,7 +425,10 @@ impl ClientInner {
         opts: FindOneAndUpdateOptions,
     ) -> Result<Option<T>> {
         let _guard = self.writer_lock.lock().unwrap();
-        match self.engine.find_one_and_update_doc(name, &filter, &update, &opts)? {
+        match self
+            .engine
+            .find_one_and_update_doc(name, &filter, &update, &opts)?
+        {
             None => Ok(None),
             Some(doc) => bson::from_document(doc)
                 .map(Some)
@@ -474,8 +477,7 @@ impl ClientInner {
         replacement: &T,
         opts: FindOneAndReplaceOptions,
     ) -> Result<Option<T>> {
-        let replacement_doc =
-            bson::to_document(replacement).map_err(Error::BsonSerialization)?;
+        let replacement_doc = bson::to_document(replacement).map_err(Error::BsonSerialization)?;
         let _guard = self.writer_lock.lock().unwrap();
         match self
             .engine

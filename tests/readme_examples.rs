@@ -4,7 +4,7 @@
 //! correctly. They mirror the examples verbatim (with minor adaptations for
 //! in-memory mode) so that any future API breakage is immediately caught in CI.
 
-use mqlite::{Client, doc};
+use mqlite::{doc, Client};
 use serde::{Deserialize, Serialize};
 
 /// README example 1: untyped Document access.
@@ -21,9 +21,7 @@ fn readme_untyped_document_example() {
         .insert_one(&doc! { "action": "login", "user": "alice" })
         .expect("insert_one");
 
-    let event = events
-        .find_one(doc! { "user": "alice" })
-        .expect("find_one");
+    let event = events.find_one(doc! { "user": "alice" }).expect("find_one");
 
     assert!(event.is_some(), "should find the inserted document");
     let event = event.unwrap();
@@ -59,9 +57,7 @@ fn readme_typed_struct_example() {
         })
         .expect("insert_one");
 
-    let theme = configs
-        .find_one(doc! { "key": "theme" })
-        .expect("find_one");
+    let theme = configs.find_one(doc! { "key": "theme" }).expect("find_one");
 
     assert!(theme.is_some(), "should find the inserted Config");
     let theme = theme.unwrap();

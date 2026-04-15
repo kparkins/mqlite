@@ -207,10 +207,7 @@ mod tests {
     #[test]
     fn file_offset_is_uniform_32k_stride() {
         for n in 0u32..10 {
-            assert_eq!(
-                FilePageIo::file_offset(n),
-                n as u64 * PAGE_SIZE_LEAF as u64
-            );
+            assert_eq!(FilePageIo::file_offset(n), n as u64 * PAGE_SIZE_LEAF as u64);
         }
     }
 
@@ -318,7 +315,10 @@ mod tests {
         let mut buf = vec![0xFFu8; PageSize::Small4k.bytes()];
         io.read_page(0, PageSize::Small4k, &mut buf).unwrap();
 
-        assert!(buf.iter().all(|&b| b == 0), "EOF read of page 0 must return zeroes");
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "EOF read of page 0 must return zeroes"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -338,6 +338,9 @@ mod tests {
         let mut buf = vec![0u8; PageSize::Small4k.bytes()];
         io.read_page(0, PageSize::Small4k, &mut buf).unwrap();
 
-        assert!(buf.iter().all(|&b| b == 0x22), "second write must overwrite first");
+        assert!(
+            buf.iter().all(|&b| b == 0x22),
+            "second write must overwrite first"
+        );
     }
 }
