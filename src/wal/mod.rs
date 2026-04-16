@@ -40,8 +40,10 @@ pub(crate) mod wal_file;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 
 use self::shm::ShmIndex;
@@ -688,6 +690,70 @@ impl WalManager {
 }
 
 // ---------------------------------------------------------------------------
+// WalLayeredSource — PageSource that composes a file source with a WAL
+// ---------------------------------------------------------------------------
+
+/// Maps the storage-layer [`PageSize`] to the WAL's own page-size enum.
+fn page_size_to_wal(size: PageSize) -> WalPageSize {
+    match size {
+        PageSize::Small4k => WalPageSize::Small4k,
+        PageSize::Large32k => WalPageSize::Large32k,
+    }
+}
+
+/// A [`PageSource`] that consults a write-ahead log before falling back to an
+/// underlying file source.
+///
+/// * **Reads** — the WAL is checked first via [`WalManager::read_page`]; on
+///   miss, the inner `PageSource` (typically [`crate::storage::file_io::FilePageSource`])
+///   services the read.
+/// * **Writes** — each `write_page` appends a non-commit WAL frame via
+///   [`WalManager::append_non_commit`]; the main database file is not touched
+///   until checkpoint time.
+///
+/// The WAL state is shared via `Arc<Mutex<WalManager>>`; contention is
+/// managed at a higher level by the engine's `RwLock<DocBackend>`.
+pub(crate) struct WalLayeredSource {
+    inner: Arc<dyn PageSource>,
+    wal: Arc<Mutex<WalManager>>,
+}
+
+impl WalLayeredSource {
+    pub(crate) fn new(inner: Arc<dyn PageSource>, wal: Arc<Mutex<WalManager>>) -> Self {
+        Self { inner, wal }
+    }
+}
+
+impl PageSource for WalLayeredSource {
+    fn read_page(&self, page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
+        let mut guard = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Internal("WAL mutex poisoned".into()))?;
+        if let Some(bytes) = guard.read_page(page_number)? {
+            debug_assert_eq!(
+                bytes.len(),
+                size.bytes(),
+                "WAL frame size does not match requested PageSize"
+            );
+            buf.copy_from_slice(&bytes);
+            return Ok(());
+        }
+        drop(guard);
+        self.inner.read_page(page_number, size, buf)
+    }
+
+    fn write_page(&self, page_number: u32, size: PageSize, buf: &[u8]) -> Result<()> {
+        let mut guard = self
+            .wal
+            .lock()
+            .map_err(|_| Error::Internal("WAL mutex poisoned".into()))?;
+        guard.append_non_commit(page_number, page_size_to_wal(size), buf)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
 
@@ -1154,6 +1220,116 @@ mod tests {
         assert!(mgr.read_page(2).unwrap().is_none());
         assert_eq!(mgr.last_committed_db_page_count, None);
         drop(mgr);
+        drop(main_file);
+        drop(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // WalLayeredSource
+    // -----------------------------------------------------------------------
+
+    struct StubFileSource {
+        pages: Mutex<std::collections::HashMap<u32, Vec<u8>>>,
+    }
+
+    impl StubFileSource {
+        fn new() -> Self {
+            Self {
+                pages: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl PageSource for StubFileSource {
+        fn read_page(&self, n: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
+            let pages = self.pages.lock().unwrap();
+            if let Some(v) = pages.get(&n) {
+                buf.copy_from_slice(v);
+            } else {
+                buf.fill(0);
+                let _ = size;
+            }
+            Ok(())
+        }
+        fn write_page(&self, n: u32, size: PageSize, buf: &[u8]) -> Result<()> {
+            debug_assert_eq!(buf.len(), size.bytes());
+            self.pages.lock().unwrap().insert(n, buf.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn layered_source_read_hits_wal_first() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+        let mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        let wal = Arc::new(Mutex::new(mgr));
+
+        let file_src: Arc<dyn PageSource> = Arc::new(StubFileSource::new());
+        let file_only = make_page_32k(0xFA);
+        file_src
+            .write_page(5, PageSize::Large32k, &file_only)
+            .unwrap();
+
+        wal.lock()
+            .unwrap()
+            .append_non_commit(5, WalPageSize::Large32k, &make_page_32k(0xB1))
+            .unwrap();
+
+        let layered = WalLayeredSource::new(Arc::clone(&file_src), Arc::clone(&wal));
+        let mut buf = vec![0u8; PageSize::Large32k.bytes()];
+        layered.read_page(5, PageSize::Large32k, &mut buf).unwrap();
+        assert_eq!(buf, make_page_32k(0xB1), "WAL version must win over file");
+        drop(wal);
+        drop(main_file);
+        drop(dir);
+    }
+
+    #[test]
+    fn layered_source_read_falls_back_to_file() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+        let mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        let wal = Arc::new(Mutex::new(mgr));
+
+        let file_src: Arc<dyn PageSource> = Arc::new(StubFileSource::new());
+        file_src
+            .write_page(9, PageSize::Small4k, &make_page_4k(0xCC))
+            .unwrap();
+
+        let layered = WalLayeredSource::new(Arc::clone(&file_src), Arc::clone(&wal));
+        let mut buf = vec![0u8; PageSize::Small4k.bytes()];
+        layered.read_page(9, PageSize::Small4k, &mut buf).unwrap();
+        assert_eq!(buf, make_page_4k(0xCC));
+        drop(wal);
+        drop(main_file);
+        drop(dir);
+    }
+
+    #[test]
+    fn layered_source_write_appends_to_wal_not_file() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+        let mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        let wal = Arc::new(Mutex::new(mgr));
+
+        let file_src = Arc::new(StubFileSource::new());
+        let layered =
+            WalLayeredSource::new(Arc::clone(&file_src) as Arc<dyn PageSource>, Arc::clone(&wal));
+
+        let payload = make_page_4k(0x5A);
+        layered.write_page(13, PageSize::Small4k, &payload).unwrap();
+
+        let wal_bytes = wal.lock().unwrap().read_page(13).unwrap();
+        assert_eq!(wal_bytes, Some(payload.clone()));
+
+        let pages = file_src.pages.lock().unwrap();
+        assert!(
+            !pages.contains_key(&13),
+            "write_page must not touch the backing file source"
+        );
+        drop(pages);
+        drop(wal);
         drop(main_file);
         drop(dir);
     }
