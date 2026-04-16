@@ -50,7 +50,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
-use crate::storage::page::PAGE_SIZE_INTERNAL;
+use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 use crate::wal::wal_file::WalPageSize;
 use crate::wal::{wal_path_for, write_page_to_main, WalManager};
 
@@ -159,8 +159,11 @@ fn setup_epoch1(db_path: &Path, seed: u32) -> Result<()> {
         .create(true)
         .open(db_path)
         .map_err(Error::Io)?;
+    // Pre-allocate enough space for all pages at the uniform 32 KB slot stride.
+    // INDEX pages go up to page 109 → 110 × 32768 = 3 604 480 bytes; use 200
+    // slots (= 6 553 600 bytes) to leave headroom.
     main_file
-        .set_len(250 * PAGE_SIZE_INTERNAL as u64)
+        .set_len(200 * PAGE_SIZE_LEAF as u64)
         .map_err(Error::Io)?;
 
     // Write a valid FileHeader at page 0.
@@ -348,8 +351,11 @@ unsafe fn child_run_scenario(db_path: &Path, scenario: Scenario, seed: u32, writ
 // ---------------------------------------------------------------------------
 
 /// Read one `PAGE_SIZE_INTERNAL`-byte page from the main file.
+///
+/// Pages are stored at the uniform 32 KB (`PAGE_SIZE_LEAF`) slot stride
+/// regardless of their actual size — this matches [`FilePageSource::file_offset`].
 fn read_main_page(file: &mut std::fs::File, page_no: u32) -> Result<Vec<u8>> {
-    let offset = page_no as u64 * PAGE_SIZE_INTERNAL as u64;
+    let offset = page_no as u64 * PAGE_SIZE_LEAF as u64;
     file.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
     let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
     file.read_exact(&mut buf).map_err(Error::Io)?;

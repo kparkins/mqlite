@@ -47,7 +47,8 @@ use crate::query::{eval_filter, get_nested_field};
 use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::{BTree, BTreePageStore, CellValue, MemPageStore};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::catalog::{Catalog, IndexEntry};
+use crate::storage::buffer_pool::PageSize;
+use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog, IndexEntry};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::oid::ObjectIdGenerator;
 use crate::storage::secondary_index::{
@@ -411,11 +412,18 @@ impl BpBackend {
         catalog_root_level: u8,
     ) -> Result<Self> {
         let store = BufferPoolPageStore::new(Arc::clone(&handle));
-        let catalog = if catalog_root_page == 0 {
-            Catalog::create(store)?
-        } else {
-            Catalog::open(store, catalog_root_page, catalog_root_level)
-        };
+        let backup_root = handle
+            .allocator()
+            .with_header(|h| h.catalog_root_backup)?;
+        let (catalog, used_backup) = catalog_open_with_fallback(
+            store,
+            catalog_root_page,
+            catalog_root_level,
+            backup_root,
+            catalog_root_level,
+            |_page| true,
+        )?;
+        let _ = used_backup; // noted for tracing/logging if needed
         let backend = Self {
             handle,
             catalog,
@@ -444,7 +452,57 @@ impl BpBackend {
         self.handle.allocator().update_header(|h| {
             h.catalog_root_page = root_page;
             h.catalog_root_level = root_level;
+            h.catalog_root_backup = root_page;
         })
+    }
+
+    /// Run `f` inside a WAL transaction boundary.
+    ///
+    /// On `Ok`: flushes dirty pages (they land in the WAL as non-commit frames
+    /// via `WalLayeredSource`), then emits a final commit frame tagged with
+    /// `total_page_count` so recovery knows the txn is durable.
+    ///
+    /// On `Err`: truncates the WAL back to the snapshot cursor and drops all
+    /// dirty, unpinned frames from the buffer pool — leaves the in-memory
+    /// state consistent with the pre-txn on-disk state.
+    ///
+    /// No-op (no commit frame, no rollback) when the handle has no WAL.
+    fn with_txn<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let mark = self.handle.begin_txn()?;
+        let result = f(self);
+        match result {
+            Ok(value) => {
+                // Flush dirty pages to the WAL as non-commit frames.
+                self.handle.flush()?;
+                // Emit a commit frame. Use page 0 (header, 32k) — it is always
+                // part of any write txn because the allocator touches it.
+                let db_page_count = self
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.total_page_count)?;
+                let header_data = {
+                    let page = self.handle.fetch_page(0, PageSize::Small4k)?;
+                    page.data().to_vec()
+                };
+                let emergency = self
+                    .handle
+                    .commit_txn(0, PageSize::Small4k, &header_data, db_page_count)?;
+                if emergency {
+                    // SHM near-full: move WAL frames into the main file so
+                    // subsequent txns have room. Best-effort — failure here
+                    // does not roll back the txn (it is already committed).
+                    let _ = self.handle.emergency_checkpoint();
+                }
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = self.handle.rollback_txn(mark);
+                Err(e)
+            }
+        }
     }
 
     /// Return a mutable reference to the data tree for `ns`.
@@ -1084,7 +1142,7 @@ impl StorageEngine for PagedEngine {
                 let tree = m.tree_or_create(ns)?;
                 btree_insert_doc(tree, &mut doc, &unique_specs)
             }
-            DocBackend::Buffered(bp) => {
+            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                 // Insert into the primary (data) tree.  Unique-constraint
                 // checking for secondary indexes happens below after the
                 // secondary index trees are maintained.
@@ -1095,7 +1153,7 @@ impl StorageEngine for PagedEngine {
                 // enforcement via the index B+ trees themselves).
                 bp.maintain_secondary_on_insert(ns, &doc, &id)?;
                 Ok(id)
-            }
+            }),
         }
     }
 
@@ -1208,34 +1266,49 @@ impl StorageEngine for PagedEngine {
             return self.do_upsert_update(ns, filter, update);
         }
 
-        let mut matched_count = 0u64;
-        let mut modified_count = 0u64;
-
-        let pairs_to_process = if many {
+        let pairs_to_process: Vec<(Vec<u8>, Document)> = if many {
             matched_pairs
         } else {
             matched_pairs.into_iter().take(1).collect()
         };
 
-        for (key, mut doc) in pairs_to_process {
-            matched_count += 1;
-            let before = doc.clone();
-            let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
-            apply_update(&mut doc, update, false)?;
-            if doc != before {
-                modified_count += 1;
-                let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                // Re-serialize and replace in the data tree.
-                let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-                match &mut *inner {
-                    DocBackend::Memory(m) => {
+        match &mut *inner {
+            DocBackend::Memory(m) => {
+                let mut matched_count = 0u64;
+                let mut modified_count = 0u64;
+                for (key, mut doc) in pairs_to_process {
+                    matched_count += 1;
+                    let before = doc.clone();
+                    apply_update(&mut doc, update, false)?;
+                    if doc != before {
+                        modified_count += 1;
+                        let new_bytes =
+                            bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
                         if let Some(tree) = m.tree_mut(ns) {
                             tree.delete(&key)?;
                             tree.insert(&key, &new_bytes)?;
                         }
                     }
-                    DocBackend::Buffered(bp) => {
-                        // Maintain secondary indexes for the updated document.
+                }
+                Ok(UpdateResult {
+                    matched_count,
+                    modified_count,
+                    upserted_id: None,
+                })
+            }
+            DocBackend::Buffered(bp) => bp.with_txn(move |bp| {
+                let mut matched_count = 0u64;
+                let mut modified_count = 0u64;
+                for (key, mut doc) in pairs_to_process {
+                    matched_count += 1;
+                    let before = doc.clone();
+                    let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
+                    apply_update(&mut doc, update, false)?;
+                    if doc != before {
+                        modified_count += 1;
+                        let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+                        let new_bytes =
+                            bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
                         bp.maintain_secondary_on_update(
                             ns, &before, &doc, &before_id, &new_id,
                         )?;
@@ -1246,14 +1319,13 @@ impl StorageEngine for PagedEngine {
                         bp.sync_data_root(ns)?;
                     }
                 }
-            }
+                Ok(UpdateResult {
+                    matched_count,
+                    modified_count,
+                    upserted_id: None,
+                })
+            }),
         }
-
-        Ok(UpdateResult {
-            matched_count,
-            modified_count,
-            upserted_id: None,
-        })
     }
 
     // -----------------------------------------------------------------------
@@ -1291,23 +1363,25 @@ impl StorageEngine for PagedEngine {
 
         let deleted_count = pairs_to_delete.len() as u64;
 
-        for (key, doc) in &pairs_to_delete {
-            let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-            match &mut *inner {
-                DocBackend::Memory(m) => {
+        match &mut *inner {
+            DocBackend::Memory(m) => {
+                for (key, _doc) in &pairs_to_delete {
                     if let Some(tree) = m.tree_mut(ns) {
                         tree.delete(key)?;
                     }
                 }
-                DocBackend::Buffered(bp) => {
-                    // Maintain secondary indexes before removing from data tree.
+            }
+            DocBackend::Buffered(bp) => bp.with_txn(move |bp| {
+                for (key, doc) in &pairs_to_delete {
+                    let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
                     bp.maintain_secondary_on_delete(ns, doc, &doc_id)?;
                     if let Some(tree) = bp.tree_mut(ns)? {
                         tree.delete(key)?;
                     }
                     bp.sync_data_root(ns)?;
                 }
-            }
+                Ok(())
+            })?,
         }
 
         Ok(DeleteResult { deleted_count })
@@ -1405,14 +1479,15 @@ impl StorageEngine for PagedEngine {
                     tree.insert(&key, &new_bytes)?;
                 }
             }
-            DocBackend::Buffered(bp) => {
+            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                 bp.maintain_secondary_on_update(ns, &before, &doc, &before_id, &new_id)?;
                 if let Some(tree) = bp.tree_mut(ns)? {
                     tree.delete(&key)?;
                     tree.insert(&key, &new_bytes)?;
                 }
                 bp.sync_data_root(ns)?;
-            }
+                Ok(())
+            })?,
         }
 
         Ok(Some(match opts.return_document {
@@ -1462,13 +1537,14 @@ impl StorageEngine for PagedEngine {
                     tree.delete(&key)?;
                 }
             }
-            DocBackend::Buffered(bp) => {
+            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                 bp.maintain_secondary_on_delete(ns, &doc, &doc_id)?;
                 if let Some(tree) = bp.tree_mut(ns)? {
                     tree.delete(&key)?;
                 }
                 bp.sync_data_root(ns)?;
-            }
+                Ok(())
+            })?,
         }
 
         Ok(Some(doc))
@@ -1540,7 +1616,7 @@ impl StorageEngine for PagedEngine {
                     tree.insert(&new_key, &new_bytes)?;
                 }
             }
-            DocBackend::Buffered(bp) => {
+            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                 bp.maintain_secondary_on_update(
                     ns,
                     &old_doc,
@@ -1553,7 +1629,8 @@ impl StorageEngine for PagedEngine {
                     tree.insert(&new_key, &new_bytes)?;
                 }
                 bp.sync_data_root(ns)?;
-            }
+                Ok(())
+            })?,
         }
 
         Ok(Some(match opts.return_document {
@@ -1740,7 +1817,7 @@ impl StorageEngine for PagedEngine {
                 }
                 Ok(())
             }
-            DocBackend::Buffered(bp) => {
+            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                 if bp.catalog.get_collection(ns)?.is_some() {
                     return Ok(());
                 }
@@ -1758,7 +1835,7 @@ impl StorageEngine for PagedEngine {
                 let id_store = bp.new_store();
                 BTree::create_at(id_store, id_root)?;
                 Ok(())
-            }
+            }),
         }
     }
 
@@ -1774,7 +1851,7 @@ impl StorageEngine for PagedEngine {
                 m.collections.remove(ns);
                 Ok(())
             }
-            DocBackend::Buffered(bp) => {
+            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                 // Collect page-root info from the catalog before removing entries.
                 // We need this to free the B+ tree pages after the catalog entries
                 // are gone (catalog.drop_collection removes both the collection and
@@ -1823,7 +1900,7 @@ impl StorageEngine for PagedEngine {
                 }
 
                 Ok(())
-            }
+            }),
         }
     }
 
@@ -1898,12 +1975,13 @@ impl PagedEngine {
                     btree_insert_doc(tree, &mut new_doc, &[])?;
                     ensure_id(&mut new_doc)
                 }
-                DocBackend::Buffered(bp) => {
+                DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                     let tree = bp.tree_or_create(ns)?;
                     let id = btree_insert_doc(tree, &mut new_doc, &[])?;
                     bp.sync_data_root(ns)?;
-                    id
-                }
+                    bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
+                    Ok(id)
+                })?,
             }
         };
         Ok(UpdateResult {
@@ -1923,7 +2001,6 @@ impl PagedEngine {
     ) -> Result<Option<Document>> {
         let mut new_doc = upsert_base_from_filter(filter);
         apply_update(&mut new_doc, update, true)?;
-        let inserted = new_doc.clone();
         {
             let mut inner = self.inner.write().unwrap();
             match &mut *inner {
@@ -1931,16 +2008,18 @@ impl PagedEngine {
                     let tree = m.tree_or_create(ns)?;
                     btree_insert_doc(tree, &mut new_doc, &[])?;
                 }
-                DocBackend::Buffered(bp) => {
+                DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                     let tree = bp.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?;
+                    let id = btree_insert_doc(tree, &mut new_doc, &[])?;
                     bp.sync_data_root(ns)?;
-                }
+                    bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
+                    Ok(())
+                })?,
             }
         }
         Ok(match opts.return_document {
             ReturnDocument::Before => None,
-            ReturnDocument::After => Some(inserted),
+            ReturnDocument::After => Some(new_doc),
         })
     }
 
@@ -1952,7 +2031,6 @@ impl PagedEngine {
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
         let mut new_doc = replacement.clone();
-        let inserted = new_doc.clone();
         {
             let mut inner = self.inner.write().unwrap();
             match &mut *inner {
@@ -1960,16 +2038,18 @@ impl PagedEngine {
                     let tree = m.tree_or_create(ns)?;
                     btree_insert_doc(tree, &mut new_doc, &[])?;
                 }
-                DocBackend::Buffered(bp) => {
+                DocBackend::Buffered(bp) => bp.with_txn(|bp| {
                     let tree = bp.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?;
+                    let id = btree_insert_doc(tree, &mut new_doc, &[])?;
                     bp.sync_data_root(ns)?;
-                }
+                    bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
+                    Ok(())
+                })?,
             }
         }
         Ok(match opts.return_document {
             ReturnDocument::Before => None,
-            ReturnDocument::After => Some(inserted),
+            ReturnDocument::After => Some(new_doc),
         })
     }
 }

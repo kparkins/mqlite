@@ -250,6 +250,28 @@ impl Partition {
         Ok(())
     }
 
+    /// Discard all dirty, unpinned frames without writing them to disk.
+    ///
+    /// Used by the WAL rollback path: frames written during an aborted
+    /// transaction must be evicted so subsequent reads fetch clean data from
+    /// the WAL/file rather than seeing partial writes.
+    fn drop_dirty_unpinned(&mut self) {
+        let mut to_drop = Vec::new();
+        for slot in self.frames.iter() {
+            if let Some(frame) = slot {
+                if frame.dirty && frame.pin_count == 0 {
+                    to_drop.push(frame.page_number);
+                }
+            }
+        }
+        for pn in to_drop {
+            if let Some(&idx) = self.page_map.get(&pn) {
+                self.frames[idx] = None;
+                self.page_map.remove(&pn);
+            }
+        }
+    }
+
     /// Return a raw mutable pointer to the frame's data buffer.
     ///
     /// # Safety
@@ -451,6 +473,25 @@ impl BufferPool {
             .lock()
             .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
             .flush_all(self.io.as_ref(), PageSize::Large32k)?;
+
+        Ok(())
+    }
+
+    /// Discard all dirty, unpinned frames in both partitions without writing
+    /// them to disk.
+    ///
+    /// Called by the WAL rollback path after [`WalManager::truncate_to`] so
+    /// that stale in-memory writes are not mistaken for committed data.
+    pub(crate) fn drop_all_dirty(&self) -> Result<()> {
+        self.inner_4k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
+            .drop_dirty_unpinned();
+
+        self.inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
+            .drop_dirty_unpinned();
 
         Ok(())
     }

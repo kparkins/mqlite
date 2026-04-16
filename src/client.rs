@@ -41,6 +41,7 @@ use crate::{
         paged_engine::PagedEngine,
     },
     storage_engine::StorageEngine,
+    wal::{WalLayeredSource, WalManager},
 };
 
 // ---------------------------------------------------------------------------
@@ -192,6 +193,15 @@ pub(crate) struct ClientInner {
     pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
     /// Storage engine.  All CRUD operations are dispatched through this trait.
     pub(crate) engine: Box<dyn StorageEngine>,
+    /// Dedicated file handle for WAL→main-file checkpoint I/O.
+    ///
+    /// Kept separate from `file_lock` to avoid the POSIX advisory-lock fd
+    /// sharing footgun: we never use this fd for locking, only for writing
+    /// checkpointed pages.  Both fds are closed together when `ClientInner`
+    /// is dropped, so the lock lifetime is unaffected.
+    ///
+    /// `None` for in-memory clients.
+    wal_main_file: Option<Arc<Mutex<std::fs::File>>>,
 }
 
 impl ClientInner {
@@ -203,6 +213,7 @@ impl ClientInner {
             file_lock,
             buffer_pool: None,
             engine: Box::new(PagedEngine::new()),
+            wal_main_file: None,
         }
     }
 
@@ -213,6 +224,7 @@ impl ClientInner {
         buffer_pool: Arc<BufferPoolHandle>,
         catalog_root_page: u32,
         catalog_root_level: u8,
+        wal_main_file: Option<Arc<Mutex<std::fs::File>>>,
     ) -> Result<Self> {
         let engine = PagedEngine::new_buffered(
             Arc::clone(&buffer_pool),
@@ -226,6 +238,7 @@ impl ClientInner {
             file_lock,
             buffer_pool: Some(buffer_pool),
             engine: Box::new(engine),
+            wal_main_file,
         })
     }
 }
@@ -595,11 +608,20 @@ impl ClientInner {
             return Ok(());
         }
 
-        // R1.2: Delegate to the engine's checkpoint, which flushes the buffer
-        // pool (all dirty B+ tree pages + updated file header) to disk.
-        // `snapshot_bytes()` returns `None` for the B+ tree engine; the legacy
-        // BSON-blob path is no longer used.
-        self.engine.checkpoint()
+        // Flush dirty buffer-pool pages (B+ tree nodes + file header) to the
+        // WAL (if attached) or directly to the main file (legacy path).
+        self.engine.checkpoint()?;
+
+        // WAL checkpoint: move all committed WAL frames into the main file
+        // and reset the WAL to empty.
+        if let (Some(bp), Some(wal_file_mutex)) = (&self.buffer_pool, &self.wal_main_file) {
+            let mut wal_file = wal_file_mutex
+                .lock()
+                .map_err(|_| Error::Internal("WAL main file mutex poisoned".into()))?;
+            bp.checkpoint_through_wal(&mut *wal_file)?;
+        }
+
+        Ok(())
     }
 
     /// Flush dirty pages to disk and, if configured for `FullSync`, call
@@ -612,8 +634,17 @@ impl ClientInner {
         if self.opts.durability != DurabilityMode::FullSync {
             return Ok(());
         }
-        // Flush all dirty pages to the OS page cache.
+        // Flush dirty pages to WAL (or directly to file on the non-WAL path).
         self.engine.checkpoint()?;
+        // WAL checkpoint: immediately move WAL frames into the main file so
+        // this write survives a process crash without relying on commit-frame
+        // recovery.  After this call the main file is complete and durable.
+        if let (Some(bp), Some(wal_file_mutex)) = (&self.buffer_pool, &self.wal_main_file) {
+            let mut wal_file = wal_file_mutex
+                .lock()
+                .map_err(|_| Error::Internal("WAL main file mutex poisoned".into()))?;
+            bp.checkpoint_through_wal(&mut *wal_file)?;
+        }
         // fsync: push OS page-cache to the storage device.
         self.file_lock.sync()
     }
@@ -651,10 +682,16 @@ impl ClientInner {
         // our checkpoint and copy.
         let _guard = self.acquire_writer_lock()?;
 
-        // Checkpoint: flush all dirty buffer-pool pages to the main database
-        // file.  After this, the on-disk file contains the complete committed
-        // state and is safe to copy.
+        // Checkpoint: flush dirty buffer-pool pages to the WAL, then move all
+        // WAL frames into the main file.  After this, the main file contains
+        // the complete committed state and is safe to copy.
         self.engine.checkpoint()?;
+        if let (Some(bp), Some(wal_file_mutex)) = (&self.buffer_pool, &self.wal_main_file) {
+            let mut wal_file = wal_file_mutex
+                .lock()
+                .map_err(|_| Error::Internal("WAL main file mutex poisoned".into()))?;
+            bp.checkpoint_through_wal(&mut *wal_file)?;
+        }
 
         // Determine the byte length of the database file.
         let file_size = std::fs::metadata(src_path)?.len();
@@ -866,11 +903,37 @@ impl Client {
         };
         let catalog_root_page = file_header.catalog_root_page;
         let catalog_root_level = file_header.catalog_root_level;
-        let pool = Arc::new(BufferPool::new(
-            opts.buffer_pool_size,
-            Box::new(FilePageSource::new(Arc::clone(&file_lock))),
+
+        // Open a dedicated file handle for WAL checkpoint I/O.  This fd is
+        // never used for advisory locking — only for writing checkpointed
+        // pages back to the main file.  Both fds live for the same duration
+        // as ClientInner so the advisory lock lifetime is unaffected.
+        let mut wal_io_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(Error::Io)?;
+
+        let wal = Arc::new(Mutex::new(WalManager::open_or_create(
+            &path,
+            &file_header,
+            &mut wal_io_file,
+        )?));
+
+        let file_src = Arc::new(FilePageSource::new(Arc::clone(&file_lock)));
+        let layered_source: Box<dyn crate::storage::buffer_pool::PageSource> =
+            Box::new(WalLayeredSource::new(
+                Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,
+                Arc::clone(&wal),
+            ));
+        let pool = Arc::new(BufferPool::new(opts.buffer_pool_size, layered_source));
+        let wal_main_file = Arc::new(Mutex::new(wal_io_file));
+        let buffer_pool = Arc::new(BufferPoolHandle::with_wal(
+            pool,
+            file_header,
+            wal,
+            Arc::clone(&wal_main_file),
         ));
-        let buffer_pool = Arc::new(BufferPoolHandle::new(pool, file_header));
 
         let inner = Arc::new(ClientInner::new_with_buffer_pool(
             Some(path.clone()),
@@ -879,6 +942,7 @@ impl Client {
             buffer_pool,
             catalog_root_page,
             catalog_root_level,
+            Some(wal_main_file),
         )?);
         let _ = file_size; // used above, suppress warning
         #[cfg(feature = "tracing")]

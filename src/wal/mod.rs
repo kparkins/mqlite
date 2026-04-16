@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
+use crate::storage::page::PAGE_SIZE_LEAF;
 
 use self::shm::ShmIndex;
 use self::wal_file::{
@@ -789,10 +790,13 @@ pub(crate) fn shm_path_for(db_path: &Path) -> PathBuf {
 pub(crate) fn write_page_to_main(
     main_file: &mut File,
     page_number: u32,
-    page_size_bytes: usize,
+    _page_size_bytes: usize,
     page_data: &[u8],
 ) -> Result<()> {
-    let offset = page_number as u64 * page_size_bytes as u64;
+    // The main file uses a uniform 32 KB slot for every page regardless of its
+    // actual size (4 KB internal nodes or 32 KB leaf/overflow pages).  Using
+    // `page_size_bytes` as the stride would write 4 KB pages at wrong offsets.
+    let offset = page_number as u64 * PAGE_SIZE_LEAF as u64;
     main_file.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
     main_file.write_all(page_data).map_err(Error::Io)?;
     Ok(())
@@ -964,8 +968,8 @@ mod tests {
 
         mgr.checkpoint(&mut main_file, &mut header).unwrap();
 
-        // Verify: page 2 in main file should now contain the data.
-        let offset = 2u64 * PAGE_SIZE_INTERNAL as u64;
+        // Verify: page 2 in main file at the uniform 32 KB slot offset.
+        let offset = 2u64 * PAGE_SIZE_LEAF as u64;
         main_file.seek(SeekFrom::Start(offset)).unwrap();
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
         main_file.read_exact(&mut buf).unwrap();
@@ -1022,16 +1026,16 @@ mod tests {
             .unwrap();
         let mgr2 = WalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
 
-        // Both pages should have been replayed into main file.
+        // Both pages should have been replayed into main file at 32 KB slots.
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
         main_file2
-            .seek(SeekFrom::Start(1 * PAGE_SIZE_INTERNAL as u64))
+            .seek(SeekFrom::Start(1 * PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 0xAA, "page 1 should be replayed");
 
         main_file2
-            .seek(SeekFrom::Start(2 * PAGE_SIZE_INTERNAL as u64))
+            .seek(SeekFrom::Start(2 * PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 0xBB, "page 2 should be replayed");
@@ -1064,10 +1068,10 @@ mod tests {
             .unwrap();
         let mgr2 = WalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
 
-        // Page 1 (committed) should be in main file.
+        // Page 1 (committed) should be in main file at the 32 KB slot offset.
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
         main_file2
-            .seek(SeekFrom::Start(1 * PAGE_SIZE_INTERNAL as u64))
+            .seek(SeekFrom::Start(1 * PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 0xCC, "committed page must be present");
