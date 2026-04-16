@@ -159,6 +159,7 @@ pub(crate) fn internal_page_checksum(page: &[u8; PAGE_SIZE_INTERNAL as usize]) -
 ///
 /// Returns `Err` if the stored checksum at offset 4–7 does not match the
 /// checksum computed from the page contents.
+#[allow(dead_code)]
 pub(crate) fn verify_internal_page_checksum(
     page: &[u8; PAGE_SIZE_INTERNAL as usize],
 ) -> Result<()> {
@@ -269,6 +270,7 @@ impl LeafPageHeader {
     }
 
     /// Returns `true` if the [`LEAF_FLAG_HAS_OVERFLOW`] flag is set.
+    #[allow(dead_code)]
     pub(crate) fn has_overflow(&self) -> bool {
         self.flags & LEAF_FLAG_HAS_OVERFLOW != 0
     }
@@ -284,6 +286,7 @@ pub(crate) fn leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> u32 {
 }
 
 /// Verify the CRC32C checksum stored in a leaf page.
+#[allow(dead_code)]
 pub(crate) fn verify_leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()> {
     let header = LeafPageHeader::from_bytes(page)?;
     let computed = leaf_page_checksum(page);
@@ -388,6 +391,7 @@ pub(crate) fn overflow_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> u3
 }
 
 /// Verify the CRC32C checksum stored in an overflow page.
+#[allow(dead_code)]
 pub(crate) fn verify_overflow_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()> {
     let header = OverflowPageHeader::from_bytes(page)?;
     let computed = overflow_page_checksum(page);

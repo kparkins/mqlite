@@ -97,9 +97,6 @@
 //! - **Wire protocol**: no authentication in Phase 1 — bind to `127.0.0.1` only;
 //!   see the [Wire Protocol Security Advisory](https://github.com/kyleparkinson/mqlite/blob/master/docs/WIRE-SECURITY.md)
 
-// Lint policy: deny common footguns that indicate implementation errors.
-// Unwrap-used is left as a warning (not deny) because stub implementations use it during
-// Phase 0 and early Phase 1. It will be escalated to deny before Phase 1 ships.
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used)]
 
@@ -129,27 +126,22 @@ pub mod options;
 pub mod results;
 
 // Internal modules (not public API)
-mod engine;
 mod query;
 mod storage;
 mod storage_engine;
 mod update_operators;
 mod validation;
-// Phase 1: WAL module — not yet wired into the main read/write paths.
 #[allow(dead_code)]
 mod wal;
 
-// Crash recovery testing (hq-ele): 500 cycles, 10 scenarios.
 // Unix-only; accesses pub(crate) WAL internals.
 #[cfg(all(test, unix))]
 mod crash_recovery_tests;
 
-// Crash recovery through the public API (hq-n9ci): R3.2.
 // Unix-only; uses fork()/SIGKILL/pipe for process-crash simulation.
 #[cfg(all(test, unix))]
 mod crash_recovery_public_api_tests;
 
-// Native API compatibility and persistence tests (hq-2yk).
 #[cfg(test)]
 mod compat_tests;
 

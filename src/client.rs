@@ -167,7 +167,6 @@ fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
 /// [`PagedEngine`] in Phase 1, but `ClientInner` never knows this.  This
 /// abstraction lets future phases swap in a different engine without changing
 /// the public API layer.
-#[allow(dead_code)]
 pub(crate) struct ClientInner {
     /// Path to the database file. `None` for in-memory databases.
     pub path: Option<PathBuf>,
@@ -189,7 +188,6 @@ pub(crate) struct ClientInner {
     /// Buffer pool handle — file I/O infrastructure wired in by R1.1.
     ///
     /// `None` for in-memory clients.  File-backed clients always have `Some`.
-    /// R1.2+ beads use this to route B+ tree operations through the pool.
     #[allow(dead_code)]
     pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
     /// Storage engine.  All CRUD operations are dispatched through this trait.

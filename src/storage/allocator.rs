@@ -365,6 +365,7 @@ impl AllocatorHandle {
     ///
     /// The closure receives a shared reference to the header; its return
     /// value is returned from this method.
+    #[allow(dead_code)]
     pub(crate) fn with_header<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&FileHeader) -> R,
@@ -419,6 +420,7 @@ impl AllocatorHandle {
 
     /// Return `true` if the in-memory header has been modified since the
     /// last [`flush_header`](Self::flush_header) call.
+    #[allow(dead_code)]
     pub(crate) fn is_header_dirty(&self) -> bool {
         self.state.lock().map(|s| s.header_dirty).unwrap_or(false)
     }

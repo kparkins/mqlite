@@ -626,6 +626,7 @@ impl<S: BTreePageStore> Catalog<S> {
 ///
 /// Useful for tests and for building the catalog before wiring it to a
 /// file-backed store.
+#[allow(dead_code)]
 pub(crate) fn new_mem_catalog() -> Result<Catalog<MemPageStore>> {
     Catalog::create(MemPageStore::new())
 }
@@ -643,6 +644,7 @@ pub(crate) fn new_mem_catalog() -> Result<Catalog<MemPageStore>> {
 /// verify its CRC32C checksum.
 ///
 /// If both roots are 0 (new database), a fresh catalog is created.
+#[allow(dead_code)]
 pub(crate) fn open_with_fallback<S, F>(
     store: S,
     primary_root: u32,

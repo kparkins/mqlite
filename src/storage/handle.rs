@@ -228,6 +228,7 @@ impl BufferPoolHandle {
     }
 
     /// Borrow the underlying [`BufferPool`].
+    #[allow(dead_code)]
     pub(crate) fn pool(&self) -> &Arc<BufferPool> {
         &self.pool
     }

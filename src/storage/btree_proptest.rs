@@ -1,4 +1,4 @@
-// Property-based tests for all 10 B+ tree invariants (Phase 1a, hq-21b).
+// Property-based tests for all 10 B+ tree invariants.
 //
 // Uses proptest to generate random sequences of Insert / Delete operations,
 // then verifies every structural invariant after the final state is reached.

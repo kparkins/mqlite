@@ -1,4 +1,4 @@
-//! Native API compatibility and persistence tests (hq-2yk).
+//! Native API compatibility and persistence tests.
 //!
 //! Implements the 6 test suites specified in `integration.md` Phase A:
 //!

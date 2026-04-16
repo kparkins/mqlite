@@ -93,7 +93,6 @@ unsafe impl<T: Send> Send for Cursor<T> {}
 // field opts out of the auto-Sync derivation, so no explicit `impl !Sync` is
 // needed (negative impls require `#![feature(negative_impls)]`).
 
-#[allow(dead_code)] // Phase 0: constructors used by storage engine (Phase 1)
 impl<T> Cursor<T> {
     /// Create a cursor over a pre-loaded set of documents.
     ///
@@ -111,51 +110,6 @@ impl<T> Cursor<T> {
             _phantom: std::marker::PhantomData,
             _not_sync: std::marker::PhantomData,
             done: false,
-            plan,
-        }
-    }
-
-    /// Create a cursor backed by an index scan.
-    ///
-    /// `docs` are the final result documents (after applying the full filter,
-    /// sort, skip, limit, and projection).  `docs_examined` is the number of
-    /// documents examined during the index pre-filter step — typically smaller
-    /// than the total collection size.
-    ///
-    /// `index_name` is the name of the index that was used (e.g. `"email_1"`).
-    pub(crate) fn new_index_scan(
-        docs: Vec<Document>,
-        docs_examined: u64,
-        index_name: String,
-    ) -> Self {
-        let plan = ExplainResult {
-            plan: format!("IXSCAN {{ {} }}", index_name),
-            index_used: Some(index_name),
-            docs_examined,
-            full_scan: false,
-        };
-        Cursor {
-            buffer: std::collections::VecDeque::from(docs),
-            _phantom: std::marker::PhantomData,
-            _not_sync: std::marker::PhantomData,
-            done: false,
-            plan,
-        }
-    }
-
-    /// Create an empty cursor (no documents, collection was not found).
-    pub(crate) fn empty() -> Self {
-        let plan = ExplainResult {
-            plan: "COLLSCAN".to_owned(),
-            index_used: None,
-            docs_examined: 0,
-            full_scan: true,
-        };
-        Cursor {
-            buffer: std::collections::VecDeque::new(),
-            _phantom: std::marker::PhantomData,
-            _not_sync: std::marker::PhantomData,
-            done: true,
             plan,
         }
     }

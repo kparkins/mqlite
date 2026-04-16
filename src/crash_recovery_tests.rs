@@ -1,4 +1,4 @@
-//! Crash Recovery Testing — 500 cycles, 10 scenarios (hq-ele)
+//! Crash Recovery Testing — 500 cycles, 10 scenarios.
 //!
 //! Implements Jepsen-style crash injection against the mqlite WAL layer.
 //! For each cycle the test:

@@ -72,6 +72,7 @@ impl BufferPoolPageStore {
     }
 
     /// Borrow the underlying [`BufferPoolHandle`].
+    #[allow(dead_code)]
     pub(crate) fn handle(&self) -> &Arc<BufferPoolHandle> {
         &self.handle
     }

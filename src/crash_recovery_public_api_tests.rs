@@ -1,4 +1,4 @@
-//! Crash recovery through the public API — R3.2 (hq-n9ci)
+//! Crash recovery through the public API.
 //!
 //! Verifies that data inserted via [`Client::open_with_options`] in
 //! [`DurabilityMode::FullSync`] mode survives a process crash (SIGKILL) that

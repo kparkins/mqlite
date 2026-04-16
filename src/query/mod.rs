@@ -3,12 +3,9 @@
 //! This is a private internal module. The public API is exposed through
 //! [`Collection`](crate::collection::Collection).
 //!
-//! Phase 1 implementation:
-//! - hq-apk: BSON key encoding (MongoDB comparison ordering)
-//! - hq-mx1: Error taxonomy and MongoDB error code mapping
-//! - hq-uii: Filter evaluation engine (comparison, logical, element operators)
-//! - hq-ca5: Array operators ($elemMatch, $all, $size) and evaluation ($regex)
-//! - hq-1gt: Query planner (index selection, sort, projection)
+//! Provides BSON key encoding (MongoDB comparison ordering), error mapping,
+//! filter evaluation (comparison, logical, element, array operators, `$regex`),
+//! and query planning (index selection, sort, projection).
 
 mod filter;
 pub(crate) mod planner;
