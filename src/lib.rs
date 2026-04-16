@@ -145,6 +145,9 @@ mod crash_recovery_public_api_tests;
 #[cfg(test)]
 mod compat_tests;
 
+#[cfg(test)]
+mod wal_atomicity_tests;
+
 // Wire protocol shim (feature-gated)
 #[cfg(feature = "wire")]
 pub mod wire;
