@@ -1798,6 +1798,14 @@ fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
             Err(_) => return err_bad_value("each index spec requires a \"key\" document"),
         };
 
+        // Reject manual creation of the _id_ index.
+        let is_id_key = key.len() == 1
+            && key.get_i32("_id").ok() == Some(1);
+        let is_id_name = spec.get_str("name").ok() == Some("_id_");
+        if is_id_key || is_id_name {
+            return err_bad_value("cannot manually create _id_ index");
+        }
+
         let mut opts = crate::options::IndexOptions::new();
         if let Ok(b) = spec.get_bool("unique") {
             opts = opts.unique(b);
@@ -1872,6 +1880,15 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
             }
             doc! { "ok": 1.0_f64 }
         }
+        Some(bson::Bson::String(name)) if name == "_id_" => {
+            // Reject attempts to drop the immutable _id_ index.
+            doc! {
+                "ok": 0.0_f64,
+                "errmsg": "cannot drop _id index",
+                "code": 27i32,
+                "codeName": "IndexNotFound",
+            }
+        }
         Some(bson::Bson::String(name)) => {
             // Drop a specific index by name.
             match state
@@ -1885,6 +1902,15 @@ fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
         Some(bson::Bson::Document(key_doc)) => {
             // Drop by key pattern — find the index whose key matches.
             let key_doc = key_doc.clone();
+            // Reject attempts to drop the immutable _id index by key pattern.
+            if key_doc == doc! { "_id": 1i32 } {
+                return doc! {
+                    "ok": 0.0_f64,
+                    "errmsg": "cannot drop _id index",
+                    "code": 27i32,
+                    "codeName": "IndexNotFound",
+                };
+            }
             let indexes = match state
                 .database
                 .list_indexes(&qualified_coll(body, &coll_name))
@@ -3796,6 +3822,32 @@ mod tests {
         assert_eq!(batch.len(), 1, "only _id_ should remain after drop *");
     }
 
+    #[test]
+    fn drop_indexes_rejects_id_index_by_name() {
+        let state = ServerState::default();
+        handle_create(&doc! { "create": "rejectidnamecoll", "$db": "local" }, &state);
+        let result = handle_drop_indexes(
+            &doc! { "dropIndexes": "rejectidnamecoll", "index": "_id_", "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 27);
+        assert_eq!(result.get_str("codeName").unwrap(), "IndexNotFound");
+    }
+
+    #[test]
+    fn drop_indexes_rejects_id_index_by_key_pattern() {
+        let state = ServerState::default();
+        handle_create(&doc! { "create": "rejectidkeycoll", "$db": "local" }, &state);
+        let result = handle_drop_indexes(
+            &doc! { "dropIndexes": "rejectidkeycoll", "index": {"_id": 1i32}, "$db": "local" },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(result.get_i32("code").unwrap(), 27);
+        assert_eq!(result.get_str("codeName").unwrap(), "IndexNotFound");
+    }
+
     // -----------------------------------------------------------------------
     // Full OP_MSG dispatch tests for new commands
     // -----------------------------------------------------------------------
@@ -3958,5 +4010,129 @@ mod tests {
             batch[1].as_document().unwrap().get_str("name").unwrap(),
             "name_1"
         );
+    }
+
+    #[test]
+    fn create_indexes_rejects_id_index_by_name() {
+        let state = ServerState::default();
+        let result = handle_create_indexes(
+            &doc! {
+                "createIndexes": "nameguardcoll",
+                "indexes": [{"key": {"x": 1i32}, "name": "_id_"}],
+                "$db": "local",
+            },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0, "{result:?}");
+        assert_eq!(result.get_i32("code").unwrap(), 2);
+        assert_eq!(result.get_str("codeName").unwrap(), "BadValue");
+    }
+
+    #[test]
+    fn create_indexes_rejects_id_index_by_key_pattern() {
+        let state = ServerState::default();
+        let result = handle_create_indexes(
+            &doc! {
+                "createIndexes": "keyguardcoll",
+                "indexes": [{"key": {"_id": 1i32}, "name": "idx"}],
+                "$db": "local",
+            },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 0.0, "{result:?}");
+        assert_eq!(result.get_i32("code").unwrap(), 2);
+        assert_eq!(result.get_str("codeName").unwrap(), "BadValue");
+    }
+
+    // T20 — dropIndexes "*" must not touch the synthetic _id_ entry reported
+    // by listIndexes. Post-Wave-1, the catalog no longer carries `_id_`, so
+    // the loop at the `*` branch of handle_drop_indexes simply won't see it
+    // when iterating list_indexes. The listIndexes handler still fabricates
+    // the `_id_` entry unconditionally.
+    #[test]
+    fn drop_indexes_star_does_not_touch_id_index() {
+        let state = ServerState::default();
+        // Create one user index alongside the implicit _id_ index.
+        handle_create_indexes(
+            &doc! {
+                "createIndexes": "starkeepidcoll",
+                "indexes": [{"key": {"x": 1i32}, "name": "x_1"}],
+                "$db": "local",
+            },
+            &state,
+        );
+
+        let drop_res = handle_drop_indexes(
+            &doc! { "dropIndexes": "starkeepidcoll", "index": "*", "$db": "local" },
+            &state,
+        );
+        assert_eq!(drop_res.get_f64("ok").unwrap(), 1.0, "{drop_res:?}");
+
+        let list_res = handle_list_indexes(
+            &doc! { "listIndexes": "starkeepidcoll", "$db": "local" },
+            &state,
+        );
+        let batch = list_res
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap();
+
+        // The user index must be gone.
+        assert!(
+            !batch.iter().any(|b| b.as_document().unwrap().get_str("name").unwrap() == "x_1"),
+            "user index x_1 should be dropped after '*'",
+        );
+
+        // The synthetic `_id_` entry must still appear (fabricated by the
+        // wire layer in handle_list_indexes regardless of catalog contents).
+        assert_eq!(batch.len(), 1, "only _id_ should remain");
+        let id_idx = batch[0].as_document().unwrap();
+        assert_eq!(id_idx.get_str("name").unwrap(), "_id_");
+        let key = id_idx.get_document("key").unwrap();
+        assert_eq!(key.get_i32("_id").unwrap(), 1);
+    }
+
+    // T21 — Lane 1 resolution test. Pre-cleanup, DocBackend::Buffered returned
+    // `_id_` from list_indexes while DocBackend::Memory did not — causing a
+    // `+1` offset in handle_create_indexes to double-count on Buffered.
+    // Post-cleanup both backends agree, and the numbers in createIndexes
+    // responses must match the Memory-backed test
+    // `create_indexes_returns_num_before_after` (before=1, after=2).
+    #[test]
+    fn create_indexes_numbers_correct_on_buffered_backend() {
+        use crate::client::Client;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("t21.mqlite");
+        let client = Client::open(&db_path).expect("open buffered client");
+
+        // Build ServerState manually to wire the file-backed Client's inner
+        // into the CRUD handlers (mirrors ServerState::new_with_db).
+        let state = ServerState {
+            start_time: Arc::new(std::time::Instant::now()),
+            next_connection_id: Arc::new(AtomicI32::new(1)),
+            db_path: Some(db_path),
+            topology_process_id: ObjectId::new(),
+            database: Arc::clone(&client.inner),
+        };
+
+        let result = handle_create_indexes(
+            &doc! {
+                "createIndexes": "bufnumcoll",
+                "indexes": [{
+                    "key": {"email": 1i32},
+                    "name": "email_1",
+                }],
+                "$db": "local",
+            },
+            &state,
+        );
+        assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+        // Before: 0 user indexes + 1 synthetic _id_ = 1.
+        assert_eq!(result.get_i32("numIndexesBefore").unwrap(), 1);
+        // After: 1 user index + 1 synthetic _id_ = 2.
+        assert_eq!(result.get_i32("numIndexesAfter").unwrap(), 2);
     }
 }

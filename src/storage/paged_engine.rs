@@ -520,7 +520,7 @@ impl BpBackend {
                 (entry.data_root_page, entry.data_root_level, false)
             } else {
                 // Lazily create the collection in the catalog.
-                let (data_root, _id_root) =
+                let data_root =
                     self.catalog
                         .create_collection(ns, bson::doc! {}, now_millis())?;
                 self.sync_catalog_root()?;
@@ -661,8 +661,6 @@ impl BpBackend {
     }
 
     /// Maintain all secondary indexes after a document insert.
-    ///
-    /// Skips the implicit `_id_` index (the data tree is already keyed by `_id`).
     fn maintain_secondary_on_insert(
         &mut self,
         ns: &str,
@@ -671,9 +669,6 @@ impl BpBackend {
     ) -> Result<()> {
         let entries = self.catalog.list_indexes(ns)?;
         for entry in entries {
-            if entry.name == "_id_" {
-                continue;
-            }
             let store = self.new_store();
             let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
             let is_multikey = update_index_on_insert(doc, doc_id, &mut idx_tree, &entry)?;
@@ -696,9 +691,6 @@ impl BpBackend {
     ) -> Result<()> {
         let entries = self.catalog.list_indexes(ns)?;
         for entry in entries {
-            if entry.name == "_id_" {
-                continue;
-            }
             let store = self.new_store();
             let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
             update_index_on_delete(doc, doc_id, &mut idx_tree, &entry)?;
@@ -723,9 +715,6 @@ impl BpBackend {
     ) -> Result<()> {
         let entries = self.catalog.list_indexes(ns)?;
         for entry in entries {
-            if entry.name == "_id_" {
-                continue;
-            }
             let store = self.new_store();
             let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
             let is_multikey =
@@ -867,7 +856,6 @@ impl BpBackend {
         }
         let index_metas: Vec<IndexMeta<'_>> = entries
             .iter()
-            .filter(|e| e.name != "_id_")
             .map(|e| IndexMeta {
                 name: &e.name,
                 keys: &e.key_pattern,
@@ -975,7 +963,6 @@ impl BpBackend {
         }
         let index_metas: Vec<IndexMeta<'_>> = entries
             .iter()
-            .filter(|e| e.name != "_id_")
             .map(|e| IndexMeta {
                 name: &e.name,
                 keys: &e.key_pattern,
@@ -1670,16 +1657,14 @@ impl StorageEngine for PagedEngine {
             DocBackend::Buffered(bp) => {
                 // Ensure the collection exists in the catalog first.
                 if bp.catalog.get_collection(ns)?.is_none() {
-                    let (data_root, id_root) = bp
+                    let data_root = bp
                         .catalog
                         .create_collection(ns, bson::doc! {}, now_millis())?;
                     bp.sync_catalog_root()?;
-                    // Initialise both allocated tree pages so they have valid headers.
+                    // Initialise the data tree leaf page so it has a valid header.
                     let data_store = bp.new_store();
                     let data_tree = BTree::create_at(data_store, data_root)?;
                     bp.data_trees.insert(ns.to_owned(), data_tree);
-                    let id_store = bp.new_store();
-                    BTree::create_at(id_store, id_root)?;
                 }
                 // Idempotent: return existing index name.
                 if bp.catalog.get_index(ns, &name)?.is_some() {
@@ -1731,6 +1716,11 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn drop_index(&self, ns: &str, name: &str) -> Result<()> {
+        if name == "_id_" {
+            return Err(Error::InvalidWireMessage {
+                detail: "drop of '_id_' index is not permitted".to_string(),
+            });
+        }
         let mut inner = self.inner.write().unwrap();
         match &mut *inner {
             DocBackend::Memory(m) => {
@@ -1821,7 +1811,7 @@ impl StorageEngine for PagedEngine {
                 if bp.catalog.get_collection(ns)?.is_some() {
                     return Ok(());
                 }
-                let (data_root, id_root) =
+                let data_root =
                     bp.catalog
                         .create_collection(ns, bson::doc! {}, now_millis())?;
                 bp.sync_catalog_root()?;
@@ -1829,11 +1819,6 @@ impl StorageEngine for PagedEngine {
                 let store = bp.new_store();
                 let tree = BTree::create_at(store, data_root)?;
                 bp.data_trees.insert(ns.to_owned(), tree);
-                // Initialise the _id index leaf page so it has a valid header.
-                // We do not cache index trees, but the page must be written
-                // before it can be parsed (e.g., during drop_namespace page freeing).
-                let id_store = bp.new_store();
-                BTree::create_at(id_store, id_root)?;
                 Ok(())
             }),
         }

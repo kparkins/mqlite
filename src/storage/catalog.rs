@@ -349,15 +349,16 @@ impl<S: BTreePageStore> Catalog<S> {
     // Collection operations
     // -----------------------------------------------------------------------
 
-    /// Insert a collection entry and its default `_id` index entry.
+    /// Insert a collection entry into the catalog.
     ///
-    /// Allocates root pages for both the collection data tree and the `_id`
-    /// index tree using `alloc_leaf` on the provided `store`.  The caller is
-    /// responsible for persisting the updated catalog root (and any new page
-    /// count) to the file header.
+    /// Allocates a root page for the collection data tree using `alloc_leaf`
+    /// on the provided `store`.  The caller is responsible for persisting the
+    /// updated catalog root (and any new page count) to the file header.
     ///
-    /// Returns `(data_root_page, id_index_root_page)` so the caller can store
-    /// them wherever needed.
+    /// The `_id_` index is no longer pre-allocated here; it is synthesised
+    /// at the wire layer on demand (see `handle_list_indexes`).
+    ///
+    /// Returns `data_root_page` so the caller can initialise the data tree.
     ///
     /// # Errors
     ///
@@ -367,7 +368,7 @@ impl<S: BTreePageStore> Catalog<S> {
         name: &str,
         options: Document,
         now_millis: i64,
-    ) -> Result<(u32, u32)> {
+    ) -> Result<u32> {
         // Reject if already present.
         let coll_key = collection_key(name);
         if self.tree.search(&coll_key)?.is_some() {
@@ -376,9 +377,8 @@ impl<S: BTreePageStore> Catalog<S> {
             });
         }
 
-        // Allocate root pages for the data B+ tree and the _id index B+ tree.
+        // Allocate a root page for the data B+ tree.
         let data_root_page = self.tree.store.alloc_leaf()?;
-        let id_root_page = self.tree.store.alloc_leaf()?;
 
         // Insert collection entry.
         let coll_entry = CollectionEntry {
@@ -393,23 +393,7 @@ impl<S: BTreePageStore> Catalog<S> {
         let coll_bytes = coll_entry.to_bson_bytes()?;
         self.tree.insert(&coll_key, &coll_bytes)?;
 
-        // Insert _id index entry.
-        let id_key = index_key(name, "_id_");
-        let id_entry = IndexEntry {
-            name: "_id_".to_owned(),
-            collection: name.to_owned(),
-            root_page: id_root_page,
-            root_level: 0,
-            key_pattern: doc! { "_id": 1 },
-            unique: true,
-            sparse: false,
-            multikey: false,
-            entry_count: 0,
-        };
-        let id_bytes = id_entry.to_bson_bytes()?;
-        self.tree.insert(&id_key, &id_bytes)?;
-
-        Ok((data_root_page, id_root_page))
+        Ok(data_root_page)
     }
 
     /// Remove a collection entry and **all** of its index entries.
@@ -809,26 +793,19 @@ mod tests {
     }
 
     #[test]
-    fn create_collection_allocates_data_and_id_root_pages() {
+    fn create_collection_allocates_data_root_page() {
         let mut cat = make_catalog();
-        let (data_page, id_page) = cat.create_collection("users", doc! {}, now()).unwrap();
+        let data_page = cat.create_collection("users", doc! {}, now()).unwrap();
         assert!(data_page > 0, "data root page must be > 0");
-        assert!(id_page > 0, "id index root page must be > 0");
-        assert_ne!(data_page, id_page, "pages must be distinct");
     }
 
     #[test]
-    fn create_collection_creates_id_index_entry() {
+    fn create_collection_does_not_create_id_index_entry() {
         let mut cat = make_catalog();
         cat.create_collection("users", doc! {}, now()).unwrap();
 
-        let idx = cat
-            .get_index("users", "_id_")
-            .unwrap()
-            .expect("_id_ index must exist");
-        assert_eq!(idx.name, "_id_");
-        assert!(idx.unique);
-        assert_eq!(idx.key_pattern, doc! { "_id": 1 });
+        let idx = cat.get_index("users", "_id_").unwrap();
+        assert!(idx.is_none(), "_id_ index must not exist");
     }
 
     #[test]
@@ -921,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn list_indexes_includes_id_and_user_indexes() {
+    fn list_indexes_returns_only_user_indexes() {
         let mut cat = make_catalog();
         cat.create_collection("users", doc! {}, now()).unwrap();
         cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
@@ -935,11 +912,9 @@ mod tests {
             .into_iter()
             .map(|e| e.name)
             .collect();
-        // _id_ sorts before age and email (underscore < letters in ASCII)
-        assert!(names.contains(&"_id_".to_owned()));
         assert!(names.contains(&"email_1".to_owned()));
         assert!(names.contains(&"age_-1".to_owned()));
-        assert_eq!(names.len(), 3);
+        assert_eq!(names.len(), 2);
     }
 
     #[test]
