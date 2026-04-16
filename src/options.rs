@@ -151,7 +151,7 @@ impl OpenOptions {
 /// Options for `find` and `find_one` operations.
 /// All fields are optional — omit to use defaults.
 #[derive(Debug, Clone, Default)]
-pub struct FindOptions {
+pub(crate) struct FindOptions {
     /// Sort order. Documents are returned in insertion order if not specified.
     pub sort: Option<Document>,
     /// Maximum number of documents to return.
@@ -164,66 +164,16 @@ pub struct FindOptions {
     pub batch_size: Option<u32>,
 }
 
-impl FindOptions {
-    /// Create default `FindOptions`.
-    pub fn new() -> Self {
-        FindOptions::default()
-    }
-
-    /// Set the sort order for results.
-    pub fn sort(mut self, sort: Document) -> Self {
-        self.sort = Some(sort);
-        self
-    }
-
-    /// Maximum number of documents to return.
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Number of documents to skip before returning results.
-    pub fn skip(mut self, skip: u64) -> Self {
-        self.skip = Some(skip);
-        self
-    }
-
-    /// Projection document specifying fields to include or exclude.
-    pub fn projection(mut self, projection: Document) -> Self {
-        self.projection = Some(projection);
-        self
-    }
-
-    /// Number of documents to fetch per internal batch.
-    pub fn batch_size(mut self, batch_size: u32) -> Self {
-        self.batch_size = Some(batch_size);
-        self
-    }
-}
-
 /// Options for `update_one` and `update_many` operations.
 #[derive(Debug, Clone, Default)]
-pub struct UpdateOptions {
+pub(crate) struct UpdateOptions {
     /// If true, insert a new document when no document matches the filter.
     pub upsert: bool,
 }
 
-impl UpdateOptions {
-    /// Create default `UpdateOptions`.
-    pub fn new() -> Self {
-        UpdateOptions::default()
-    }
-
-    /// Set whether to upsert (insert if no match).
-    pub fn upsert(mut self, upsert: bool) -> Self {
-        self.upsert = upsert;
-        self
-    }
-}
-
 /// Options for `insert_many` operations.
 #[derive(Debug, Clone)]
-pub struct InsertManyOptions {
+pub(crate) struct InsertManyOptions {
     /// If `true` (default), stop at the first error. If `false`, attempt all documents
     /// and collect all errors.
     pub ordered: bool,
@@ -232,22 +182,6 @@ pub struct InsertManyOptions {
 impl Default for InsertManyOptions {
     fn default() -> Self {
         InsertManyOptions { ordered: true }
-    }
-}
-
-impl InsertManyOptions {
-    /// Create default `InsertManyOptions` (ordered = true).
-    pub fn new() -> Self {
-        InsertManyOptions::default()
-    }
-
-    /// Set whether inserts should stop on the first error.
-    ///
-    /// `true` (default): stop on first error, report successes so far + the first error.
-    /// `false`: attempt all documents, collect all errors.
-    pub fn ordered(mut self, ordered: bool) -> Self {
-        self.ordered = ordered;
-        self
     }
 }
 
@@ -304,7 +238,7 @@ pub enum ReturnDocument {
 
 /// Options for `find_one_and_update` operations.
 #[derive(Debug, Clone, Default)]
-pub struct FindOneAndUpdateOptions {
+pub(crate) struct FindOneAndUpdateOptions {
     /// Which version of the document to return. Default: [`ReturnDocument::Before`].
     pub return_document: ReturnDocument,
     /// If `true`, insert a new document when no document matches the filter. Default: false.
@@ -313,54 +247,16 @@ pub struct FindOneAndUpdateOptions {
     pub sort: Option<Document>,
 }
 
-impl FindOneAndUpdateOptions {
-    /// Create default `FindOneAndUpdateOptions`.
-    pub fn new() -> Self {
-        FindOneAndUpdateOptions::default()
-    }
-
-    /// Set the return-document policy.
-    pub fn return_document(mut self, rd: ReturnDocument) -> Self {
-        self.return_document = rd;
-        self
-    }
-
-    /// Set whether to upsert when no document matches.
-    pub fn upsert(mut self, upsert: bool) -> Self {
-        self.upsert = upsert;
-        self
-    }
-
-    /// Set the sort order used to pick a document when multiple match.
-    pub fn sort(mut self, sort: Document) -> Self {
-        self.sort = Some(sort);
-        self
-    }
-}
-
 /// Options for `find_one_and_delete` operations.
 #[derive(Debug, Clone, Default)]
-pub struct FindOneAndDeleteOptions {
+pub(crate) struct FindOneAndDeleteOptions {
     /// Sort order — determines which document to delete when multiple match.
     pub sort: Option<Document>,
 }
 
-impl FindOneAndDeleteOptions {
-    /// Create default `FindOneAndDeleteOptions`.
-    pub fn new() -> Self {
-        FindOneAndDeleteOptions::default()
-    }
-
-    /// Set the sort order used to pick a document when multiple match.
-    pub fn sort(mut self, sort: Document) -> Self {
-        self.sort = Some(sort);
-        self
-    }
-}
-
 /// Options for `find_one_and_replace` operations.
 #[derive(Debug, Clone, Default)]
-pub struct FindOneAndReplaceOptions {
+pub(crate) struct FindOneAndReplaceOptions {
     /// Which version of the document to return. Default: [`ReturnDocument::Before`].
     pub return_document: ReturnDocument,
     /// If `true`, insert a new document when no document matches the filter. Default: false.
@@ -369,27 +265,3 @@ pub struct FindOneAndReplaceOptions {
     pub sort: Option<Document>,
 }
 
-impl FindOneAndReplaceOptions {
-    /// Create default `FindOneAndReplaceOptions`.
-    pub fn new() -> Self {
-        FindOneAndReplaceOptions::default()
-    }
-
-    /// Set the return-document policy.
-    pub fn return_document(mut self, rd: ReturnDocument) -> Self {
-        self.return_document = rd;
-        self
-    }
-
-    /// Set whether to upsert when no document matches.
-    pub fn upsert(mut self, upsert: bool) -> Self {
-        self.upsert = upsert;
-        self
-    }
-
-    /// Set the sort order used to pick a document when multiple match.
-    pub fn sort(mut self, sort: Document) -> Self {
-        self.sort = Some(sort);
-        self
-    }
-}

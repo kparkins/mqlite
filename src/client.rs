@@ -468,16 +468,6 @@ impl ClientInner {
         self.engine.delete(name, &filter, true)
     }
 
-    pub(crate) fn find_one_and_update<T: Serialize + DeserializeOwned>(
-        &self,
-        name: &str,
-        filter: Document,
-        update: Document,
-    ) -> Result<Option<T>> {
-        let opts = FindOneAndUpdateOptions::new();
-        self.find_one_and_update_with_options(name, filter, update, opts)
-    }
-
     pub(crate) fn find_one_and_update_with_options<T: Serialize + DeserializeOwned>(
         &self,
         name: &str,
@@ -497,15 +487,6 @@ impl ClientInner {
         }
     }
 
-    pub(crate) fn find_one_and_delete<T: DeserializeOwned>(
-        &self,
-        name: &str,
-        filter: Document,
-    ) -> Result<Option<T>> {
-        let opts = FindOneAndDeleteOptions::new();
-        self.find_one_and_delete_with_options(name, filter, opts)
-    }
-
     pub(crate) fn find_one_and_delete_with_options<T: DeserializeOwned>(
         &self,
         name: &str,
@@ -519,16 +500,6 @@ impl ClientInner {
                 .map(Some)
                 .map_err(Error::BsonDeserialization),
         }
-    }
-
-    pub(crate) fn find_one_and_replace<T: Serialize + DeserializeOwned>(
-        &self,
-        name: &str,
-        filter: Document,
-        replacement: &T,
-    ) -> Result<Option<T>> {
-        let opts = FindOneAndReplaceOptions::new();
-        self.find_one_and_replace_with_options(name, filter, replacement, opts)
     }
 
     pub(crate) fn find_one_and_replace_with_options<T: Serialize + DeserializeOwned>(
@@ -1400,6 +1371,7 @@ mod tests {
                     let col = db.collection::<bson::Document>("data");
                     let docs: Vec<_> = col
                         .find(doc! {})
+                        .run()
                         .expect("find")
                         .filter_map(|r| r.ok())
                         .collect();
@@ -1575,5 +1547,459 @@ mod tests {
             "backup file must have mode 0600, got {:o}",
             mode
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Crash recovery — public API (Unix only)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod crash_recovery_public_api_tests {
+    use tempfile::TempDir;
+
+    use crate::{
+        client::Client,
+        doc,
+        options::{DurabilityMode, OpenOptions},
+    };
+    use bson::Document;
+
+    fn fullsync_opts() -> OpenOptions {
+        OpenOptions::new().durability(DurabilityMode::FullSync)
+    }
+
+    fn setup_seed_data(dir: &TempDir) -> std::path::PathBuf {
+        let db_path = dir.path().join("crash_public.mqlite");
+        let client = Client::open_with_options(&db_path, fullsync_opts()).expect("open seed db");
+        let db = client.database("test");
+        let col = db.collection::<Document>("items");
+        col.insert_one(&doc! { "key": "seed", "value": 1i32 }).expect("insert seed");
+        drop(client);
+        db_path
+    }
+
+    #[test]
+    fn crash_recovery_fullsync_via_public_api() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = setup_seed_data(&dir);
+
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe() failed");
+        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            unsafe { libc::close(read_fd) };
+            let client = match Client::open_with_options(&db_path, fullsync_opts()) {
+                Ok(c) => c,
+                Err(_) => unsafe { libc::_exit(2) },
+            };
+            let db = client.database("test");
+            let col = db.collection::<Document>("items");
+            match col.insert_one(&doc! { "key": "child_insert", "value": 2i32 }) {
+                Ok(_) => {}
+                Err(_) => unsafe { libc::_exit(3) },
+            }
+            let signal_byte: u8 = 1;
+            unsafe { libc::write(write_fd, &signal_byte as *const u8 as *const libc::c_void, 1) };
+            unsafe { libc::sleep(60) };
+            unsafe { libc::_exit(0) };
+        }
+
+        unsafe { libc::close(write_fd) };
+        let mut buf = 0u8;
+        let n = unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+        unsafe { libc::close(read_fd) };
+
+        if n != 1 {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            panic!("child exited before signalling fsync completion");
+        }
+
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+
+        let client = Client::open_with_options(&db_path, fullsync_opts()).expect("reopen after crash");
+        let db = client.database("test");
+        let col = db.collection::<Document>("items");
+
+        let seed = col
+            .find_one(doc! { "key": "seed" })
+            .expect("find_one seed")
+            .expect("seed document must survive crash");
+        assert_eq!(seed.get_i32("value").ok(), Some(1), "seed document value must be 1");
+
+        let child_doc = col
+            .find_one(doc! { "key": "child_insert" })
+            .expect("find_one child_insert")
+            .expect("child_insert document must survive crash (FullSync fsync completed before kill)");
+        assert_eq!(child_doc.get_i32("value").ok(), Some(2), "child_insert document value must be 2");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compatibility and persistence tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod compat_tests {
+    use crate::{
+        client::Client,
+        doc,
+        error::{codes, Error},
+        options::ReturnDocument,
+        IndexModel, IndexOptions,
+    };
+    use bson::Document;
+    use tempfile::TempDir;
+
+    #[test]
+    fn insert_many_ordered_behavioral_contract() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("items");
+        let model = IndexModel::builder()
+            .keys(doc! { "x": 1i32 })
+            .options(IndexOptions::new().unique(true))
+            .build().unwrap();
+        col.create_index(model).unwrap();
+        col.insert_one(&doc! { "x": "dup" }).unwrap();
+        let docs = vec![
+            doc! { "x": "a", "label": "doc0" },
+            doc! { "x": "b", "label": "doc1" },
+            doc! { "x": "dup", "label": "doc2" },
+            doc! { "x": "c", "label": "doc3" },
+            doc! { "x": "d", "label": "doc4" },
+        ];
+        let res = col.insert_many(&docs).ordered(true).run().unwrap();
+        assert_eq!(res.inserted_ids.len(), 2);
+        assert!(res.inserted_ids.contains_key(&0));
+        assert!(res.inserted_ids.contains_key(&1));
+        assert_eq!(res.errors.len(), 1);
+        assert_eq!(res.errors[0].index, 2);
+        assert_eq!(res.errors[0].code, codes::DUPLICATE_KEY);
+        assert!(col.find_one(doc! { "x": "c" }).unwrap().is_none());
+        assert!(col.find_one(doc! { "x": "d" }).unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_many_unordered_behavioral_contract() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("items");
+        let model = IndexModel::builder()
+            .keys(doc! { "x": 1i32 })
+            .options(IndexOptions::new().unique(true))
+            .build().unwrap();
+        col.create_index(model).unwrap();
+        col.insert_one(&doc! { "x": "dup" }).unwrap();
+        let docs = vec![
+            doc! { "x": "a", "label": "doc0" },
+            doc! { "x": "b", "label": "doc1" },
+            doc! { "x": "dup", "label": "doc2" },
+            doc! { "x": "c", "label": "doc3" },
+            doc! { "x": "d", "label": "doc4" },
+        ];
+        let res = col.insert_many(&docs).ordered(false).run().unwrap();
+        assert_eq!(res.inserted_ids.len(), 4);
+        assert!(res.inserted_ids.contains_key(&0));
+        assert!(res.inserted_ids.contains_key(&1));
+        assert!(!res.inserted_ids.contains_key(&2));
+        assert!(res.inserted_ids.contains_key(&3));
+        assert!(res.inserted_ids.contains_key(&4));
+        assert_eq!(res.errors.len(), 1);
+        assert_eq!(res.errors[0].index, 2);
+        assert_eq!(res.errors[0].code, codes::DUPLICATE_KEY);
+        assert!(col.find_one(doc! { "x": "dup", "label": "doc2" }).unwrap().is_none());
+        assert!(col.find_one(doc! { "x": "a" }).unwrap().is_some());
+        assert!(col.find_one(doc! { "x": "b" }).unwrap().is_some());
+        assert!(col.find_one(doc! { "x": "c" }).unwrap().is_some());
+        assert!(col.find_one(doc! { "x": "d" }).unwrap().is_some());
+    }
+
+    #[test]
+    fn find_one_and_update_returns_pre_modification() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("docs");
+        col.insert_one(&doc! { "a": 1i32 }).unwrap();
+        let returned: Option<Document> = col
+            .find_one_and_update(doc! { "a": 1i32 }, doc! { "$set": { "a": 2i32 } })
+            .run()
+            .unwrap();
+        let returned_doc = returned.expect("must return the pre-update document");
+        assert_eq!(returned_doc.get_i32("a").unwrap(), 1);
+        let db_doc = col.find_one(doc! {}).unwrap().expect("document must still exist");
+        assert_eq!(db_doc.get_i32("a").unwrap(), 2);
+    }
+
+    #[test]
+    fn find_one_and_update_return_document_after() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("docs");
+        col.insert_one(&doc! { "b": 1i32 }).unwrap();
+        let returned: Option<Document> = col
+            .find_one_and_update(doc! { "b": 1i32 }, doc! { "$set": { "b": 2i32 } })
+            .return_document(ReturnDocument::After)
+            .run()
+            .unwrap();
+        let returned_doc = returned.expect("must return the post-update document");
+        assert_eq!(returned_doc.get_i32("b").unwrap(), 2);
+    }
+
+    #[test]
+    fn upsert_behavioral_contract() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("users");
+        let res = col
+            .update_one(doc! { "email": "a@b.com" }, doc! { "$set": { "name": "Alice" } })
+            .upsert(true)
+            .run()
+            .unwrap();
+        assert!(res.upserted_id.is_some());
+        assert_eq!(res.matched_count, 0);
+        assert_eq!(res.modified_count, 0);
+        let found = col.find_one(doc! { "email": "a@b.com" }).unwrap()
+            .expect("upserted doc must be findable");
+        assert_eq!(found.get_str("email").unwrap(), "a@b.com");
+        assert_eq!(found.get_str("name").unwrap(), "Alice");
+    }
+
+    #[test]
+    fn persistence_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("round_trip.mqlite");
+        let expected_count = 1_000u64;
+        let reference_email = "user42@example.com";
+        {
+            let client = Client::open(&db_path).expect("open new database");
+            let db = client.database("app");
+            let col = db.collection::<Document>("users");
+            let docs: Vec<Document> = (0..expected_count as i32)
+                .map(|i| doc! { "email": format!("user{}@example.com", i), "index": i })
+                .collect();
+            for doc in &docs {
+                col.insert_one(doc).expect("insert_one");
+            }
+            let model = IndexModel::builder()
+                .keys(doc! { "email": 1i32 })
+                .options(IndexOptions::new().unique(true).name("email_1".to_string()))
+                .build().unwrap();
+            col.create_index(model).expect("create email index");
+            assert!(col.find_one(doc! { "email": reference_email }).expect("find_one before close").is_some());
+            db.close().expect("close database");
+        }
+        {
+            let client = Client::open(&db_path).expect("reopen database");
+            let db = client.database("app");
+            let col = db.collection::<Document>("users");
+            let count = col.count_documents(doc! {}).expect("count_documents");
+            assert_eq!(count, expected_count, "document count must survive reopen");
+            let indexes = col.list_indexes().expect("list_indexes");
+            let email_idx = indexes.iter().find(|idx| idx.name == "email_1");
+            assert!(email_idx.is_some(), "email_1 index must survive reopen");
+            assert!(email_idx.unwrap().unique);
+            let after_doc = col.find_one(doc! { "email": reference_email }).expect("find_one after reopen")
+                .expect("reference document must be findable after reopen");
+            assert_eq!(after_doc.get_str("email").unwrap(), reference_email);
+            assert_eq!(after_doc.get_i32("index").unwrap(), 42);
+        }
+    }
+
+    #[test]
+    fn index_vs_scan_consistency_ne() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("scores");
+        for i in 0..10i32 {
+            col.insert_one(&doc! { "score": i }).unwrap();
+        }
+        let model = IndexModel::builder().keys(doc! { "score": 1i32 }).build().unwrap();
+        let idx_name = col.create_index(model).unwrap();
+        let filter = doc! { "score": { "$ne": 5i32 } };
+        let with_index: Vec<Document> = col.find(filter.clone()).run().unwrap()
+            .collect::<crate::error::Result<_>>().unwrap();
+        col.drop_index(&idx_name).unwrap();
+        let without_index: Vec<Document> = col.find(filter).run().unwrap()
+            .collect::<crate::error::Result<_>>().unwrap();
+        assert_eq!(with_index.len(), 9);
+        assert_eq!(without_index.len(), 9);
+        let ids = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
+            use crate::key_encoding::encode_key;
+            docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+        };
+        assert_eq!(ids(&with_index), ids(&without_index));
+    }
+
+    #[test]
+    fn error_code_duplicate_key() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let col = client.database("test").collection::<Document>("u");
+        let model = IndexModel::builder()
+            .keys(doc! { "email": 1i32 })
+            .options(IndexOptions::new().unique(true))
+            .build().unwrap();
+        col.create_index(model).unwrap();
+        col.insert_one(&doc! { "email": "alice@example.com" }).unwrap();
+        let err = col.insert_one(&doc! { "email": "alice@example.com" }).unwrap_err();
+        assert!(matches!(err, Error::DuplicateKey { .. }));
+        assert_eq!(err.code(), Some(codes::DUPLICATE_KEY));
+    }
+
+    #[test]
+    fn error_code_unsupported_operator() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let col = client.database("test").collection::<Document>("u");
+        col.insert_one(&doc! { "x": 1i32 }).unwrap();
+        let err = col.find(doc! { "$where": "this.x == 1" }).run().err()
+            .expect("find with $where must return Err");
+        assert!(matches!(err, Error::UnsupportedOperator { .. }));
+        assert_eq!(err.code(), Some(codes::UNSUPPORTED_OPERATOR));
+    }
+
+    #[test]
+    fn error_code_unsupported_index_option() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let col = client.database("test").collection::<Document>("u");
+        let model = IndexModel::builder().keys(doc! { "description": "text" }).build().unwrap();
+        let err = col.create_index(model).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedIndexOption { .. }));
+        assert_eq!(err.code(), Some(codes::CANNOT_CREATE_INDEX));
+    }
+
+    #[test]
+    fn error_code_document_too_large() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let col = client.database("test").collection::<Document>("u");
+        let big_doc = doc! { "data": "x".repeat(16 * 1024 * 1024 + 1) };
+        let err = col.insert_one(&big_doc).unwrap_err();
+        assert!(matches!(err, Error::DocumentTooLarge { .. }));
+        assert_eq!(err.code(), Some(codes::DOCUMENT_TOO_LARGE));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn error_code_symlink_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_file = dir.path().join("real.mqlite");
+        let symlink_path = dir.path().join("link.mqlite");
+        std::fs::write(&real_file, b"").expect("create real file");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+        let err = Client::open(&symlink_path).err().expect("opening symlink must return Err");
+        assert!(matches!(err, Error::SymlinkRejected { .. }));
+        assert_eq!(err.code(), Some(codes::BAD_VALUE));
+    }
+
+    #[test]
+    fn collection_not_found_returns_empty() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let col = client.database("test").collection::<Document>("nonexistent");
+        assert_eq!(col.count_documents(doc! {}).unwrap(), 0);
+        assert!(col.find_one(doc! {}).unwrap().is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WAL atomicity regression tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod wal_atomicity_tests {
+    use tempfile::TempDir;
+
+    use crate::{
+        doc,
+        error::Error,
+        Client, Document, IndexModel, IndexOptions, OpenOptions,
+    };
+
+    fn open(dir: &TempDir, name: &str) -> Client {
+        Client::open_with_options(dir.path().join(name), OpenOptions::new()).expect("open client")
+    }
+
+    #[test]
+    fn insert_dup_key_leaves_no_zombie_after_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_name = "atomicity_zombie.mqlite";
+        {
+            let client = open(&dir, db_name);
+            let col = client.database("t").collection::<Document>("people");
+            col.create_index(
+                IndexModel::builder()
+                    .keys(doc! { "email": 1 })
+                    .options(IndexOptions::new().unique(true))
+                    .build().unwrap(),
+            ).expect("create unique index");
+            col.insert_one(&doc! { "_id": 1i32, "email": "a@b.com" }).expect("first insert succeeds");
+            let err = col.insert_one(&doc! { "_id": 2i32, "email": "a@b.com" }).unwrap_err();
+            assert!(matches!(err, Error::DuplicateKey { .. }));
+            assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
+            assert!(col.find_one(doc! { "_id": 2i32 }).unwrap().is_none());
+        }
+        let client = open(&dir, db_name);
+        let col = client.database("t").collection::<Document>("people");
+        assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
+        assert!(col.find_one(doc! { "_id": 2i32 }).unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_enforces_unique_secondary_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let client = open(&dir, "atomicity_upsert.mqlite");
+        let col = client.database("t").collection::<Document>("people");
+        col.create_index(
+            IndexModel::builder()
+                .keys(doc! { "email": 1 })
+                .options(IndexOptions::new().unique(true))
+                .build().unwrap(),
+        ).expect("create unique index");
+        col.update_one(doc! { "_id": 1i32 }, doc! { "$set": { "email": "x@y.com" } })
+            .upsert(true)
+            .run()
+            .expect("first upsert");
+        assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
+        let err = col
+            .update_one(doc! { "_id": 2i32 }, doc! { "$set": { "email": "x@y.com" } })
+            .upsert(true)
+            .run()
+            .unwrap_err();
+        assert!(matches!(err, Error::DuplicateKey { .. }));
+        assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
+    }
+
+    #[test]
+    fn multi_txn_commits_survive_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_name = "atomicity_durability.mqlite";
+        {
+            let client = open(&dir, db_name);
+            let col = client.database("t").collection::<Document>("k");
+            for i in 0..20i32 {
+                col.insert_one(&doc! { "_id": i, "n": i }).unwrap();
+            }
+        }
+        let client = open(&dir, db_name);
+        let col = client.database("t").collection::<Document>("k");
+        assert_eq!(col.count_documents(doc! {}).unwrap(), 20);
+        for i in 0..20i32 {
+            assert!(col.find_one(doc! { "_id": i }).unwrap().is_some(), "doc _id={i} missing after reopen");
+        }
     }
 }

@@ -56,7 +56,7 @@ fn end_to_end_persistence_across_three_databases() {
                     }
                 })
                 .collect();
-            col.insert_many(&docs).expect("insert users");
+            col.insert_many(&docs).run().expect("insert users");
 
             let model = IndexModel::builder()
                 .keys(doc! { "email": 1i32 })
@@ -90,7 +90,7 @@ fn end_to_end_persistence_across_three_databases() {
                     }
                 })
                 .collect();
-            col.insert_many(&docs).expect("insert products");
+            col.insert_many(&docs).run().expect("insert products");
 
             let model = IndexModel::builder()
                 .keys(doc! { "sku": 1i32 })
@@ -128,7 +128,7 @@ fn end_to_end_persistence_across_three_databases() {
                     }
                 })
                 .collect();
-            col.insert_many(&docs).expect("insert events");
+            col.insert_many(&docs).run().expect("insert events");
 
             let model = IndexModel::builder()
                 .keys(doc! { "kind": 1i32 })

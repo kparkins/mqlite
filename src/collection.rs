@@ -8,7 +8,7 @@ use crate::{
     index::{IndexInfo, IndexModel},
     options::{
         FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
-        InsertManyOptions, UpdateOptions,
+        InsertManyOptions, ReturnDocument, UpdateOptions,
     },
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
 };
@@ -42,9 +42,7 @@ use crate::{
 /// # }
 /// ```
 pub struct Collection<T> {
-    /// The database name component of the qualified namespace.
     pub(crate) db_name: String,
-    /// The unqualified collection name.
     pub(crate) name: String,
     pub(crate) inner: Arc<crate::client::ClientInner>,
     pub(crate) _phantom: std::marker::PhantomData<T>,
@@ -63,8 +61,6 @@ impl<T> Clone for Collection<T> {
 
 impl<T> Collection<T> {
     /// The fully-qualified namespace: `<db_name>.<collection_name>`.
-    ///
-    /// This is the key used in the storage engine, matching MongoDB's namespace format.
     pub fn namespace(&self) -> String {
         format!("{}.{}", self.db_name, self.name)
     }
@@ -90,19 +86,26 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
         self.inner.insert_one(&self.namespace(), doc)
     }
 
-    /// Insert multiple documents. Returns the `_id` values of all inserted documents.
-    pub fn insert_many(&self, docs: &[T]) -> Result<InsertManyResult> {
-        self.inner
-            .insert_many(&self.namespace(), docs, InsertManyOptions::new())
-    }
-
-    /// Insert multiple documents with options.
-    pub fn insert_many_with_options(
-        &self,
-        docs: &[T],
-        opts: InsertManyOptions,
-    ) -> Result<InsertManyResult> {
-        self.inner.insert_many(&self.namespace(), docs, opts)
+    /// Insert multiple documents.
+    ///
+    /// Returns an [`InsertMany`] action. Chain option methods before calling `.run()`:
+    /// ```no_run
+    /// # use mqlite::{Client, doc};
+    /// # use bson::Document;
+    /// # fn main() -> mqlite::error::Result<()> {
+    /// # let client = Client::open("/tmp/db.mqlite")?;
+    /// # let col = client.database("test").collection::<Document>("items");
+    /// let docs = vec![doc! { "x": 1 }, doc! { "x": 2 }];
+    /// col.insert_many(&docs).ordered(false).run()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn insert_many<'a>(&'a self, docs: &'a [T]) -> InsertMany<'a, T> {
+        InsertMany {
+            coll: self,
+            docs,
+            options: InsertManyOptions::default(),
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -114,15 +117,28 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
         self.inner.find_one(&self.namespace(), filter)
     }
 
-    /// Find all documents matching `filter`. Returns a [`Cursor`] over the results.
-    pub fn find(&self, filter: Document) -> Result<Cursor<T>> {
-        self.inner
-            .find(&self.namespace(), filter, FindOptions::new())
-    }
-
-    /// Find all documents matching `filter` with options (sort, limit, skip, projection).
-    pub fn find_with_options(&self, filter: Document, opts: FindOptions) -> Result<Cursor<T>> {
-        self.inner.find(&self.namespace(), filter, opts)
+    /// Find all documents matching `filter`.
+    ///
+    /// Returns a [`Find`] action. Chain option methods before calling `.run()`:
+    /// ```no_run
+    /// # use mqlite::{Client, doc};
+    /// # use bson::Document;
+    /// # fn main() -> mqlite::error::Result<()> {
+    /// # let client = Client::open("/tmp/db.mqlite")?;
+    /// # let col = client.database("test").collection::<Document>("items");
+    /// let cursor = col.find(doc! { "active": true })
+    ///     .sort(doc! { "name": 1 })
+    ///     .limit(20)
+    ///     .run()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn find(&self, filter: Document) -> Find<'_, T> {
+        Find {
+            coll: self,
+            filter,
+            options: FindOptions::default(),
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -130,37 +146,41 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // -------------------------------------------------------------------------
 
     /// Update the first document matching `filter`.
-    pub fn update_one(&self, filter: Document, update: Document) -> Result<UpdateResult> {
-        self.inner
-            .update_one(&self.namespace(), filter, update, UpdateOptions::new())
-    }
-
-    /// Update the first document matching `filter` with options (e.g., upsert).
-    pub fn update_one_with_options(
-        &self,
-        filter: Document,
-        update: Document,
-        opts: UpdateOptions,
-    ) -> Result<UpdateResult> {
-        self.inner
-            .update_one(&self.namespace(), filter, update, opts)
+    ///
+    /// Returns an [`Update`] action. Chain option methods before calling `.run()`:
+    /// ```no_run
+    /// # use mqlite::{Client, doc};
+    /// # use bson::Document;
+    /// # fn main() -> mqlite::error::Result<()> {
+    /// # let client = Client::open("/tmp/db.mqlite")?;
+    /// # let col = client.database("test").collection::<Document>("users");
+    /// col.update_one(doc! { "email": "a@b.com" }, doc! { "$set": { "active": true } })
+    ///     .upsert(true)
+    ///     .run()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_one(&self, filter: Document, update: Document) -> Update<'_, T> {
+        Update {
+            coll: self,
+            filter,
+            update,
+            options: UpdateOptions::default(),
+            multi: false,
+        }
     }
 
     /// Update all documents matching `filter`.
-    pub fn update_many(&self, filter: Document, update: Document) -> Result<UpdateResult> {
-        self.inner
-            .update_many(&self.namespace(), filter, update, UpdateOptions::new())
-    }
-
-    /// Update all documents matching `filter` with options.
-    pub fn update_many_with_options(
-        &self,
-        filter: Document,
-        update: Document,
-        opts: UpdateOptions,
-    ) -> Result<UpdateResult> {
-        self.inner
-            .update_many(&self.namespace(), filter, update, opts)
+    ///
+    /// Returns an [`Update`] action. Chain option methods before calling `.run()`.
+    pub fn update_many(&self, filter: Document, update: Document) -> Update<'_, T> {
+        Update {
+            coll: self,
+            filter,
+            update,
+            options: UpdateOptions::default(),
+            multi: true,
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -178,61 +198,65 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     }
 
     // -------------------------------------------------------------------------
-    // Atomic read-modify-write (findAndModify equivalents)
+    // Atomic read-modify-write
     // -------------------------------------------------------------------------
 
-    /// Atomically find the first document matching `filter`, apply `update`, and return the
-    /// original document (before the update). Returns `None` if no document matched.
-    pub fn find_one_and_update(&self, filter: Document, update: Document) -> Result<Option<T>> {
-        self.inner
-            .find_one_and_update(&self.namespace(), filter, update)
-    }
-
-    /// Atomically find the first document matching `filter`, apply `update` with options.
-    /// Returns `None` if no document matched (and no upsert was performed).
-    pub fn find_one_and_update_with_options(
+    /// Atomically find the first document matching `filter`, apply `update`, and return a
+    /// document. By default returns the document **before** the update.
+    ///
+    /// Returns a [`FindOneAndUpdate`] action. Chain option methods before calling `.run()`:
+    /// ```no_run
+    /// # use mqlite::{Client, doc, options::ReturnDocument};
+    /// # use bson::Document;
+    /// # fn main() -> mqlite::error::Result<()> {
+    /// # let client = Client::open("/tmp/db.mqlite")?;
+    /// # let col = client.database("test").collection::<Document>("items");
+    /// let updated = col
+    ///     .find_one_and_update(doc! { "x": 1 }, doc! { "$set": { "x": 2 } })
+    ///     .return_document(ReturnDocument::After)
+    ///     .run()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn find_one_and_update(
         &self,
         filter: Document,
         update: Document,
-        opts: FindOneAndUpdateOptions,
-    ) -> Result<Option<T>> {
-        self.inner
-            .find_one_and_update_with_options(&self.namespace(), filter, update, opts)
+    ) -> FindOneAndUpdate<'_, T> {
+        FindOneAndUpdate {
+            coll: self,
+            filter,
+            update,
+            options: FindOneAndUpdateOptions::default(),
+        }
     }
 
     /// Atomically find the first document matching `filter`, delete it, and return it.
-    /// Returns `None` if no document matched.
-    pub fn find_one_and_delete(&self, filter: Document) -> Result<Option<T>> {
-        self.inner.find_one_and_delete(&self.namespace(), filter)
-    }
-
-    /// Atomically find the first document matching `filter`, delete it, and return it with options.
-    pub fn find_one_and_delete_with_options(
-        &self,
-        filter: Document,
-        opts: FindOneAndDeleteOptions,
-    ) -> Result<Option<T>> {
-        self.inner
-            .find_one_and_delete_with_options(&self.namespace(), filter, opts)
+    ///
+    /// Returns a [`FindOneAndDelete`] action. Chain option methods before calling `.run()`.
+    pub fn find_one_and_delete(&self, filter: Document) -> FindOneAndDelete<'_, T> {
+        FindOneAndDelete {
+            coll: self,
+            filter,
+            options: FindOneAndDeleteOptions::default(),
+        }
     }
 
     /// Atomically find the first document matching `filter`, replace it with `replacement`,
-    /// and return the original document. Returns `None` if no document matched.
-    pub fn find_one_and_replace(&self, filter: Document, replacement: &T) -> Result<Option<T>> {
-        self.inner
-            .find_one_and_replace(&self.namespace(), filter, replacement)
-    }
-
-    /// Atomically find the first document matching `filter`, replace it with `replacement`
-    /// with options.  Returns `None` if no document matched (and no upsert was performed).
-    pub fn find_one_and_replace_with_options(
-        &self,
+    /// and return a document. By default returns the document **before** the replacement.
+    ///
+    /// Returns a [`FindOneAndReplace`] action. Chain option methods before calling `.run()`.
+    pub fn find_one_and_replace<'a>(
+        &'a self,
         filter: Document,
-        replacement: &T,
-        opts: FindOneAndReplaceOptions,
-    ) -> Result<Option<T>> {
-        self.inner
-            .find_one_and_replace_with_options(&self.namespace(), filter, replacement, opts)
+        replacement: &'a T,
+    ) -> FindOneAndReplace<'a, T> {
+        FindOneAndReplace {
+            coll: self,
+            filter,
+            replacement,
+            options: FindOneAndReplaceOptions::default(),
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -240,7 +264,6 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // -------------------------------------------------------------------------
 
     /// Return an approximate count of all documents in the collection.
-    /// This is a fast estimate, not a precise count.
     pub fn estimated_document_count(&self) -> Result<u64> {
         self.inner.estimated_document_count(&self.namespace())
     }
@@ -267,5 +290,215 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// List all indexes on the collection.
     pub fn list_indexes(&self) -> Result<Vec<IndexInfo>> {
         self.inner.list_indexes(&self.namespace())
+    }
+}
+
+// =============================================================================
+// Action types
+// =============================================================================
+
+/// Action returned by [`Collection::find`]. Chain option methods, then call `.run()`.
+pub struct Find<'a, T> {
+    coll: &'a Collection<T>,
+    filter: Document,
+    options: FindOptions,
+}
+
+impl<'a, T: DeserializeOwned> Find<'a, T> {
+    /// Sort order for results.
+    pub fn sort(mut self, sort: Document) -> Self {
+        self.options.sort = Some(sort);
+        self
+    }
+
+    /// Maximum number of documents to return.
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.options.limit = Some(limit);
+        self
+    }
+
+    /// Number of documents to skip before returning results.
+    pub fn skip(mut self, skip: u64) -> Self {
+        self.options.skip = Some(skip);
+        self
+    }
+
+    /// Projection document specifying fields to include or exclude.
+    pub fn projection(mut self, projection: Document) -> Self {
+        self.options.projection = Some(projection);
+        self
+    }
+
+    /// Number of documents per internal batch.
+    pub fn batch_size(mut self, batch_size: u32) -> Self {
+        self.options.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Execute the find and return a [`Cursor`].
+    pub fn run(self) -> Result<Cursor<T>> {
+        self.coll
+            .inner
+            .find(&self.coll.namespace(), self.filter, self.options)
+    }
+}
+
+/// Action returned by [`Collection::insert_many`]. Chain option methods, then call `.run()`.
+pub struct InsertMany<'a, T> {
+    coll: &'a Collection<T>,
+    docs: &'a [T],
+    options: InsertManyOptions,
+}
+
+impl<'a, T: Serialize + DeserializeOwned> InsertMany<'a, T> {
+    /// If `true` (default), stop at the first error.
+    /// If `false`, attempt all documents and collect errors.
+    pub fn ordered(mut self, ordered: bool) -> Self {
+        self.options.ordered = ordered;
+        self
+    }
+
+    /// Execute the insert and return an [`InsertManyResult`].
+    pub fn run(self) -> Result<InsertManyResult> {
+        self.coll
+            .inner
+            .insert_many(&self.coll.namespace(), self.docs, self.options)
+    }
+}
+
+/// Action returned by [`Collection::update_one`] and [`Collection::update_many`].
+/// Chain option methods, then call `.run()`.
+pub struct Update<'a, T> {
+    coll: &'a Collection<T>,
+    filter: Document,
+    update: Document,
+    options: UpdateOptions,
+    multi: bool,
+}
+
+impl<'a, T> Update<'a, T> {
+    /// Insert a new document when no document matches the filter.
+    pub fn upsert(mut self, upsert: bool) -> Self {
+        self.options.upsert = upsert;
+        self
+    }
+
+    /// Execute the update and return an [`UpdateResult`].
+    pub fn run(self) -> Result<UpdateResult> {
+        if self.multi {
+            self.coll.inner.update_many(
+                &self.coll.namespace(),
+                self.filter,
+                self.update,
+                self.options,
+            )
+        } else {
+            self.coll.inner.update_one(
+                &self.coll.namespace(),
+                self.filter,
+                self.update,
+                self.options,
+            )
+        }
+    }
+}
+
+/// Action returned by [`Collection::find_one_and_update`]. Chain option methods, then call `.run()`.
+pub struct FindOneAndUpdate<'a, T> {
+    coll: &'a Collection<T>,
+    filter: Document,
+    update: Document,
+    options: FindOneAndUpdateOptions,
+}
+
+impl<'a, T: Serialize + DeserializeOwned> FindOneAndUpdate<'a, T> {
+    /// Which version of the document to return. Default: [`ReturnDocument::Before`].
+    pub fn return_document(mut self, rd: ReturnDocument) -> Self {
+        self.options.return_document = rd;
+        self
+    }
+
+    /// Insert a new document when no document matches the filter.
+    pub fn upsert(mut self, upsert: bool) -> Self {
+        self.options.upsert = upsert;
+        self
+    }
+
+    /// Sort order used to pick a document when multiple match.
+    pub fn sort(mut self, sort: Document) -> Self {
+        self.options.sort = Some(sort);
+        self
+    }
+
+    /// Execute and return the document (before or after update, per [`return_document`]).
+    pub fn run(self) -> Result<Option<T>> {
+        self.coll.inner.find_one_and_update_with_options(
+            &self.coll.namespace(),
+            self.filter,
+            self.update,
+            self.options,
+        )
+    }
+}
+
+/// Action returned by [`Collection::find_one_and_delete`]. Chain option methods, then call `.run()`.
+pub struct FindOneAndDelete<'a, T> {
+    coll: &'a Collection<T>,
+    filter: Document,
+    options: FindOneAndDeleteOptions,
+}
+
+impl<'a, T: DeserializeOwned> FindOneAndDelete<'a, T> {
+    /// Sort order used to pick a document when multiple match.
+    pub fn sort(mut self, sort: Document) -> Self {
+        self.options.sort = Some(sort);
+        self
+    }
+
+    /// Execute and return the deleted document, or `None` if no document matched.
+    pub fn run(self) -> Result<Option<T>> {
+        self.coll.inner.find_one_and_delete_with_options(
+            &self.coll.namespace(),
+            self.filter,
+            self.options,
+        )
+    }
+}
+
+/// Action returned by [`Collection::find_one_and_replace`]. Chain option methods, then call `.run()`.
+pub struct FindOneAndReplace<'a, T> {
+    coll: &'a Collection<T>,
+    filter: Document,
+    replacement: &'a T,
+    options: FindOneAndReplaceOptions,
+}
+
+impl<'a, T: Serialize + DeserializeOwned> FindOneAndReplace<'a, T> {
+    /// Which version of the document to return. Default: [`ReturnDocument::Before`].
+    pub fn return_document(mut self, rd: ReturnDocument) -> Self {
+        self.options.return_document = rd;
+        self
+    }
+
+    /// Insert a new document when no document matches the filter.
+    pub fn upsert(mut self, upsert: bool) -> Self {
+        self.options.upsert = upsert;
+        self
+    }
+
+    /// Sort order used to pick a document when multiple match.
+    pub fn sort(mut self, sort: Document) -> Self {
+        self.options.sort = Some(sort);
+        self
+    }
+
+    /// Execute and return the document (before or after replacement, per [`return_document`]).
+    pub fn run(self) -> Result<Option<T>> {
+        self.coll.inner.find_one_and_replace_with_options(
+            &self.coll.namespace(),
+            self.filter,
+            self.replacement,
+            self.options,
+        )
     }
 }

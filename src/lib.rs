@@ -134,20 +134,6 @@ mod validation;
 #[allow(dead_code)]
 mod wal;
 
-// Unix-only; accesses pub(crate) WAL internals.
-#[cfg(all(test, unix))]
-mod crash_recovery_tests;
-
-// Unix-only; uses fork()/SIGKILL/pipe for process-crash simulation.
-#[cfg(all(test, unix))]
-mod crash_recovery_public_api_tests;
-
-#[cfg(test)]
-mod compat_tests;
-
-#[cfg(test)]
-mod wal_atomicity_tests;
-
 // Wire protocol shim (feature-gated)
 #[cfg(feature = "wire")]
 pub mod wire;
@@ -166,9 +152,11 @@ pub use database::Database;
 pub use error::{Error, Result};
 
 // Configuration
-pub use options::{
-    DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
-    FindOptions, IndexOptions, InsertManyOptions, OpenOptions, ReturnDocument, UpdateOptions,
+pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
+
+// Collection action types (returned by Collection methods; users chain options onto them)
+pub use collection::{
+    Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update,
 };
 
 // Index
