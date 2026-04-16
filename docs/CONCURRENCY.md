@@ -88,7 +88,9 @@ but may be **stale** if the application requires seeing the latest write.
 use mqlite::{Client, doc};
 use std::thread;
 
-let client = Client::open_in_memory()?;
+use tempfile::TempDir;
+let tempdir = TempDir::new()?;
+let client = Client::open(tempdir.path().join("db.mqlite"))?;
 let db = client.database("mydb");
 let users = db.collection::<bson::Document>("users");
 

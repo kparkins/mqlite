@@ -16,7 +16,7 @@
 //! 6. Error code verification — each error condition returns the MongoDB-
 //!    compatible error code defined in `error::codes`.
 //!
-//! Tests 1–3 and 5–6 use `Client::open_in_memory()` for speed.
+//! Tests 1–3 and 5–6 use a `tempfile`-backed `Client` for speed.
 //! Test 4 uses a real on-disk file via `tempfile`.
 //!
 //! # Organisational note
@@ -37,6 +37,7 @@ mod tests {
         IndexModel, IndexOptions,
     };
     use bson::{Bson, Document};
+    use tempfile::TempDir;
 
     // =========================================================================
     // Suite 1 — insert_many behavioral contract
@@ -51,7 +52,8 @@ mod tests {
     ///   mode stops at first error).
     #[test]
     fn insert_many_ordered_behavioral_contract() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("items");
 
@@ -136,7 +138,8 @@ mod tests {
     /// - `errors` has exactly 1 entry with index 2 and code 11000.
     #[test]
     fn insert_many_unordered_behavioral_contract() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("items");
 
@@ -219,7 +222,8 @@ mod tests {
     /// DB is updated.
     #[test]
     fn find_one_and_update_returns_pre_modification() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("docs");
 
@@ -250,7 +254,8 @@ mod tests {
     /// `return_document=After`: returned doc reflects post-update state.
     #[test]
     fn find_one_and_update_return_document_after() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("docs");
 
@@ -285,7 +290,8 @@ mod tests {
     ///   both `email: "a@b.com"` and `name: "Alice"`.
     #[test]
     fn upsert_behavioral_contract() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("users");
 
@@ -432,7 +438,8 @@ mod tests {
     /// queried field.
     #[test]
     fn index_vs_scan_consistency_ne() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("scores");
 
@@ -501,7 +508,8 @@ mod tests {
     /// return error code 11000.
     #[test]
     fn error_code_duplicate_key() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("u");
 
@@ -535,7 +543,8 @@ mod tests {
     /// return error code 9.
     #[test]
     fn error_code_unsupported_operator() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("u");
         col.insert_one(&doc! { "x": 1i32 }).unwrap();
@@ -564,7 +573,8 @@ mod tests {
     /// `text`) must return error code 67.
     #[test]
     fn error_code_unsupported_index_option() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("u");
 
@@ -592,7 +602,8 @@ mod tests {
     /// 10334.
     #[test]
     fn error_code_document_too_large() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("u");
 
@@ -652,7 +663,8 @@ mod tests {
     /// collection is not an error.
     #[test]
     fn collection_not_found_returns_empty() {
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("test");
         let col = db.collection::<Document>("nonexistent");
 

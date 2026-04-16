@@ -1,7 +1,10 @@
 # mqlite Test Double Cookbook
 
-Drop-in replacement for MongoDB in your test suite — no containers, no ports,
-no temp directories.
+Drop-in replacement for MongoDB in your test suite — no containers, no ports.
+
+> **Note:** Previously mqlite exposed `Client::open_in_memory()`. That API is
+> removed; use `tempfile::TempDir` + `Client::open` instead (shown throughout
+> this guide).
 
 ---
 
@@ -9,16 +12,17 @@ no temp directories.
 
 | | MongoDB in tests | mqlite in tests |
 |-|-----------------|-----------------|
-| **Startup** | Docker pull + container start (seconds) | `Client::open_in_memory()` (nanoseconds) |
+| **Startup** | Docker pull + container start (seconds) | `TempDir::new()` + `Client::open` (microseconds) |
 | **Isolation** | Shared container or per-test client | Each test gets its own `Client` |
 | **Cleanup** | `db.drop()` or container teardown | Automatic on `Drop` — no cleanup code |
 | **CI** | Requires Docker daemon | Zero external dependencies |
-| **Parallelism** | Shared state unless isolated carefully | `open_in_memory()` is always isolated |
+| **Parallelism** | Shared state unless isolated carefully | Each `TempDir` is always isolated |
 | **Wire compatibility** | Full MongoDB | Phase 1 operator set (see [Compatibility Matrix](COMPATIBILITY.md)) |
 
-mqlite's `Client::open_in_memory()` is designed for exactly this use case.
-Every call returns a fresh, empty database backed entirely by process memory.
-When the last `Client` clone is dropped the memory is freed — there is nothing to clean up.
+The `tempfile::TempDir` + `Client::open` pattern is designed for exactly this
+use case. Each call creates a fresh, empty database backed by a temporary
+directory that is automatically deleted when the `TempDir` handle is dropped —
+there is nothing to clean up.
 
 ---
 
@@ -27,6 +31,7 @@ When the last `Client` clone is dropped the memory is freed — there is nothing
 ```rust
 use mqlite::{Client, doc};
 use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct User {
@@ -37,8 +42,10 @@ struct User {
 
 #[test]
 fn user_lookup_by_email() {
-    // Open a fresh in-memory database — no files, no ports, no cleanup.
-    let client = Client::open_in_memory().expect("in-memory database never fails");
+    // Open a fresh temp-file database — no ports, no cleanup.
+    let tempdir = TempDir::new().expect("create tempdir");
+    let client = Client::open(tempdir.path().join("db.mqlite"))
+        .expect("open tempdir-backed client");
     let db = client.database("test");
     let users = db.collection::<User>("users");
 
@@ -52,14 +59,16 @@ fn user_lookup_by_email() {
     assert!(found.is_some());
     assert_eq!(found.unwrap().name, "Alice");
 }
-// `db` is dropped here — no cleanup needed.
+// `tempdir` is dropped here — the temp directory is deleted automatically.
 ```
 
 **Key points:**
-- `open_in_memory()` never returns an error (there are no file-system calls).
-  Use `.expect("in-memory database never fails")` — the expect message is only
-  for documentation; it will not trigger in practice.
-- No `#[teardown]`, no temp directory, no `after_each` hook.
+- `TempDir::new()` creates an OS temp directory; `Client::open` on a path
+  inside it practically never fails. Use descriptive `.expect` messages for
+  clarity.
+- No `#[teardown]`, no `after_each` hook. The `TempDir` handle owns cleanup.
+- Keep `tempdir` alive for the duration of the test — dropping it early deletes
+  the database files while the client still holds them open.
 - `Client`, `Database`, and `Collection<T>` are all `Clone + Send + Sync` — move
   them into closures or helper functions freely.
 
@@ -67,23 +76,24 @@ fn user_lookup_by_email() {
 
 ## Drop as the Cleanup Hook
 
-In-memory databases clean up automatically when the last `Client` clone is
+Temp-file databases clean up automatically when the `TempDir` handle is
 dropped. There is no action required:
 
 ```rust
 #[test]
 fn database_is_self_cleaning() {
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().unwrap();
+    let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
     let col = client.database("test").collection::<mqlite::Document>("items");
     col.insert_one(&doc! { "x": 1 }).unwrap();
-    // `col` and `client` are dropped at the end of the block.
-    // No files on disk, no `client.close()` needed.
+    // `col`, `client`, and `tempdir` are dropped at the end of the block.
+    // The temp directory (and its database files) is deleted automatically.
 }
 ```
 
-This means you can open a `Database` in a test helper function, pass a
-`Collection` to the system under test, and the database is automatically freed
-when the test function returns.
+This means you can open a `Client` in a test helper function, pass a
+`Collection` to the system under test, and the database files are automatically
+removed when both `client` and `tempdir` go out of scope.
 
 ---
 
@@ -96,7 +106,8 @@ For small fixture sets, embed data directly in the test:
 ```rust
 #[test]
 fn order_totals_are_correct() {
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().unwrap();
+    let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
     let orders = client.database("test").collection::<mqlite::Document>("orders");
 
     orders.insert_many(&[
@@ -126,6 +137,7 @@ at compile time:
 
 ```rust
 use mqlite::{Client, Document};
+use tempfile::TempDir;
 
 fn load_fixture(db: &mqlite::Database, collection: &str, json: &str) {
     let docs: Vec<Document> = serde_json::from_str::<Vec<serde_json::Value>>(json)
@@ -140,7 +152,8 @@ fn load_fixture(db: &mqlite::Database, collection: &str, json: &str) {
 
 #[test]
 fn low_stock_query() {
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().unwrap();
+    let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
     let db = client.database("test");
     load_fixture(&db, "products", include_str!("fixtures/products.json"));
 
@@ -178,7 +191,7 @@ useful when preserving exact BSON types (e.g., `Date`, `Decimal128`) matters.
 ## Parallel Test Isolation
 
 Rust's default test runner runs unit tests on multiple threads. Because each
-call to `open_in_memory()` returns a completely independent database, parallel
+`TempDir::new()` call creates a completely independent directory, parallel
 tests need no synchronization at all:
 
 ```rust
@@ -186,7 +199,8 @@ tests need no synchronization at all:
 
 #[test]
 fn test_a() {
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().unwrap();
+    let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
     let col = client.database("test").collection::<mqlite::Document>("items");
     col.insert_one(&doc! { "key": "a" }).unwrap();
     assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
@@ -194,7 +208,8 @@ fn test_a() {
 
 #[test]
 fn test_b() {
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().unwrap();
+    let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
     let col = client.database("test").collection::<mqlite::Document>("items");
     // Zero documents — test_a's insert is invisible here.
     assert_eq!(col.count_documents(doc! {}).unwrap(), 0);
@@ -202,7 +217,8 @@ fn test_b() {
 
 #[test]
 fn test_c() {
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().unwrap();
+    let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
     let col = client.database("test").collection::<mqlite::Document>("items");
     col.insert_many(&[
         doc! { "val": 1_i32 },
@@ -213,9 +229,9 @@ fn test_c() {
 }
 ```
 
-**No `#[serial]` attribute required.** `open_in_memory()` databases do not
-share any in-process state. This is the primary reason to prefer in-memory
-databases over a shared MongoDB container in tests.
+**No `#[serial]` attribute required.** Each `TempDir` is a separate path on
+disk and databases do not share any in-process state. This is the primary
+reason to prefer this pattern over a shared MongoDB container in tests.
 
 ---
 
@@ -278,12 +294,18 @@ pub trait UserStore: Send + Sync {
 // mqlite implementation (sync, in tests):
 pub struct MqliteUserStore {
     col: mqlite::Collection<User>,
+    // Keep tempdir alive so the database files are not deleted while in use.
+    _tempdir: tempfile::TempDir,
 }
 
 impl MqliteUserStore {
     pub fn new() -> Self {
-        let client = Client::open_in_memory().unwrap();
-        MqliteUserStore { col: client.database("test").collection("users") }
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
+        MqliteUserStore {
+            col: client.database("test").collection("users"),
+            _tempdir: tempdir,
+        }
     }
 }
 
@@ -302,7 +324,7 @@ impl UserStore for MqliteUserStore {
 | MongoDB driver | mqlite |
 |----------------|--------|
 | `async/await` throughout | Synchronous — no `.await` |
-| `Client::with_uri_str(uri).await?` | `Client::open_in_memory()?` |
+| `Client::with_uri_str(uri).await?` | `TempDir::new()` + `Client::open(path)?` |
 | `db.collection::<T>("name")` | Same |
 | `col.find_one(filter, None).await?` | `col.find_one(filter)?` (no `None`, no await) |
 | `col.insert_one(doc, None).await?` | `col.insert_one(&doc)?` |
@@ -325,6 +347,7 @@ assert on `_id` values, assign them explicitly:
 ```rust
 use mqlite::{Client, ObjectId, doc};
 use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Item {
@@ -335,7 +358,8 @@ struct Item {
 
 #[test]
 fn deterministic_id_assignment() {
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().unwrap();
+    let client = Client::open(tempdir.path().join("db.mqlite")).unwrap();
     let items = client.database("test").collection::<Item>("items");
 
     // Construct predictable ObjectId values from hex strings.
@@ -353,9 +377,8 @@ fn deterministic_id_assignment() {
 }
 ```
 
-> **Note:** `open_in_memory_with_seed` (seeded ObjectId generation) is planned
-> for Phase 2. Until then, explicit `_id` assignment is the recommended approach
-> for deterministic tests.
+> **Note:** Seeded ObjectId generation is planned for Phase 2. Until then,
+> explicit `_id` assignment is the recommended approach for deterministic tests.
 
 ---
 

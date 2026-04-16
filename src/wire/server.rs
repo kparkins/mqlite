@@ -195,7 +195,7 @@ struct ServerState {
     /// Starts at 1; each new connection receives the old value before increment.
     next_connection_id: Arc<AtomicI32>,
 
-    /// Path to the database file (`None` for in-memory databases).
+    /// Path to the database file.
     /// Used to locate the WAL file (`<path>-wal`) for `serverStatus`.
     db_path: Option<std::path::PathBuf>,
 
@@ -205,31 +205,47 @@ struct ServerState {
 
     /// Shared client inner state — used by CRUD command handlers.
     database: Arc<ClientInner>,
+
+    /// Keeps the temp directory alive for the lifetime of this state.
+    /// Only populated when `ServerState` is constructed without an explicit
+    /// database path (i.e., in tests via `default()` or `new()`).
+    #[cfg(test)]
+    _tempdir: Option<Arc<tempfile::TempDir>>,
 }
 
+#[cfg(test)]
 impl Default for ServerState {
     fn default() -> Self {
-        let client = Client::open_in_memory().expect("in-memory client never fails");
+        let tempdir = tempfile::TempDir::new().expect("create tempdir for default ServerState");
+        let db_path = tempdir.path().join("mqlite_test.db");
+        let client = Client::open(&db_path).expect("open tempdir-backed client");
         ServerState {
             start_time: Arc::new(std::time::Instant::now()),
             next_connection_id: Arc::new(AtomicI32::new(1)),
-            db_path: None,
+            db_path: Some(db_path.clone()),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
+            _tempdir: Some(Arc::new(tempdir)),
         }
     }
 }
 
 impl ServerState {
-    /// Create state for a client at the given path (in-memory client for non-CRUD state).
+    /// Create state backed by a tempdir-scoped [`Client`] for use in tests.
+    /// `db_path` is recorded as-is so callers can pass an explicit path or
+    /// `None` when the exact path does not matter.
+    #[cfg(test)]
     fn new(db_path: Option<std::path::PathBuf>) -> Self {
-        let client = Client::open_in_memory().expect("in-memory client never fails");
+        let tempdir = tempfile::TempDir::new().expect("create tempdir for ServerState::new");
+        let tmp_db_path = tempdir.path().join("mqlite_test.db");
+        let client = Client::open(&tmp_db_path).expect("open tempdir-backed client");
         ServerState {
             start_time: Arc::new(std::time::Instant::now()),
             next_connection_id: Arc::new(AtomicI32::new(1)),
-            db_path,
+            db_path: Some(db_path.unwrap_or(tmp_db_path)),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
+            _tempdir: Some(Arc::new(tempdir)),
         }
     }
 
@@ -243,6 +259,8 @@ impl ServerState {
             db_path: client.inner.path.clone(),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
+            #[cfg(test)]
+            _tempdir: None,
         }
     }
 
@@ -256,7 +274,7 @@ impl ServerState {
         self.start_time.elapsed().as_secs() as i64
     }
 
-    /// Return the size of the WAL file in bytes, or 0 if absent / in-memory.
+    /// Return the size of the WAL file in bytes, or 0 if absent.
     fn wal_file_size(&self) -> u64 {
         let wal_path = match &self.db_path {
             Some(p) => {
@@ -317,8 +335,10 @@ fn qualified_coll(body: &Document, coll_name: &str) -> String {
 /// # Example
 /// ```no_run
 /// use mqlite::{Client, WireProtocol};
+/// # use tempfile::TempDir;
+/// # let dir = TempDir::new()?;
+/// # let client = Client::open(dir.path().join("db.mqlite"))?;
 ///
-/// let client = Client::open_in_memory()?;
 /// let server = WireProtocol::bind(&client, "127.0.0.1:27017")?;
 /// // Server is running. Connect with:
 /// //   mongosh "mongodb://localhost:27017/?directConnection=true"
@@ -2726,7 +2746,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = tempfile::TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let _server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
         let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -2774,7 +2795,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = tempfile::TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let _server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
         let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -2840,7 +2862,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let client = Client::open_in_memory().unwrap();
+        let _tempdir = tempfile::TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let _server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
 
         let mut client = std::net::TcpStream::connect(addr).unwrap();
@@ -4093,12 +4116,11 @@ mod tests {
         assert_eq!(key.get_i32("_id").unwrap(), 1);
     }
 
-    // T21 — Lane 1 resolution test. Pre-cleanup, DocBackend::Buffered returned
-    // `_id_` from list_indexes while DocBackend::Memory did not — causing a
+    // T21 — Lane 1 resolution test. Pre-cleanup, the Buffered backend returned
+    // `_id_` from list_indexes while the old Memory backend did not — causing a
     // `+1` offset in handle_create_indexes to double-count on Buffered.
-    // Post-cleanup both backends agree, and the numbers in createIndexes
-    // responses must match the Memory-backed test
-    // `create_indexes_returns_num_before_after` (before=1, after=2).
+    // Post-cleanup only the Buffered backend exists, and the numbers in
+    // createIndexes responses must match (before=1, after=2).
     #[test]
     fn create_indexes_numbers_correct_on_buffered_backend() {
         use crate::client::Client;
@@ -4116,6 +4138,8 @@ mod tests {
             db_path: Some(db_path),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
+            #[cfg(test)]
+            _tempdir: None,
         };
 
         let result = handle_create_indexes(

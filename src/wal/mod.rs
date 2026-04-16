@@ -713,7 +713,7 @@ fn page_size_to_wal(size: PageSize) -> WalPageSize {
 ///   until checkpoint time.
 ///
 /// The WAL state is shared via `Arc<Mutex<WalManager>>`; contention is
-/// managed at a higher level by the engine's `RwLock<DocBackend>`.
+/// managed at a higher level by the engine's `RwLock<BpBackend>`.
 pub(crate) struct WalLayeredSource {
     inner: Arc<dyn PageSource>,
     wal: Arc<Mutex<WalManager>>,

@@ -168,18 +168,20 @@ pub(crate) trait FileLock: Send + Sync {
     /// (`fsync(2)` on Unix).
     ///
     /// Called by the `FullSync` durability path after every write commit to
-    /// guarantee data survives a process crash.  No-op for in-memory databases.
+    /// guarantee data survives a process crash.  No-op on platforms without
+    /// file-based locking (e.g. the `NoopFileLock` stub).
     fn sync(&self) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
-// NoopFileLock — in-memory databases
+// NoopFileLock — platforms without native file locking
 // ---------------------------------------------------------------------------
 
-/// A no-op lock implementation for in-memory databases.
+/// A no-op [`FileLock`] for platforms that lack a native locking primitive.
 ///
-/// In-memory databases have no file and therefore no need for cross-process
-/// locking.  All operations succeed immediately.
+/// Used as the fallback on targets that are neither Unix nor Windows.
+/// All lock operations succeed immediately; I/O operations return an error
+/// because there is no backing file to read or write.
 pub(crate) struct NoopFileLock;
 
 impl FileLock for NoopFileLock {
@@ -196,21 +198,21 @@ impl FileLock for NoopFileLock {
     }
 
     fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<()> {
-        // In-memory databases have no backing file to write.
+        // No backing file on this platform.
         Err(Error::Internal(
-            "NoopFileLock::write_at: no backing file (in-memory database)".into(),
+            "NoopFileLock::write_at: no backing file on this platform".into(),
         ))
     }
 
     fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
-        // In-memory databases have no backing file to read.
+        // No backing file on this platform.
         Err(Error::Internal(
-            "NoopFileLock::read_exact_at: no backing file (in-memory database)".into(),
+            "NoopFileLock::read_exact_at: no backing file on this platform".into(),
         ))
     }
 
     fn sync(&self) -> Result<()> {
-        // In-memory databases have no backing file to sync.
+        // No backing file — sync is a no-op.
         Ok(())
     }
 }
@@ -467,7 +469,7 @@ impl FileLock for WindowsFileLock {
 ///
 /// On Unix, opens the path with `O_RDWR` and returns a [`PosixFileLock`].
 /// On Windows, returns a [`WindowsFileLock`] stub.
-/// For in-memory databases (no path), use [`NoopFileLock`] directly.
+/// For platforms without native locking, use [`NoopFileLock`] directly.
 ///
 /// The returned lock **has not yet acquired any lock mode** — call
 /// [`FileLock::acquire_exclusive`] or [`FileLock::acquire_shared`] to

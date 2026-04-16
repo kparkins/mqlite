@@ -71,8 +71,10 @@ TLS support is planned for Phase 2.
 ### Development / Local Testing (Supported)
 
 ```rust
-// Safe: localhost only, ephemeral in-memory database
-let client = Client::open_in_memory()?;
+// Safe: localhost only, ephemeral temp-file database
+use tempfile::TempDir;
+let tempdir = TempDir::new()?;
+let client = Client::open(tempdir.path().join("db.mqlite"))?;
 let _server = WireProtocol::bind(&client, "127.0.0.1:27017")?;
 # Ok::<(), mqlite::Error>(())
 ```

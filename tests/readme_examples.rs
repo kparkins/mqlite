@@ -6,6 +6,7 @@
 
 use mqlite::{doc, Client};
 use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
 
 /// README example 1: untyped Document access.
 ///
@@ -13,7 +14,8 @@ use serde::{Deserialize, Serialize};
 /// not need a direct `bson` dependency.
 #[test]
 fn readme_untyped_document_example() {
-    let client = Client::open_in_memory().expect("open in-memory client");
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
     let db = client.database("test");
     let events = db.collection::<mqlite::Document>("events");
 
@@ -46,7 +48,8 @@ struct Config {
 
 #[test]
 fn readme_typed_struct_example() {
-    let client = Client::open_in_memory().expect("open in-memory client");
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
     let db = client.database("test");
     let configs = db.collection::<Config>("config");
 
@@ -77,10 +80,12 @@ fn readme_crate_root_imports() {
     let _ = mqlite::ObjectId::new();
 }
 
-/// Verify `Client::open_in_memory()` — the test-double pattern.
+/// Verify the tempfile test-double pattern: open a `Client` backed by a
+/// temporary file, perform basic CRUD, and confirm results are correct.
 #[test]
 fn readme_in_memory_test_double() {
-    let client = Client::open_in_memory().expect("open in-memory client");
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
     let db = client.database("test");
     let col = db.collection::<mqlite::Document>("things");
     col.insert_one(&doc! { "x": 1 }).expect("insert");

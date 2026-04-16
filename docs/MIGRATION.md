@@ -65,8 +65,10 @@ fn main() -> mqlite::Result<()> {
             .durability(DurabilityMode::FullSync),
     )?;
 
-    // In-memory (useful for tests):
-    let client = Client::open_in_memory()?;
+    // Temp-file (useful for tests — see docs/TEST-DOUBLE-COOKBOOK.md):
+    use tempfile::TempDir;
+    let tempdir = TempDir::new()?;
+    let client = Client::open(tempdir.path().join("db.mqlite"))?;
 
     Ok(())
 }

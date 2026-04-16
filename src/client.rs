@@ -37,7 +37,7 @@ use crate::{
         file_io::FilePageSource,
         handle::BufferPoolHandle,
         header::{FileHeader, HEADER_PAGE_SIZE},
-        lock::{self, FileLock, NoopFileLock},
+        lock::{self, FileLock},
         paged_engine::PagedEngine,
     },
     storage_engine::StorageEngine,
@@ -169,7 +169,7 @@ fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
 /// abstraction lets future phases swap in a different engine without changing
 /// the public API layer.
 pub(crate) struct ClientInner {
-    /// Path to the database file. `None` for in-memory databases.
+    /// Path to the database file.
     pub path: Option<PathBuf>,
     /// Configuration options.
     pub opts: OpenOptions,
@@ -187,8 +187,6 @@ pub(crate) struct ClientInner {
     /// advisory lock when the second fd is closed (POSIX footgun).
     file_lock: Arc<dyn FileLock>,
     /// Buffer pool handle — file I/O infrastructure wired in by R1.1.
-    ///
-    /// `None` for in-memory clients.  File-backed clients always have `Some`.
     #[allow(dead_code)]
     pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
     /// Storage engine.  All CRUD operations are dispatched through this trait.
@@ -200,23 +198,10 @@ pub(crate) struct ClientInner {
     /// checkpointed pages.  Both fds are closed together when `ClientInner`
     /// is dropped, so the lock lifetime is unaffected.
     ///
-    /// `None` for in-memory clients.
     wal_main_file: Option<Arc<Mutex<std::fs::File>>>,
 }
 
 impl ClientInner {
-    fn new(path: Option<PathBuf>, opts: OpenOptions, file_lock: Arc<dyn FileLock>) -> Self {
-        ClientInner {
-            path,
-            opts,
-            writer_lock: Mutex::new(()),
-            file_lock,
-            buffer_pool: None,
-            engine: Box::new(PagedEngine::new()),
-            wal_main_file: None,
-        }
-    }
-
     fn new_with_buffer_pool(
         path: Option<PathBuf>,
         opts: OpenOptions,
@@ -650,12 +635,11 @@ impl ClientInner {
     }
 
     pub(crate) fn backup(&self, dest: &Path) -> Result<()> {
-        // Backup of an in-memory database is not supported.
         let src_path = match &self.path {
             Some(p) => p.as_path(),
             None => {
                 return Err(Error::Internal(
-                    "backup: in-memory databases cannot be backed up to a file".into(),
+                    "backup: no source path available".into(),
                 ));
             }
         };
@@ -767,8 +751,9 @@ impl ClientInner {
 /// // Open (or create) a database file
 /// let client = Client::open("myapp.mqlite")?;
 ///
-/// // In-memory (for tests — no files created)
-/// let client = Client::open_in_memory()?;
+/// # use tempfile::TempDir;
+/// # let dir = TempDir::new()?;
+/// # let client = Client::open(dir.path().join("db.mqlite"))?;
 /// # Ok::<(), mqlite::Error>(())
 /// ```
 ///
@@ -782,7 +767,9 @@ impl ClientInner {
 /// struct User { name: String }
 ///
 /// # fn main() -> mqlite::Result<()> {
-/// let client = Client::open_in_memory()?;
+/// # use tempfile::TempDir;
+/// # let dir = TempDir::new()?;
+/// # let client = Client::open(dir.path().join("db.mqlite"))?;
 /// let db = client.database("myapp");
 /// let users = db.collection::<User>("users");
 /// # Ok(())
@@ -955,18 +942,6 @@ impl Client {
         Ok(Client { inner })
     }
 
-    /// Create an in-memory client with no persistence.
-    ///
-    /// In-memory databases are ideal for testing — no files are created and
-    /// everything is released when the last handle is dropped.
-    ///
-    /// File locking is a no-op for in-memory databases (there is no file to lock).
-    pub fn open_in_memory() -> Result<Client> {
-        let noop_lock: Arc<dyn FileLock> = Arc::new(NoopFileLock);
-        let inner = Arc::new(ClientInner::new(None, OpenOptions::new(), noop_lock));
-        Ok(Client { inner })
-    }
-
     /// Get a handle to a named database.
     ///
     /// This call is infallible — the database namespace is logical only.
@@ -977,7 +952,9 @@ impl Client {
     /// use mqlite::Client;
     ///
     /// # fn main() -> mqlite::Result<()> {
-    /// let client = Client::open_in_memory()?;
+    /// # use tempfile::TempDir;
+    /// # let dir = TempDir::new()?;
+    /// # let client = Client::open(dir.path().join("db.mqlite"))?;
     /// let db = client.database("myapp");
     /// # Ok(())
     /// # }
@@ -1033,6 +1010,7 @@ mod tests {
     #[cfg(unix)]
     use libc;
     use std::fs;
+    use tempfile::TempDir;
 
     // ---- Symlink rejection -------------------------------------------------
 
@@ -1118,8 +1096,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn in_memory_open_does_not_lock() {
-        let _c1 = Client::open_in_memory().expect("first open");
-        let _c2 = Client::open_in_memory().expect("second open");
+        let _tempdir = TempDir::new().expect("tempdir");
+        let _c1 = Client::open(_tempdir.path().join("db1.mqlite")).expect("first open");
+        let _tempdir2 = TempDir::new().expect("tempdir");
+        let _c2 = Client::open(_tempdir2.path().join("db2.mqlite")).expect("second open");
     }
 
     #[test]
@@ -1320,19 +1300,20 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_creates_no_files() {
+    fn tempdir_client_creates_no_files_outside_tempdir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_count_before = fs::read_dir(dir.path()).expect("read dir").count();
 
         {
-            let _client = Client::open_in_memory().expect("in-memory open");
+            let _tempdir = TempDir::new().expect("tempdir");
+            let _client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         }
 
         let file_count_after = fs::read_dir(dir.path()).expect("read dir").count();
 
         assert_eq!(
             file_count_before, file_count_after,
-            "in-memory client must not create files"
+            "tempdir-backed client must not create files outside its own tempdir"
         );
     }
 
@@ -1353,14 +1334,16 @@ mod tests {
 
     #[test]
     fn database_returns_handle_with_correct_name() {
-        let client = Client::open_in_memory().expect("open");
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let db = client.database("myapp");
         assert_eq!(db.name(), "myapp");
     }
 
     #[test]
     fn multiple_databases_are_independent() {
-        let client = Client::open_in_memory().expect("open");
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         use bson::doc;
         use serde::{Deserialize, Serialize};
         #[derive(Serialize, Deserialize, Debug)]
@@ -1398,7 +1381,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let client = Arc::new(Client::open_in_memory().expect("open"));
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Arc::new(Client::open(_tempdir.path().join("db.mqlite")).expect("open"));
         let db = client.database("test");
         let col = db.collection::<bson::Document>("data");
 
@@ -1437,7 +1421,8 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let client = Arc::new(Client::open_in_memory().expect("open"));
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Arc::new(Client::open(_tempdir.path().join("db.mqlite")).expect("open"));
 
         // 8 writer threads, each inserts 10 docs.
         let handles: Vec<_> = (0..8u32)
@@ -1501,26 +1486,6 @@ mod tests {
                 .expect("count");
             assert_eq!(count, 100, "backup must contain all 100 documents");
         }
-    }
-
-    /// backup() on an in-memory database must return an error.
-    #[test]
-    fn backup_in_memory_returns_error() {
-        let client = Client::open_in_memory().expect("open");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dst = dir.path().join("dst.mqlite");
-        let result = client.backup(&dst);
-        assert!(
-            result.is_err(),
-            "backup of in-memory database must fail, got: {:?}",
-            result
-        );
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, Error::Internal(_)),
-            "expected Internal error, got: {:?}",
-            err
-        );
     }
 
     /// backup() to the same path as the source must return an error.

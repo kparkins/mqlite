@@ -30,11 +30,13 @@
 //! The server runs until terminated (Ctrl-C or SIGTERM).
 
 use mqlite::{Client, WireProtocol};
+use tempfile::TempDir;
 
 fn main() -> mqlite::Result<()> {
     let port = parse_port();
     let addr = format!("127.0.0.1:{port}");
-    let client = Client::open_in_memory()?;
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite"))?;
     println!("mqlite wire server starting on {addr}");
     let _server = WireProtocol::bind(&client, &addr)?;
     println!("Listening on mongodb://{addr}/?directConnection=true");

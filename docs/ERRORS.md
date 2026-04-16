@@ -170,7 +170,9 @@ A write violated a unique index constraint.
 ```rust
 use mqlite::{Client, Error, doc};
 
-let client = Client::open_in_memory()?;
+use tempfile::TempDir;
+let tempdir = TempDir::new()?;
+let client = Client::open(tempdir.path().join("db.mqlite"))?;
 let users = client.database("test").collection::<bson::Document>("users");
 
 let result = users.insert_one(&doc! { "_id": "alice", "name": "Alice" });
@@ -294,7 +296,9 @@ collection to exist. `insert_one` and `find` create the collection implicitly.
 ```rust
 use mqlite::{Client, Error};
 
-let client = Client::open_in_memory()?;
+use tempfile::TempDir;
+let tempdir = TempDir::new()?;
+let client = Client::open(tempdir.path().join("db.mqlite"))?;
 let col = client.database("test").collection::<bson::Document>("events");
 
 match col.drop_index("myindex") {
@@ -340,7 +344,9 @@ A query filter or update document used an MQL operator not supported in Phase 1.
 ```rust
 use mqlite::{Client, Error, doc};
 
-let client = Client::open_in_memory()?;
+use tempfile::TempDir;
+let tempdir = TempDir::new()?;
+let client = Client::open(tempdir.path().join("db.mqlite"))?;
 let col = client.database("test").collection::<bson::Document>("items");
 
 match col.find_one(doc! { "text": { "$text": { "$search": "hello" } } }) {
@@ -386,7 +392,9 @@ over the wire protocol.
 ```rust
 use mqlite::{Client, IndexModel, options::IndexOptions, doc};
 
-let client = Client::open_in_memory()?;
+use tempfile::TempDir;
+let tempdir = TempDir::new()?;
+let client = Client::open(tempdir.path().join("db.mqlite"))?;
 let col = client.database("test").collection::<bson::Document>("users");
 
 // Supported: unique index on a field

@@ -46,7 +46,9 @@ use crate::{client::ClientInner, collection::Collection, error::Result};
 /// struct User { name: String }
 ///
 /// # fn main() -> mqlite::Result<()> {
-/// let client = Client::open_in_memory()?;
+/// # use tempfile::TempDir;
+/// # let dir = TempDir::new()?;
+/// # let client = Client::open(dir.path().join("db.mqlite"))?;
 /// let db = client.database("myapp");
 /// let users = db.collection::<User>("users");
 /// users.insert_one(&User { name: "Alice".into() })?;

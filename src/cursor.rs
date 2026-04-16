@@ -10,8 +10,11 @@ use crate::error::{Error, Result};
 /// # Example
 /// ```no_run
 /// # use mqlite::{Client, doc};
+/// # use tempfile::TempDir;
 /// # fn main() -> mqlite::Result<()> {
-/// # let client = Client::open_in_memory()?; let db = client.database("test");
+/// # let dir = TempDir::new()?;
+/// # let client = Client::open(dir.path().join("db.mqlite"))?;
+/// # let db = client.database("test");
 /// # let col = db.collection::<bson::Document>("orders");
 /// let cursor = col.find(doc! { "status": "pending" })?;
 /// let plan = cursor.explain()?;
@@ -48,8 +51,11 @@ pub struct ExplainResult {
 ///
 /// ```no_run
 /// # use mqlite::{Client, doc};
+/// # use tempfile::TempDir;
 /// # fn main() -> mqlite::Result<()> {
-/// # let client = Client::open_in_memory()?; let db = client.database("test");
+/// # let dir = TempDir::new()?;
+/// # let client = Client::open(dir.path().join("db.mqlite"))?;
+/// # let db = client.database("test");
 /// # let collection = db.collection::<bson::Document>("users");
 /// let cursor = collection.find(doc! {})?;
 /// for result in cursor {
@@ -144,8 +150,11 @@ impl<T> Cursor<T> {
     /// # Example
     /// ```no_run
     /// # use mqlite::{Client, doc};
+    /// # use tempfile::TempDir;
     /// # fn main() -> mqlite::Result<()> {
-    /// # let client = Client::open_in_memory()?; let db = client.database("test");
+    /// # let dir = TempDir::new()?;
+    /// # let client = Client::open(dir.path().join("db.mqlite"))?;
+    /// # let db = client.database("test");
     /// # let col = db.collection::<bson::Document>("logs");
     /// let cursor = col.find(doc! { "level": "error" })?;
     /// let plan = cursor.explain()?;

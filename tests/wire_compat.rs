@@ -42,6 +42,7 @@ use std::net::TcpStream;
 
 use bson::{doc, Bson, Document};
 use mqlite::{Client, WireProtocol};
+use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Wire protocol constants
@@ -55,19 +56,22 @@ const OP_REPLY: i32 = 1;
 // Test helper: spin up a wire server on a random port
 // ---------------------------------------------------------------------------
 
-/// Spin up a `WireProtocol` server backed by an in-memory client.
+/// Spin up a `WireProtocol` server backed by a file-backed client in a temp dir.
 ///
-/// Returns `(client, server, addr)`.  The server runs in the background until dropped.
+/// Returns `(tempdir, client, server, addr)`.  The caller must hold `tempdir` alive
+/// for the duration of the test; dropping it removes the database files.
+/// The server runs in the background until dropped.
 /// The address is a random loopback port chosen by the OS.
-fn start_server() -> (Client, WireProtocol, std::net::SocketAddr) {
+fn start_server() -> (TempDir, Client, WireProtocol, std::net::SocketAddr) {
     // Grab a random ephemeral port.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let client = Client::open_in_memory().unwrap();
+    let tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(tempdir.path().join("db.mqlite")).expect("open");
     let server = WireProtocol::bind(&client, &addr.to_string()).unwrap();
-    (client, server, addr)
+    (tempdir, client, server, addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +185,7 @@ fn round_trip(stream: &mut TcpStream, request_id: i32, body: &Document) -> Docum
 /// mongosh step 0: OP_QUERY isMaster handshake (mongosh sends this first).
 #[test]
 fn mongosh_smoke_op_query_ismaster_handshake() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let frame = build_op_query(1, "admin.$cmd", &doc! { "ismaster": 1, "helloOk": true });
@@ -213,7 +217,7 @@ fn mongosh_smoke_op_query_ismaster_handshake() {
 /// Insert a document first so that a database is visible.
 #[test]
 fn mongosh_smoke_show_dbs() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Insert a document to create the "local" database namespace.
@@ -247,7 +251,7 @@ fn mongosh_smoke_show_dbs() {
 /// mongosh step 2: `show collections` → listCollections (empty db).
 #[test]
 fn mongosh_smoke_show_collections_empty() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(&mut s, 1, &doc! { "listCollections": 1i32, "$db": "local" });
@@ -268,7 +272,7 @@ fn mongosh_smoke_show_collections_empty() {
 /// mongosh step 3: `db.col.insertOne({name:"Alice"})`.
 #[test]
 fn mongosh_smoke_insert_one() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(
@@ -293,7 +297,7 @@ fn mongosh_smoke_insert_one() {
 /// mongosh step 4: `db.col.find({})` — returns inserted docs.
 #[test]
 fn mongosh_smoke_find_returns_docs() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Insert first.
@@ -327,7 +331,7 @@ fn mongosh_smoke_find_returns_docs() {
 /// mongosh step 5: `db.col.updateOne({name:"Alice"},{$set:{score:100}})`.
 #[test]
 fn mongosh_smoke_update_one() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -358,7 +362,7 @@ fn mongosh_smoke_update_one() {
 /// mongosh step 6: `db.col.deleteOne({name:"Bob"})`.
 #[test]
 fn mongosh_smoke_delete_one() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -412,7 +416,7 @@ fn mongosh_smoke_delete_one() {
 /// pymongo connect: OP_QUERY isMaster (initial handshake), then hello OP_MSG.
 #[test]
 fn pymongo_compat_handshake_sequence() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Step 1: OP_QUERY isMaster (pymongo sends this before it knows wire version).
@@ -432,7 +436,7 @@ fn pymongo_compat_handshake_sequence() {
 /// pymongo: MongoClient.server_info() → buildInfo.
 #[test]
 fn pymongo_compat_build_info() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(&mut s, 1, &doc! { "buildInfo": 1i32, "$db": "admin" });
@@ -453,7 +457,7 @@ fn pymongo_compat_build_info() {
 /// pymongo: ping.
 #[test]
 fn pymongo_compat_ping() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(&mut s, 1, &doc! { "ping": 1i32, "$db": "admin" });
@@ -463,7 +467,7 @@ fn pymongo_compat_ping() {
 /// pymongo: insert_one / find.
 #[test]
 fn pymongo_compat_insert_one_find() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let ins = round_trip(
@@ -492,7 +496,7 @@ fn pymongo_compat_insert_one_find() {
 /// pymongo: update_one.
 #[test]
 fn pymongo_compat_update_one() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -518,7 +522,7 @@ fn pymongo_compat_update_one() {
 /// pymongo: delete_one.
 #[test]
 fn pymongo_compat_delete_one() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -545,7 +549,7 @@ fn pymongo_compat_delete_one() {
 /// Key format requirement: response uses `value` field, NOT `document`.
 #[test]
 fn pymongo_compat_find_one_and_update() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -590,7 +594,7 @@ fn pymongo_compat_find_one_and_update() {
 /// pymongo: find_one_and_update with new=true returns post-update doc.
 #[test]
 fn pymongo_compat_find_one_and_update_new_true() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -618,7 +622,7 @@ fn pymongo_compat_find_one_and_update_new_true() {
 /// pymongo: findAndModify on missing doc → value is null.
 #[test]
 fn pymongo_compat_find_and_modify_no_match_null_value() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let fam = round_trip(
@@ -641,7 +645,7 @@ fn pymongo_compat_find_and_modify_no_match_null_value() {
 /// - `numIndexesBefore` and `numIndexesAfter` must be present.
 #[test]
 fn pymongo_compat_create_index_list_indexes() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let ci = round_trip(
@@ -694,7 +698,7 @@ fn pymongo_compat_create_index_list_indexes() {
 /// Key format requirement: getMore response uses `nextBatch` (not `firstBatch`).
 #[test]
 fn pymongo_compat_cursor_get_more() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Insert 5 docs.
@@ -783,7 +787,7 @@ fn pymongo_compat_cursor_get_more() {
 /// pymongo: getMore on unknown cursor returns CursorNotFound (code 43).
 #[test]
 fn pymongo_compat_get_more_unknown_cursor() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(
@@ -814,7 +818,7 @@ fn pymongo_compat_get_more_unknown_cursor() {
 /// Format parity: ping response.
 #[test]
 fn format_parity_ping() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(&mut s, 1, &doc! { "ping": 1i32, "$db": "admin" });
     assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -823,7 +827,7 @@ fn format_parity_ping() {
 /// Format parity: hello response fields.
 #[test]
 fn format_parity_hello() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(&mut s, 1, &doc! { "hello": 1i32, "$db": "admin" });
 
@@ -850,7 +854,7 @@ fn format_parity_hello() {
 /// Format parity: isMaster (legacy alias for hello).
 #[test]
 fn format_parity_ismaster() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(&mut s, 1, &doc! { "isMaster": 1i32, "$db": "admin" });
 
@@ -862,7 +866,7 @@ fn format_parity_ismaster() {
 /// Format parity: buildInfo response.
 #[test]
 fn format_parity_build_info() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(&mut s, 1, &doc! { "buildInfo": 1i32, "$db": "admin" });
 
@@ -881,7 +885,7 @@ fn format_parity_build_info() {
 /// Format parity: serverStatus response.
 #[test]
 fn format_parity_server_status() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(&mut s, 1, &doc! { "serverStatus": 1i32, "$db": "admin" });
 
@@ -898,7 +902,7 @@ fn format_parity_server_status() {
 /// R2.1: databases only appear after a write.  Insert first, then verify format.
 #[test]
 fn format_parity_list_databases() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Seed a document so that "fmtdb" appears in listDatabases.
@@ -929,7 +933,7 @@ fn format_parity_list_databases() {
 /// Format parity: insert response fields and types.
 #[test]
 fn format_parity_insert() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(
         &mut s,
@@ -957,7 +961,7 @@ fn format_parity_insert() {
 /// The writeErrors array is the MongoDB 8.0 format for partial write failures.
 #[test]
 fn format_parity_insert_write_errors() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Create unique index on "email".
@@ -1020,7 +1024,7 @@ fn format_parity_insert_write_errors() {
 /// Format parity: find with empty collection → cursor.firstBatch = [].
 #[test]
 fn format_parity_find_empty_first_batch() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(
         &mut s,
@@ -1045,7 +1049,7 @@ fn format_parity_find_empty_first_batch() {
 /// Format parity: update response fields (n, nModified, upserted).
 #[test]
 fn format_parity_update() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1083,7 +1087,7 @@ fn format_parity_update() {
 /// Format parity: update with upsert → upserted array with index + _id.
 #[test]
 fn format_parity_update_upserted_array() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(
@@ -1107,7 +1111,7 @@ fn format_parity_update_upserted_array() {
 /// Format parity: delete response.
 #[test]
 fn format_parity_delete() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1137,7 +1141,7 @@ fn format_parity_delete() {
 /// MongoDB 8.0 uses `value` (not `document`) + `lastErrorObject`.
 #[test]
 fn format_parity_find_and_modify() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1175,7 +1179,7 @@ fn format_parity_find_and_modify() {
 /// Format parity: getMore response — cursor.nextBatch (not firstBatch).
 #[test]
 fn format_parity_get_more_next_batch() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1225,7 +1229,7 @@ fn format_parity_get_more_next_batch() {
 /// Format parity: killCursors response.
 #[test]
 fn format_parity_kill_cursors() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Open a cursor.
@@ -1269,7 +1273,7 @@ fn format_parity_kill_cursors() {
 /// Format parity: create collection response.
 #[test]
 fn format_parity_create_collection() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(&mut s, 1, &doc! { "create": "newcol", "$db": "local" });
     assert_eq!(body.get_f64("ok").unwrap(), 1.0);
@@ -1278,7 +1282,7 @@ fn format_parity_create_collection() {
 /// Format parity: drop collection response.
 #[test]
 fn format_parity_drop_collection() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1295,7 +1299,7 @@ fn format_parity_drop_collection() {
 /// Each collection entry must have: name, type, options, idIndex.
 #[test]
 fn format_parity_list_collections() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1328,7 +1332,7 @@ fn format_parity_list_collections() {
 /// Format parity: createIndexes response.
 #[test]
 fn format_parity_create_indexes() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
     let body = round_trip(
         &mut s,
@@ -1349,7 +1353,7 @@ fn format_parity_create_indexes() {
 /// Format parity: dropIndexes response.
 #[test]
 fn format_parity_drop_indexes() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1373,7 +1377,7 @@ fn format_parity_drop_indexes() {
 /// Format parity: listIndexes response.
 #[test]
 fn format_parity_list_indexes() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     round_trip(
@@ -1417,7 +1421,8 @@ fn format_parity_list_indexes() {
 /// Native API → wire: insert via native API, read via wire protocol.
 #[test]
 fn bson_roundtrip_native_write_wire_read() {
-    let client = Client::open_in_memory().unwrap();
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
     let db = client.database("local");
     let coll = db.collection::<Document>("items");
 
@@ -1497,7 +1502,8 @@ fn bson_roundtrip_native_write_wire_read() {
 /// Wire → native API: insert via wire, read via native API.
 #[test]
 fn bson_roundtrip_wire_write_native_read() {
-    let client = Client::open_in_memory().unwrap();
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
     let db = client.database("local");
     let coll = db.collection::<Document>("items");
 
@@ -1542,7 +1548,8 @@ fn bson_roundtrip_wire_write_native_read() {
 /// BSON round-trip: ObjectId preserved across wire.
 #[test]
 fn bson_roundtrip_object_id_preserved() {
-    let client = Client::open_in_memory().unwrap();
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
     let db = client.database("local");
     let coll = db.collection::<Document>("oids");
 
@@ -1585,7 +1592,7 @@ fn bson_roundtrip_object_id_preserved() {
 /// aggregate → CommandNotFound (code 59).
 #[test]
 fn unsupported_command_aggregate_returns_command_not_found() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(&mut s, 1, &doc! { "aggregate": "coll", "$db": "local" });
@@ -1608,7 +1615,7 @@ fn unsupported_command_aggregate_returns_command_not_found() {
 /// Unknown command → CommandNotFound.
 #[test]
 fn unsupported_command_unknown_returns_command_not_found() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(
@@ -1629,7 +1636,7 @@ fn unsupported_command_unknown_returns_command_not_found() {
 /// mapReduce → CommandNotFound (removed in MongoDB 8.0).
 #[test]
 fn unsupported_command_map_reduce_not_found() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(&mut s, 1, &doc! { "mapReduce": "coll", "$db": "local" });
@@ -1647,7 +1654,7 @@ fn unsupported_command_map_reduce_not_found() {
 /// hello response must indicate standalone topology (no setName).
 #[test]
 fn direct_connection_no_replica_set_fields() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     let body = round_trip(&mut s, 1, &doc! { "hello": 1i32, "$db": "admin" });
@@ -1682,7 +1689,7 @@ fn direct_connection_no_replica_set_fields() {
 /// Full CRUD lifecycle on one connection.
 #[test]
 fn session_full_crud_lifecycle() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // 1. Insert 3 docs.
@@ -1759,7 +1766,7 @@ fn session_full_crud_lifecycle() {
 /// listCollections after creating collections via inserts.
 #[test]
 fn session_list_collections_after_inserts() {
-    let (_db, _srv, addr) = start_server();
+    let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
     // Create two collections by inserting.

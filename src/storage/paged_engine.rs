@@ -7,7 +7,6 @@
 //!
 //! | Mode | Backing store | Persistence |
 //! |------|--------------|-------------|
-//! | **Memory** | [`MemPageStore`] (independent per tree) | None (RAM only) |
 //! | **Buffered** | [`BufferPoolPageStore`] (shared [`BufferPoolHandle`]) | Via buffer pool flush |
 //!
 //! ## Catalog (Buffered mode)
@@ -45,7 +44,7 @@ use crate::options::{
 use crate::query::planner::{select_plan, IndexCondition, IndexMeta, ScanPlan};
 use crate::query::{eval_filter, get_nested_field};
 use crate::results::{DeleteResult, UpdateResult};
-use crate::storage::btree::{BTree, BTreePageStore, CellValue, MemPageStore};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog, IndexEntry};
@@ -313,74 +312,6 @@ fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Vec<Document>
             .collect();
     }
     docs
-}
-
-// ---------------------------------------------------------------------------
-// MemBackend — in-memory collections (no persistence)
-// ---------------------------------------------------------------------------
-
-/// Metadata held for an in-memory collection (no page-root tracking needed).
-struct MemCollMeta {
-    /// Index records: (name, model).
-    indexes: Vec<(String, IndexModel)>,
-}
-
-impl MemCollMeta {
-    /// Return `(name, fields, sparse)` tuples for all unique indexes.
-    fn unique_specs(&self) -> Vec<(String, Vec<String>, bool)> {
-        self.indexes
-            .iter()
-            .filter(|(_, m)| m.options.unique)
-            .map(|(name, m)| {
-                let fields = m.keys.keys().cloned().collect();
-                (name.clone(), fields, m.options.sparse)
-            })
-            .collect()
-    }
-}
-
-/// In-memory storage backend.
-///
-/// Each namespace gets an independent `BTree<MemPageStore>`.  There is no
-/// catalog B+ tree; metadata is stored in a plain [`HashMap`].
-struct MemBackend {
-    /// Per-namespace data trees.
-    data_trees: HashMap<String, BTree<MemPageStore>>,
-    /// Per-namespace collection metadata (indexes).
-    collections: HashMap<String, MemCollMeta>,
-}
-
-impl MemBackend {
-    fn new() -> Self {
-        Self {
-            data_trees: HashMap::new(),
-            collections: HashMap::new(),
-        }
-    }
-
-    /// Return a mutable reference to the data tree for `ns`, creating it if absent.
-    fn tree_or_create(&mut self, ns: &str) -> Result<&mut BTree<MemPageStore>> {
-        if !self.data_trees.contains_key(ns) {
-            let tree = BTree::create(MemPageStore::new())?;
-            self.data_trees.insert(ns.to_owned(), tree);
-            self.collections
-                .entry(ns.to_owned())
-                .or_insert_with(|| MemCollMeta {
-                    indexes: Vec::new(),
-                });
-        }
-        Ok(self.data_trees.get_mut(ns).unwrap())
-    }
-
-    /// Return a reference to the data tree for `ns`, or `None` if it doesn't exist.
-    fn tree(&self, ns: &str) -> Option<&BTree<MemPageStore>> {
-        self.data_trees.get(ns)
-    }
-
-    /// Return a mutable reference to the data tree for `ns`, or `None`.
-    fn tree_mut(&mut self, ns: &str) -> Option<&mut BTree<MemPageStore>> {
-        self.data_trees.get_mut(ns)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,15 +985,6 @@ impl BpBackend {
 }
 
 // ---------------------------------------------------------------------------
-// DocBackend — unified enum
-// ---------------------------------------------------------------------------
-
-enum DocBackend {
-    Memory(MemBackend),
-    Buffered(BpBackend),
-}
-
-// ---------------------------------------------------------------------------
 // PagedEngine — public struct
 // ---------------------------------------------------------------------------
 
@@ -1078,18 +1000,10 @@ enum DocBackend {
 /// - **Writers** (`insert`, `update`, `delete`, `create_index`, etc.) acquire an
 ///   exclusive write lock — one writer at a time, writers never block readers.
 pub(crate) struct PagedEngine {
-    inner: RwLock<DocBackend>,
+    inner: RwLock<BpBackend>,
 }
 
 impl PagedEngine {
-    /// Create an in-memory engine with no persistence.
-    ///
-    /// Used by [`Client::open_in_memory`].
-    pub(crate) fn new() -> Self {
-        PagedEngine {
-            inner: RwLock::new(DocBackend::Memory(MemBackend::new())),
-        }
-    }
 
     /// Create a file-backed engine using `handle` as the page store.
     ///
@@ -1102,7 +1016,7 @@ impl PagedEngine {
     ) -> Result<Self> {
         let backend = BpBackend::new(handle, catalog_root_page, catalog_root_level)?;
         Ok(PagedEngine {
-            inner: RwLock::new(DocBackend::Buffered(backend)),
+            inner: RwLock::new(backend),
         })
     }
 }
@@ -1118,30 +1032,19 @@ impl StorageEngine for PagedEngine {
 
     fn insert(&self, ns: &str, mut doc: Document) -> Result<Bson> {
         let mut inner = self.inner.write().unwrap();
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                // Collect unique specs before mutably borrowing the tree.
-                let unique_specs = m
-                    .collections
-                    .get(ns)
-                    .map(|meta| meta.unique_specs())
-                    .unwrap_or_default();
-                let tree = m.tree_or_create(ns)?;
-                btree_insert_doc(tree, &mut doc, &unique_specs)
-            }
-            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                // Insert into the primary (data) tree.  Unique-constraint
-                // checking for secondary indexes happens below after the
-                // secondary index trees are maintained.
-                let tree = bp.tree_or_create(ns)?;
-                let id = btree_insert_doc(tree, &mut doc, &[])?;
-                bp.sync_data_root(ns)?;
-                // Maintain secondary indexes (includes unique-constraint
-                // enforcement via the index B+ trees themselves).
-                bp.maintain_secondary_on_insert(ns, &doc, &id)?;
-                Ok(id)
-            }),
-        }
+        let bp = &mut *inner;
+        bp.with_txn(|bp| {
+            // Insert into the primary (data) tree.  Unique-constraint
+            // checking for secondary indexes happens below after the
+            // secondary index trees are maintained.
+            let tree = bp.tree_or_create(ns)?;
+            let id = btree_insert_doc(tree, &mut doc, &[])?;
+            bp.sync_data_root(ns)?;
+            // Maintain secondary indexes (includes unique-constraint
+            // enforcement via the index B+ trees themselves).
+            bp.maintain_secondary_on_insert(ns, &doc, &id)?;
+            Ok(id)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1151,28 +1054,18 @@ impl StorageEngine for PagedEngine {
     fn find(&self, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>> {
         // Read-only: acquire a shared read lock so concurrent readers don't block.
         let inner = self.inner.read().unwrap();
-        let matched: Vec<Document> = match &*inner {
-            DocBackend::Memory(m) => {
-                let Some(tree) = m.tree(ns) else {
-                    return Ok(Vec::new());
-                };
-                btree_collscan(tree, filter)?
-                    .into_iter()
-                    .map(|(_, doc)| doc)
-                    .collect()
-            }
-            DocBackend::Buffered(bp) => {
-                // Try an index scan first; fall back to a full collection scan.
-                if let Some(docs) = bp.try_index_scan_ro(ns, filter)? {
-                    docs
-                } else {
-                    match bp.open_tree_for_read(ns)? {
-                        None => return Ok(Vec::new()),
-                        Some(tree) => btree_collscan(&tree, filter)?
-                            .into_iter()
-                            .map(|(_, doc)| doc)
-                            .collect(),
-                    }
+        let bp = &*inner;
+        let matched: Vec<Document> = {
+            // Try an index scan first; fall back to a full collection scan.
+            if let Some(docs) = bp.try_index_scan_ro(ns, filter)? {
+                docs
+            } else {
+                match bp.open_tree_for_read(ns)? {
+                    None => return Ok(Vec::new()),
+                    Some(tree) => btree_collscan(&tree, filter)?
+                        .into_iter()
+                        .map(|(_, doc)| doc)
+                        .collect(),
                 }
             }
         };
@@ -1215,22 +1108,9 @@ impl StorageEngine for PagedEngine {
         }
 
         let mut inner = self.inner.write().unwrap();
-        let (matched_pairs, tree_exists): (Vec<(Vec<u8>, Document)>, bool) = match &mut *inner {
-            DocBackend::Memory(m) => {
-                let Some(tree) = m.tree(ns) else {
-                    if opts.upsert {
-                        drop(inner);
-                        return self.do_upsert_update(ns, filter, update);
-                    }
-                    return Ok(UpdateResult {
-                        matched_count: 0,
-                        modified_count: 0,
-                        upserted_id: None,
-                    });
-                };
-                (btree_collscan(tree, filter)?, true)
-            }
-            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+        let (matched_pairs, tree_exists): (Vec<(Vec<u8>, Document)>, bool) = {
+            let bp = &mut *inner;
+            match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
                         drop(inner);
@@ -1243,7 +1123,7 @@ impl StorageEngine for PagedEngine {
                     });
                 }
                 Some(tree) => (btree_collscan(tree, filter)?, true),
-            },
+            }
         };
 
         let _ = tree_exists;
@@ -1259,60 +1139,36 @@ impl StorageEngine for PagedEngine {
             matched_pairs.into_iter().take(1).collect()
         };
 
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                let mut matched_count = 0u64;
-                let mut modified_count = 0u64;
-                for (key, mut doc) in pairs_to_process {
-                    matched_count += 1;
-                    let before = doc.clone();
-                    apply_update(&mut doc, update, false)?;
-                    if doc != before {
-                        modified_count += 1;
-                        let new_bytes =
-                            bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-                        if let Some(tree) = m.tree_mut(ns) {
-                            tree.delete(&key)?;
-                            tree.insert(&key, &new_bytes)?;
-                        }
+        let bp = &mut *inner;
+        bp.with_txn(move |bp| {
+            let mut matched_count = 0u64;
+            let mut modified_count = 0u64;
+            for (key, mut doc) in pairs_to_process {
+                matched_count += 1;
+                let before = doc.clone();
+                let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
+                apply_update(&mut doc, update, false)?;
+                if doc != before {
+                    modified_count += 1;
+                    let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+                    let new_bytes =
+                        bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
+                    bp.maintain_secondary_on_update(
+                        ns, &before, &doc, &before_id, &new_id,
+                    )?;
+                    if let Some(tree) = bp.tree_mut(ns)? {
+                        tree.delete(&key)?;
+                        tree.insert(&key, &new_bytes)?;
                     }
+                    bp.sync_data_root(ns)?;
                 }
-                Ok(UpdateResult {
-                    matched_count,
-                    modified_count,
-                    upserted_id: None,
-                })
             }
-            DocBackend::Buffered(bp) => bp.with_txn(move |bp| {
-                let mut matched_count = 0u64;
-                let mut modified_count = 0u64;
-                for (key, mut doc) in pairs_to_process {
-                    matched_count += 1;
-                    let before = doc.clone();
-                    let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
-                    apply_update(&mut doc, update, false)?;
-                    if doc != before {
-                        modified_count += 1;
-                        let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                        let new_bytes =
-                            bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-                        bp.maintain_secondary_on_update(
-                            ns, &before, &doc, &before_id, &new_id,
-                        )?;
-                        if let Some(tree) = bp.tree_mut(ns)? {
-                            tree.delete(&key)?;
-                            tree.insert(&key, &new_bytes)?;
-                        }
-                        bp.sync_data_root(ns)?;
-                    }
-                }
-                Ok(UpdateResult {
-                    matched_count,
-                    modified_count,
-                    upserted_id: None,
-                })
-            }),
-        }
+            Ok(UpdateResult {
+                matched_count,
+                modified_count,
+                upserted_id: None,
+            })
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1323,19 +1179,9 @@ impl StorageEngine for PagedEngine {
         let mut inner = self.inner.write().unwrap();
 
         // Collect (key, doc) pairs to delete; we need the doc for index maintenance.
-        let pairs_to_delete: Vec<(Vec<u8>, Document)> = match &mut *inner {
-            DocBackend::Memory(m) => {
-                let Some(tree) = m.tree(ns) else {
-                    return Ok(DeleteResult { deleted_count: 0 });
-                };
-                let pairs = btree_collscan(tree, filter)?;
-                if many {
-                    pairs
-                } else {
-                    pairs.into_iter().take(1).collect()
-                }
-            }
-            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+        let pairs_to_delete: Vec<(Vec<u8>, Document)> = {
+            let bp = &mut *inner;
+            match bp.tree(ns)? {
                 None => return Ok(DeleteResult { deleted_count: 0 }),
                 Some(tree) => {
                     let pairs = btree_collscan(tree, filter)?;
@@ -1345,31 +1191,23 @@ impl StorageEngine for PagedEngine {
                         pairs.into_iter().take(1).collect()
                     }
                 }
-            },
+            }
         };
 
         let deleted_count = pairs_to_delete.len() as u64;
 
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                for (key, _doc) in &pairs_to_delete {
-                    if let Some(tree) = m.tree_mut(ns) {
-                        tree.delete(key)?;
-                    }
+        let bp = &mut *inner;
+        bp.with_txn(move |bp| {
+            for (key, doc) in &pairs_to_delete {
+                let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+                bp.maintain_secondary_on_delete(ns, doc, &doc_id)?;
+                if let Some(tree) = bp.tree_mut(ns)? {
+                    tree.delete(key)?;
                 }
+                bp.sync_data_root(ns)?;
             }
-            DocBackend::Buffered(bp) => bp.with_txn(move |bp| {
-                for (key, doc) in &pairs_to_delete {
-                    let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                    bp.maintain_secondary_on_delete(ns, doc, &doc_id)?;
-                    if let Some(tree) = bp.tree_mut(ns)? {
-                        tree.delete(key)?;
-                    }
-                    bp.sync_data_root(ns)?;
-                }
-                Ok(())
-            })?,
-        }
+            Ok(())
+        })?;
 
         Ok(DeleteResult { deleted_count })
     }
@@ -1381,21 +1219,13 @@ impl StorageEngine for PagedEngine {
     fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
         // Read-only: shared read lock for concurrent reader support.
         let inner = self.inner.read().unwrap();
-        match &*inner {
-            DocBackend::Memory(m) => {
-                let Some(tree) = m.tree(ns) else {
-                    return Ok(0);
-                };
-                let pairs = btree_collscan(tree, filter)?;
+        let bp = &*inner;
+        match bp.open_tree_for_read(ns)? {
+            None => Ok(0),
+            Some(tree) => {
+                let pairs = btree_collscan(&tree, filter)?;
                 Ok(pairs.len() as u64)
             }
-            DocBackend::Buffered(bp) => match bp.open_tree_for_read(ns)? {
-                None => Ok(0),
-                Some(tree) => {
-                    let pairs = btree_collscan(&tree, filter)?;
-                    Ok(pairs.len() as u64)
-                }
-            },
         }
     }
 
@@ -1417,18 +1247,9 @@ impl StorageEngine for PagedEngine {
         }
 
         let mut inner = self.inner.write().unwrap();
-        let mut matched: Vec<(Vec<u8>, Document)> = match &mut *inner {
-            DocBackend::Memory(m) => {
-                let Some(tree) = m.tree(ns) else {
-                    if opts.upsert {
-                        drop(inner);
-                        return self.fam_upsert_update(ns, filter, update, opts);
-                    }
-                    return Ok(None);
-                };
-                btree_collscan(tree, filter)?
-            }
-            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+        let mut matched: Vec<(Vec<u8>, Document)> = {
+            let bp = &mut *inner;
+            match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
                         drop(inner);
@@ -1437,7 +1258,7 @@ impl StorageEngine for PagedEngine {
                     return Ok(None);
                 }
                 Some(tree) => btree_collscan(tree, filter)?,
-            },
+            }
         };
 
         if matched.is_empty() {
@@ -1459,23 +1280,16 @@ impl StorageEngine for PagedEngine {
         let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
         let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                if let Some(tree) = m.tree_mut(ns) {
-                    tree.delete(&key)?;
-                    tree.insert(&key, &new_bytes)?;
-                }
+        let bp = &mut *inner;
+        bp.with_txn(|bp| {
+            bp.maintain_secondary_on_update(ns, &before, &doc, &before_id, &new_id)?;
+            if let Some(tree) = bp.tree_mut(ns)? {
+                tree.delete(&key)?;
+                tree.insert(&key, &new_bytes)?;
             }
-            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                bp.maintain_secondary_on_update(ns, &before, &doc, &before_id, &new_id)?;
-                if let Some(tree) = bp.tree_mut(ns)? {
-                    tree.delete(&key)?;
-                    tree.insert(&key, &new_bytes)?;
-                }
-                bp.sync_data_root(ns)?;
-                Ok(())
-            })?,
-        }
+            bp.sync_data_root(ns)?;
+            Ok(())
+        })?;
 
         Ok(Some(match opts.return_document {
             ReturnDocument::Before => before,
@@ -1494,17 +1308,12 @@ impl StorageEngine for PagedEngine {
         opts: &FindOneAndDeleteOptions,
     ) -> Result<Option<Document>> {
         let mut inner = self.inner.write().unwrap();
-        let mut matched: Vec<(Vec<u8>, Document)> = match &mut *inner {
-            DocBackend::Memory(m) => {
-                let Some(tree) = m.tree(ns) else {
-                    return Ok(None);
-                };
-                btree_collscan(tree, filter)?
-            }
-            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+        let mut matched: Vec<(Vec<u8>, Document)> = {
+            let bp = &mut *inner;
+            match bp.tree(ns)? {
                 None => return Ok(None),
                 Some(tree) => btree_collscan(tree, filter)?,
-            },
+            }
         };
 
         if matched.is_empty() {
@@ -1518,21 +1327,15 @@ impl StorageEngine for PagedEngine {
         let (key, doc) = matched.remove(0);
         let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                if let Some(tree) = m.tree_mut(ns) {
-                    tree.delete(&key)?;
-                }
+        let bp = &mut *inner;
+        bp.with_txn(|bp| {
+            bp.maintain_secondary_on_delete(ns, &doc, &doc_id)?;
+            if let Some(tree) = bp.tree_mut(ns)? {
+                tree.delete(&key)?;
             }
-            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                bp.maintain_secondary_on_delete(ns, &doc, &doc_id)?;
-                if let Some(tree) = bp.tree_mut(ns)? {
-                    tree.delete(&key)?;
-                }
-                bp.sync_data_root(ns)?;
-                Ok(())
-            })?,
-        }
+            bp.sync_data_root(ns)?;
+            Ok(())
+        })?;
 
         Ok(Some(doc))
     }
@@ -1549,18 +1352,9 @@ impl StorageEngine for PagedEngine {
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
         let mut inner = self.inner.write().unwrap();
-        let mut matched: Vec<(Vec<u8>, Document)> = match &mut *inner {
-            DocBackend::Memory(m) => {
-                let Some(tree) = m.tree(ns) else {
-                    if opts.upsert {
-                        drop(inner);
-                        return self.fam_upsert_replace(ns, replacement, opts);
-                    }
-                    return Ok(None);
-                };
-                btree_collscan(tree, filter)?
-            }
-            DocBackend::Buffered(bp) => match bp.tree(ns)? {
+        let mut matched: Vec<(Vec<u8>, Document)> = {
+            let bp = &mut *inner;
+            match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
                         drop(inner);
@@ -1569,7 +1363,7 @@ impl StorageEngine for PagedEngine {
                     return Ok(None);
                 }
                 Some(tree) => btree_collscan(tree, filter)?,
-            },
+            }
         };
 
         if matched.is_empty() {
@@ -1596,29 +1390,22 @@ impl StorageEngine for PagedEngine {
         let new_key = encode_key(&original_id);
         let new_bytes = bson::to_vec(&new_doc).map_err(Error::BsonSerialization)?;
 
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                if let Some(tree) = m.tree_mut(ns) {
-                    tree.delete(&old_key)?;
-                    tree.insert(&new_key, &new_bytes)?;
-                }
+        let bp = &mut *inner;
+        bp.with_txn(|bp| {
+            bp.maintain_secondary_on_update(
+                ns,
+                &old_doc,
+                &new_doc,
+                &original_id,
+                &original_id,
+            )?;
+            if let Some(tree) = bp.tree_mut(ns)? {
+                tree.delete(&old_key)?;
+                tree.insert(&new_key, &new_bytes)?;
             }
-            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                bp.maintain_secondary_on_update(
-                    ns,
-                    &old_doc,
-                    &new_doc,
-                    &original_id,
-                    &original_id,
-                )?;
-                if let Some(tree) = bp.tree_mut(ns)? {
-                    tree.delete(&old_key)?;
-                    tree.insert(&new_key, &new_bytes)?;
-                }
-                bp.sync_data_root(ns)?;
-                Ok(())
-            })?,
-        }
+            bp.sync_data_root(ns)?;
+            Ok(())
+        })?;
 
         Ok(Some(match opts.return_document {
             ReturnDocument::Before => old_doc,
@@ -1639,76 +1426,61 @@ impl StorageEngine for PagedEngine {
             .unwrap_or_else(|| generate_index_name(&model.keys));
 
         let mut inner = self.inner.write().unwrap();
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                let meta = m
-                    .collections
-                    .entry(ns.to_owned())
-                    .or_insert_with(|| MemCollMeta {
-                        indexes: Vec::new(),
-                    });
-                // Idempotent: return early if already exists.
-                if meta.indexes.iter().any(|(n, _)| n == &name) {
-                    return Ok(name);
-                }
-                meta.indexes.push((name.clone(), model.clone()));
-                Ok(name)
-            }
-            DocBackend::Buffered(bp) => {
-                // Ensure the collection exists in the catalog first.
-                if bp.catalog.get_collection(ns)?.is_none() {
-                    let data_root = bp
-                        .catalog
-                        .create_collection(ns, bson::doc! {}, now_millis())?;
-                    bp.sync_catalog_root()?;
-                    // Initialise the data tree leaf page so it has a valid header.
-                    let data_store = bp.new_store();
-                    let data_tree = BTree::create_at(data_store, data_root)?;
-                    bp.data_trees.insert(ns.to_owned(), data_tree);
-                }
-                // Idempotent: return existing index name.
-                if bp.catalog.get_index(ns, &name)?.is_some() {
-                    return Ok(name);
-                }
-                // Allocate a root page and register the index in the catalog.
-                let idx_root = bp.catalog.create_index(ns, model, &name)?;
-                bp.sync_catalog_root()?;
-                // Initialise the index tree's leaf root page.
-                let idx_store = bp.new_store();
-                BTree::create_at(idx_store, idx_root)?;
-
-                // Build the index by scanning all documents already in the
-                // data tree ("online index build").
-                let idx_entry = bp
+        let bp = &mut *inner;
+        {
+            // Ensure the collection exists in the catalog first.
+            if bp.catalog.get_collection(ns)?.is_none() {
+                let data_root = bp
                     .catalog
-                    .get_index(ns, &name)?
-                    .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
+                    .create_collection(ns, bson::doc! {}, now_millis())?;
+                bp.sync_catalog_root()?;
+                // Initialise the data tree leaf page so it has a valid header.
+                let data_store = bp.new_store();
+                let data_tree = BTree::create_at(data_store, data_root)?;
+                bp.data_trees.insert(ns.to_owned(), data_tree);
+            }
+            // Idempotent: return existing index name.
+            if bp.catalog.get_index(ns, &name)?.is_some() {
+                return Ok(name);
+            }
+            // Allocate a root page and register the index in the catalog.
+            let idx_root = bp.catalog.create_index(ns, model, &name)?;
+            bp.sync_catalog_root()?;
+            // Initialise the index tree's leaf root page.
+            let idx_store = bp.new_store();
+            BTree::create_at(idx_store, idx_root)?;
 
-                // Open data tree (read-only scan); if the collection is empty
-                // this is a no-op.
-                if let Some(data_entry) = bp.catalog.get_collection(ns)? {
-                    let data_store = bp.new_store();
-                    let data_tree = BTree::open(
-                        data_store,
-                        data_entry.data_root_page,
-                        data_entry.data_root_level,
-                    );
-                    let idx_build_store = bp.new_store();
-                    let mut idx_tree =
-                        BTree::open(idx_build_store, idx_entry.root_page, idx_entry.root_level);
-                    let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
+            // Build the index by scanning all documents already in the
+            // data tree ("online index build").
+            let idx_entry = bp
+                .catalog
+                .get_index(ns, &name)?
+                .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
 
-                    // Persist the (possibly updated) index root and multikey flag.
-                    bp.sync_index_entry(
-                        &idx_entry,
-                        idx_tree.root_page,
-                        idx_tree.root_level,
-                        any_multikey,
-                    )?;
-                }
-                Ok(name)
+            // Open data tree (read-only scan); if the collection is empty
+            // this is a no-op.
+            if let Some(data_entry) = bp.catalog.get_collection(ns)? {
+                let data_store = bp.new_store();
+                let data_tree = BTree::open(
+                    data_store,
+                    data_entry.data_root_page,
+                    data_entry.data_root_level,
+                );
+                let idx_build_store = bp.new_store();
+                let mut idx_tree =
+                    BTree::open(idx_build_store, idx_entry.root_page, idx_entry.root_level);
+                let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
+
+                // Persist the (possibly updated) index root and multikey flag.
+                bp.sync_index_entry(
+                    &idx_entry,
+                    idx_tree.root_page,
+                    idx_tree.root_level,
+                    any_multikey,
+                )?;
             }
         }
+        Ok(name)
     }
 
     // -----------------------------------------------------------------------
@@ -1722,32 +1494,16 @@ impl StorageEngine for PagedEngine {
             });
         }
         let mut inner = self.inner.write().unwrap();
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                if let Some(meta) = m.collections.get_mut(ns) {
-                    let before = meta.indexes.len();
-                    meta.indexes.retain(|(n, _)| n != name);
-                    if meta.indexes.len() == before {
-                        return Err(Error::Internal(format!(
-                            "index '{}' not found on '{}'",
-                            name, ns
-                        )));
-                    }
-                }
-                Ok(())
-            }
-            DocBackend::Buffered(bp) => {
-                let removed = bp.catalog.drop_index(ns, name)?;
-                if removed {
-                    bp.sync_catalog_root()?;
-                    Ok(())
-                } else {
-                    Err(Error::Internal(format!(
-                        "index '{}' not found on '{}'",
-                        name, ns
-                    )))
-                }
-            }
+        let bp = &mut *inner;
+        let removed = bp.catalog.drop_index(ns, name)?;
+        if removed {
+            bp.sync_catalog_root()?;
+            Ok(())
+        } else {
+            Err(Error::Internal(format!(
+                "index '{}' not found on '{}'",
+                name, ns
+            )))
         }
     }
 
@@ -1757,35 +1513,17 @@ impl StorageEngine for PagedEngine {
 
     fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
         let inner = self.inner.read().unwrap();
-        match &*inner {
-            DocBackend::Memory(m) => {
-                let Some(meta) = m.collections.get(ns) else {
-                    return Ok(Vec::new());
-                };
-                Ok(meta
-                    .indexes
-                    .iter()
-                    .map(|(name, model)| IndexInfo {
-                        name: name.clone(),
-                        keys: model.keys.clone(),
-                        unique: model.options.unique,
-                        sparse: model.options.sparse,
-                    })
-                    .collect())
-            }
-            DocBackend::Buffered(bp) => {
-                let entries = bp.catalog.list_indexes(ns)?;
-                Ok(entries
-                    .into_iter()
-                    .map(|e| IndexInfo {
-                        name: e.name,
-                        keys: e.key_pattern,
-                        unique: e.unique,
-                        sparse: e.sparse,
-                    })
-                    .collect())
-            }
-        }
+        let bp = &*inner;
+        let entries = bp.catalog.list_indexes(ns)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| IndexInfo {
+                name: e.name,
+                keys: e.key_pattern,
+                unique: e.unique,
+                sparse: e.sparse,
+            })
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1794,34 +1532,21 @@ impl StorageEngine for PagedEngine {
 
     fn create_namespace(&self, ns: &str) -> Result<()> {
         let mut inner = self.inner.write().unwrap();
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                m.collections
-                    .entry(ns.to_owned())
-                    .or_insert_with(|| MemCollMeta {
-                        indexes: Vec::new(),
-                    });
-                if !m.data_trees.contains_key(ns) {
-                    let tree = BTree::create(MemPageStore::new())?;
-                    m.data_trees.insert(ns.to_owned(), tree);
-                }
-                Ok(())
+        let bp = &mut *inner;
+        bp.with_txn(|bp| {
+            if bp.catalog.get_collection(ns)?.is_some() {
+                return Ok(());
             }
-            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                if bp.catalog.get_collection(ns)?.is_some() {
-                    return Ok(());
-                }
-                let data_root =
-                    bp.catalog
-                        .create_collection(ns, bson::doc! {}, now_millis())?;
-                bp.sync_catalog_root()?;
-                // Initialise the data tree leaf page and cache it for fast first access.
-                let store = bp.new_store();
-                let tree = BTree::create_at(store, data_root)?;
-                bp.data_trees.insert(ns.to_owned(), tree);
-                Ok(())
-            }),
-        }
+            let data_root =
+                bp.catalog
+                    .create_collection(ns, bson::doc! {}, now_millis())?;
+            bp.sync_catalog_root()?;
+            // Initialise the data tree leaf page and cache it for fast first access.
+            let store = bp.new_store();
+            let tree = BTree::create_at(store, data_root)?;
+            bp.data_trees.insert(ns.to_owned(), tree);
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1830,13 +1555,8 @@ impl StorageEngine for PagedEngine {
 
     fn drop_namespace(&self, ns: &str) -> Result<()> {
         let mut inner = self.inner.write().unwrap();
-        match &mut *inner {
-            DocBackend::Memory(m) => {
-                m.data_trees.remove(ns);
-                m.collections.remove(ns);
-                Ok(())
-            }
-            DocBackend::Buffered(bp) => bp.with_txn(|bp| {
+        let bp = &mut *inner;
+        bp.with_txn(|bp| {
                 // Collect page-root info from the catalog before removing entries.
                 // We need this to free the B+ tree pages after the catalog entries
                 // are gone (catalog.drop_collection removes both the collection and
@@ -1885,8 +1605,7 @@ impl StorageEngine for PagedEngine {
                 }
 
                 Ok(())
-            }),
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1895,13 +1614,9 @@ impl StorageEngine for PagedEngine {
 
     fn list_namespaces(&self) -> Result<Vec<String>> {
         let inner = self.inner.read().unwrap();
-        match &*inner {
-            DocBackend::Memory(m) => Ok(m.collections.keys().cloned().collect()),
-            DocBackend::Buffered(bp) => {
-                let entries = bp.catalog.list_collections()?;
-                Ok(entries.into_iter().map(|e| e.name).collect())
-            }
-        }
+        let bp = &*inner;
+        let entries = bp.catalog.list_collections()?;
+        Ok(entries.into_iter().map(|e| e.name).collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1910,15 +1625,11 @@ impl StorageEngine for PagedEngine {
 
     fn checkpoint(&self) -> Result<()> {
         let inner = self.inner.read().unwrap();
-        match &*inner {
-            DocBackend::Memory(_) => Ok(()), // nothing to persist
-            DocBackend::Buffered(bp) => {
-                // Ensure the catalog root is in the file header before flush.
-                bp.sync_catalog_root()?;
-                // Flush all dirty pages (data + catalog + header) to disk.
-                bp.handle.flush()
-            }
-        }
+        let bp = &*inner;
+        // Ensure the catalog root is in the file header before flush.
+        bp.sync_catalog_root()?;
+        // Flush all dirty pages (data + catalog + header) to disk.
+        bp.handle.flush()
     }
 
     // -----------------------------------------------------------------------
@@ -1954,20 +1665,14 @@ impl PagedEngine {
         apply_update(&mut new_doc, update, true)?;
         let id = {
             let mut inner = self.inner.write().unwrap();
-            match &mut *inner {
-                DocBackend::Memory(m) => {
-                    let tree = m.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?;
-                    ensure_id(&mut new_doc)
-                }
-                DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                    let tree = bp.tree_or_create(ns)?;
-                    let id = btree_insert_doc(tree, &mut new_doc, &[])?;
-                    bp.sync_data_root(ns)?;
-                    bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
-                    Ok(id)
-                })?,
-            }
+            let bp = &mut *inner;
+            bp.with_txn(|bp| {
+                let tree = bp.tree_or_create(ns)?;
+                let id = btree_insert_doc(tree, &mut new_doc, &[])?;
+                bp.sync_data_root(ns)?;
+                bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
+                Ok(id)
+            })?
         };
         Ok(UpdateResult {
             matched_count: 0,
@@ -1988,19 +1693,14 @@ impl PagedEngine {
         apply_update(&mut new_doc, update, true)?;
         {
             let mut inner = self.inner.write().unwrap();
-            match &mut *inner {
-                DocBackend::Memory(m) => {
-                    let tree = m.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?;
-                }
-                DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                    let tree = bp.tree_or_create(ns)?;
-                    let id = btree_insert_doc(tree, &mut new_doc, &[])?;
-                    bp.sync_data_root(ns)?;
-                    bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
-                    Ok(())
-                })?,
-            }
+            let bp = &mut *inner;
+            bp.with_txn(|bp| {
+                let tree = bp.tree_or_create(ns)?;
+                let id = btree_insert_doc(tree, &mut new_doc, &[])?;
+                bp.sync_data_root(ns)?;
+                bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
+                Ok(())
+            })?;
         }
         Ok(match opts.return_document {
             ReturnDocument::Before => None,
@@ -2018,19 +1718,14 @@ impl PagedEngine {
         let mut new_doc = replacement.clone();
         {
             let mut inner = self.inner.write().unwrap();
-            match &mut *inner {
-                DocBackend::Memory(m) => {
-                    let tree = m.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?;
-                }
-                DocBackend::Buffered(bp) => bp.with_txn(|bp| {
-                    let tree = bp.tree_or_create(ns)?;
-                    let id = btree_insert_doc(tree, &mut new_doc, &[])?;
-                    bp.sync_data_root(ns)?;
-                    bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
-                    Ok(())
-                })?,
-            }
+            let bp = &mut *inner;
+            bp.with_txn(|bp| {
+                let tree = bp.tree_or_create(ns)?;
+                let id = btree_insert_doc(tree, &mut new_doc, &[])?;
+                bp.sync_data_root(ns)?;
+                bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
+                Ok(())
+            })?;
         }
         Ok(match opts.return_document {
             ReturnDocument::Before => None,
@@ -2049,7 +1744,8 @@ mod tests {
     use bson::doc;
 
     fn engine() -> PagedEngine {
-        PagedEngine::new()
+        let (e, _io) = buffered_engine();
+        e
     }
 
     #[test]
@@ -2209,7 +1905,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // R1.3: Buffered-mode (catalog namespace registry) tests
     //
-    // These tests exercise PagedEngine in DocBackend::Buffered mode, using
+    // These tests exercise PagedEngine in buffered mode, using
     // an in-memory mock I/O layer so they remain hermetic and fast.
     // -----------------------------------------------------------------------
 
@@ -2360,14 +2056,11 @@ mod tests {
         // Record total page count before drop.
         let total_before = {
             let inner = e.inner.read().unwrap();
-            match &*inner {
-                DocBackend::Buffered(bp) => bp
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.total_page_count)
-                    .unwrap(),
-                _ => panic!("expected buffered backend"),
-            }
+            inner
+                .handle
+                .allocator()
+                .with_header(|h| h.total_page_count)
+                .unwrap()
         };
 
         e.drop_namespace("mydb.users").unwrap();
@@ -2375,14 +2068,11 @@ mod tests {
         // Free page count should have increased (pages returned to free list).
         let free_after = {
             let inner = e.inner.read().unwrap();
-            match &*inner {
-                DocBackend::Buffered(bp) => bp
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.free_page_count_32k + h.free_page_count_4k)
-                    .unwrap(),
-                _ => panic!("expected buffered backend"),
-            }
+            inner
+                .handle
+                .allocator()
+                .with_header(|h| h.free_page_count_32k + h.free_page_count_4k)
+                .unwrap()
         };
 
         // After drop the free page count must be > 0 (at least the data leaf
@@ -2480,14 +2170,11 @@ mod tests {
 
         let page_count_after_create = {
             let inner = e.inner.read().unwrap();
-            match &*inner {
-                DocBackend::Buffered(bp) => bp
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.total_page_count)
-                    .unwrap(),
-                _ => panic!("expected buffered"),
-            }
+            inner
+                .handle
+                .allocator()
+                .with_header(|h| h.total_page_count)
+                .unwrap()
         };
 
         e.drop_namespace("test.c").unwrap();
@@ -2501,14 +2188,11 @@ mod tests {
 
         let page_count_after_recreate = {
             let inner = e.inner.read().unwrap();
-            match &*inner {
-                DocBackend::Buffered(bp) => bp
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.total_page_count)
-                    .unwrap(),
-                _ => panic!("expected buffered"),
-            }
+            inner
+                .handle
+                .allocator()
+                .with_header(|h| h.total_page_count)
+                .unwrap()
         };
 
         // After drop + recreate, pages should be recycled — total page count
@@ -2887,19 +2571,11 @@ mod tests {
             barrier_reader.wait();
 
             // Do the actual scan while holding the read lock.
-            let matched = match &*inner {
-                DocBackend::Memory(m) => {
-                    m.tree("test.snap")
-                        .map(|t| btree_collscan(t, &doc! {}).unwrap())
-                        .unwrap_or_default()
-                }
-                DocBackend::Buffered(bp) => {
-                    bp.open_tree_for_read("test.snap")
-                        .unwrap()
-                        .map(|t| btree_collscan(&t, &doc! {}).unwrap())
-                        .unwrap_or_default()
-                }
-            };
+            let matched = inner
+                .open_tree_for_read("test.snap")
+                .unwrap()
+                .map(|t| btree_collscan(&t, &doc! {}).unwrap())
+                .unwrap_or_default();
             drop(inner); // release read lock
             matched
         });
