@@ -7,7 +7,7 @@
 //!
 //! - [`BufferPool`] — in-memory page cache with CLOCK eviction.
 //! - [`AllocatorHandle`] — owned-state dual free-list page allocator.
-//! - [`BufferPoolPageIo`] — thin adapter that routes all I/O (including
+//! - [`BufferPoolPageSource`] — thin adapter that routes all I/O (including
 //!   allocator free-list maintenance) through the buffer pool.
 //!
 //! The intent is that `DatabaseInner` holds a single
@@ -36,14 +36,14 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::storage::allocator::AllocatorHandle;
-use crate::storage::buffer_pool::{BufferPool, PageIo, PageSize, PinnedPage};
+use crate::storage::buffer_pool::{BufferPool, PageSource, PageSize, PinnedPage};
 use crate::storage::header::FileHeader;
 
 // ---------------------------------------------------------------------------
-// BufferPoolPageIo — PageIo adapter for BufferPool
+// BufferPoolPageSource — PageSource adapter for BufferPool
 // ---------------------------------------------------------------------------
 
-/// `PageIo` implementation that routes all reads and writes through the
+/// `PageSource` implementation that routes all reads and writes through the
 /// [`BufferPool`].
 ///
 /// Using this adapter as the `io` argument for [`AllocatorHandle`] ensures
@@ -53,18 +53,18 @@ use crate::storage::header::FileHeader;
 /// This solves the **single-point-of-I/O** requirement: every byte that
 /// travels between memory and the database file passes through the pool's
 /// pin/unpin mechanism.
-pub(crate) struct BufferPoolPageIo {
+pub(crate) struct BufferPoolPageSource {
     pool: Arc<BufferPool>,
 }
 
-impl BufferPoolPageIo {
-    /// Wrap `pool` in a `PageIo` adapter.
+impl BufferPoolPageSource {
+    /// Wrap `pool` in a `PageSource` adapter.
     pub(crate) fn new(pool: Arc<BufferPool>) -> Self {
         Self { pool }
     }
 }
 
-impl PageIo for BufferPoolPageIo {
+impl PageSource for BufferPoolPageSource {
     /// Pin the page, copy its content into `buf`, then unpin.
     fn read_page(&self, page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
         let page = self.pool.pin(page_number, size)?;
@@ -96,23 +96,23 @@ impl PageIo for BufferPoolPageIo {
 pub(crate) struct BufferPoolHandle {
     pool: Arc<BufferPool>,
     allocator: AllocatorHandle,
-    /// `PageIo` adapter that routes allocator I/O through the pool.
-    pool_io: BufferPoolPageIo,
+    /// `PageSource` adapter that routes allocator I/O through the pool.
+    pool_io: BufferPoolPageSource,
 }
 
 impl BufferPoolHandle {
     /// Create a `BufferPoolHandle` from a `BufferPool` and an existing
     /// `FileHeader`.
     ///
-    /// The `BufferPool` must already be backed by a `FilePageIo` (or another
-    /// `PageIo` implementation) so that cache misses reach the database file.
+    /// The `BufferPool` must already be backed by a `FilePageSource` (or another
+    /// `PageSource` implementation) so that cache misses reach the database file.
     ///
     /// `OpenOptions::buffer_pool_size` controls the pool capacity; pass
-    /// `BufferPool::new(opts.buffer_pool_size, Box::new(FilePageIo::new(lock)))`
+    /// `BufferPool::new(opts.buffer_pool_size, Box::new(FilePageSource::new(lock)))`
     /// to wire the pool to the file.
     pub(crate) fn new(pool: Arc<BufferPool>, header: FileHeader) -> Self {
         let allocator = AllocatorHandle::new(header);
-        let pool_io = BufferPoolPageIo::new(Arc::clone(&pool));
+        let pool_io = BufferPoolPageSource::new(Arc::clone(&pool));
         Self {
             pool,
             allocator,
@@ -127,7 +127,7 @@ impl BufferPoolHandle {
     /// Pin `page_number` in the buffer pool and return a [`PinnedPage`] guard.
     ///
     /// On a cache miss the page is loaded from the backing file via the
-    /// `FilePageIo` backend.  Pages beyond the current end of file are loaded
+    /// `FilePageSource` backend.  Pages beyond the current end of file are loaded
     /// as zero-filled frames.
     ///
     /// The returned guard **automatically unpins the page on drop**.  Call
@@ -202,7 +202,7 @@ impl BufferPoolHandle {
     /// Write all dirty pages to disk and persist the file header if modified.
     ///
     /// Call order:
-    /// 1. Flush all dirty data pages from the pool → `FilePageIo`.
+    /// 1. Flush all dirty data pages from the pool → `FilePageSource`.
     /// 2. Write the updated file header (page 0) through the pool if it is
     ///    dirty (this re-marks page 0 as dirty in the pool).
     /// 3. Flush the pool again to write the freshly dirtied header page.
@@ -250,7 +250,7 @@ mod tests {
     // Mock I/O
     // -----------------------------------------------------------------------
 
-    /// Minimal in-memory `PageIo` used to back the `BufferPool` in tests.
+    /// Minimal in-memory `PageSource` used to back the `BufferPool` in tests.
     #[derive(Default)]
     struct MockIo {
         pages: StdMutex<HashMap<u32, Vec<u8>>>,
@@ -264,7 +264,7 @@ mod tests {
 
     struct ArcIo(Arc<MockIo>);
 
-    impl PageIo for ArcIo {
+    impl PageSource for ArcIo {
         fn read_page(&self, pn: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
             let pages = self.0.pages.lock().unwrap();
             if let Some(data) = pages.get(&pn) {
@@ -432,7 +432,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // BufferPoolPageIo
+    // BufferPoolPageSource
     // -----------------------------------------------------------------------
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
             pages.insert(5, data);
         }
 
-        let pool_io = BufferPoolPageIo::new(Arc::clone(&pool));
+        let pool_io = BufferPoolPageSource::new(Arc::clone(&pool));
         let mut buf = vec![0u8; PageSize::Large32k.bytes()];
         pool_io.read_page(5, PageSize::Large32k, &mut buf).unwrap();
 
@@ -465,7 +465,7 @@ mod tests {
         // Pre-pin page 2 into the pool (so it's in cache).
         let _ = handle.fetch_page(2, PageSize::Small4k).unwrap();
 
-        let pool_io = BufferPoolPageIo::new(Arc::clone(handle.pool()));
+        let pool_io = BufferPoolPageSource::new(Arc::clone(handle.pool()));
         let data = vec![0xAAu8; PageSize::Small4k.bytes()];
         pool_io.write_page(2, PageSize::Small4k, &data).unwrap();
 

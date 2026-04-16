@@ -2148,12 +2148,12 @@ mod tests {
     // an in-memory mock I/O layer so they remain hermetic and fast.
     // -----------------------------------------------------------------------
 
-    use crate::storage::buffer_pool::{default_sizes, BufferPool, PageIo, PageSize};
+    use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSource, PageSize};
     use crate::storage::header::FileHeader;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
-    /// Minimal in-memory `PageIo` for buffered-mode engine tests.
+    /// Minimal in-memory `PageSource` for buffered-mode engine tests.
     #[derive(Default)]
     struct MockIo {
         pages: StdMutex<HashMap<u32, Vec<u8>>>,
@@ -2161,7 +2161,7 @@ mod tests {
 
     struct ArcIo(Arc<MockIo>);
 
-    impl PageIo for ArcIo {
+    impl PageSource for ArcIo {
         fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
             let pages = self.0.pages.lock().unwrap();
             if let Some(data) = pages.get(&pn) {

@@ -65,7 +65,7 @@ impl PageSize {
 ///
 /// Implementors are responsible for knowing the page size from the `size`
 /// parameter and performing the appropriate seek + I/O.
-pub(crate) trait PageIo: Send + Sync {
+pub(crate) trait PageSource: Send + Sync {
     /// Read `size.bytes()` bytes for `page_number` into `buf`.
     ///
     /// `buf.len()` is guaranteed to equal `size.bytes()`.
@@ -155,7 +155,7 @@ impl Partition {
     }
 
     /// Evict the frame at `idx`, flushing to disk if dirty.
-    fn evict_frame(&mut self, idx: usize, io: &dyn PageIo, size: PageSize) -> Result<()> {
+    fn evict_frame(&mut self, idx: usize, io: &dyn PageSource, size: PageSize) -> Result<()> {
         if let Some(frame) = &self.frames[idx] {
             let was_dirty = frame.dirty;
             if was_dirty {
@@ -174,7 +174,7 @@ impl Partition {
     }
 
     /// Pin `page_number`.  Returns the frame slot index.
-    fn pin_page(&mut self, page_number: u32, io: &dyn PageIo, size: PageSize) -> Result<usize> {
+    fn pin_page(&mut self, page_number: u32, io: &dyn PageSource, size: PageSize) -> Result<usize> {
         // Cache hit path
         if let Some(&idx) = self.page_map.get(&page_number) {
             let frame = self.frames[idx]
@@ -238,7 +238,7 @@ impl Partition {
     }
 
     /// Write every dirty frame to disk and clear their dirty bits.
-    fn flush_all(&mut self, io: &dyn PageIo, size: PageSize) -> Result<()> {
+    fn flush_all(&mut self, io: &dyn PageSource, size: PageSize) -> Result<()> {
         for slot in self.frames.iter_mut() {
             if let Some(frame) = slot {
                 if frame.dirty {
@@ -370,14 +370,14 @@ impl Drop for PinnedPage<'_> {
 /// # Usage
 ///
 /// Create the pool with [`BufferPool::new`], specifying the total byte budget
-/// and a [`PageIo`] backend.  Pin pages with [`BufferPool::pin`], read or
+/// and a [`PageSource`] backend.  Pin pages with [`BufferPool::pin`], read or
 /// write them via [`PinnedPage::data`] / [`PinnedPage::data_mut`], then drop
 /// the guard to unpin.  Call [`BufferPool::flush`] before a checkpoint or
 /// close to write all dirty pages to disk.
 pub(crate) struct BufferPool {
     inner_4k: Mutex<Partition>,
     inner_32k: Mutex<Partition>,
-    io: Box<dyn PageIo>,
+    io: Box<dyn PageSource>,
 }
 
 impl BufferPool {
@@ -385,7 +385,7 @@ impl BufferPool {
     ///
     /// `buffer_pool_size` is the total byte budget.  Both partitions receive
     /// at least one frame even when the budget is very small.
-    pub(crate) fn new(buffer_pool_size: usize, io: Box<dyn PageIo>) -> Self {
+    pub(crate) fn new(buffer_pool_size: usize, io: Box<dyn PageSource>) -> Self {
         let size_4k = buffer_pool_size / 4;
         let size_32k = buffer_pool_size - size_4k;
 
@@ -530,7 +530,7 @@ mod tests {
         }
     }
 
-    impl PageIo for MockIo {
+    impl PageSource for MockIo {
         fn read_page(&self, page_number: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
             *self.read_count.lock().unwrap() += 1;
             let pages = self.pages.lock().unwrap();
@@ -556,9 +556,9 @@ mod tests {
         }
     }
 
-    // Newtype wrapper so Arc<MockIo> can be boxed as `Box<dyn PageIo>`.
+    // Newtype wrapper so Arc<MockIo> can be boxed as `Box<dyn PageSource>`.
     struct ArcIo(Arc<MockIo>);
-    impl PageIo for ArcIo {
+    impl PageSource for ArcIo {
         fn read_page(&self, p: u32, s: PageSize, buf: &mut [u8]) -> Result<()> {
             self.0.read_page(p, s, buf)
         }

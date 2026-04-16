@@ -34,7 +34,7 @@ use crate::{
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
     storage::{
         buffer_pool::BufferPool,
-        file_io::FilePageIo,
+        file_io::FilePageSource,
         handle::BufferPoolHandle,
         header::{FileHeader, HEADER_PAGE_SIZE},
         lock::{self, FileLock, NoopFileLock},
@@ -181,7 +181,7 @@ pub(crate) struct ClientInner {
     writer_lock: Mutex<()>,
     /// OS advisory file lock.
     ///
-    /// Stored as `Arc` so the same fd can be shared with the `FilePageIo`
+    /// Stored as `Arc` so the same fd can be shared with the `FilePageSource`
     /// backing the buffer pool.  Opening a second fd would release the POSIX
     /// advisory lock when the second fd is closed (POSIX footgun).
     file_lock: Arc<dyn FileLock>,
@@ -797,7 +797,7 @@ impl Client {
         }
 
         // Acquire OS advisory file lock.
-        // Store as Arc so the same fd can be shared with FilePageIo.
+        // Store as Arc so the same fd can be shared with FilePageSource.
         let file_lock: Arc<dyn FileLock> = Arc::from(lock::open_file_lock(&path)?);
         let busy_timeout = opts.busy_timeout;
         #[cfg(feature = "tracing")]
@@ -851,7 +851,7 @@ impl Client {
         // R1.2: Construct the buffer pool handle wired to the database file and
         // create a B+ tree engine backed by it.
         //
-        // The pool is backed by FilePageIo which shares the lock fd (Arc clone)
+        // The pool is backed by FilePageSource which shares the lock fd (Arc clone)
         // to avoid the POSIX advisory-lock footgun.  OpenOptions::buffer_pool_size
         // controls the total byte budget split between 4 KB and 32 KB partitions.
         //
@@ -868,7 +868,7 @@ impl Client {
         let catalog_root_level = file_header.catalog_root_level;
         let pool = Arc::new(BufferPool::new(
             opts.buffer_pool_size,
-            Box::new(FilePageIo::new(Arc::clone(&file_lock))),
+            Box::new(FilePageSource::new(Arc::clone(&file_lock))),
         ));
         let buffer_pool = Arc::new(BufferPoolHandle::new(pool, file_header));
 

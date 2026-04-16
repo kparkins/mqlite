@@ -41,7 +41,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::storage::buffer_pool::{PageIo, PageSize};
+use crate::storage::buffer_pool::{PageSource, PageSize};
 use crate::storage::header::FileHeader;
 
 // ---------------------------------------------------------------------------
@@ -58,13 +58,13 @@ use crate::storage::header::FileHeader;
 /// `allocate_*` or `free_*` call to persist the changes.
 pub(crate) struct PageAllocator<'a> {
     header: &'a mut FileHeader,
-    io: &'a dyn PageIo,
+    io: &'a dyn PageSource,
 }
 
 impl<'a> PageAllocator<'a> {
     /// Create a new `PageAllocator` that modifies `header` and uses `io` for
     /// reading and writing free-list link pages.
-    pub(crate) fn new(header: &'a mut FileHeader, io: &'a dyn PageIo) -> Self {
+    pub(crate) fn new(header: &'a mut FileHeader, io: &'a dyn PageSource) -> Self {
         Self { header, io }
     }
 
@@ -268,7 +268,7 @@ struct AllocatorState {
 ///
 /// After any allocation or free, the in-memory header is marked dirty.  Call
 /// [`flush_header`](AllocatorHandle::flush_header) to persist the updated
-/// header to page 0 through a `PageIo`.
+/// header to page 0 through a `PageSource`.
 #[derive(Clone)]
 pub(crate) struct AllocatorHandle {
     state: Arc<Mutex<AllocatorState>>,
@@ -298,7 +298,7 @@ impl AllocatorHandle {
     /// Updates the in-memory free list and marks the header dirty.  The
     /// caller must call [`flush_header`](Self::flush_header) (or flush the
     /// buffer pool) to persist the change to disk.
-    pub(crate) fn alloc_4k(&self, io: &dyn PageIo) -> Result<u32> {
+    pub(crate) fn alloc_4k(&self, io: &dyn PageSource) -> Result<u32> {
         let mut state = self
             .state
             .lock()
@@ -312,7 +312,7 @@ impl AllocatorHandle {
     /// Allocate a 32 KB leaf / overflow page.
     ///
     /// Updates the in-memory free list and marks the header dirty.
-    pub(crate) fn alloc_32k(&self, io: &dyn PageIo) -> Result<u32> {
+    pub(crate) fn alloc_32k(&self, io: &dyn PageSource) -> Result<u32> {
         let mut state = self
             .state
             .lock()
@@ -331,7 +331,7 @@ impl AllocatorHandle {
     ///
     /// Marks the header dirty.  The freed page's first 4 bytes are
     /// overwritten with the free-list head pointer via `io`.
-    pub(crate) fn free_4k(&self, page_number: u32, io: &dyn PageIo) -> Result<()> {
+    pub(crate) fn free_4k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -346,7 +346,7 @@ impl AllocatorHandle {
     ///
     /// Marks the header dirty.  The freed page's first 4 bytes are
     /// overwritten with the free-list head pointer via `io`.
-    pub(crate) fn free_32k(&self, page_number: u32, io: &dyn PageIo) -> Result<()> {
+    pub(crate) fn free_32k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -405,7 +405,7 @@ impl AllocatorHandle {
     ///
     /// Typically called after all B+ tree operations in a transaction are
     /// complete, before the WAL commit frame is written.
-    pub(crate) fn flush_header(&self, io: &dyn PageIo) -> Result<()> {
+    pub(crate) fn flush_header(&self, io: &dyn PageSource) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -437,7 +437,7 @@ mod tests {
     use std::sync::Mutex;
 
     // -----------------------------------------------------------------------
-    // MockIo — in-memory PageIo for tests
+    // MockIo — in-memory PageSource for tests
     // -----------------------------------------------------------------------
 
     /// In-memory page store for testing.  Pages are stored as raw byte vectors
@@ -464,7 +464,7 @@ mod tests {
         }
     }
 
-    impl PageIo for MockIo {
+    impl PageSource for MockIo {
         fn read_page(&self, page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
             assert_eq!(buf.len(), size.bytes(), "buf.len() must equal size.bytes()");
             let pages = self.pages.lock().expect("MockIo lock poisoned");

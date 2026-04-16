@@ -1,6 +1,6 @@
-//! File-backed `PageIo` implementation.
+//! File-backed `PageSource` implementation.
 //!
-//! [`FilePageIo`] routes all page reads and writes through the database file
+//! [`FilePageSource`] routes all page reads and writes through the database file
 //! using the `FileLock` file descriptor.  Using the lock fd for all I/O is
 //! **required** to avoid the POSIX advisory-lock footgun: closing *any* open
 //! file descriptor for a file while the process holds a `fcntl` advisory lock
@@ -28,7 +28,7 @@
 //! ## EOF handling
 //!
 //! When a page beyond the current end of file is read (e.g., a newly
-//! allocated page that has not yet been written to disk), [`FilePageIo`]
+//! allocated page that has not yet been written to disk), [`FilePageSource`]
 //! returns a zeroed buffer instead of propagating the OS `UnexpectedEof`
 //! error.  This matches the buffer pool's expectation that a freshly allocated
 //! page contains zeroes.
@@ -36,25 +36,25 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::storage::buffer_pool::{PageIo, PageSize};
+use crate::storage::buffer_pool::{PageSource, PageSize};
 use crate::storage::lock::FileLock;
 use crate::storage::page::PAGE_SIZE_LEAF;
 
 // ---------------------------------------------------------------------------
-// FilePageIo
+// FilePageSource
 // ---------------------------------------------------------------------------
 
-/// File-backed `PageIo` implementation.
+/// File-backed `PageSource` implementation.
 ///
 /// Wraps an `Arc<dyn FileLock>` so that I/O and advisory locking share the
 /// same underlying file descriptor.  Using the same fd for both operations
 /// prevents accidental lock release on fd close (POSIX footgun).
-pub(crate) struct FilePageIo {
+pub(crate) struct FilePageSource {
     lock: Arc<dyn FileLock>,
 }
 
-impl FilePageIo {
-    /// Create a new `FilePageIo` backed by `lock`.
+impl FilePageSource {
+    /// Create a new `FilePageSource` backed by `lock`.
     ///
     /// All reads and writes go through `lock.read_exact_at` /
     /// `lock.write_at` so that the advisory lock fd is never inadvertently
@@ -72,7 +72,7 @@ impl FilePageIo {
     }
 }
 
-impl PageIo for FilePageIo {
+impl PageSource for FilePageSource {
     /// Read `size.bytes()` bytes for `page_number` from the file into `buf`.
     ///
     /// If the read would extend beyond the current end of file (the page has
@@ -128,7 +128,7 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// In-memory `FileLock` implementation for testing `FilePageIo`.
+    /// In-memory `FileLock` implementation for testing `FilePageSource`.
     ///
     /// Backed by a `HashMap<u64, Vec<u8>>` keyed by byte offset + length.
     /// Supports positional reads and writes.
@@ -189,9 +189,9 @@ mod tests {
         }
     }
 
-    fn make_io() -> (Arc<MemFileLock>, FilePageIo) {
+    fn make_io() -> (Arc<MemFileLock>, FilePageSource) {
         let lock = MemFileLock::new();
-        let io = FilePageIo::new(Arc::clone(&lock) as Arc<dyn FileLock>);
+        let io = FilePageSource::new(Arc::clone(&lock) as Arc<dyn FileLock>);
         (lock, io)
     }
 
@@ -201,18 +201,18 @@ mod tests {
 
     #[test]
     fn file_offset_page_0_is_zero() {
-        assert_eq!(FilePageIo::file_offset(0), 0);
+        assert_eq!(FilePageSource::file_offset(0), 0);
     }
 
     #[test]
     fn file_offset_page_1_is_32768() {
-        assert_eq!(FilePageIo::file_offset(1), PAGE_SIZE_LEAF as u64);
+        assert_eq!(FilePageSource::file_offset(1), PAGE_SIZE_LEAF as u64);
     }
 
     #[test]
     fn file_offset_is_uniform_32k_stride() {
         for n in 0u32..10 {
-            assert_eq!(FilePageIo::file_offset(n), n as u64 * PAGE_SIZE_LEAF as u64);
+            assert_eq!(FilePageSource::file_offset(n), n as u64 * PAGE_SIZE_LEAF as u64);
         }
     }
 
