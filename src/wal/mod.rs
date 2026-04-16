@@ -600,6 +600,61 @@ impl WalManager {
     }
 
     // -----------------------------------------------------------------------
+    // Rollback
+    // -----------------------------------------------------------------------
+
+    /// Truncate the WAL file back to `cursor` bytes and rebuild the SHM index
+    /// so it reflects only the surviving frames.
+    ///
+    /// `cursor` must be a byte offset previously obtained from
+    /// [`write_cursor`](Self::write_cursor) at the start of a transaction.
+    /// All frames written since that mark are dropped; this is the rollback
+    /// primitive used by [`crate::storage::paged_engine::PagedEngine`] when a
+    /// mutator returns an error.
+    ///
+    /// The SHM index is rebuilt by a linear scan over the surviving frame
+    /// range — O(surviving frames) — which is correct regardless of whether
+    /// the dropped frames were commit or non-commit frames.
+    pub(crate) fn truncate_to(&mut self, cursor: u64) -> Result<()> {
+        if cursor < WAL_HEADER_SIZE as u64 || cursor > self.write_cursor {
+            return Err(Error::Internal(format!(
+                "WAL truncate_to: cursor {cursor} out of range \
+                 [{WAL_HEADER_SIZE}, {}]",
+                self.write_cursor
+            )));
+        }
+
+        self.wal_file.set_len(cursor).map_err(Error::Io)?;
+        self.wal_file.flush().map_err(Error::Io)?;
+        self.write_cursor = cursor;
+
+        self.shm.clear_index();
+        self.wal_file
+            .seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))
+            .map_err(Error::Io)?;
+        let mut scan = WAL_HEADER_SIZE as u64;
+        let mut latest_commit_pages: Option<u32> = None;
+        while scan < cursor {
+            self.wal_file
+                .seek(SeekFrom::Start(scan))
+                .map_err(Error::Io)?;
+            let frame_opt = WalFrameHeader::read(&mut self.wal_file, self.salt1, self.salt2)?;
+            let frame_hdr = match frame_opt {
+                None => break,
+                Some(h) => h,
+            };
+            self.shm.insert(frame_hdr.page_number, scan);
+            if frame_hdr.db_page_count > 0 {
+                latest_commit_pages = Some(frame_hdr.db_page_count);
+            }
+            scan += (WAL_FRAME_HEADER_SIZE + frame_hdr.page_size.bytes()) as u64;
+        }
+        self.last_committed_db_page_count = latest_commit_pages;
+        self.shm.save(&self.shm_path)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
@@ -1018,5 +1073,103 @@ mod tests {
         let result = mgr.read_page_linear(7).unwrap();
         assert_eq!(result, Some(page_data));
         assert!(mgr.read_page_linear(999).unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Rollback (truncate_to)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_to_drops_frames_written_after_mark() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+
+        let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        mgr.append_non_commit(1, WalPageSize::Small4k, &make_page_4k(0x11))
+            .unwrap();
+        let mark = mgr.write_cursor();
+        mgr.append_non_commit(2, WalPageSize::Small4k, &make_page_4k(0x22))
+            .unwrap();
+        mgr.append_non_commit(3, WalPageSize::Small4k, &make_page_4k(0x33))
+            .unwrap();
+
+        mgr.truncate_to(mark).unwrap();
+
+        assert_eq!(mgr.write_cursor(), mark);
+        assert_eq!(
+            mgr.read_page(1).unwrap(),
+            Some(make_page_4k(0x11)),
+            "frame before mark must survive"
+        );
+        assert!(
+            mgr.read_page(2).unwrap().is_none(),
+            "frame after mark must be dropped"
+        );
+        assert!(mgr.read_page(3).unwrap().is_none());
+        drop(mgr);
+        drop(main_file);
+        drop(dir);
+    }
+
+    #[test]
+    fn truncate_to_preserves_prior_commit_state() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+
+        let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        mgr.append_non_commit(1, WalPageSize::Small4k, &make_page_4k(0x11))
+            .unwrap();
+        mgr.commit(2, WalPageSize::Small4k, &make_page_4k(0x22), 50)
+            .unwrap();
+        let mark = mgr.write_cursor();
+        mgr.append_non_commit(3, WalPageSize::Small4k, &make_page_4k(0x33))
+            .unwrap();
+
+        mgr.truncate_to(mark).unwrap();
+
+        assert_eq!(mgr.last_committed_db_page_count, Some(50));
+        assert_eq!(mgr.read_page(1).unwrap(), Some(make_page_4k(0x11)));
+        assert_eq!(mgr.read_page(2).unwrap(), Some(make_page_4k(0x22)));
+        assert!(mgr.read_page(3).unwrap().is_none());
+        drop(mgr);
+        drop(main_file);
+        drop(dir);
+    }
+
+    #[test]
+    fn truncate_to_full_drops_all_non_header_frames() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+
+        let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        mgr.append_non_commit(1, WalPageSize::Small4k, &make_page_4k(0xAA))
+            .unwrap();
+        mgr.append_non_commit(2, WalPageSize::Small4k, &make_page_4k(0xBB))
+            .unwrap();
+
+        mgr.truncate_to(WAL_HEADER_SIZE as u64).unwrap();
+
+        assert_eq!(mgr.write_cursor(), WAL_HEADER_SIZE as u64);
+        assert!(mgr.read_page(1).unwrap().is_none());
+        assert!(mgr.read_page(2).unwrap().is_none());
+        assert_eq!(mgr.last_committed_db_page_count, None);
+        drop(mgr);
+        drop(main_file);
+        drop(dir);
+    }
+
+    #[test]
+    fn truncate_to_rejects_out_of_range_cursor() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+
+        let mut mgr = WalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        let cur = mgr.write_cursor();
+
+        assert!(mgr.truncate_to(cur + 1).is_err());
+        assert!(mgr.truncate_to(0).is_err());
+        drop(mgr);
+        drop(main_file);
+        drop(dir);
     }
 }
