@@ -39,9 +39,11 @@
 //! instances (e.g. one per collection namespace) can each hold their own
 //! `BufferPoolPageStore` pointing to the same shared handle.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::mvcc::version::VersionEntry;
 use crate::storage::btree::BTreePageStore;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
@@ -138,6 +140,34 @@ impl BTreePageStore for BufferPoolPageStore {
 
     fn free_leaf(&mut self, page: u32) -> Result<()> {
         self.handle.free_page(page, PageSize::Large32k)
+    }
+
+    // -----------------------------------------------------------------------
+    // MVCC version-chain accessors (T3.5)
+    //
+    // Delegate to the buffer pool's chain helpers, which operate on the
+    // `Frame::version_chains` map for the 32 KB leaf partition.
+    // -----------------------------------------------------------------------
+
+    fn take_chain(
+        &mut self,
+        page: u32,
+        key: &[u8],
+    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
+        self.handle.pool().take_chain(page, key)
+    }
+
+    fn put_chain(
+        &mut self,
+        page: u32,
+        key: Vec<u8>,
+        chain: Arc<VecDeque<VersionEntry>>,
+    ) -> Result<()> {
+        self.handle.pool().put_chain(page, key, chain)
+    }
+
+    fn chains_empty(&self, page: u32) -> Result<bool> {
+        self.handle.pool().chains_empty(page)
     }
 }
 

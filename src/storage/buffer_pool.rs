@@ -29,11 +29,12 @@
 //! read-only pins (using only [`data`](PinnedPage::data)) are safe.  The
 //! database-level single-writer lock enforces this at a higher level.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::mvcc::version::VersionEntry;
 
 // ---------------------------------------------------------------------------
 // Page size
@@ -87,6 +88,10 @@ struct Frame {
     pin_count: u32,
     dirty: bool,
     ref_bit: bool,
+    /// Per-frame MVCC version chains, keyed by B+ tree key. Migrates with
+    /// the frame's cells on split / merge (see T3.5). Empty for non-leaf
+    /// frames and for leaf frames written by the pre-MVCC writer path.
+    version_chains: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +212,7 @@ impl Partition {
             pin_count: 1,
             dirty: false,
             ref_bit: true,
+            version_chains: HashMap::new(),
         });
         self.page_map.insert(page_number, idx);
 
@@ -494,6 +500,74 @@ impl BufferPool {
             .drop_dirty_unpinned();
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // MVCC version-chain helpers (T3.5)
+    //
+    // Chains are stored on the 32 KB partition's frames (leaf pages). The
+    // caller is responsible for having pinned the page (via `read_leaf` or
+    // `write_leaf`) recently enough that the frame is still resident — the
+    // MVCC writer lane sequences these calls synchronously after a leaf
+    // read / write, so the frame has not yet been eligible for eviction.
+    // -----------------------------------------------------------------------
+
+    /// Remove and return the version chain for `key` on leaf page `page`.
+    pub(crate) fn take_chain(
+        &self,
+        page: u32,
+        key: &[u8],
+    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
+        let mut guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let Some(&idx) = guard.page_map.get(&page) else {
+            return Ok(None);
+        };
+        let frame = guard.frames[idx]
+            .as_mut()
+            .expect("page_map invariant: frame must exist at mapped slot");
+        Ok(frame.version_chains.remove(key))
+    }
+
+    /// Install a version chain for `key` on leaf page `page`.
+    pub(crate) fn put_chain(
+        &self,
+        page: u32,
+        key: Vec<u8>,
+        chain: Arc<VecDeque<VersionEntry>>,
+    ) -> Result<()> {
+        let mut guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let idx = guard.page_map.get(&page).copied().ok_or_else(|| {
+            Error::Internal(format!(
+                "buffer pool put_chain: page {page} is not resident"
+            ))
+        })?;
+        let frame = guard.frames[idx]
+            .as_mut()
+            .expect("page_map invariant: frame must exist at mapped slot");
+        frame.version_chains.insert(key, chain);
+        Ok(())
+    }
+
+    /// True if no version chains are attached to leaf page `page` (including
+    /// the case where the page is not currently resident).
+    pub(crate) fn chains_empty(&self, page: u32) -> Result<bool> {
+        let guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let Some(&idx) = guard.page_map.get(&page) else {
+            return Ok(true);
+        };
+        let frame = guard.frames[idx]
+            .as_ref()
+            .expect("page_map invariant: frame must exist at mapped slot");
+        Ok(frame.version_chains.is_empty())
     }
 
     // -----------------------------------------------------------------------

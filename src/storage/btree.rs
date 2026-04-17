@@ -25,7 +25,11 @@
 //! `root_level` and updates `root_page`; callers must persist the new root page number
 //! (e.g. into the catalog or file header) if durability is required.
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
+use crate::mvcc::version::VersionEntry;
 use crate::storage::page::{
     internal_page_checksum, leaf_page_checksum, overflow_page_checksum, InternalPageHeader,
     LeafPageHeader, OverflowPageHeader, INTERNAL_HEADER_SIZE, LEAF_FLAG_HAS_OVERFLOW,
@@ -83,6 +87,34 @@ pub(crate) trait BTreePageStore {
 
     /// Return a 32 KB leaf page to the free pool.
     fn free_leaf(&mut self, page: u32) -> Result<()>;
+
+    // -----------------------------------------------------------------------
+    // MVCC version-chain accessors (T3.5)
+    //
+    // Leaf frames own per-key MVCC version chains. Split / merge operations
+    // migrate these chains alongside the cells that own them; the `free_leaf`
+    // call sites in the merge path are guarded by `chains_empty` to fail
+    // loudly if migration is ever skipped.
+    // -----------------------------------------------------------------------
+
+    /// Remove and return the version chain for `key` on leaf `page`.
+    fn take_chain(
+        &mut self,
+        page: u32,
+        key: &[u8],
+    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>>;
+
+    /// Install a version chain for `key` on leaf `page`. Overwrites any
+    /// existing chain for that key.
+    fn put_chain(
+        &mut self,
+        page: u32,
+        key: Vec<u8>,
+        chain: Arc<VecDeque<VersionEntry>>,
+    ) -> Result<()>;
+
+    /// True iff no version chains are attached to leaf `page`.
+    fn chains_empty(&self, page: u32) -> Result<bool>;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +130,9 @@ use std::collections::HashMap;
 pub(crate) struct MemPageStore {
     internal_pages: HashMap<u32, Box<[u8; PAGE_SIZE_INTERNAL as usize]>>,
     leaf_pages: HashMap<u32, Box<[u8; PAGE_SIZE_LEAF as usize]>>,
+    /// Per-leaf-page MVCC version chains (T3.5). Outer key is page number,
+    /// inner key is the B+ tree cell key.
+    leaf_chains: HashMap<u32, HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>>,
     next_page: u32,
 }
 
@@ -107,6 +142,7 @@ impl MemPageStore {
         Self {
             internal_pages: HashMap::new(),
             leaf_pages: HashMap::new(),
+            leaf_chains: HashMap::new(),
             next_page: 1,
         }
     }
@@ -163,6 +199,37 @@ impl BTreePageStore for MemPageStore {
     fn free_leaf(&mut self, page: u32) -> Result<()> {
         self.leaf_pages.remove(&page);
         Ok(())
+    }
+
+    fn take_chain(
+        &mut self,
+        page: u32,
+        key: &[u8],
+    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
+        Ok(self
+            .leaf_chains
+            .get_mut(&page)
+            .and_then(|m| m.remove(key)))
+    }
+
+    fn put_chain(
+        &mut self,
+        page: u32,
+        key: Vec<u8>,
+        chain: Arc<VecDeque<VersionEntry>>,
+    ) -> Result<()> {
+        self.leaf_chains
+            .entry(page)
+            .or_default()
+            .insert(key, chain);
+        Ok(())
+    }
+
+    fn chains_empty(&self, page: u32) -> Result<bool> {
+        Ok(self
+            .leaf_chains
+            .get(&page)
+            .map_or(true, |m| m.is_empty()))
     }
 }
 
@@ -985,6 +1052,15 @@ impl<S: BTreePageStore> BTree<S> {
         let right_cells: Vec<LeafCell> = left_node.cells.drain(split_at..).collect();
         let promoted_key = right_cells[0].key.clone();
 
+        // T3.5: Migrate version chains for the keys that are moving to the
+        // right sibling. Chains stay pinned (refcount invariant preserved)
+        // because Arc ownership transfers without touching the inner data.
+        for cell in &right_cells {
+            if let Some(chain) = self.store.take_chain(left_page, &cell.key)? {
+                self.store.put_chain(right_page, cell.key.clone(), chain)?;
+            }
+        }
+
         let right_node = LeafNode {
             flags: 0,
             next_leaf_page: left_node.next_leaf_page,
@@ -1210,6 +1286,10 @@ impl<S: BTreePageStore> BTree<S> {
             if left_node.cells.len() > MIN_LEAF_CELLS {
                 let moved = left_node.cells.pop().unwrap();
                 let new_sep = moved.key.clone();
+                // T3.5: migrate the moved cell's version chain (if any).
+                if let Some(chain) = self.store.take_chain(left_page, &moved.key)? {
+                    self.store.put_chain(page, moved.key.clone(), chain)?;
+                }
                 let mut new_node = node.clone();
                 new_node.cells.insert(0, moved);
 
@@ -1245,6 +1325,10 @@ impl<S: BTreePageStore> BTree<S> {
             if right_node.cells.len() > MIN_LEAF_CELLS {
                 let moved = right_node.cells.remove(0);
                 let new_sep = right_node.cells[0].key.clone(); // new separator is new first key of right
+                // T3.5: migrate the moved cell's version chain (if any).
+                if let Some(chain) = self.store.take_chain(right_page, &moved.key)? {
+                    self.store.put_chain(page, moved.key.clone(), chain)?;
+                }
                 let mut new_node = node.clone();
                 new_node.cells.push(moved);
 
@@ -1270,6 +1354,16 @@ impl<S: BTreePageStore> BTree<S> {
             let left_buf = self.store.read_leaf(left_page)?;
             let mut left_node = LeafNode::parse(&left_buf[..])?;
 
+            // T3.5: migrate version chains for every cell moving into the
+            // left sibling BEFORE we free `page`. Chains for keys not backed
+            // by a live cell intentionally stay on `page` so the guard below
+            // fails loudly rather than silently leaking a refcount.
+            for cell in &node.cells {
+                if let Some(chain) = self.store.take_chain(page, &cell.key)? {
+                    self.store.put_chain(left_page, cell.key.clone(), chain)?;
+                }
+            }
+
             left_node.cells.extend(node.cells);
             left_node.next_leaf_page = node.next_leaf_page;
 
@@ -1284,6 +1378,13 @@ impl<S: BTreePageStore> BTree<S> {
 
             let left_enc = left_node.encode()?;
             self.store.write_leaf(left_page, &left_enc)?;
+            // T3.5 guard (MAJOR-5): free_leaf must never be called on a leaf
+            // whose version_chains map is still non-empty.
+            if !self.store.chains_empty(page)? {
+                return Err(Error::Internal(
+                    "free_leaf called with non-empty version chain".into(),
+                ));
+            }
             self.store.free_leaf(page)?;
 
             // Remove separator key from parent: the separator between left_sibling and page
@@ -1294,6 +1395,14 @@ impl<S: BTreePageStore> BTree<S> {
             let right_page = parent.child_at(1);
             let right_buf = self.store.read_leaf(right_page)?;
             let mut right_node = LeafNode::parse(&right_buf[..])?;
+
+            // T3.5: migrate version chains for every cell moving into the
+            // right sibling BEFORE we free `page`. See merge-into-left above.
+            for cell in &node.cells {
+                if let Some(chain) = self.store.take_chain(page, &cell.key)? {
+                    self.store.put_chain(right_page, cell.key.clone(), chain)?;
+                }
+            }
 
             let mut merged_cells = node.cells.clone();
             merged_cells.extend(right_node.cells.drain(..));
@@ -1311,6 +1420,13 @@ impl<S: BTreePageStore> BTree<S> {
 
             let right_enc = right_node.encode()?;
             self.store.write_leaf(right_page, &right_enc)?;
+            // T3.5 guard (MAJOR-5): free_leaf must never be called on a leaf
+            // whose version_chains map is still non-empty.
+            if !self.store.chains_empty(page)? {
+                return Err(Error::Internal(
+                    "free_leaf called with non-empty version chain".into(),
+                ));
+            }
             self.store.free_leaf(page)?;
 
             // If page was the root's left child (child_idx == 0), the separator
@@ -2030,5 +2146,309 @@ mod tests {
             tree.delete(&key(i)).unwrap();
         }
         verify_tree_invariants(&tree);
+    }
+
+    // -----------------------------------------------------------------------
+    // T3.5 — version-chain migration across split / merge
+    //
+    // These tests exercise the split / redistribute / merge paths that were
+    // taught to migrate per-frame MVCC version chains alongside the cells
+    // that own them, and the `chains_empty` guard guarding the two merge
+    // `free_leaf` call sites at btree.rs:1281 and :1308 (per plan MAJOR-5).
+    // -----------------------------------------------------------------------
+
+    use crate::mvcc::timestamp::Ts;
+    use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry};
+    use crate::storage::allocator::AllocatorHandle;
+    use crate::storage::header::FileHeader;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    fn dummy_entry(marker: u8) -> VersionEntry {
+        VersionEntry {
+            start_ts: Ts {
+                physical_ms: marker as u64,
+                logical: 0,
+            },
+            stop_ts: Ts::MAX,
+            txn_id: marker as u64,
+            data: VersionData::Inline(vec![marker; 16]),
+            is_tombstone: false,
+        }
+    }
+
+    fn chain_with(markers: &[u8]) -> Arc<VecDeque<VersionEntry>> {
+        Arc::new(markers.iter().copied().map(dummy_entry).collect())
+    }
+
+    fn leaf_of(tree: &BTree<MemPageStore>, k: &[u8]) -> u32 {
+        tree.find_leaf(k).expect("find_leaf")
+    }
+
+    // --- T3.5 split: primary-shaped keys -----------------------------------
+
+    #[test]
+    fn t3_5_split_migrates_chains_for_moving_cells_primary() {
+        let store = MemPageStore::new();
+        let mut tree = BTree::create(store).unwrap();
+
+        // Use values large enough to split after a handful of inserts.
+        let v = vec![0xABu8; 6000];
+        // Insert 4 keys — all fit in one leaf (pre-split).
+        for i in 0u64..4 {
+            tree.insert(&key(i), &v).unwrap();
+        }
+        assert_eq!(tree.root_level, 0, "pre-split, root should still be a leaf");
+
+        let leaf_page = tree.root_page;
+        // Attach a unique chain to every key.
+        for i in 0u64..4 {
+            tree.store
+                .put_chain(leaf_page, key(i), chain_with(&[i as u8]))
+                .unwrap();
+        }
+
+        // Insert two more keys to force a split.
+        for i in 4u64..6 {
+            tree.insert(&key(i), &v).unwrap();
+        }
+        assert_eq!(tree.root_level, 1, "expected a split to occur");
+
+        // Every original key's chain must still be reachable, on whichever
+        // leaf the key now lives on, byte-identical to what we inserted.
+        for i in 0u64..4 {
+            let home = leaf_of(&tree, &key(i));
+            let chain = tree.store.take_chain(home, &key(i)).unwrap();
+            let chain = chain.expect("chain survived the split");
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].txn_id, i);
+            // Put it back for subsequent checks / cleanup.
+            tree.store.put_chain(home, key(i), chain).unwrap();
+        }
+    }
+
+    // --- T3.5 split: sec-index-shaped 9-byte keys --------------------------
+
+    #[test]
+    fn t3_5_split_migrates_chains_for_moving_cells_secondary() {
+        // Secondary-index key shape: [field_byte || id_be_bytes(8)] = 9 B.
+        fn sec_key(field: u8, id: u64) -> Vec<u8> {
+            let mut k = Vec::with_capacity(9);
+            k.push(field);
+            k.extend_from_slice(&id.to_be_bytes());
+            k
+        }
+
+        let store = MemPageStore::new();
+        let mut tree = BTree::create(store).unwrap();
+        let v = vec![0xCDu8; 6000];
+
+        for i in 0u64..4 {
+            tree.insert(&sec_key(0x5A, i), &v).unwrap();
+        }
+        let leaf_page = tree.root_page;
+        for i in 0u64..4 {
+            tree.store
+                .put_chain(leaf_page, sec_key(0x5A, i), chain_with(&[i as u8]))
+                .unwrap();
+        }
+
+        for i in 4u64..6 {
+            tree.insert(&sec_key(0x5A, i), &v).unwrap();
+        }
+        assert_eq!(tree.root_level, 1);
+
+        for i in 0u64..4 {
+            let k = sec_key(0x5A, i);
+            let home = leaf_of(&tree, &k);
+            let chain = tree.store.take_chain(home, &k).unwrap();
+            let chain = chain.expect("chain survived the split (sec-index)");
+            assert_eq!(chain[0].txn_id, i);
+            tree.store.put_chain(home, k, chain).unwrap();
+        }
+    }
+
+    // --- T3.5 merge: refcount invariant preserved across merge -------------
+
+    #[test]
+    fn t3_5_merge_preserves_overflow_refcount_invariant() {
+        let store = MemPageStore::new();
+        let mut tree = BTree::create(store).unwrap();
+        let alloc = AllocatorHandle::new(FileHeader::new(0, 0, 0));
+
+        // Force a split with 6000-byte values.
+        let v = vec![0xEFu8; 6000];
+        for i in 0u64..6 {
+            tree.insert(&key(i), &v).unwrap();
+        }
+        assert_eq!(tree.root_level, 1);
+
+        // Attach an overflow-backed chain to two keys that will survive the
+        // merge; the refcounts they hold must remain exactly 1 after the
+        // entire merge dance.
+        const OVF_A: u32 = 4242;
+        const OVF_B: u32 = 4343;
+        let chain_a = {
+            let r = OverflowRef::new_owned(OVF_A, 32, alloc.clone()).unwrap();
+            let mut q = VecDeque::new();
+            q.push_back(VersionEntry {
+                start_ts: Ts {
+                    physical_ms: 1,
+                    logical: 0,
+                },
+                stop_ts: Ts::MAX,
+                txn_id: 1,
+                data: VersionData::Overflow(r),
+                is_tombstone: false,
+            });
+            Arc::new(q)
+        };
+        let chain_b = {
+            let r = OverflowRef::new_owned(OVF_B, 32, alloc.clone()).unwrap();
+            let mut q = VecDeque::new();
+            q.push_back(VersionEntry {
+                start_ts: Ts {
+                    physical_ms: 2,
+                    logical: 0,
+                },
+                stop_ts: Ts::MAX,
+                txn_id: 2,
+                data: VersionData::Overflow(r),
+                is_tombstone: false,
+            });
+            Arc::new(q)
+        };
+        assert_eq!(alloc.overflow_refcount(OVF_A), 1);
+        assert_eq!(alloc.overflow_refcount(OVF_B), 1);
+
+        let home_a = leaf_of(&tree, &key(0));
+        let home_b = leaf_of(&tree, &key(5));
+        tree.store.put_chain(home_a, key(0), chain_a).unwrap();
+        tree.store.put_chain(home_b, key(5), chain_b).unwrap();
+
+        // Delete one key to force a leaf underflow that takes the merge path
+        // (both siblings hold MIN or fewer cells after the split, so
+        // redistribute fails and the merge branch at btree.rs:1393 fires,
+        // migrating chain_a onto the surviving leaf).
+        assert!(tree.delete(&key(1)).unwrap());
+
+        // Refcounts still 1 each — migration neither dropped nor duplicated
+        // the OverflowRefs.
+        assert_eq!(alloc.overflow_refcount(OVF_A), 1);
+        assert_eq!(alloc.overflow_refcount(OVF_B), 1);
+
+        // Chains are reachable on whichever leaf the keys now live on.
+        let home_a = leaf_of(&tree, &key(0));
+        let home_b = leaf_of(&tree, &key(5));
+        let a = tree
+            .store
+            .take_chain(home_a, &key(0))
+            .unwrap()
+            .expect("chain A survived merge");
+        let b = tree
+            .store
+            .take_chain(home_b, &key(5))
+            .unwrap()
+            .expect("chain B survived merge");
+
+        // Drop the chains — refcounts should fall to 0 and the pages should
+        // land on the deferred-free queue exactly once each.
+        drop(a);
+        drop(b);
+        assert_eq!(alloc.overflow_refcount(OVF_A), 0);
+        assert_eq!(alloc.overflow_refcount(OVF_B), 0);
+        assert_eq!(alloc.deferred_free_queue().depth(), 2);
+    }
+
+    // --- T3.5 merge guard: :1281 (merge-into-left) -------------------------
+
+    #[test]
+    fn t3_5_merge_into_left_guard_fires_on_orphan_chain() {
+        let store = MemPageStore::new();
+        let mut tree = BTree::create(store).unwrap();
+
+        let v = vec![0x11u8; 6000];
+        for i in 0u64..6 {
+            tree.insert(&key(i), &v).unwrap();
+        }
+        assert_eq!(tree.root_level, 1);
+
+        // Pick a leaf that is NOT the leftmost — its underflow will take the
+        // merge-into-left branch at btree.rs:1281.
+        let victim_leaf = leaf_of(&tree, &key(5));
+        assert_ne!(victim_leaf, tree.leftmost_leaf().unwrap());
+
+        // Install an orphan chain (key not present in any cell) on the
+        // victim leaf. The per-cell migration will leave it in place, so the
+        // guard right before free_leaf must fire.
+        tree.store
+            .put_chain(victim_leaf, b"orphan-key".to_vec(), chain_with(&[0xEE]))
+            .unwrap();
+
+        // Delete cells on the victim leaf until handle_leaf_underflow fires
+        // with merge-into-left.
+        let mut err = None;
+        for i in 3u64..6 {
+            match tree.delete(&key(i)) {
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let e = err.expect("guard at :1281 should have fired during merge-into-left");
+        assert!(
+            matches!(&e, Error::Internal(s) if s.contains("non-empty version chain")),
+            "expected guard error, got {e:?}"
+        );
+    }
+
+    // --- T3.5 merge guard: :1308 (merge-into-right, child_idx == 0) --------
+
+    #[test]
+    fn t3_5_merge_into_right_guard_fires_on_orphan_chain() {
+        let store = MemPageStore::new();
+        let mut tree = BTree::create(store).unwrap();
+
+        let v = vec![0x22u8; 6000];
+        for i in 0u64..6 {
+            tree.insert(&key(i), &v).unwrap();
+        }
+        assert_eq!(tree.root_level, 1);
+
+        // The leftmost leaf underflowing takes the merge-into-right branch
+        // at btree.rs:1308 (child_idx == 0 path).
+        let victim_leaf = tree.leftmost_leaf().unwrap();
+
+        tree.store
+            .put_chain(victim_leaf, b"orphan-key".to_vec(), chain_with(&[0xFF]))
+            .unwrap();
+
+        let mut err = None;
+        for i in 0u64..3 {
+            match tree.delete(&key(i)) {
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let e = err.expect("guard at :1308 should have fired during merge-into-right");
+        assert!(
+            matches!(&e, Error::Internal(s) if s.contains("non-empty version chain")),
+            "expected guard error, got {e:?}"
+        );
+    }
+
+    // --- T3.5 chains_empty semantics on absent page ------------------------
+
+    #[test]
+    fn t3_5_chains_empty_on_absent_page_is_true() {
+        let store = MemPageStore::new();
+        let tree: BTree<MemPageStore> = BTree::create(store).unwrap();
+        // Page 999 was never touched.
+        assert!(tree.store.chains_empty(999).unwrap());
     }
 }
