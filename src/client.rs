@@ -1217,8 +1217,8 @@ mod tests {
         let good_header = FileHeader::new_now();
         let mut bytes = good_header.to_bytes();
         bytes[0] = b'X';
-        let checksum = FileHeader::compute_checksum(bytes[..60].try_into().expect("60 bytes"));
-        bytes[60..64].copy_from_slice(&checksum.to_le_bytes());
+        let checksum = FileHeader::compute_checksum(bytes[..64].try_into().expect("64 bytes"));
+        bytes[64..68].copy_from_slice(&checksum.to_le_bytes());
         fs::write(&db_path, &bytes).expect("write bad-magic file");
 
         let result = Client::open(&db_path);

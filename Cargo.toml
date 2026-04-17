@@ -30,6 +30,14 @@ serde = { version = "1", features = ["derive"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `loom` is pulled in as a regular dependency only when the caller passes
+# `--cfg loom` (which activates the permutation-testing engine for MVCC
+# concurrency primitives in `src/mvcc/*`). Under ordinary `cargo check` /
+# `cargo test` builds the shim in those modules falls back to `std::sync`
+# and `loom` is unused, so no dependency is imposed on downstream crates.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 
 # Optional: wire feature
 tokio = { version = "1", features = ["full"], optional = true }

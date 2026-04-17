@@ -126,6 +126,8 @@ pub mod options;
 pub mod results;
 
 // Internal modules (not public API)
+#[allow(dead_code)]
+mod mvcc;
 mod query;
 mod storage;
 mod storage_engine;

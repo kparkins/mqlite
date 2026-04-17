@@ -68,6 +68,56 @@ pub(crate) const JOURNAL_HEADER_SIZE: usize = 32;
 pub(crate) const JOURNAL_FRAME_HEADER_SIZE: usize = 24;
 
 // ---------------------------------------------------------------------------
+// FrameKind (MVCC T2+)
+// ---------------------------------------------------------------------------
+//
+// Post-T2 the journal distinguishes legacy page-write commit frames from the
+// MVCC `ChainCommit` frame introduced for version-chain installations. Byte
+// layout for `ChainCommit` is pinned in Format Lock Appendix §A.2 of the
+// MVCC plan:
+//
+//   offset  size  field
+//    0       1    frame_kind: u8 (0x02 = CHAIN_COMMIT; 0x01 = legacy commit)
+//    1       3    reserved: [u8; 3] (MUST be 0)
+//    4       4    total_frame_bytes: u32 LE (length prefix — MAJOR-2 fix)
+//    8       4    salt1: u32 LE
+//   12       4    salt2: u32 LE
+//   16      12    commit_ts: Ts-LE (physical_ms u64 LE || logical u32 LE)
+//   28       4    refcount_delta_count: u32 LE
+//   32       N    refcount_deltas: [(page: u32, delta: i32)] × count
+//   32+N     4    page_write_count: u32 LE
+//   36+N     M    page_writes[]
+//   36+N+M   4    checksum_crc32: u32 LE (covers bytes 0..36+N+M)
+//
+// T2 pins the discriminants and the fixed-size header offsets so later tasks
+// (T3/T5'/T6) can plumb the frame through the writer/recovery paths without
+// re-opening the format lock.
+
+/// Discriminant byte at offset 0 of any frame introduced post-T2.
+///
+/// Legacy page-write frames emitted before T2 do not carry this byte — they
+/// are identified by position within the journal and by the length/salt
+/// fields of `JournalFrameHeader`. The `ChainCommit` byte is chosen to be
+/// distinct from any plausible high-order byte of a `page_number` field
+/// in the legacy frame format so a mixed journal can be recovered.
+#[allow(dead_code)]
+pub(crate) const FRAME_KIND_LEGACY_COMMIT: u8 = 0x01;
+
+/// Frame-kind discriminant for MVCC chain-commit frames (Format Lock §A.2).
+#[allow(dead_code)]
+pub(crate) const FRAME_KIND_CHAIN_COMMIT: u8 = 0x02;
+
+/// Byte offset of the fixed-size `ChainCommit` header prefix end
+/// (through `refcount_delta_count`, exclusive of the variable-length tail).
+#[allow(dead_code)]
+pub(crate) const CHAIN_COMMIT_FIXED_HEADER_LEN: usize = 32;
+
+/// Hard cap on `ChainCommit.total_frame_bytes` used during recovery to reject
+/// nonsense lengths before any allocation.
+#[allow(dead_code)]
+pub(crate) const CHAIN_COMMIT_MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
 // JournalHeader
 // ---------------------------------------------------------------------------
 

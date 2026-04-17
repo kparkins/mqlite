@@ -1,7 +1,7 @@
 //! File header — Page 0 of every `.mqlite` database file.
 //!
 //! Page 0 is always exactly 4 096 bytes (one internal-node page). The first
-//! 128 bytes hold structured header fields; the remaining 3 968 bytes are
+//! 132 bytes hold structured header fields; the remaining bytes are
 //! zero-filled padding reserved for future use.
 
 // All expect() calls in this module operate on fixed-size slice conversions
@@ -11,7 +11,7 @@
 // to a custom byte-reader helper that avoids expect_used entirely.
 #![allow(clippy::expect_used)]
 //!
-//! ## On-disk layout
+//! ## On-disk layout (v1 — Format Lock Appendix §A)
 //!
 //! ```text
 //! Offset  Size  Field
@@ -20,24 +20,25 @@
 //!   8      4    Page size internal: u32 LE (4096)
 //!  12      4    Page size leaf: u32 LE (32768)
 //!  16      8    DB creation timestamp: u64 LE Unix milliseconds
-//!  24      8    Last checkpoint timestamp: u64 LE Unix milliseconds
-//!  32      4    Catalog root page: u32 LE
-//!  36      4    Free list head 4 KB: u32 LE (0 = empty)
-//!  40      4    Free list head 32 KB: u32 LE (0 = empty)
-//!  44      4    Total page count: u32 LE
-//!  48      4    Free page count 4 KB: u32 LE
-//!  52      4    Free page count 32 KB: u32 LE
-//!  56      4    Checksum algorithm: u32 LE (1 = CRC32C)
-//!  60      4    Header checksum: CRC32C of bytes 0–59
-//!  64      4    WAL salt 1: u32 LE
-//!  68      4    WAL salt 2: u32 LE
-//!  72      4    Catalog root backup: u32 LE (redundant copy of offset 32)
-//!  76     52    Reserved (zero-filled; future: encryption metadata, etc.)
+//!  24     12    Last checkpoint HLC Ts: Ts-LE (physical_ms u64 || logical u32)
+//!  36      4    Catalog root page: u32 LE
+//!  40      4    Free list head 4 KB: u32 LE (0 = empty)
+//!  44      4    Free list head 32 KB: u32 LE (0 = empty)
+//!  48      4    Total page count: u32 LE
+//!  52      4    Free page count 4 KB: u32 LE
+//!  56      4    Free page count 32 KB: u32 LE
+//!  60      4    Checksum algorithm: u32 LE (1 = CRC32C)
+//!  64      4    Header checksum: CRC32C of bytes 0–63
+//!  68      4    WAL salt 1: u32 LE
+//!  72      4    WAL salt 2: u32 LE
+//!  76      4    Catalog root backup: u32 LE (redundant copy of offset 36)
+//!  80      1    Catalog root level: u8
+//!  81     47    Reserved (zero-filled; future: encryption metadata, etc.)
 //! 128   3968    Unused padding to 4096 bytes
 //! ```
 //!
-//! The **header checksum** at offset 60 is a CRC32C over bytes 0–59 **only**.
-//! Fields at offsets 64 and beyond (WAL salts, catalog root backup) are not
+//! The **header checksum** at offset 64 is a CRC32C over bytes 0–63 **only**.
+//! Fields at offsets 68 and beyond (WAL salts, catalog root backup) are not
 //! included and may be updated without recomputing the checksum.
 //!
 //! ## WAL stale detection
@@ -50,6 +51,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
+use crate::mvcc::Ts;
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
 /// Magic bytes that identify a valid `.mqlite` database file.
@@ -64,11 +66,11 @@ pub(crate) const CHECKSUM_ALGO_CRC32C: u32 = 1;
 /// Size of the file header page in bytes (equal to one internal page = 4 KiB).
 pub(crate) const HEADER_PAGE_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 
-/// Number of bytes covered by the header checksum (offsets 0–59 inclusive).
-const CHECKSUM_RANGE_END: usize = 60;
+/// Number of bytes covered by the header checksum (offsets 0–63 inclusive).
+const CHECKSUM_RANGE_END: usize = 64;
 
 /// Byte offset of the header checksum field.
-const CHECKSUM_OFFSET: usize = 60;
+const CHECKSUM_OFFSET: usize = 64;
 
 /// Structured representation of the `.mqlite` file header (Page 0).
 ///
@@ -92,51 +94,51 @@ pub(crate) struct FileHeader {
     // offset 16
     /// Unix milliseconds when this database file was first created.
     pub created_at: u64,
-    // offset 24
-    /// Unix milliseconds of the last successful checkpoint.
-    pub checkpointed_at: u64,
-    // offset 32
+    // offset 24 (12 bytes — Ts-LE)
+    /// HLC timestamp of the last successful checkpoint.
+    pub last_checkpoint_ts: Ts,
+    // offset 36
     /// Page number of the catalog B+ tree root. 0 = catalog not yet written.
     pub catalog_root_page: u32,
-    // offset 36
+    // offset 40
     /// Head of the 4 KB free-page list. 0 = list is empty.
     pub free_list_head_4k: u32,
-    // offset 40
+    // offset 44
     /// Head of the 32 KB free-page list. 0 = list is empty.
     pub free_list_head_32k: u32,
-    // offset 44
+    // offset 48
     /// Total number of pages in the file (including header page 0).
     pub total_page_count: u32,
-    // offset 48
+    // offset 52
     /// Number of free 4 KB pages available for allocation.
     pub free_page_count_4k: u32,
-    // offset 52
+    // offset 56
     /// Number of free 32 KB pages available for allocation.
     pub free_page_count_32k: u32,
-    // offset 56
+    // offset 60
     /// Checksum algorithm used for page checksums. Must be
     /// [`CHECKSUM_ALGO_CRC32C`] (1).
     pub checksum_algo: u32,
-    // offset 60: header_checksum — not stored here; computed on write
-    // offset 64
+    // offset 64: header_checksum — not stored here; computed on write
+    // offset 68
     /// Random u32 used to associate the WAL file with this database file.
     pub wal_salt1: u32,
-    // offset 68
+    // offset 72
     /// Second WAL association salt.
     pub wal_salt2: u32,
-    // offset 72
-    /// Redundant copy of `catalog_root_page` (offset 32).
+    // offset 76
+    /// Redundant copy of `catalog_root_page` (offset 36).
     /// Used as a fallback if the primary catalog root page fails checksum
     /// validation on open.
     pub catalog_root_backup: u32,
-    // offset 76
+    // offset 80
     /// Root-level byte of the catalog B+ tree (0 = leaf-only; >0 = internal at that level).
     ///
-    /// Stored at offset 76 in the reserved region.  Together with
+    /// Stored at offset 80 in the reserved region.  Together with
     /// [`catalog_root_page`](Self::catalog_root_page) this lets R1.2+ reopen the
     /// catalog without a full tree scan.
     pub catalog_root_level: u8,
-    // offsets 77–127: reserved, zero-filled
+    // offsets 81–127: reserved, zero-filled
     // offsets 128–4095: unused padding
 }
 
@@ -154,7 +156,7 @@ impl FileHeader {
             page_size_internal: PAGE_SIZE_INTERNAL,
             page_size_leaf: PAGE_SIZE_LEAF,
             created_at,
-            checkpointed_at: created_at,
+            last_checkpoint_ts: Ts::PENDING,
             catalog_root_page: 0,
             free_list_head_4k: 0,
             free_list_head_32k: 0,
@@ -185,24 +187,24 @@ impl FileHeader {
         Self::new(created_at, salt1, salt2)
     }
 
-    /// Compute the header checksum: CRC32C of the first 60 bytes of the
+    /// Compute the header checksum: CRC32C of the first 64 bytes of the
     /// serialized header.
     ///
-    /// The checksum field at offset 60–63 is **not** included.
+    /// The checksum field at offset 64–67 is **not** included.
     pub(crate) fn compute_checksum(header_prefix: &[u8; CHECKSUM_RANGE_END]) -> u32 {
         crc32c::crc32c(header_prefix)
     }
 
     /// Serialize the header to a full [`HEADER_PAGE_SIZE`]-byte buffer.
     ///
-    /// The checksum at offset 60 is computed and written during serialization.
-    /// All reserved bytes (76–127) and padding (128–4095) are zero-filled.
+    /// The checksum at offset 64 is computed and written during serialization.
+    /// All reserved bytes (81–127) and padding (128–4095) are zero-filled.
     pub(crate) fn to_bytes(&self) -> [u8; HEADER_PAGE_SIZE] {
         let mut buf = [0u8; HEADER_PAGE_SIZE];
         self.write_fields(&mut buf);
 
         let prefix: [u8; CHECKSUM_RANGE_END] =
-            buf[..CHECKSUM_RANGE_END].try_into().expect("60-byte slice");
+            buf[..CHECKSUM_RANGE_END].try_into().expect("64-byte slice");
         let checksum = Self::compute_checksum(&prefix);
         buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
 
@@ -215,7 +217,7 @@ impl FileHeader {
     /// 1. Magic bytes equal `"MQLT"`.
     /// 2. Format version is `1` (the only version this build supports).
     /// 3. Page sizes match the compile-time constants.
-    /// 4. Header checksum (CRC32C over bytes 0–59) matches stored value.
+    /// 4. Header checksum (CRC32C over bytes 0–63) matches stored value.
     ///
     /// Returns [`Error::CorruptDatabase`] on any validation failure.
     pub(crate) fn from_bytes(buf: &[u8; HEADER_PAGE_SIZE]) -> Result<Self> {
@@ -270,9 +272,9 @@ impl FileHeader {
             });
         }
 
-        // 4. Header checksum: CRC32C of bytes 0–59
+        // 4. Header checksum: CRC32C of bytes 0–63
         let prefix: [u8; CHECKSUM_RANGE_END] =
-            buf[..CHECKSUM_RANGE_END].try_into().expect("60 bytes");
+            buf[..CHECKSUM_RANGE_END].try_into().expect("64 bytes");
         let computed = Self::compute_checksum(&prefix);
         let stored = u32::from_le_bytes(
             buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
@@ -296,24 +298,26 @@ impl FileHeader {
             });
         }
 
+        let last_checkpoint_ts = Ts::from_le_bytes(buf[24..36].try_into().expect("12 bytes"));
+
         Ok(Self {
             magic,
             format_version,
             page_size_internal,
             page_size_leaf,
             created_at: u64::from_le_bytes(buf[16..24].try_into().expect("8 bytes")),
-            checkpointed_at: u64::from_le_bytes(buf[24..32].try_into().expect("8 bytes")),
-            catalog_root_page: u32::from_le_bytes(buf[32..36].try_into().expect("4 bytes")),
-            free_list_head_4k: u32::from_le_bytes(buf[36..40].try_into().expect("4 bytes")),
-            free_list_head_32k: u32::from_le_bytes(buf[40..44].try_into().expect("4 bytes")),
-            total_page_count: u32::from_le_bytes(buf[44..48].try_into().expect("4 bytes")),
-            free_page_count_4k: u32::from_le_bytes(buf[48..52].try_into().expect("4 bytes")),
-            free_page_count_32k: u32::from_le_bytes(buf[52..56].try_into().expect("4 bytes")),
-            checksum_algo: u32::from_le_bytes(buf[56..60].try_into().expect("4 bytes")),
-            wal_salt1: u32::from_le_bytes(buf[64..68].try_into().expect("4 bytes")),
-            wal_salt2: u32::from_le_bytes(buf[68..72].try_into().expect("4 bytes")),
-            catalog_root_backup: u32::from_le_bytes(buf[72..76].try_into().expect("4 bytes")),
-            catalog_root_level: buf[76],
+            last_checkpoint_ts,
+            catalog_root_page: u32::from_le_bytes(buf[36..40].try_into().expect("4 bytes")),
+            free_list_head_4k: u32::from_le_bytes(buf[40..44].try_into().expect("4 bytes")),
+            free_list_head_32k: u32::from_le_bytes(buf[44..48].try_into().expect("4 bytes")),
+            total_page_count: u32::from_le_bytes(buf[48..52].try_into().expect("4 bytes")),
+            free_page_count_4k: u32::from_le_bytes(buf[52..56].try_into().expect("4 bytes")),
+            free_page_count_32k: u32::from_le_bytes(buf[56..60].try_into().expect("4 bytes")),
+            checksum_algo: u32::from_le_bytes(buf[60..64].try_into().expect("4 bytes")),
+            wal_salt1: u32::from_le_bytes(buf[68..72].try_into().expect("4 bytes")),
+            wal_salt2: u32::from_le_bytes(buf[72..76].try_into().expect("4 bytes")),
+            catalog_root_backup: u32::from_le_bytes(buf[76..80].try_into().expect("4 bytes")),
+            catalog_root_level: buf[80],
         })
     }
 
@@ -352,7 +356,7 @@ impl FileHeader {
 
     /// Write all structured fields into `buf`.
     ///
-    /// Does **not** write the checksum at offset 60 — that is the caller's
+    /// Does **not** write the checksum at offset 64 — that is the caller's
     /// responsibility (done in `to_bytes`).
     fn write_fields(&self, buf: &mut [u8; HEADER_PAGE_SIZE]) {
         buf[0..4].copy_from_slice(&self.magic);
@@ -360,20 +364,20 @@ impl FileHeader {
         buf[8..12].copy_from_slice(&self.page_size_internal.to_le_bytes());
         buf[12..16].copy_from_slice(&self.page_size_leaf.to_le_bytes());
         buf[16..24].copy_from_slice(&self.created_at.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.checkpointed_at.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.catalog_root_page.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.free_list_head_4k.to_le_bytes());
-        buf[40..44].copy_from_slice(&self.free_list_head_32k.to_le_bytes());
-        buf[44..48].copy_from_slice(&self.total_page_count.to_le_bytes());
-        buf[48..52].copy_from_slice(&self.free_page_count_4k.to_le_bytes());
-        buf[52..56].copy_from_slice(&self.free_page_count_32k.to_le_bytes());
-        buf[56..60].copy_from_slice(&self.checksum_algo.to_le_bytes());
-        // offset 60–63: checksum — written by to_bytes after this call
-        buf[64..68].copy_from_slice(&self.wal_salt1.to_le_bytes());
-        buf[68..72].copy_from_slice(&self.wal_salt2.to_le_bytes());
-        buf[72..76].copy_from_slice(&self.catalog_root_backup.to_le_bytes());
-        buf[76] = self.catalog_root_level;
-        // offsets 77–127: reserved, already zero-filled by array init
+        buf[24..36].copy_from_slice(&self.last_checkpoint_ts.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.catalog_root_page.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.free_list_head_4k.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.free_list_head_32k.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.total_page_count.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.free_page_count_4k.to_le_bytes());
+        buf[56..60].copy_from_slice(&self.free_page_count_32k.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.checksum_algo.to_le_bytes());
+        // offset 64–67: checksum — written by to_bytes after this call
+        buf[68..72].copy_from_slice(&self.wal_salt1.to_le_bytes());
+        buf[72..76].copy_from_slice(&self.wal_salt2.to_le_bytes());
+        buf[76..80].copy_from_slice(&self.catalog_root_backup.to_le_bytes());
+        buf[80] = self.catalog_root_level;
+        // offsets 81–127: reserved, already zero-filled by array init
         // offsets 128–4095: padding, already zero-filled
     }
 }
@@ -427,7 +431,7 @@ mod tests {
         assert_eq!(decoded.page_size_internal, 4096);
         assert_eq!(decoded.page_size_leaf, 32768);
         assert_eq!(decoded.created_at, TEST_TS);
-        assert_eq!(decoded.checkpointed_at, TEST_TS);
+        assert_eq!(decoded.last_checkpoint_ts, Ts::PENDING);
         assert_eq!(decoded.catalog_root_page, 0);
         assert_eq!(decoded.free_list_head_4k, 0);
         assert_eq!(decoded.free_list_head_32k, 0);
@@ -450,6 +454,10 @@ mod tests {
         h.free_page_count_4k = 10;
         h.free_page_count_32k = 5;
         h.catalog_root_backup = 99;
+        h.last_checkpoint_ts = Ts {
+            physical_ms: 1_700_000_050_000,
+            logical: 42,
+        };
 
         let bytes = h.to_bytes();
         let decoded = FileHeader::from_bytes(&bytes).unwrap();
@@ -458,6 +466,13 @@ mod tests {
         assert_eq!(decoded.free_list_head_4k, 12);
         assert_eq!(decoded.total_page_count, 500);
         assert_eq!(decoded.catalog_root_backup, 99);
+        assert_eq!(
+            decoded.last_checkpoint_ts,
+            Ts {
+                physical_ms: 1_700_000_050_000,
+                logical: 42
+            }
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -481,10 +496,10 @@ mod tests {
     }
 
     #[test]
-    fn reserved_bytes_76_to_127_are_zero() {
+    fn reserved_bytes_81_to_127_are_zero() {
         let bytes = fresh_header().to_bytes();
         assert!(
-            bytes[76..128].iter().all(|&b| b == 0),
+            bytes[81..128].iter().all(|&b| b == 0),
             "reserved region must be zero-filled"
         );
     }
@@ -494,12 +509,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn checksum_is_written_at_offset_60() {
+    fn checksum_is_written_at_offset_64() {
         let h = fresh_header();
         let bytes = h.to_bytes();
-        // Checksum at offset 60
-        let stored = u32::from_le_bytes(bytes[60..64].try_into().unwrap());
-        let computed = FileHeader::compute_checksum(bytes[..60].try_into().unwrap());
+        // Checksum at offset 64
+        let stored = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
+        let computed = FileHeader::compute_checksum(bytes[..64].try_into().unwrap());
         assert_eq!(stored, computed);
     }
 
@@ -512,17 +527,17 @@ mod tests {
     #[test]
     fn checksum_verification_fails_on_body_corruption() {
         let mut bytes = fresh_header().to_bytes();
-        bytes[10] ^= 0xFF; // corrupt within checksum range (0–59)
+        bytes[10] ^= 0xFF; // corrupt within checksum range (0–63)
         assert!(FileHeader::from_bytes(&bytes).is_err());
     }
 
     #[test]
     fn checksum_does_not_cover_wal_salts() {
-        // The checksum covers only bytes 0–59. WAL salts are at 64+.
+        // The checksum covers only bytes 0–63. WAL salts are at 68+.
         // Corrupting them AFTER re-writing the checksum should still parse.
         let original = fresh_header();
         let mut bytes = original.to_bytes();
-        bytes[64] ^= 0xFF; // corrupt wal_salt1 LSB
+        bytes[68] ^= 0xFF; // corrupt wal_salt1 LSB
                            // from_bytes should succeed (checksum still valid; corruption is outside range)
         let decoded = FileHeader::from_bytes(&bytes).expect("should parse");
         // The decoded salt reflects the corruption
@@ -539,8 +554,8 @@ mod tests {
         let mut bytes = original.to_bytes();
         // Overwrite magic + recompute checksum so only the magic is wrong
         bytes[0] = b'X';
-        let new_checksum = FileHeader::compute_checksum(bytes[..60].try_into().unwrap());
-        bytes[60..64].copy_from_slice(&new_checksum.to_le_bytes());
+        let new_checksum = FileHeader::compute_checksum(bytes[..64].try_into().unwrap());
+        bytes[64..68].copy_from_slice(&new_checksum.to_le_bytes());
         assert!(FileHeader::from_bytes(&bytes).is_err());
     }
 
@@ -550,8 +565,8 @@ mod tests {
         let mut bytes = original.to_bytes();
         // Overwrite format_version with 99
         bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
-        let new_checksum = FileHeader::compute_checksum(bytes[..60].try_into().unwrap());
-        bytes[60..64].copy_from_slice(&new_checksum.to_le_bytes());
+        let new_checksum = FileHeader::compute_checksum(bytes[..64].try_into().unwrap());
+        bytes[64..68].copy_from_slice(&new_checksum.to_le_bytes());
         assert!(FileHeader::from_bytes(&bytes).is_err());
     }
 
@@ -634,21 +649,18 @@ mod tests {
         assert_eq!(&bytes[0..4], b"MQLT", "magic mismatch");
 
         // Format version = 1  →  LE bytes [0x01, 0x00, 0x00, 0x00]
-        // (BE would give [0x00, 0x00, 0x00, 0x01])
         assert_eq!(bytes[4], 0x01, "version LSB at offset 4");
         assert_eq!(bytes[5], 0x00);
         assert_eq!(bytes[6], 0x00);
         assert_eq!(bytes[7], 0x00, "version MSB at offset 7");
 
-        // Internal page size = 4096 = 0x0000_1000
-        // LE bytes: [0x00, 0x10, 0x00, 0x00]
+        // Internal page size = 4096 = 0x0000_1000  →  LE [0x00, 0x10, 0x00, 0x00]
         assert_eq!(bytes[8], 0x00);
         assert_eq!(bytes[9], 0x10, "page_size_internal byte 1");
         assert_eq!(bytes[10], 0x00);
         assert_eq!(bytes[11], 0x00);
 
-        // Leaf page size = 32768 = 0x0000_8000
-        // LE bytes: [0x00, 0x80, 0x00, 0x00]
+        // Leaf page size = 32768 = 0x0000_8000  →  LE [0x00, 0x80, 0x00, 0x00]
         assert_eq!(bytes[12], 0x00);
         assert_eq!(bytes[13], 0x80, "page_size_leaf byte 1");
         assert_eq!(bytes[14], 0x00);
@@ -661,29 +673,29 @@ mod tests {
             "created_at LE bytes"
         );
 
-        // checkpointed_at same as created_at for a brand-new header
+        // last_checkpoint_ts = Ts::PENDING (zeroes) for a fresh header — 12 bytes
         assert_eq!(
-            &bytes[24..32],
-            &TEST_TS.to_le_bytes(),
-            "checkpointed_at LE bytes"
+            &bytes[24..36],
+            &[0u8; 12],
+            "last_checkpoint_ts Ts-LE bytes"
         );
 
-        // Checksum algorithm = 1 (CRC32C)  →  LE bytes [0x01, 0x00, 0x00, 0x00]
-        assert_eq!(bytes[56], 0x01, "checksum_algo LSB");
-        assert_eq!(bytes[57], 0x00);
-        assert_eq!(bytes[58], 0x00);
-        assert_eq!(bytes[59], 0x00, "checksum_algo MSB");
+        // Checksum algorithm = 1 (CRC32C)  →  LE bytes [0x01, 0x00, 0x00, 0x00] at offset 60
+        assert_eq!(bytes[60], 0x01, "checksum_algo LSB");
+        assert_eq!(bytes[61], 0x00);
+        assert_eq!(bytes[62], 0x00);
+        assert_eq!(bytes[63], 0x00, "checksum_algo MSB");
 
-        // WAL salt 1 = 0xDEAD_BEEF  →  LE bytes [0xEF, 0xBE, 0xAD, 0xDE]
-        assert_eq!(bytes[64], 0xEF, "wal_salt1 byte 0 (LSB)");
-        assert_eq!(bytes[65], 0xBE);
-        assert_eq!(bytes[66], 0xAD);
-        assert_eq!(bytes[67], 0xDE, "wal_salt1 byte 3 (MSB)");
+        // WAL salt 1 = 0xDEAD_BEEF  →  LE bytes [0xEF, 0xBE, 0xAD, 0xDE] at offset 68
+        assert_eq!(bytes[68], 0xEF, "wal_salt1 byte 0 (LSB)");
+        assert_eq!(bytes[69], 0xBE);
+        assert_eq!(bytes[70], 0xAD);
+        assert_eq!(bytes[71], 0xDE, "wal_salt1 byte 3 (MSB)");
 
-        // WAL salt 2 = 0xCAFE_BABE  →  LE bytes [0xBE, 0xBA, 0xFE, 0xCA]
-        assert_eq!(bytes[68], 0xBE, "wal_salt2 byte 0 (LSB)");
-        assert_eq!(bytes[69], 0xBA);
-        assert_eq!(bytes[70], 0xFE);
-        assert_eq!(bytes[71], 0xCA, "wal_salt2 byte 3 (MSB)");
+        // WAL salt 2 = 0xCAFE_BABE  →  LE bytes [0xBE, 0xBA, 0xFE, 0xCA] at offset 72
+        assert_eq!(bytes[72], 0xBE, "wal_salt2 byte 0 (LSB)");
+        assert_eq!(bytes[73], 0xBA);
+        assert_eq!(bytes[74], 0xFE);
+        assert_eq!(bytes[75], 0xCA, "wal_salt2 byte 3 (MSB)");
     }
 }

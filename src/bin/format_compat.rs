@@ -76,11 +76,11 @@ const HEADER_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 /// Checksum algorithm code for CRC32C.
 const CHECKSUM_ALGO_CRC32C: u32 = 1;
 
-/// Number of bytes covered by the header checksum.
-const HEADER_CHECKSUM_RANGE: usize = 60;
+/// Number of bytes covered by the header checksum (v1 post-T2: bytes 0–63).
+const HEADER_CHECKSUM_RANGE: usize = 64;
 
-/// Byte offset of the header checksum field.
-const HEADER_CHECKSUM_OFFSET: usize = 60;
+/// Byte offset of the header checksum field (v1 post-T2).
+const HEADER_CHECKSUM_OFFSET: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Deterministic test data constants
@@ -137,18 +137,19 @@ fn write_header(file: &mut File) -> io::Result<()> {
     buf[8..12].copy_from_slice(&PAGE_SIZE_INTERNAL.to_le_bytes());
     buf[12..16].copy_from_slice(&PAGE_SIZE_LEAF.to_le_bytes());
     buf[16..24].copy_from_slice(&FIXED_CREATED_AT.to_le_bytes());
-    buf[24..32].copy_from_slice(&FIXED_CREATED_AT.to_le_bytes()); // checkpointed_at
-                                                                  // Offsets 32–55: zero (catalog root, free lists, page counts)
-    buf[56..60].copy_from_slice(&CHECKSUM_ALGO_CRC32C.to_le_bytes());
-    // Offset 60–63: CRC32C of bytes 0–59
+    // Offsets 24..36: last_checkpoint_ts (Ts-LE, 12 B) — left zero for this
+    // static test fixture.
+    // Offsets 36–59: zero (catalog root, free lists, page counts)
+    buf[60..64].copy_from_slice(&CHECKSUM_ALGO_CRC32C.to_le_bytes());
+    // Offset 64–67: CRC32C of bytes 0–63
     let checksum = crc32c(&buf[..HEADER_CHECKSUM_RANGE]);
     buf[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_OFFSET + 4]
         .copy_from_slice(&checksum.to_le_bytes());
-    // Offset 64–67: WAL salt 1
-    buf[64..68].copy_from_slice(&FIXED_SALT1.to_le_bytes());
-    // Offset 68–71: WAL salt 2
-    buf[68..72].copy_from_slice(&FIXED_SALT2.to_le_bytes());
-    // Offsets 72–4095: zero (catalog root backup, reserved, padding)
+    // Offset 68–71: WAL salt 1
+    buf[68..72].copy_from_slice(&FIXED_SALT1.to_le_bytes());
+    // Offset 72–75: WAL salt 2
+    buf[72..76].copy_from_slice(&FIXED_SALT2.to_le_bytes());
+    // Offsets 76–4095: zero (catalog root backup, reserved, padding)
 
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&buf)?;
@@ -205,9 +206,9 @@ fn verify_header(file: &mut File) -> Result<(), String> {
         ));
     }
 
-    // CRC32C over bytes 0–59
+    // CRC32C over bytes 0–63
     let computed_crc = crc32c(&buf[..HEADER_CHECKSUM_RANGE]);
-    let stored_crc = u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]);
+    let stored_crc = u32::from_le_bytes([buf[64], buf[65], buf[66], buf[67]]);
     if computed_crc != stored_crc {
         return Err(format!(
             "header checksum mismatch: stored 0x{stored_crc:08X}, \
@@ -215,14 +216,14 @@ fn verify_header(file: &mut File) -> Result<(), String> {
         ));
     }
 
-    // WAL salts
-    let salt1 = u32::from_le_bytes([buf[64], buf[65], buf[66], buf[67]]);
+    // WAL salts (post-T2 header layout: salts shifted +4 vs v0)
+    let salt1 = u32::from_le_bytes([buf[68], buf[69], buf[70], buf[71]]);
     if salt1 != FIXED_SALT1 {
         return Err(format!(
             "bad wal_salt1 0x{salt1:08X} (expected 0x{FIXED_SALT1:08X})"
         ));
     }
-    let salt2 = u32::from_le_bytes([buf[68], buf[69], buf[70], buf[71]]);
+    let salt2 = u32::from_le_bytes([buf[72], buf[73], buf[74], buf[75]]);
     if salt2 != FIXED_SALT2 {
         return Err(format!(
             "bad wal_salt2 0x{salt2:08X} (expected 0x{FIXED_SALT2:08X})"

@@ -206,6 +206,18 @@ pub enum Error {
         /// Magic bytes this build expects (`MQJL`).
         expected: [u8; 4],
     },
+
+    /// The HLC logical counter saturated at `u32::MAX` for the current
+    /// millisecond and the wall clock has not advanced past it.
+    ///
+    /// Only reachable under pathological load (more than `u32::MAX` commits
+    /// in the same millisecond) or a stuck clock.
+    #[error(
+        "TimestampExhausted — the HLC logical counter reached u32::MAX for \
+         the current millisecond. Wait for the wall clock to advance or \
+         reduce the commit rate."
+    )]
+    TimestampExhausted,
 }
 
 impl Error {
