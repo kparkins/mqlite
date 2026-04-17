@@ -43,6 +43,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::btree::BTreePageStore;
 use crate::storage::buffer_pool::PageSize;
@@ -93,11 +94,18 @@ impl BTreePageStore for BufferPoolPageStore {
         // pinned auto-unpins here
     }
 
-    fn read_leaf(&self, page: u32) -> Result<Box<[u8; LEAF_SIZE]>> {
+    fn read_leaf(
+        &self,
+        page: u32,
+    ) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
         let pinned = self.handle.fetch_page(page, PageSize::Large32k)?;
         let mut buf = Box::new([0u8; LEAF_SIZE]);
         buf.copy_from_slice(pinned.data());
-        Ok(buf)
+        // The page is pinned — the frame is guaranteed resident, so we can
+        // snapshot its MVCC chains before unpinning. T3.75 supplies
+        // `view = None`; T4+ will thread the reader's Arc<ReadView> through.
+        let snap = self.handle.pool().snapshot_chains(page, None)?;
+        Ok((buf, snap))
         // pinned auto-unpins here
     }
 
@@ -289,7 +297,7 @@ mod tests {
         data[32760] = 0xDD;
         store.write_leaf(pn, &data).unwrap();
 
-        let read_back = store.read_leaf(pn).unwrap();
+        let (read_back, _) = store.read_leaf(pn).unwrap();
         assert_eq!(read_back[0], 0xCC);
         assert_eq!(read_back[32760], 0xDD);
     }

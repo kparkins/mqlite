@@ -29,6 +29,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::page::{
     internal_page_checksum, leaf_page_checksum, overflow_page_checksum, InternalPageHeader,
@@ -66,8 +67,27 @@ pub(crate) trait BTreePageStore {
     /// Read a 4 KB internal page into a heap-allocated buffer.
     fn read_internal(&self, page: u32) -> Result<Box<[u8; PAGE_SIZE_INTERNAL as usize]>>;
 
-    /// Read a 32 KB leaf (or overflow) page into a heap-allocated buffer.
-    fn read_leaf(&self, page: u32) -> Result<Box<[u8; PAGE_SIZE_LEAF as usize]>>;
+    /// Read a 32 KB leaf (or overflow) page into a heap-allocated buffer,
+    /// returning an optional [`ChainSnapshot`] pinning every per-key MVCC
+    /// version chain on the frame.
+    ///
+    /// The returned snapshot deep-clones each `VersionEntry`, running
+    /// `OverflowRef::Clone` (CAS-loop incref) so every overflow page
+    /// referenced from the chain is pinned for the snapshot's lifetime.
+    /// Callers that do not need chain visibility can ignore the second
+    /// tuple element — dropping the snapshot RAII-decrefs every bumped
+    /// refcount.
+    ///
+    /// `None` is returned when the backing implementation has no MVCC
+    /// chains for `page` (e.g. overflow pages read through the same API,
+    /// or a buffer pool frame that is not currently resident).
+    fn read_leaf(
+        &self,
+        page: u32,
+    ) -> Result<(
+        Box<[u8; PAGE_SIZE_LEAF as usize]>,
+        Option<ChainSnapshot>,
+    )>;
 
     /// Write a 4 KB internal page.
     fn write_internal(&mut self, page: u32, data: &[u8; PAGE_SIZE_INTERNAL as usize])
@@ -157,12 +177,23 @@ impl BTreePageStore for MemPageStore {
             .unwrap_or_else(|| Box::new([0u8; PAGE_SIZE_INTERNAL as usize])))
     }
 
-    fn read_leaf(&self, page: u32) -> Result<Box<[u8; PAGE_SIZE_LEAF as usize]>> {
-        Ok(self
+    fn read_leaf(
+        &self,
+        page: u32,
+    ) -> Result<(
+        Box<[u8; PAGE_SIZE_LEAF as usize]>,
+        Option<ChainSnapshot>,
+    )> {
+        let buf = self
             .leaf_pages
             .get(&page)
             .cloned()
-            .unwrap_or_else(|| Box::new([0u8; PAGE_SIZE_LEAF as usize])))
+            .unwrap_or_else(|| Box::new([0u8; PAGE_SIZE_LEAF as usize]));
+        let snap = self
+            .leaf_chains
+            .get(&page)
+            .map(|src| ChainSnapshot::new(src, None));
+        Ok((buf, snap))
     }
 
     fn write_internal(
@@ -718,7 +749,7 @@ fn read_overflow_chain<S: BTreePageStore>(
     let mut result = Vec::with_capacity(total_length as usize);
     let mut cur = first_page;
     while cur != 0 {
-        let buf = store.read_leaf(cur)?;
+        let (buf, _) = store.read_leaf(cur)?;
         let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
         hdr.validate_type()?;
         let data_len = hdr.data_length as usize;
@@ -737,7 +768,7 @@ fn read_overflow_chain<S: BTreePageStore>(
 fn free_overflow_chain<S: BTreePageStore>(store: &mut S, first_page: u32) -> Result<()> {
     let mut cur = first_page;
     while cur != 0 {
-        let buf = store.read_leaf(cur)?;
+        let (buf, _) = store.read_leaf(cur)?;
         let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
         let next = hdr.next_overflow_page;
         store.free_leaf(cur)?;
@@ -756,7 +787,7 @@ fn free_subtree<S: BTreePageStore>(store: &mut S, page: u32, level: u8) -> Resul
         // Leaf node: free any overflow chains, then free the leaf page.
         // We do NOT follow `next_leaf_page` here — the parent's child-pointer
         // traversal already enumerates every leaf exactly once.
-        let buf = store.read_leaf(page)?;
+        let (buf, _) = store.read_leaf(page)?;
         let node = LeafNode::parse(&buf[..])?;
         for cell in &node.cells {
             if let CellValue::Overflow { first_page, .. } = cell.value {
@@ -893,7 +924,7 @@ impl<S: BTreePageStore> BTree<S> {
     /// [`BTree::get`] for a fully resolved lookup.
     pub(crate) fn search(&self, key: &[u8]) -> Result<Option<CellValue>> {
         let leaf_page = self.find_leaf(key)?;
-        let buf = self.store.read_leaf(leaf_page)?;
+        let (buf, _) = self.store.read_leaf(leaf_page)?;
         let node = LeafNode::parse(&buf[..])?;
         match node.binary_search(key) {
             Ok(i) => Ok(Some(node.cells[i].value.clone())),
@@ -1002,7 +1033,7 @@ impl<S: BTreePageStore> BTree<S> {
         key: &[u8],
         value: CellValue,
     ) -> Result<Option<SplitResult>> {
-        let buf = self.store.read_leaf(page)?;
+        let (buf, _) = self.store.read_leaf(page)?;
         let mut node = LeafNode::parse(&buf[..])?;
 
         let new_cell = LeafCell {
@@ -1073,7 +1104,7 @@ impl<S: BTreePageStore> BTree<S> {
 
         // Update the old right sibling's prev pointer (if any).
         if right_node.next_leaf_page != 0 {
-            let old_next_buf = self.store.read_leaf(right_node.next_leaf_page)?;
+            let (old_next_buf, _) = self.store.read_leaf(right_node.next_leaf_page)?;
             let mut old_next = LeafNode::parse(&old_next_buf[..])?;
             old_next.prev_leaf_page = right_page;
             let enc = old_next.encode()?;
@@ -1236,7 +1267,7 @@ impl<S: BTreePageStore> BTree<S> {
 
     /// Delete `key` from the leaf at `page`, then handle underflow.
     fn delete_from_leaf(&mut self, page: u32, key: &[u8], path: &[(u32, usize)]) -> Result<bool> {
-        let buf = self.store.read_leaf(page)?;
+        let (buf, _) = self.store.read_leaf(page)?;
         let mut node = LeafNode::parse(&buf[..])?;
 
         let idx = match node.binary_search(key) {
@@ -1279,7 +1310,7 @@ impl<S: BTreePageStore> BTree<S> {
         if child_idx > 0 {
             let left_sibling_idx = child_idx - 1;
             let left_page = parent.child_at(left_sibling_idx);
-            let left_buf = self.store.read_leaf(left_page)?;
+            let (left_buf, _) = self.store.read_leaf(left_page)?;
             let mut left_node = LeafNode::parse(&left_buf[..])?;
 
             // Redistribute: move last cell of left sibling to front of our node.
@@ -1319,7 +1350,7 @@ impl<S: BTreePageStore> BTree<S> {
             // child_idx + 1 is valid if child_idx + 1 <= key_count.
             let right_sibling_idx = child_idx + 1;
             let right_page = parent.child_at(right_sibling_idx);
-            let right_buf = self.store.read_leaf(right_page)?;
+            let (right_buf, _) = self.store.read_leaf(right_page)?;
             let mut right_node = LeafNode::parse(&right_buf[..])?;
 
             if right_node.cells.len() > MIN_LEAF_CELLS {
@@ -1351,7 +1382,7 @@ impl<S: BTreePageStore> BTree<S> {
             // Merge page into left sibling.
             let left_sibling_idx = child_idx - 1;
             let left_page = parent.child_at(left_sibling_idx);
-            let left_buf = self.store.read_leaf(left_page)?;
+            let (left_buf, _) = self.store.read_leaf(left_page)?;
             let mut left_node = LeafNode::parse(&left_buf[..])?;
 
             // T3.5: migrate version chains for every cell moving into the
@@ -1369,7 +1400,7 @@ impl<S: BTreePageStore> BTree<S> {
 
             // Update former right sibling's prev pointer.
             if node.next_leaf_page != 0 {
-                let next_buf = self.store.read_leaf(node.next_leaf_page)?;
+                let (next_buf, _) = self.store.read_leaf(node.next_leaf_page)?;
                 let mut next_node = LeafNode::parse(&next_buf[..])?;
                 next_node.prev_leaf_page = left_page;
                 let enc = next_node.encode()?;
@@ -1393,7 +1424,7 @@ impl<S: BTreePageStore> BTree<S> {
         } else {
             // child_idx == 0: merge page with right sibling.
             let right_page = parent.child_at(1);
-            let right_buf = self.store.read_leaf(right_page)?;
+            let (right_buf, _) = self.store.read_leaf(right_page)?;
             let mut right_node = LeafNode::parse(&right_buf[..])?;
 
             // T3.5: migrate version chains for every cell moving into the
@@ -1411,7 +1442,7 @@ impl<S: BTreePageStore> BTree<S> {
 
             // Update former left sibling's next pointer (if any).
             if node.prev_leaf_page != 0 {
-                let prev_buf = self.store.read_leaf(node.prev_leaf_page)?;
+                let (prev_buf, _) = self.store.read_leaf(node.prev_leaf_page)?;
                 let mut prev_node = LeafNode::parse(&prev_buf[..])?;
                 prev_node.next_leaf_page = right_page;
                 let enc = prev_node.encode()?;
@@ -1552,7 +1583,7 @@ impl<S: BTreePageStore> BTree<S> {
 
         let mut cur_page = first_leaf;
         'outer: while cur_page != 0 {
-            let buf = self.store.read_leaf(cur_page)?;
+            let (buf, _) = self.store.read_leaf(cur_page)?;
             let node = LeafNode::parse(&buf[..])?;
 
             let start_idx = match start_key {
@@ -2086,7 +2117,7 @@ mod tests {
         let mut cur = first;
         let mut keys = Vec::new();
         while cur != 0 {
-            let buf = tree.store.read_leaf(cur).unwrap();
+            let (buf, _) = tree.store.read_leaf(cur).unwrap();
             let node = LeafNode::parse(&buf[..]).unwrap();
             for cell in &node.cells {
                 keys.push(cell.key.clone());

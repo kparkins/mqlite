@@ -34,6 +34,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::mvcc::read_view::{ChainSnapshot, ReadView};
 use crate::mvcc::version::VersionEntry;
 
 // ---------------------------------------------------------------------------
@@ -552,6 +553,35 @@ impl BufferPool {
             .expect("page_map invariant: frame must exist at mapped slot");
         frame.version_chains.insert(key, chain);
         Ok(())
+    }
+
+    /// Build a [`ChainSnapshot`] from the per-key MVCC version chains on
+    /// leaf page `page`. Returns `None` if the page is not currently
+    /// resident (the caller must have the frame pinned via `pin_page` for
+    /// the snapshot to reflect the live chains).
+    ///
+    /// Deep-clones every `VersionEntry` under the partition mutex,
+    /// which runs `OverflowRef::Clone` on `VersionData::Overflow` entries
+    /// (CAS-loop incref on the page's refcount header). The partition
+    /// mutex and the overflow refcount atomics are orthogonal: the CAS
+    /// loop touches an `AtomicU32` off the `AllocatorHandle::overflow_refcounts`
+    /// table, never the partition mutex itself.
+    pub(crate) fn snapshot_chains(
+        &self,
+        page: u32,
+        view: Option<Arc<ReadView>>,
+    ) -> Result<Option<ChainSnapshot>> {
+        let guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let Some(&idx) = guard.page_map.get(&page) else {
+            return Ok(None);
+        };
+        let frame = guard.frames[idx]
+            .as_ref()
+            .expect("page_map invariant: frame must exist at mapped slot");
+        Ok(Some(ChainSnapshot::new(&frame.version_chains, view)))
     }
 
     /// True if no version chains are attached to leaf page `page` (including

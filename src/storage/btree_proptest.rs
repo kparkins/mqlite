@@ -221,7 +221,7 @@ fn check_internal_key_coverage(tree: &BTree<MemPageStore>, page: u32, level: u8)
 
 fn subtree_max_key(tree: &BTree<MemPageStore>, page: u32, level: u8) -> Option<Vec<u8>> {
     if level == 0 {
-        let buf = tree.store.read_leaf(page).expect("read_leaf");
+        let (buf, _) = tree.store.read_leaf(page).expect("read_leaf");
         let node = LeafNode::parse(&buf[..]).expect("parse leaf");
         node.cells.last().map(|c| c.key.clone())
     } else {
@@ -233,7 +233,7 @@ fn subtree_max_key(tree: &BTree<MemPageStore>, page: u32, level: u8) -> Option<V
 
 fn subtree_min_key(tree: &BTree<MemPageStore>, page: u32, level: u8) -> Option<Vec<u8>> {
     if level == 0 {
-        let buf = tree.store.read_leaf(page).expect("read_leaf");
+        let (buf, _) = tree.store.read_leaf(page).expect("read_leaf");
         let node = LeafNode::parse(&buf[..]).expect("parse leaf");
         node.cells.first().map(|c| c.key.clone())
     } else {
@@ -306,7 +306,7 @@ fn check_parent_child_recursive(
 
     if level == 0 {
         // Leaf page — verify it is readable and has the right page type.
-        let buf = tree.store.read_leaf(page).expect("read_leaf");
+        let (buf, _) = tree.store.read_leaf(page).expect("read_leaf");
         let hdr = LeafPageHeader::from_bytes(&buf[..]).expect("leaf header parse");
         assert_eq!(
             hdr.page_type, PAGE_TYPE_LEAF,
@@ -351,7 +351,7 @@ fn check_inv4_sibling_pointers(tree: &BTree<MemPageStore>) {
     let mut prev_page: u32 = 0;
     let mut cur = first;
     while cur != 0 {
-        let buf = tree.store.read_leaf(cur).expect("read_leaf");
+        let (buf, _) = tree.store.read_leaf(cur).expect("read_leaf");
         let node = LeafNode::parse(&buf[..]).expect("parse leaf");
 
         // Verify backward pointer.
@@ -432,7 +432,7 @@ fn check_key_counts_recursive(
     is_root_leaf: bool,
 ) {
     if level == 0 {
-        let buf = tree.store.read_leaf(page).expect("read_leaf");
+        let (buf, _) = tree.store.read_leaf(page).expect("read_leaf");
         let node = LeafNode::parse(&buf[..]).expect("parse leaf");
 
         // Max check: used_bytes must not exceed the page size.
@@ -495,7 +495,7 @@ fn check_inv6_overflow_chains(tree: &BTree<MemPageStore>) {
 
 fn check_overflow_recursive(tree: &BTree<MemPageStore>, page: u32, level: u8) {
     if level == 0 {
-        let buf = tree.store.read_leaf(page).expect("read_leaf");
+        let (buf, _) = tree.store.read_leaf(page).expect("read_leaf");
         let node = LeafNode::parse(&buf[..]).expect("parse leaf");
         for cell in &node.cells {
             if let CellValue::Overflow {
@@ -531,7 +531,7 @@ fn verify_overflow_chain(
             visited.insert(cur),
             "INV6 overflow: cycle in overflow chain for key {cell_key:?} at page {cur}"
         );
-        let buf = tree.store.read_leaf(cur).expect("read_leaf (overflow)");
+        let (buf, _) = tree.store.read_leaf(cur).expect("read_leaf (overflow)");
         let hdr = OverflowPageHeader::from_bytes(&buf[..])
             .expect("overflow header parse");
         assert_eq!(
@@ -656,7 +656,7 @@ fn check_inv8_checksums(tree: &BTree<MemPageStore>) {
 
 fn check_checksums_recursive(tree: &BTree<MemPageStore>, page: u32, level: u8) {
     if level == 0 {
-        let buf = tree.store.read_leaf(page).expect("read_leaf");
+        let (buf, _) = tree.store.read_leaf(page).expect("read_leaf");
         verify_leaf_page_checksum(&buf).unwrap_or_else(|e| {
             panic!("INV8 checksum: leaf page {page}: {e}");
         });
@@ -685,7 +685,7 @@ fn check_checksums_recursive(tree: &BTree<MemPageStore>, page: u32, level: u8) {
 fn check_overflow_checksums(tree: &BTree<MemPageStore>, first_page: u32) {
     let mut cur = first_page;
     while cur != 0 {
-        let buf = tree.store.read_leaf(cur).expect("read_leaf (overflow checksum)");
+        let (buf, _) = tree.store.read_leaf(cur).expect("read_leaf (overflow checksum)");
         verify_overflow_page_checksum(&buf).unwrap_or_else(|e| {
             panic!("INV8 checksum: overflow page {cur}: {e}");
         });
