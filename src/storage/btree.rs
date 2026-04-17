@@ -621,6 +621,11 @@ fn write_overflow_chain<S: BTreePageStore>(store: &mut S, data: &[u8]) -> Result
         let mut buf = [0u8; PAGE_SIZE_LEAF as usize];
         let hdr = OverflowPageHeader {
             page_type: PAGE_TYPE_OVERFLOW,
+            // Legacy non-MVCC writer: refcount semantics land in T5'/T6.
+            // Starting at 0 preserves previous behaviour — no pins are
+            // claimed here — and tracks the "unmanaged" state until the
+            // MVCC writer path wraps these pages in OverflowRefs.
+            refcount: 0,
             checksum: 0,
             next_overflow_page: next,
             data_length: chunk.len() as u32,
@@ -629,7 +634,8 @@ fn write_overflow_chain<S: BTreePageStore>(store: &mut S, data: &[u8]) -> Result
         buf[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
 
         let cs = overflow_page_checksum(&buf);
-        buf[4..8].copy_from_slice(&cs.to_le_bytes());
+        // Post-T3 checksum field is at bytes 8..12 (Format Lock §A.1).
+        buf[8..12].copy_from_slice(&cs.to_le_bytes());
 
         store.write_leaf(pages[i], &buf)?;
     }

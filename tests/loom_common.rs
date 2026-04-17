@@ -96,4 +96,84 @@ mod refcount_model {
             );
         });
     }
+
+    /// T3 fixture: two concurrent Clones from a live baseline refcount=1
+    /// must drive the final refcount to 3 under every interleaving. This
+    /// models two callers simultaneously cloning an `OverflowRef` — neither
+    /// may observe a lost update from the CAS retry loop.
+    #[test]
+    fn model_two_clones_from_refcount_one_reaches_three() {
+        loom::model(|| {
+            let count = Arc::new(AtomicU32::new(1));
+            let a = count.clone();
+            let b = count.clone();
+
+            let t1 = thread::spawn(move || {
+                incref(&a).expect("incref OK");
+            });
+            let t2 = thread::spawn(move || {
+                incref(&b).expect("incref OK");
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(
+                count.load(Ordering::Acquire),
+                3,
+                "two clones from refcount=1 must reach refcount=3 on every interleaving",
+            );
+        });
+    }
+
+    /// T3 fixture: Clone racing Drop from baseline refcount=2 must always
+    /// leave at least one live ref (final >= 1). A 0-enqueue in this
+    /// scenario would mean the page could be deferred-freed while a live
+    /// `OverflowRef` still exists — catastrophic use-after-free.
+    #[test]
+    fn model_clone_racing_drop_leaves_live_ref() {
+        loom::model(|| {
+            let count = Arc::new(AtomicU32::new(2));
+            let a = count.clone();
+            let b = count.clone();
+
+            let cloner = thread::spawn(move || {
+                incref(&a).expect("incref OK");
+            });
+            let dropper = thread::spawn(move || {
+                decref(&b);
+            });
+            cloner.join().unwrap();
+            dropper.join().unwrap();
+
+            // One clone (+1) and one drop (-1) from 2 → final must be 2.
+            // The key invariant is >= 1 in all reachable states after both
+            // threads complete: no 0-enqueue possible.
+            assert_eq!(count.load(Ordering::Acquire), 2);
+        });
+    }
+
+    /// T3 fixture: when refcount is saturated at u32::MAX, concurrent
+    /// `incref` calls must all fail without mutating the counter. Models
+    /// the CAS-loop saturation bailout from `incref_overflow`.
+    #[test]
+    fn model_cas_saturation_never_mutates() {
+        loom::model(|| {
+            let count = Arc::new(AtomicU32::new(u32::MAX));
+            let a = count.clone();
+            let b = count.clone();
+
+            let t1 = thread::spawn(move || incref(&a));
+            let t2 = thread::spawn(move || incref(&b));
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            assert!(r1.is_err(), "saturated incref must fail");
+            assert!(r2.is_err(), "saturated incref must fail");
+            assert_eq!(
+                count.load(Ordering::Acquire),
+                u32::MAX,
+                "saturated refcount must not wrap or otherwise mutate",
+            );
+        });
+    }
 }

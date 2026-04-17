@@ -218,6 +218,19 @@ pub enum Error {
          reduce the commit rate."
     )]
     TimestampExhausted,
+
+    /// An overflow-page refcount would exceed `u32::MAX`.
+    ///
+    /// Returned by `incref_overflow` when the CAS-loop observes the refcount
+    /// already at `u32::MAX`. The atomic value is left unchanged. This only
+    /// arises under pathological pin counts (≥ 4 billion live OverflowRefs
+    /// on one chain) and indicates a pin leak.
+    #[error(
+        "RefcountOverflow — overflow-page refcount would exceed u32::MAX. \
+         This indicates a pin leak; investigate long-lived ReadViews or \
+         OverflowRef retention."
+    )]
+    RefcountOverflow,
 }
 
 impl Error {

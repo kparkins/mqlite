@@ -8,7 +8,19 @@
 //!
 //! See `.omc/plans/mvcc-wiredtiger.md` for the full design.
 
+pub mod deferred_free;
+pub mod read_view;
 pub mod timestamp;
+pub mod transaction;
+pub mod version;
 
 #[allow(unused_imports)]
+pub use deferred_free::DeferredFreeQueue;
+#[allow(unused_imports)]
+pub use read_view::ReadView;
+#[allow(unused_imports)]
 pub use timestamp::{HlcState, TimestampOracle, Ts};
+#[allow(unused_imports)]
+pub use transaction::WriteTxn;
+#[allow(unused_imports)]
+pub use version::{OverflowRef, VersionData, VersionEntry};

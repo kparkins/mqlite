@@ -51,7 +51,12 @@ pub(crate) const INTERNAL_HEADER_SIZE: usize = 12;
 pub(crate) const LEAF_HEADER_SIZE: usize = 20;
 
 /// Size of the overflow page header in bytes.
-pub(crate) const OVERFLOW_HEADER_SIZE: usize = 16;
+///
+/// Grew from 16 → 20 in T3 (MVCC Format Lock §A.1) to add a
+/// `refcount: AtomicU32` field at offset 4. Checksum coverage explicitly
+/// excludes bytes 4..8 (refcount) and bytes 8..12 (checksum field itself)
+/// so atomic refcount ops do not invalidate the page's integrity guarantee.
+pub(crate) const OVERFLOW_HEADER_SIZE: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Leaf page flags
@@ -307,7 +312,7 @@ pub(crate) fn verify_leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) ->
 }
 
 // ---------------------------------------------------------------------------
-// Overflow page header  (16 bytes)
+// Overflow page header  (20 bytes, post-T3)
 // ---------------------------------------------------------------------------
 
 /// Structured header of a 32 KB overflow page.
@@ -316,22 +321,33 @@ pub(crate) fn verify_leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) ->
 /// usable space in a single leaf cell. The leaf cell stores a pointer to the
 /// first overflow page; subsequent fragments are linked via `next_overflow_page`.
 ///
-/// ## On-disk layout (16 bytes at start of page)
+/// ## On-disk layout (20 bytes at start of page — post-T3, MVCC Format Lock §A.1)
 ///
 /// ```text
 /// Offset  Size  Field
 ///  0       1    page_type: u8 (must be 0x05)
 ///  1       3    reserved: [u8; 3] (zero-filled)
-///  4       4    checksum: u32 LE (CRC32C over bytes 0–3 and 8 onward)
-///  8       4    next_overflow_page: u32 LE (0 = last page in chain)
-/// 12       4    data_length: u32 LE (bytes of payload in this page)
-/// 16        …   payload (continuation of BSON document)
+///  4       4    refcount: u32 LE (atomic — see allocator::AllocatorHandle)
+///  8       4    checksum: u32 LE (CRC32C; coverage excludes bytes 4..12)
+/// 12       4    next_overflow_page: u32 LE (0 = last page in chain)
+/// 16       4    data_length: u32 LE (bytes of payload in this page)
+/// 20        …   payload (continuation of BSON document)
 /// ```
+///
+/// **Checksum coverage** (MAJOR-3 fix): CRC32C over bytes 0..4 + 12..END.
+/// EXCLUDES bytes 4..8 (refcount — mutated atomically without rewriting the
+/// page) and bytes 8..12 (checksum field itself). A flip of any byte in
+/// 4..8 does NOT invalidate the page's stored checksum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OverflowPageHeader {
     /// Must be [`PAGE_TYPE_OVERFLOW`] (0x05).
     pub page_type: u8,
-    /// CRC32C checksum. Covers bytes 0–3 and 8 onward.
+    /// Reference count — number of live `OverflowRef` handles pinning this
+    /// chain. Serialized as a plain `u32` in the on-disk struct; atomic
+    /// operations go through `allocator::AllocatorHandle::incref_overflow`
+    /// etc. See MVCC plan §A.1 / §A.4.
+    pub refcount: u32,
+    /// CRC32C checksum. Covers bytes 0..4 + 12..END; EXCLUDES bytes 4..12.
     pub checksum: u32,
     /// Page number of the next overflow page in the chain, or 0 if this is the
     /// last page.
@@ -352,9 +368,10 @@ impl OverflowPageHeader {
         Ok(Self {
             page_type: buf[0],
             // buf[1..4] are reserved; ignored on read
-            checksum: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            next_overflow_page: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            data_length: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            refcount: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            checksum: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            next_overflow_page: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            data_length: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
         })
     }
 
@@ -364,9 +381,10 @@ impl OverflowPageHeader {
         buf[1] = 0; // reserved
         buf[2] = 0;
         buf[3] = 0;
-        buf[4..8].copy_from_slice(&self.checksum.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.next_overflow_page.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.data_length.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.refcount.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.checksum.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.next_overflow_page.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.data_length.to_le_bytes());
     }
 
     /// Return an error if the page type byte is not [`PAGE_TYPE_OVERFLOW`].
@@ -383,11 +401,13 @@ impl OverflowPageHeader {
 
 /// Compute the CRC32C checksum for an overflow page.
 ///
-/// Covers bytes 0–3 and bytes 8 onward (skips the checksum field at offset
-/// 4–7).
+/// Post-T3 layout (Format Lock §A.1): covers bytes 0..4 (page_type +
+/// reserved) and bytes 12..END (next_overflow_page + data_length + payload).
+/// EXCLUDES bytes 4..8 (refcount — mutated atomically) and bytes 8..12
+/// (checksum field itself).
 pub(crate) fn overflow_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> u32 {
     let digest = crc32c::crc32c(&page[..4]);
-    crc32c::crc32c_append(digest, &page[8..])
+    crc32c::crc32c_append(digest, &page[12..])
 }
 
 /// Verify the CRC32C checksum stored in an overflow page.
@@ -586,6 +606,7 @@ mod tests {
         let mut buf = [0u8; PAGE_SIZE_LEAF as usize];
         let mut hdr = OverflowPageHeader {
             page_type: PAGE_TYPE_OVERFLOW,
+            refcount: 1,
             checksum: 0,
             next_overflow_page: 77,
             data_length: 64,
@@ -596,7 +617,6 @@ mod tests {
             buf[OVERFLOW_HEADER_SIZE + i] = i as u8;
         }
         let cs = overflow_page_checksum(&buf);
-        buf[4..8].copy_from_slice(&cs.to_le_bytes());
         hdr.checksum = cs;
         hdr.write_to(&mut buf);
         buf
@@ -607,6 +627,7 @@ mod tests {
         let page = make_overflow_page();
         let hdr = OverflowPageHeader::from_bytes(&page).unwrap();
         assert_eq!(hdr.page_type, PAGE_TYPE_OVERFLOW);
+        assert_eq!(hdr.refcount, 1);
         assert_eq!(hdr.next_overflow_page, 77);
         assert_eq!(hdr.data_length, 64);
         // Reserved bytes read as zero
@@ -633,6 +654,45 @@ mod tests {
         let mut page = make_overflow_page();
         page[OVERFLOW_HEADER_SIZE + 10] ^= 0x55; // corrupt payload
         assert!(verify_overflow_page_checksum(&page).is_err());
+    }
+
+    /// Byte-exact gate for MVCC Format Lock §A.1 / MAJOR-3:
+    /// flipping any byte in the refcount field (4..8) must NOT alter the
+    /// stored checksum at bytes 8..12. This lets the allocator mutate the
+    /// atomic refcount without re-checksumming the page.
+    #[test]
+    fn overflow_page_checksum_excludes_refcount_bytes() {
+        let page = make_overflow_page();
+        let stored_checksum = u32::from_le_bytes([page[8], page[9], page[10], page[11]]);
+
+        for offset in 4..8 {
+            let mut mutated = page;
+            mutated[offset] ^= 0xFF;
+            let recomputed = overflow_page_checksum(&mutated);
+            assert_eq!(
+                recomputed, stored_checksum,
+                "flipping refcount byte at offset {offset} must not change the checksum",
+            );
+            // And verification still succeeds — the stored checksum is unchanged
+            // and the recomputed checksum matches.
+            verify_overflow_page_checksum(&mutated)
+                .expect("refcount flip must not invalidate page");
+        }
+    }
+
+    /// The checksum field itself (bytes 8..12) is excluded from coverage, so
+    /// any bit flipped there is detected via the stored-vs-computed comparison
+    /// at verify time.
+    #[test]
+    fn overflow_page_checksum_detects_checksum_field_flip() {
+        let mut page = make_overflow_page();
+        page[8] ^= 0xFF;
+        assert!(verify_overflow_page_checksum(&page).is_err());
+    }
+
+    #[test]
+    fn overflow_header_size_is_20() {
+        assert_eq!(OVERFLOW_HEADER_SIZE, 20);
     }
 
     // -----------------------------------------------------------------------

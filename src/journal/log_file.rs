@@ -49,6 +49,7 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
+use crate::mvcc::timestamp::Ts;
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
 // ---------------------------------------------------------------------------
@@ -394,6 +395,247 @@ pub(crate) fn seek_to_first_frame<F: Seek>(f: &mut F) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// ChainCommit frame (MVCC T3 — Format Lock §A.2)
+// ---------------------------------------------------------------------------
+
+/// Page-write entry carried inside a `ChainCommit` frame.
+///
+/// Byte layout (§A.2): `(page: u32 LE, page_size: u8, reserved: [u8; 3],
+/// data: [u8; page_size_bytes])`. `page_size == 0` selects
+/// [`PAGE_SIZE_INTERNAL`]; `page_size == 1` selects [`PAGE_SIZE_LEAF`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ChainPageWrite {
+    pub page: u32,
+    pub page_size: JournalPageSize,
+    pub data: Vec<u8>,
+}
+
+impl ChainPageWrite {
+    /// Total encoded byte size (8 B header + payload).
+    fn encoded_len(&self) -> usize {
+        8 + self.page_size.bytes()
+    }
+}
+
+/// MVCC chain-commit frame — one emitted per `WriteTxn::commit()`.
+///
+/// Byte layout per Format Lock Appendix §A.2:
+///
+/// ```text
+///  0       1    frame_kind: u8 (0x02 = CHAIN_COMMIT)
+///  1       3    reserved: [u8; 3] (MUST be 0)
+///  4       4    total_frame_bytes: u32 LE
+///  8       4    salt1: u32 LE
+/// 12       4    salt2: u32 LE
+/// 16      12    commit_ts: Ts-LE
+/// 28       4    refcount_delta_count: u32 LE
+/// 32       N    refcount_deltas[]: (page: u32 LE, delta: i32 LE) × count
+/// 32+N     4    page_write_count: u32 LE
+/// 36+N     M    page_writes[]
+/// 36+N+M   4    checksum_crc32: u32 LE (covers 0..36+N+M)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ChainCommitFrame {
+    pub salt1: u32,
+    pub salt2: u32,
+    pub commit_ts: Ts,
+    pub refcount_deltas: Vec<(u32, i32)>,
+    pub page_writes: Vec<ChainPageWrite>,
+}
+
+impl ChainCommitFrame {
+    /// Compute the total encoded byte size (`total_frame_bytes`).
+    #[allow(dead_code)]
+    pub(crate) fn total_frame_bytes(&self) -> usize {
+        let deltas_n = 8 * self.refcount_deltas.len();
+        let writes_m: usize = self.page_writes.iter().map(|w| w.encoded_len()).sum();
+        36 + deltas_n + writes_m + 4
+    }
+
+    /// Encode to bytes. Fails only on arithmetic overflow of the
+    /// length prefix (≥ `CHAIN_COMMIT_MAX_FRAME_SIZE`).
+    #[allow(dead_code)]
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        let total = self.total_frame_bytes();
+        if total > CHAIN_COMMIT_MAX_FRAME_SIZE {
+            return Err(Error::Internal(format!(
+                "ChainCommit frame {total} B exceeds MAX_FRAME_SIZE {CHAIN_COMMIT_MAX_FRAME_SIZE}"
+            )));
+        }
+        let total_u32 = u32::try_from(total)
+            .map_err(|_| Error::Internal("ChainCommit frame length overflows u32".into()))?;
+
+        let mut buf = Vec::with_capacity(total);
+        buf.push(FRAME_KIND_CHAIN_COMMIT);
+        buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&total_u32.to_le_bytes());
+        buf.extend_from_slice(&self.salt1.to_le_bytes());
+        buf.extend_from_slice(&self.salt2.to_le_bytes());
+        buf.extend_from_slice(&self.commit_ts.to_le_bytes());
+
+        let delta_count = u32::try_from(self.refcount_deltas.len()).map_err(|_| {
+            Error::Internal("ChainCommit refcount_delta_count exceeds u32".into())
+        })?;
+        buf.extend_from_slice(&delta_count.to_le_bytes());
+        for (page, delta) in &self.refcount_deltas {
+            buf.extend_from_slice(&page.to_le_bytes());
+            buf.extend_from_slice(&delta.to_le_bytes());
+        }
+
+        let write_count = u32::try_from(self.page_writes.len())
+            .map_err(|_| Error::Internal("ChainCommit page_write_count exceeds u32".into()))?;
+        buf.extend_from_slice(&write_count.to_le_bytes());
+        for pw in &self.page_writes {
+            debug_assert_eq!(
+                pw.data.len(),
+                pw.page_size.bytes(),
+                "page_write data length must match page_size"
+            );
+            buf.extend_from_slice(&pw.page.to_le_bytes());
+            buf.push(match pw.page_size {
+                JournalPageSize::Small4k => 0,
+                JournalPageSize::Large32k => 1,
+            });
+            buf.extend_from_slice(&[0u8; 3]); // reserved
+            buf.extend_from_slice(&pw.data);
+        }
+
+        debug_assert_eq!(buf.len(), total - 4, "checksum not yet appended");
+        let cs = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&cs.to_le_bytes());
+        debug_assert_eq!(buf.len(), total);
+
+        Ok(buf)
+    }
+
+    /// Decode from bytes. Returns `Ok(None)` when the buffer is
+    /// truncated, salt-mismatched, kind-wrong, or checksum-invalid —
+    /// the recovery caller treats every such outcome as frame-not-present
+    /// per §A.2. Returns `Err` only on programmer error (callers pass an
+    /// absurdly tiny slice) — which is never emitted in recovery.
+    #[allow(dead_code)]
+    pub(crate) fn decode(
+        buf: &[u8],
+        expected_salt1: u32,
+        expected_salt2: u32,
+    ) -> Result<Option<Self>> {
+        // 1. Need at least the 32-byte fixed header to read counts.
+        if buf.len() < CHAIN_COMMIT_FIXED_HEADER_LEN {
+            return Ok(None);
+        }
+
+        // 2. Frame kind discriminant.
+        if buf[0] != FRAME_KIND_CHAIN_COMMIT {
+            return Ok(None);
+        }
+
+        // 3. Length prefix. Validate before trusting any count field.
+        let total_frame_bytes =
+            u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize;
+        if total_frame_bytes > CHAIN_COMMIT_MAX_FRAME_SIZE {
+            return Ok(None);
+        }
+        let refcount_delta_count =
+            u32::from_le_bytes(buf[28..32].try_into().expect("4 bytes")) as usize;
+        let min_required = 36usize
+            .saturating_add(8usize.saturating_mul(refcount_delta_count))
+            .saturating_add(4);
+        if total_frame_bytes < min_required {
+            return Ok(None);
+        }
+        if buf.len() < total_frame_bytes {
+            return Ok(None); // truncated
+        }
+
+        // 4. Salts.
+        let salt1 = u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
+        let salt2 = u32::from_le_bytes(buf[12..16].try_into().expect("4 bytes"));
+        if salt1 != expected_salt1 || salt2 != expected_salt2 {
+            return Ok(None);
+        }
+
+        // 5. CRC over bytes 0..total-4 against trailing 4 bytes.
+        let body_end = total_frame_bytes - 4;
+        let stored_cs = u32::from_le_bytes(
+            buf[body_end..total_frame_bytes]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let computed_cs = crc32c::crc32c(&buf[..body_end]);
+        if stored_cs != computed_cs {
+            return Ok(None);
+        }
+
+        // 6. Parse body.
+        let commit_ts = Ts::from_le_bytes(buf[16..28].try_into().expect("12 bytes"));
+
+        let mut cursor = 32usize;
+        let mut refcount_deltas = Vec::with_capacity(refcount_delta_count);
+        for _ in 0..refcount_delta_count {
+            if cursor + 8 > body_end {
+                return Ok(None);
+            }
+            let page =
+                u32::from_le_bytes(buf[cursor..cursor + 4].try_into().expect("4 bytes"));
+            let delta =
+                i32::from_le_bytes(buf[cursor + 4..cursor + 8].try_into().expect("4 bytes"));
+            refcount_deltas.push((page, delta));
+            cursor += 8;
+        }
+
+        if cursor + 4 > body_end {
+            return Ok(None);
+        }
+        let page_write_count =
+            u32::from_le_bytes(buf[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
+        cursor += 4;
+
+        let mut page_writes = Vec::with_capacity(page_write_count);
+        for _ in 0..page_write_count {
+            if cursor + 8 > body_end {
+                return Ok(None);
+            }
+            let page =
+                u32::from_le_bytes(buf[cursor..cursor + 4].try_into().expect("4 bytes"));
+            let page_size_marker = buf[cursor + 4];
+            // reserved: buf[cursor+5..cursor+8]
+            let page_size = match page_size_marker {
+                0 => JournalPageSize::Small4k,
+                1 => JournalPageSize::Large32k,
+                _ => return Ok(None),
+            };
+            cursor += 8;
+            let data_len = page_size.bytes();
+            if cursor + data_len > body_end {
+                return Ok(None);
+            }
+            let data = buf[cursor..cursor + data_len].to_vec();
+            cursor += data_len;
+            page_writes.push(ChainPageWrite {
+                page,
+                page_size,
+                data,
+            });
+        }
+
+        // Final tail consistency: cursor must equal body_end.
+        if cursor != body_end {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            salt1,
+            salt2,
+            commit_ts,
+            refcount_deltas,
+            page_writes,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -534,5 +776,151 @@ mod tests {
         assert_eq!(JournalPageSize::from_u32(4096).unwrap(), JournalPageSize::Small4k);
         assert_eq!(JournalPageSize::from_u32(32768).unwrap(), JournalPageSize::Large32k);
         assert!(JournalPageSize::from_u32(9999).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // ChainCommit frame tests (MVCC T3 / Format Lock §A.2)
+    // -----------------------------------------------------------------
+
+    fn sample_chain_commit() -> ChainCommitFrame {
+        ChainCommitFrame {
+            salt1: 0xDEAD_BEEF,
+            salt2: 0xCAFE_BABE,
+            commit_ts: Ts {
+                physical_ms: 0x0011_2233_4455_6677,
+                logical: 0x89AB_CDEF,
+            },
+            refcount_deltas: vec![(10, 1), (20, -1), (u32::MAX - 1, 42)],
+            page_writes: vec![
+                ChainPageWrite {
+                    page: 100,
+                    page_size: JournalPageSize::Small4k,
+                    data: vec![0xAAu8; PAGE_SIZE_INTERNAL as usize],
+                },
+                ChainPageWrite {
+                    page: 200,
+                    page_size: JournalPageSize::Large32k,
+                    data: vec![0x5Au8; PAGE_SIZE_LEAF as usize],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn chain_commit_roundtrip() {
+        let frame = sample_chain_commit();
+        let bytes = frame.encode().unwrap();
+        assert_eq!(bytes.len(), frame.total_frame_bytes());
+        let decoded = ChainCommitFrame::decode(&bytes, frame.salt1, frame.salt2)
+            .unwrap()
+            .expect("round-trip must decode");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn chain_commit_empty_payload_roundtrip() {
+        let frame = ChainCommitFrame {
+            salt1: 1,
+            salt2: 2,
+            commit_ts: Ts { physical_ms: 0, logical: 0 },
+            refcount_deltas: vec![],
+            page_writes: vec![],
+        };
+        let bytes = frame.encode().unwrap();
+        // 32-byte fixed header + 4-byte page_write_count + 4-byte CRC = 40.
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(frame.total_frame_bytes(), 40);
+        let decoded = ChainCommitFrame::decode(&bytes, 1, 2).unwrap().expect("decode");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn chain_commit_total_frame_bytes_bound_min() {
+        let frame = ChainCommitFrame {
+            salt1: 1,
+            salt2: 2,
+            commit_ts: Ts::PENDING,
+            refcount_deltas: vec![],
+            page_writes: vec![],
+        };
+        // §A.2 minimum: 32-byte fixed header + 4-byte page_write_count + 4-byte CRC.
+        assert_eq!(frame.total_frame_bytes(), 40);
+    }
+
+    #[test]
+    fn chain_commit_truncation_returns_none() {
+        let frame = sample_chain_commit();
+        let bytes = frame.encode().unwrap();
+        // Every prefix shorter than total must decode as None, not panic.
+        for n in 0..bytes.len() {
+            let res = ChainCommitFrame::decode(&bytes[..n], frame.salt1, frame.salt2).unwrap();
+            assert!(res.is_none(), "prefix of length {n} should be truncated");
+        }
+        // Full-length must succeed.
+        let full = ChainCommitFrame::decode(&bytes, frame.salt1, frame.salt2)
+            .unwrap()
+            .expect("full decode");
+        assert_eq!(full, frame);
+    }
+
+    #[test]
+    fn chain_commit_salt_mismatch_returns_none() {
+        let frame = sample_chain_commit();
+        let bytes = frame.encode().unwrap();
+        assert!(ChainCommitFrame::decode(&bytes, 0, frame.salt2).unwrap().is_none());
+        assert!(ChainCommitFrame::decode(&bytes, frame.salt1, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn chain_commit_corrupt_checksum_returns_none() {
+        let frame = sample_chain_commit();
+        let mut bytes = frame.encode().unwrap();
+        // Flip a byte in the body — CRC must now reject.
+        bytes[40] ^= 0xFF;
+        let res = ChainCommitFrame::decode(&bytes, frame.salt1, frame.salt2).unwrap();
+        assert!(res.is_none(), "corrupt body must fail CRC and return None");
+    }
+
+    #[test]
+    fn chain_commit_bad_frame_kind_returns_none() {
+        let frame = sample_chain_commit();
+        let mut bytes = frame.encode().unwrap();
+        bytes[0] = 0xFF;
+        assert!(
+            ChainCommitFrame::decode(&bytes, frame.salt1, frame.salt2).unwrap().is_none(),
+            "wrong frame_kind must return None, not parse as ChainCommit"
+        );
+    }
+
+    #[test]
+    fn chain_commit_bogus_length_prefix_returns_none() {
+        let frame = sample_chain_commit();
+        let mut bytes = frame.encode().unwrap();
+        // total_frame_bytes field at offset 4..8 — set beyond MAX to hit the bound.
+        let bogus = (CHAIN_COMMIT_MAX_FRAME_SIZE as u64 + 1) as u32;
+        bytes[4..8].copy_from_slice(&bogus.to_le_bytes());
+        assert!(
+            ChainCommitFrame::decode(&bytes, frame.salt1, frame.salt2).unwrap().is_none(),
+            "length prefix above MAX must reject before reading any count"
+        );
+    }
+
+    #[test]
+    fn chain_commit_inflated_delta_count_returns_none() {
+        // An attacker-crafted frame whose refcount_delta_count claims more
+        // deltas than the length prefix can accommodate must be rejected
+        // before any out-of-bounds indexing.
+        let frame = ChainCommitFrame {
+            salt1: 1,
+            salt2: 2,
+            commit_ts: Ts::PENDING,
+            refcount_deltas: vec![],
+            page_writes: vec![],
+        };
+        let mut bytes = frame.encode().unwrap();
+        // Poke refcount_delta_count = 1000 at offset 28..32 without resizing.
+        bytes[28..32].copy_from_slice(&1000u32.to_le_bytes());
+        let res = ChainCommitFrame::decode(&bytes, 1, 2).unwrap();
+        assert!(res.is_none(), "count exceeding length prefix must return None");
     }
 }

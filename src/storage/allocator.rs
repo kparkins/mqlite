@@ -38,9 +38,12 @@
 //! When extending the file would cause `total_page_count` to overflow a `u32`,
 //! [`Error::DiskFull`] is returned with `available_bytes: 0`.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::mvcc::deferred_free::DeferredFreeQueue;
 use crate::storage::buffer_pool::{PageSource, PageSize};
 use crate::storage::header::FileHeader;
 
@@ -272,6 +275,20 @@ struct AllocatorState {
 #[derive(Clone)]
 pub(crate) struct AllocatorHandle {
     state: Arc<Mutex<AllocatorState>>,
+    /// Per-overflow-chain refcount table.
+    ///
+    /// Maps `first_page` → shared `AtomicU32` pin counter. Populated when
+    /// the first `OverflowRef` for a chain is created (T5'/T6 wires this
+    /// into the writer path). Cloned-out `Arc<AtomicU32>` handles let
+    /// callers do atomic ops without holding the HashMap mutex.
+    ///
+    /// MVCC plan §T3: atomic ops on the refcount happen OUTSIDE the
+    /// allocator state mutex.
+    overflow_refcounts: Arc<Mutex<HashMap<u32, Arc<AtomicU32>>>>,
+    /// Refcount-to-zero queue drained by the writer path.
+    ///
+    /// Lock-order position 1.5 (before `state` at position 2).
+    deferred_free_queue: Arc<DeferredFreeQueue>,
 }
 
 impl AllocatorHandle {
@@ -286,7 +303,175 @@ impl AllocatorHandle {
                 header,
                 header_dirty: false,
             })),
+            overflow_refcounts: Arc::new(Mutex::new(HashMap::new())),
+            deferred_free_queue: Arc::new(DeferredFreeQueue::new()),
         }
+    }
+
+    /// Borrow the deferred-free queue (used by `OverflowRef::drop` and the
+    /// writer-path drain).
+    pub(crate) fn deferred_free_queue(&self) -> &Arc<DeferredFreeQueue> {
+        &self.deferred_free_queue
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow refcount — MVCC T3
+    // -----------------------------------------------------------------------
+    //
+    // The refcount for each overflow chain lives in an AtomicU32 that is
+    // logically bound to the first page of the chain. These methods access
+    // the atomic OUTSIDE the allocator state mutex — only mutations of the
+    // allocator state (`state.header`) take that mutex. The per-entry atomic
+    // access pattern lets Clone / Drop on OverflowRef stay lock-free on the
+    // hot path.
+    //
+    // `drain_free_queue` is the single writer-path that transitions a page
+    // from refcount=0 → free list.
+
+    /// Look up or create the shared `AtomicU32` refcount for `first_page`.
+    fn refcount_handle(&self, first_page: u32) -> Arc<AtomicU32> {
+        #[allow(clippy::unwrap_used)]
+        let mut table = self.overflow_refcounts.lock().unwrap();
+        table
+            .entry(first_page)
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+            .clone()
+    }
+
+    /// Get the refcount handle if one exists; do not create.
+    fn refcount_handle_opt(&self, first_page: u32) -> Option<Arc<AtomicU32>> {
+        #[allow(clippy::unwrap_used)]
+        let table = self.overflow_refcounts.lock().unwrap();
+        table.get(&first_page).cloned()
+    }
+
+    /// Saturating CAS-loop incref on the overflow-chain refcount.
+    ///
+    /// Returns the new (post-bump) refcount on success. Returns
+    /// [`Error::RefcountOverflow`] if the observed pre-bump value is
+    /// `u32::MAX`; in that case the atomic is left unchanged under every
+    /// interleaving.
+    ///
+    /// Ordering:
+    /// * Acquire on the initial load and on failed CAS attempts —
+    ///   synchronizes-with prior Release decrefs for visibility of
+    ///   preceding writes to the page's metadata.
+    /// * Release on successful CAS store — synchronizes-with subsequent
+    ///   Acquire decrefs and the `drain_free_queue` Acquire recheck.
+    pub(crate) fn incref_overflow(&self, first_page: u32) -> Result<u32> {
+        let atomic = self.refcount_handle(first_page);
+        let mut cur = atomic.load(Ordering::Acquire);
+        loop {
+            if cur == u32::MAX {
+                return Err(Error::RefcountOverflow);
+            }
+            match atomic.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(cur + 1),
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Decref. Returns the post-decrement refcount.
+    ///
+    /// Ordering: Release on `fetch_sub`, synchronizing with subsequent
+    /// Acquire loads by `overflow_refcount` / `drain_free_queue`.
+    ///
+    /// # Panics
+    /// Debug-asserts that the pre-decrement count is > 0. In release
+    /// builds a decref on an unknown / zeroed refcount returns 0 and has
+    /// no net effect (defense-in-depth for a class of bugs that RAII is
+    /// supposed to prevent).
+    pub(crate) fn decref_overflow(&self, first_page: u32) -> u32 {
+        let atomic = match self.refcount_handle_opt(first_page) {
+            Some(a) => a,
+            None => {
+                debug_assert!(
+                    false,
+                    "decref on unknown first_page {first_page} — pin accounting bug"
+                );
+                return 0;
+            }
+        };
+        let prev = atomic.fetch_sub(1, Ordering::Release);
+        debug_assert!(prev > 0, "decref on already-zero refcount");
+        prev.saturating_sub(1)
+    }
+
+    /// Read-only refcount probe. Uses Acquire so the reader sees all prior
+    /// Release decrefs.
+    pub(crate) fn overflow_refcount(&self, first_page: u32) -> u32 {
+        self.refcount_handle_opt(first_page)
+            .map(|a| a.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Enqueue a page for deferred free. Called by `OverflowRef::drop`
+    /// when the decrement brings refcount to 0.
+    pub(crate) fn enqueue_deferred_free(&self, first_page: u32) {
+        self.deferred_free_queue.push(first_page);
+    }
+
+    /// Writer-serialized drain of the deferred-free queue.
+    ///
+    /// Precondition: caller holds writer serialization. For each queued
+    /// page, re-loads refcount with Acquire ordering and frees only if
+    /// still 0. A non-zero count re-enqueues (defense-in-depth; should be
+    /// unreachable under RAII correctness).
+    ///
+    /// Locks acquired in order: queue (1.5) → state (2). The queue is
+    /// drained into a Vec before `state` is locked, so the two locks are
+    /// never held simultaneously.
+    ///
+    /// Returns the number of pages actually freed.
+    pub(crate) fn drain_free_queue(&self, io: &dyn PageSource) -> Result<usize> {
+        let pages = self.deferred_free_queue.take_all();
+        if pages.is_empty() {
+            return Ok(0);
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut freed = 0usize;
+        let mut requeue: Vec<u32> = Vec::new();
+
+        for page in pages {
+            let cnt = self.overflow_refcount(page);
+            if cnt == 0 {
+                let mut alloc = PageAllocator::new(&mut state.header, io);
+                alloc.free_32k(page)?;
+                // Drop the refcount entry — the page is no longer live.
+                #[allow(clippy::unwrap_used)]
+                let mut table = self.overflow_refcounts.lock().unwrap();
+                table.remove(&page);
+                freed += 1;
+            } else {
+                requeue.push(page);
+            }
+        }
+
+        state.header_dirty = true;
+        drop(state);
+
+        if !requeue.is_empty() {
+            self.deferred_free_queue.push_many(requeue);
+        }
+        Ok(freed)
+    }
+
+    /// Test-only: force-set the refcount for a page (used by CAS-saturation
+    /// contract tests).
+    #[cfg(test)]
+    pub(crate) fn set_overflow_refcount_for_test(&self, first_page: u32, value: u32) {
+        let atomic = self.refcount_handle(first_page);
+        atomic.store(value, Ordering::Release);
     }
 
     // -----------------------------------------------------------------------
@@ -1037,5 +1222,143 @@ mod tests {
         // Clone 2 sees the updated state.
         let count = handle2.with_header(|h| h.total_page_count).unwrap();
         assert_eq!(count, 2, "clone must share underlying state");
+    }
+
+    // -----------------------------------------------------------------------
+    // MVCC T3 — overflow refcount contract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overflow_refcount_starts_at_zero_for_unknown_page() {
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+        assert_eq!(handle.overflow_refcount(42), 0);
+    }
+
+    #[test]
+    fn incref_overflow_bumps_by_one() {
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        let n1 = handle.incref_overflow(42).unwrap();
+        assert_eq!(n1, 1);
+        let n2 = handle.incref_overflow(42).unwrap();
+        assert_eq!(n2, 2);
+        assert_eq!(handle.overflow_refcount(42), 2);
+    }
+
+    #[test]
+    fn decref_overflow_returns_post_decrement() {
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+
+        handle.incref_overflow(7).unwrap();
+        handle.incref_overflow(7).unwrap();
+        let post1 = handle.decref_overflow(7);
+        assert_eq!(post1, 1);
+        let post0 = handle.decref_overflow(7);
+        assert_eq!(post0, 0);
+        assert_eq!(handle.overflow_refcount(7), 0);
+    }
+
+    #[test]
+    fn incref_overflow_saturates_at_u32_max_without_bumping() {
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+        handle.set_overflow_refcount_for_test(99, u32::MAX);
+
+        let err = handle.incref_overflow(99).unwrap_err();
+        assert!(matches!(err, Error::RefcountOverflow));
+        // Atomic value must remain u32::MAX — saturation bailout does not bump.
+        assert_eq!(handle.overflow_refcount(99), u32::MAX);
+    }
+
+    #[test]
+    fn incref_overflow_contended_saturation_exact_500_winners() {
+        // Plan §T3 iter-4 Test 2: refcount = u32::MAX - 500, 8 threads x
+        // 125 calls each (1000 total). Exactly 500 succeed, 500 return
+        // RefcountOverflow; final refcount == u32::MAX.
+        use std::sync::Arc;
+        let hdr = fresh_header();
+        let handle = Arc::new(AllocatorHandle::new(hdr));
+        handle.set_overflow_refcount_for_test(500, u32::MAX - 500);
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 125;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    let mut oks = 0usize;
+                    let mut errs = 0usize;
+                    for _ in 0..PER_THREAD {
+                        match h.incref_overflow(500) {
+                            Ok(_) => oks += 1,
+                            Err(Error::RefcountOverflow) => errs += 1,
+                            Err(e) => panic!("unexpected error: {e:?}"),
+                        }
+                    }
+                    (oks, errs)
+                })
+            })
+            .collect();
+
+        let (total_ok, total_err) = handles.into_iter().fold((0, 0), |acc, h| {
+            let (ok, err) = h.join().unwrap();
+            (acc.0 + ok, acc.1 + err)
+        });
+
+        assert_eq!(total_ok, 500, "exactly 500 incref calls must succeed");
+        assert_eq!(total_err, 500, "exactly 500 calls must saturate");
+        assert_eq!(handle.overflow_refcount(500), u32::MAX);
+    }
+
+    #[test]
+    fn drain_free_queue_frees_zero_refcount_pages() {
+        let io = MockIo::new();
+        let mut hdr = fresh_header();
+        hdr.total_page_count = 5; // pages 1..=4 exist
+        let handle = AllocatorHandle::new(hdr);
+
+        // Page 2 has refcount 0 (queued as if OverflowRef::drop happened).
+        handle.incref_overflow(2).unwrap();
+        let post = handle.decref_overflow(2);
+        assert_eq!(post, 0);
+        handle.enqueue_deferred_free(2);
+
+        let freed = handle.drain_free_queue(&io).unwrap();
+        assert_eq!(freed, 1);
+        // Page 2 must now be on the 32k free list.
+        let head = handle.with_header(|h| h.free_list_head_32k).unwrap();
+        assert_eq!(head, 2);
+    }
+
+    #[test]
+    fn drain_free_queue_requeues_nonzero_refcount_pages() {
+        let io = MockIo::new();
+        let mut hdr = fresh_header();
+        hdr.total_page_count = 5;
+        let handle = AllocatorHandle::new(hdr);
+
+        // Page 3 enqueued but refcount is still 1 (e.g., a late re-bump).
+        handle.incref_overflow(3).unwrap();
+        handle.enqueue_deferred_free(3);
+
+        let freed = handle.drain_free_queue(&io).unwrap();
+        assert_eq!(freed, 0, "non-zero refcount page must not be freed");
+        assert_eq!(handle.deferred_free_queue().depth(), 1, "must be requeued");
+        // Page 3 must NOT be on the free list.
+        let head = handle.with_header(|h| h.free_list_head_32k).unwrap();
+        assert_eq!(head, 0);
+    }
+
+    #[test]
+    fn drain_free_queue_empty_is_noop() {
+        let io = MockIo::new();
+        let hdr = fresh_header();
+        let handle = AllocatorHandle::new(hdr);
+        let freed = handle.drain_free_queue(&io).unwrap();
+        assert_eq!(freed, 0);
     }
 }
