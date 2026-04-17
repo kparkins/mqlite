@@ -43,7 +43,10 @@ impl OverflowRef {
     /// All other construction goes through `Clone`. Returns
     /// `Err(Error::RefcountOverflow)` only in the pathological saturation
     /// case (unreachable when called on a newly-allocated chain).
-    pub fn new_owned(
+    ///
+    /// `pub(crate)` because `AllocatorHandle` is `pub(crate)` — the
+    /// signature is unreachable from outside the crate regardless.
+    pub(crate) fn new_owned(
         first_page: u32,
         total_length: u64,
         allocator: AllocatorHandle,

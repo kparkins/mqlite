@@ -12,10 +12,51 @@
 //!
 //! Production-path atomics use the cfg(loom) shim pattern so future
 //! concurrency harnesses (T4, T8) can permute them.
+//
+// LOCK-ORDER: (CRITICAL-1 fix; iter-4 adds DeferredFreeQueue at 1.5)
+// The full database-wide total order; any path that acquires two or more of
+// these mutexes MUST acquire them in this order, and release in reverse:
+//
+// 1.   history-store partition mutex (outermost)
+// 1.5. DeferredFreeQueue::pending mutex
+//      — brief; acquired by OverflowRef::Drop on 0-refcount transition to push
+//      a u32 first_page, by drain_free_queue on writer path to drain.
+//      OverflowRef::Drop acquires 1.5 and releases immediately (no downstream
+//      acquisitions). drain_free_queue acquires 1.5 first, then
+//      AllocatorHandle::state (1.5 → 2).
+// 2.   AllocatorHandle::state mutex (Arc<Mutex<AllocatorState>>)
+//      — for any alloc_*/free_*/free_overflow_chain / refcount-header-write op
+//      that must update FileHeader free lists. Atomic page-header refcount ops
+//      (incref_overflow, decref_overflow) happen WITHOUT this mutex and are
+//      lock-free.
+// 3.   32 KB main partition mutex (BufferPool::inner_32k)
+// 4.   4 KB main partition mutex  (BufferPool::inner_4k)
+// 5.   ReadViewRegistry mutex (Arc<Mutex<BTreeMap<u64, u64>>>)
+// 6.   writer serialization mutex (replaces inner: RwLock<BpBackend> → inner: Mutex<BpBackend>)
+//
+// Readers DO NOT acquire `AllocatorHandle::state` for pure reads (refcount
+// atomics live on the page header and are lock-free). The reader-path
+// `OverflowRef::Drop` DOES acquire `DeferredFreeQueue::pending` briefly
+// (push a u32) when decref brings count to 0 — this is the ONLY lock any
+// reader path acquires; it is strictly above the allocator mutex in the
+// order and closed before any other acquisition. Free-side
+// `drain_free_queue` acquires `DeferredFreeQueue::pending` first, then
+// `AllocatorHandle::state`, and is called only from writer-serialized
+// context (writer mutex held). `ReadViewRegistry::oldest_required_ts()`
+// MUST be snapshotted **before** any partition mutex is acquired in a
+// reconciliation path.
+//
+// Iter-3 correction: iteration 2 falsely asserted "the allocator does NOT
+// appear in the lock order" and "PageAllocator serializes via exclusive
+// borrow obtained under inner.write()". Both are contradicted by HEAD
+// `src/storage/allocator.rs:273-274`
+// (`AllocatorHandle { state: Arc<Mutex<AllocatorState>> }`) and every
+// alloc/free path at `:301-357`. Iter-3 honestly puts the allocator mutex
+// at position 2.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicU32};
@@ -54,17 +95,118 @@ pub struct ReadView {
     /// spins until this reaches 0 before the caller is allowed to proceed
     /// with page-release.
     pub pin_ops_in_flight: AtomicU32,
+    /// Registry back-pointer. When `Some`, `Drop` unregisters `txn_id` from
+    /// the registry so `oldest_required_ts()` no longer considers this
+    /// view. `None` for standalone `ReadView::new(..)` callers — primarily
+    /// tests that exercise snapshot visibility without a registry.
+    registry: Option<Arc<ReadViewRegistry>>,
 }
 
 impl ReadView {
-    /// Construct a fresh, live `ReadView`.
+    /// Construct a fresh, live `ReadView` that is NOT tracked by any
+    /// registry. Prefer `ReadViewRegistry::open` on reader paths — this
+    /// constructor exists for tests and internal snapshot fixtures.
     pub fn new(read_ts: Ts, txn_id: u64) -> Self {
         Self {
             read_ts,
             txn_id,
             poisoned: AtomicBool::new(false),
             pin_ops_in_flight: AtomicU32::new(0),
+            registry: None,
         }
+    }
+
+    /// Open a `ReadView` that registers itself with `registry` for the
+    /// lifetime of the returned `Arc`. The last `Arc::drop` unregisters
+    /// the view's `txn_id`, bounding the duration that `read_ts` pins the
+    /// `oldest_required_ts()` horizon.
+    ///
+    /// T4 adds only the primitive; T5' wires real reader paths through
+    /// this entry point.
+    pub fn open(registry: Arc<ReadViewRegistry>, read_ts: Ts, txn_id: u64) -> Arc<Self> {
+        registry.register(txn_id, read_ts);
+        Arc::new(Self {
+            read_ts,
+            txn_id,
+            poisoned: AtomicBool::new(false),
+            pin_ops_in_flight: AtomicU32::new(0),
+            registry: Some(registry),
+        })
+    }
+}
+
+impl Drop for ReadView {
+    fn drop(&mut self) {
+        if let Some(reg) = &self.registry {
+            reg.unregister(self.txn_id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadViewRegistry
+// ---------------------------------------------------------------------------
+
+/// Tracks live `ReadView`s so the writer / reconciliation path can compute
+/// `oldest_required_ts()` — the lowest `read_ts` any open reader pins, and
+/// therefore the upper bound on versions the reconciler may discard.
+///
+/// Invariants:
+/// - Every `ReadView::open(registry, …)` inserts; the matching drop removes.
+/// - Empty registry ⇒ `oldest_required_ts() == Ts::MAX` (no horizon held).
+///
+/// The internal mutex is position **5** in the global lock order documented
+/// at the top of this file. `oldest_required_ts()` must be snapshotted
+/// BEFORE any partition mutex is acquired in a reconciliation path.
+pub struct ReadViewRegistry {
+    inner: Mutex<BTreeMap<u64, Ts>>,
+}
+
+impl std::fmt::Debug for ReadViewRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self.inner.lock().unwrap();
+        f.debug_struct("ReadViewRegistry")
+            .field("live_views", &guard.len())
+            .finish()
+    }
+}
+
+impl ReadViewRegistry {
+    /// Construct an empty registry.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Insert `(txn_id → read_ts)`. Overwrites any prior entry for the
+    /// same `txn_id` (callers must keep `txn_id` unique across concurrently
+    /// live views).
+    pub fn register(&self, txn_id: u64, read_ts: Ts) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.insert(txn_id, read_ts);
+    }
+
+    /// Remove `txn_id` from the registry. No-op if absent.
+    pub fn unregister(&self, txn_id: u64) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.remove(&txn_id);
+    }
+
+    /// Smallest `read_ts` across all live views, or `Ts::MAX` if empty.
+    pub fn oldest_required_ts(&self) -> Ts {
+        let guard = self.inner.lock().unwrap();
+        guard.values().copied().min().unwrap_or(Ts::MAX)
+    }
+
+    /// Number of live views. Mainly for tests / observability.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    /// True iff no live views are registered.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
     }
 }
 
@@ -379,6 +521,62 @@ mod tests {
         // body of `new` after fetch_add succeeds, assuming no poison)
         // must restore refcount to baseline on Drop. Already covered by
         // `chain_snapshot_new_bumps_each_overflow_refcount`.
+    }
+
+    // -----------------------------------------------------------------------
+    // ReadViewRegistry — plan T4 acceptance bullets 1–3
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_registry_oldest_is_ts_max() {
+        let reg = ReadViewRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.oldest_required_ts(), Ts::MAX);
+    }
+
+    #[test]
+    fn three_open_views_report_min_ts() {
+        let reg = ReadViewRegistry::new();
+        let ts100 = Ts { physical_ms: 100, logical: 0 };
+        let ts200 = Ts { physical_ms: 200, logical: 0 };
+        let ts300 = Ts { physical_ms: 300, logical: 0 };
+        let v100 = ReadView::open(reg.clone(), ts100, 1);
+        let v200 = ReadView::open(reg.clone(), ts200, 2);
+        let v300 = ReadView::open(reg.clone(), ts300, 3);
+        assert_eq!(reg.len(), 3);
+        assert_eq!(reg.oldest_required_ts(), ts100);
+        // Keep all three alive through the assertion.
+        drop((v100, v200, v300));
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn drop_oldest_advances_horizon() {
+        let reg = ReadViewRegistry::new();
+        let ts100 = Ts { physical_ms: 100, logical: 0 };
+        let ts200 = Ts { physical_ms: 200, logical: 0 };
+        let ts300 = Ts { physical_ms: 300, logical: 0 };
+        let v100 = ReadView::open(reg.clone(), ts100, 1);
+        let _v200 = ReadView::open(reg.clone(), ts200, 2);
+        let _v300 = ReadView::open(reg.clone(), ts300, 3);
+        assert_eq!(reg.oldest_required_ts(), ts100);
+        drop(v100);
+        assert_eq!(reg.oldest_required_ts(), ts200);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn standalone_new_does_not_register() {
+        // ReadView::new(..) paths (tests, snapshot fixtures) must not
+        // affect any registry — the `registry` field is None and Drop is
+        // a no-op.
+        let reg = ReadViewRegistry::new();
+        {
+            let _rv = ReadView::new(Ts { physical_ms: 500, logical: 0 }, 99);
+            assert!(reg.is_empty());
+        }
+        assert!(reg.is_empty());
+        assert_eq!(reg.oldest_required_ts(), Ts::MAX);
     }
 
     #[test]

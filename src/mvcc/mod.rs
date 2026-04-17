@@ -17,7 +17,7 @@ pub mod version;
 #[allow(unused_imports)]
 pub use deferred_free::DeferredFreeQueue;
 #[allow(unused_imports)]
-pub use read_view::{ChainSnapshot, ReadView};
+pub use read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
 #[allow(unused_imports)]
 pub use timestamp::{HlcState, TimestampOracle, Ts};
 #[allow(unused_imports)]

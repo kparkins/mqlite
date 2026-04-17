@@ -126,8 +126,13 @@ pub mod options;
 pub mod results;
 
 // Internal modules (not public API)
+// `mvcc` is `pub` but `#[doc(hidden)]` — integration tests
+// (`tests/registry_stress.rs`, future T4+ concurrency harnesses) need to
+// reference `ReadView` / `ReadViewRegistry` / `Ts` through the crate root,
+// but the module is not part of the stable surface yet.
+#[doc(hidden)]
 #[allow(dead_code)]
-mod mvcc;
+pub mod mvcc;
 mod query;
 mod storage;
 mod storage_engine;

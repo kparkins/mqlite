@@ -28,6 +28,19 @@
 //! calls [`data_mut`](PinnedPage::data_mut) at a time.  Multiple concurrent
 //! read-only pins (using only [`data`](PinnedPage::data)) are safe.  The
 //! database-level single-writer lock enforces this at a higher level.
+//
+// LOCK-ORDER (CRITICAL-1; iter-4): this file owns positions **3** (32 KB
+// partition mutex, `BufferPool::inner_32k`) and **4** (4 KB partition
+// mutex, `BufferPool::inner_4k`) in the database-wide total order. Any
+// path that acquires both partitions MUST acquire 32 KB before 4 KB, and
+// must NOT re-enter the history-store partition (position 1),
+// `DeferredFreeQueue::pending` (1.5), or `AllocatorHandle::state` (2)
+// while holding either partition mutex. The canonical definition of the
+// full order (positions 1 → 1.5 → 2 → 3 → 4 → 5 → 6) lives at the top of
+// `src/mvcc/read_view.rs` — edit both blocks together or neither.
+// T6 wires the reconciliation path that snapshots
+// `ReadViewRegistry::oldest_required_ts()` (position 5) BEFORE acquiring
+// a partition mutex; T4 only adds the primitive.
 
 use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
