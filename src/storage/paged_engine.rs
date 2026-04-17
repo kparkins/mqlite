@@ -2109,6 +2109,44 @@ impl StorageEngine for PagedEngine {
         let bp = &*inner;
         // Ensure the catalog root is in the file header before flush.
         bp.sync_catalog_root()?;
+
+        // Plan §T8: invoke the history-store GC pass at checkpoint
+        // cadence. `ort` = `ReadViewRegistry::oldest_required_ts()` — the
+        // smallest `read_ts` still visible to some live reader, or
+        // `Ts::MAX` when no readers are registered (entire aged history
+        // eligible for reclamation). Every history-store entry with
+        // `stop_ts <= ort` is deleted; overflow refcounts are decremented
+        // via RAII and enqueued for deferred free on hitting zero.
+        let ort = bp.handle.read_view_registry().oldest_required_ts();
+        {
+            let mut hs = bp.history_store.lock().unwrap();
+            hs.gc_pass(ort)?;
+        }
+
+        // Plan §T8 counter samplers.
+        // `mvcc.oldest_required_ts_lag_ms` = `(oracle.now().physical_ms -
+        // ort.physical_ms).max(0)` when `ort < Ts::MAX`, else 0 (no live
+        // readers). Stuck-oracle alert fires when this is large and
+        // `active_read_views == 0`.
+        let lag_ms = if ort == crate::mvcc::timestamp::Ts::MAX {
+            0
+        } else {
+            bp.oracle
+                .now()
+                .physical_ms
+                .saturating_sub(ort.physical_ms)
+        };
+        crate::mvcc::metrics::set_oldest_required_ts_lag_ms(lag_ms);
+        // `mvcc.overflow.pages_in_use` = allocator's current count of
+        // overflow-chain first_pages with refcount >= 1.
+        crate::mvcc::metrics::set_overflow_pages_in_use(
+            bp.handle.allocator().overflow_pages_in_use() as u64,
+        );
+        // `mvcc.deferred_free_queue_depth` = current queue length.
+        crate::mvcc::metrics::set_deferred_free_queue_depth(
+            bp.handle.allocator().deferred_free_queue().depth() as u64,
+        );
+
         // Flush all dirty pages (data + catalog + header) to disk.
         bp.handle.flush()
     }

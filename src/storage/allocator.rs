@@ -372,7 +372,10 @@ impl AllocatorHandle {
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Ok(cur + 1),
-                Err(observed) => cur = observed,
+                Err(observed) => {
+                    crate::mvcc::metrics::record_overflow_refcount_cas_retry();
+                    cur = observed;
+                }
             }
         }
     }
@@ -409,6 +412,20 @@ impl AllocatorHandle {
         self.refcount_handle_opt(first_page)
             .map(|a| a.load(Ordering::Acquire))
             .unwrap_or(0)
+    }
+
+    /// Number of overflow-chain `first_page`s whose refcount is currently
+    /// `>= 1`. Backs the `mvcc.overflow.pages_in_use` gauge (plan §T8).
+    ///
+    /// Walks the refcount table under the table mutex; acceptable because
+    /// this is called at checkpoint cadence, not on the hot path.
+    pub(crate) fn overflow_pages_in_use(&self) -> usize {
+        #[allow(clippy::unwrap_used)]
+        let table = self.overflow_refcounts.lock().unwrap();
+        table
+            .values()
+            .filter(|a| a.load(Ordering::Acquire) >= 1)
+            .count()
     }
 
     /// Enqueue a page for deferred free. Called by `OverflowRef::drop`

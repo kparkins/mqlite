@@ -57,6 +57,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::mvcc::metrics;
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicU32};
@@ -133,6 +136,70 @@ impl ReadView {
             registry: Some(registry),
         })
     }
+
+    /// Force-expire. Iter-4 "subtraction" force-expiry: we DO NOT walk any
+    /// owned snapshots. This method has two responsibilities:
+    ///
+    /// 1. Flip `poisoned = true` (Release) so any subsequent
+    ///    `ChainSnapshot::new` short-circuits at its pre-check without
+    ///    performing a refcount bump.
+    /// 2. Spin until `pin_ops_in_flight == 0` so any pin-walk that
+    ///    happened to run `fetch_add(1)` before it observed the poison
+    ///    store has finished its critical section; such a pin-walk
+    ///    observes poison on its post-bump recheck and rolls back via
+    ///    RAII Drop.
+    ///
+    /// Snapshots that completed construction before the poison store
+    /// remain valid Rust values held by the reader; their default drop
+    /// glue runs `OverflowRef::Drop` (atomic decref) on each entry when
+    /// the reader releases the snapshot. Force-expiry does not skip any
+    /// refcount decrement that the natural drop would have performed.
+    ///
+    /// Ticks `mvcc.read_views_force_expired_total += 1` once per call.
+    pub fn force_expire(&self) {
+        // Step 1: poison BEFORE any wait. New pin ops see poisoned=true
+        // on their pre-check and return early without CAS.
+        self.poisoned.store(true, Ordering::Release);
+
+        // Step 2: spin until no pin op is mid-flight.
+        self.wait_pin_drain();
+
+        metrics::record_read_view_force_expired();
+    }
+
+    /// Spin-wait for `pin_ops_in_flight` to drain to zero.
+    ///
+    /// First `SPIN_BUDGET` iterations: `spin_loop()` (fast path for
+    /// microsecond races). After the spin budget: `yield_now()` so the
+    /// scheduler can run the pin-walker. After `TIMEOUT_MS` ms: emit a
+    /// warning tracing event and tick
+    /// `mvcc.force_expire_spin_stalls_total`; keep yielding.
+    fn wait_pin_drain(&self) {
+        const SPIN_BUDGET: u32 = 128;
+        const TIMEOUT_MS: u64 = 10;
+
+        for _ in 0..SPIN_BUDGET {
+            if self.pin_ops_in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+
+        let start = Instant::now();
+        let mut stalled = false;
+        loop {
+            if self.pin_ops_in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            if !stalled && start.elapsed().as_millis() as u64 > TIMEOUT_MS {
+                metrics::record_force_expire_spin_stall();
+                #[cfg(feature = "tracing")]
+                tracing::warn!("force_expire spinning > {}ms", TIMEOUT_MS);
+                stalled = true;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 impl Drop for ReadView {
@@ -181,16 +248,19 @@ impl ReadViewRegistry {
 
     /// Insert `(txn_id → read_ts)`. Overwrites any prior entry for the
     /// same `txn_id` (callers must keep `txn_id` unique across concurrently
-    /// live views).
+    /// live views). Refreshes `mvcc.active_read_views` gauge.
     pub fn register(&self, txn_id: u64, read_ts: Ts) {
         let mut guard = self.inner.lock().unwrap();
         guard.insert(txn_id, read_ts);
+        metrics::set_active_read_views(guard.len() as u64);
     }
 
-    /// Remove `txn_id` from the registry. No-op if absent.
+    /// Remove `txn_id` from the registry. No-op if absent. Refreshes
+    /// `mvcc.active_read_views` gauge.
     pub fn unregister(&self, txn_id: u64) {
         let mut guard = self.inner.lock().unwrap();
         guard.remove(&txn_id);
+        metrics::set_active_read_views(guard.len() as u64);
     }
 
     /// Smallest `read_ts` across all live views, or `Ts::MAX` if empty.
@@ -532,6 +602,34 @@ mod tests {
         let reg = ReadViewRegistry::new();
         assert!(reg.is_empty());
         assert_eq!(reg.oldest_required_ts(), Ts::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // T8 — force_expire
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn force_expire_sets_poisoned_and_ticks_counter() {
+        crate::mvcc::metrics::reset_read_views_force_expired();
+        let rv = ReadView::new(Ts { physical_ms: 100, logical: 0 }, 42);
+        assert!(!rv.poisoned.load(Ordering::Acquire));
+        rv.force_expire();
+        assert!(rv.poisoned.load(Ordering::Acquire));
+        assert_eq!(
+            crate::mvcc::metrics::read_views_force_expired_snapshot(),
+            1,
+            "force_expire must tick the counter",
+        );
+    }
+
+    #[test]
+    fn force_expire_returns_immediately_when_pin_ops_is_zero() {
+        let rv = ReadView::new(Ts::PENDING, 0);
+        assert_eq!(rv.pin_ops_in_flight.load(Ordering::Acquire), 0);
+        let start = std::time::Instant::now();
+        rv.force_expire();
+        // Should be well under the 10ms timeout; 100ms budget is generous.
+        assert!(start.elapsed().as_millis() < 100);
     }
 
     #[test]

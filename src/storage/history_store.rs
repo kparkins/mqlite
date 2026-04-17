@@ -415,6 +415,106 @@ impl<S: BTreePageStore> HistoryStore<S> {
     }
 }
 
+/// Result of a [`HistoryStore::gc_pass`] sweep.
+///
+/// `entries_deleted` counts history-store B-tree cells removed. `pages_freed`
+/// counts overflow-chain `first_page`s whose refcount dropped to zero as a
+/// direct consequence of the sweep (thereby enqueued for deferred free by
+/// the [`OverflowRef`] RAII `Drop`). Actual page reclamation runs on the
+/// writer path via `AllocatorHandle::drain_free_queue`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GcResult {
+    pub entries_deleted: u64,
+    pub pages_freed: u64,
+}
+
+impl<S: BTreePageStore> HistoryStore<S> {
+    /// Sweep history-store entries whose `stop_ts <= ort` (oldest required
+    /// timestamp). Plan §T8: "`gc_pass(ort: Ts) -> GcResult { entries_deleted,
+    /// pages_freed }`. Called from checkpoint hook in paged_engine."
+    ///
+    /// Each expired entry is deleted from the B-tree. For entries with
+    /// `VersionData::Overflow`, the history entry's logical +1 refcount on
+    /// `first_page` is transferred to an ephemeral [`OverflowRef`] via
+    /// [`OverflowRef::from_existing_refcount`] (no bump) which then
+    /// `Drop`s — decrementing the refcount and enqueueing the page for
+    /// deferred free when the count reaches 0. All decrement accounting
+    /// goes through RAII; this method never calls
+    /// `AllocatorHandle::decref_overflow` directly.
+    ///
+    /// Ticks `mvcc.history_store.gc_passes_total` on every invocation. Does
+    /// not tick `mvcc.reconcile.entries_dropped_total` — that counter
+    /// measures reconciliation drops, not GC-pass deletes.
+    ///
+    /// Never deletes entries with `stop_ts == Ts::MAX` (live heads) nor
+    /// entries with `stop_ts > ort` (still visible to some live reader).
+    pub(crate) fn gc_pass(&mut self, ort: Ts) -> Result<GcResult> {
+        let _guard = HistoryStoreGuard::enter();
+
+        // Phase 1: scan, identifying victims. Full-tree range_scan is
+        // acceptable in v1 — the history store is expected to be sparse
+        // relative to main data, and GC runs at checkpoint cadence.
+        let rows = self.tree.range_scan(None, None)?;
+        type Victim = (Vec<u8>, Option<(u32, u64)>);
+        let mut victims: Vec<Victim> = Vec::new();
+        for (key, cell_value) in rows {
+            let value_bytes = cell_value_bytes(cell_value)?;
+            if value_bytes.len() < 34 {
+                continue;
+            }
+            let stop_ts =
+                Ts::from_le_bytes(value_bytes[12..24].try_into().expect("12 bytes"));
+            if stop_ts == Ts::MAX || stop_ts > ort {
+                continue;
+            }
+            let data_kind = value_bytes[33];
+            let overflow = if data_kind == DATA_KIND_OVERFLOW {
+                if value_bytes.len() < 46 {
+                    continue;
+                }
+                let first_page =
+                    u32::from_le_bytes(value_bytes[34..38].try_into().expect("4 bytes"));
+                let total_length =
+                    u64::from_le_bytes(value_bytes[38..46].try_into().expect("8 bytes"));
+                Some((first_page, total_length))
+            } else {
+                None
+            };
+            victims.push((key, overflow));
+        }
+
+        // Phase 2: delete each victim and, for overflow entries, transfer
+        // the logical +1 refcount into an ephemeral OverflowRef and drop it.
+        let mut result = GcResult::default();
+        for (key, overflow) in victims {
+            if !self.tree.delete(&key)? {
+                continue;
+            }
+            result.entries_deleted += 1;
+            if let Some((first_page, total_length)) = overflow {
+                if let Some(alloc) = self.overflow_allocator.as_deref() {
+                    {
+                        let _oref = OverflowRef::from_existing_refcount(
+                            first_page,
+                            total_length,
+                            alloc.clone(),
+                        );
+                        // `_oref` drops at the end of this scope; Drop runs
+                        // `decref_overflow` and enqueues for deferred free
+                        // on refcount 0.
+                    }
+                    if alloc.overflow_refcount(first_page) == 0 {
+                        result.pages_freed += 1;
+                    }
+                }
+            }
+        }
+
+        crate::mvcc::metrics::record_history_store_gc_pass();
+        Ok(result)
+    }
+}
+
 /// Resolve a `CellValue` from `BTree::range_scan` into the raw bytes that
 /// were stored at insert time.
 fn cell_value_bytes(
@@ -674,5 +774,187 @@ mod tests {
         // no journal/frame I/O on the main store is possible by type
         // construction because `HistoryStore` only holds `hist_store`.
         assert_eq!(main_tree.root_page, main_root_before);
+    }
+
+    // -----------------------------------------------------------------------
+    // GC pass — plan §T8 acceptance bullets
+    // -----------------------------------------------------------------------
+
+    /// Given 10k entries with `stop_ts` spread across [1, 10_000], and
+    /// `ort = Ts{3000, 0}`: exactly 3000 entries are deleted. Plan T8
+    /// acceptance bullet 1 (inline variant; no overflow required to prove
+    /// the delete-count invariant).
+    #[test]
+    fn gc_pass_deletes_exactly_the_expired_entries() {
+        let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
+        // 10_000 entries keyed by (ns=1, KIND_PRIMARY, i-big-endian)
+        // with distinct start_ts per entry. stop_ts == start_ts + 1 so
+        // `stop_ts <= ort == 3000` iff start_ts < 3000.
+        for i in 0..10_000u64 {
+            let key = (i as u32).to_be_bytes();
+            hs.insert(
+                1,
+                KIND_PRIMARY,
+                &key,
+                &inline_entry(
+                    ts(i, 0),
+                    ts(i + 1, 0),
+                    i,
+                    format!("v{i}").as_bytes(),
+                ),
+            )
+            .unwrap();
+        }
+
+        crate::mvcc::metrics::reset_history_store_gc_passes();
+        let result = hs.gc_pass(ts(3000, 0)).unwrap();
+        // stop_ts <= 3000 is entries with start_ts < 3000 → i in 0..2999 (2999 entries),
+        // plus i == 2999 where stop_ts = 3000 (exactly equal, also expired).
+        // So i in 0..=2999 → 3000 entries.
+        assert_eq!(result.entries_deleted, 3000);
+        assert_eq!(result.pages_freed, 0, "no overflow entries → no pages freed");
+        assert_eq!(
+            crate::mvcc::metrics::history_store_gc_passes_snapshot(),
+            1,
+            "gc_passes counter must tick exactly once"
+        );
+
+        // Post-GC: a probe at read_ts = 5000 for a non-GC'd key must still
+        // resolve; a probe for a GC'd key must return None.
+        let live_key = (5000u32).to_be_bytes();
+        let got = hs.probe_primary(1, &live_key, ts(10_000, 0)).unwrap();
+        assert!(got.is_some(), "non-expired entry must still be reachable");
+
+        let gc_key = (0u32).to_be_bytes();
+        let gone = hs.probe_primary(1, &gc_key, ts(10_000, 0)).unwrap();
+        assert!(gone.is_none(), "GC'd entry must be absent");
+    }
+
+    /// Plan T8 acceptance bullet 2: GC respects active-reader horizon. An
+    /// entry with `stop_ts > ort` must never be deleted even if the entry
+    /// looks stale by oracle time.
+    #[test]
+    fn gc_pass_respects_active_readview_horizon() {
+        let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
+        // Reader's `ort = Ts{100,0}`. Two entries:
+        //   A: stop_ts = 50 (expired — visible to no live reader)
+        //   B: stop_ts = 150 (STILL visible at ts 100 — must NOT be deleted)
+        //   C: stop_ts = Ts::MAX (live head — must NEVER be deleted)
+        hs.insert(
+            1,
+            KIND_PRIMARY,
+            b"A",
+            &inline_entry(ts(10, 0), ts(50, 0), 1, b"a"),
+        )
+        .unwrap();
+        hs.insert(
+            1,
+            KIND_PRIMARY,
+            b"B",
+            &inline_entry(ts(90, 0), ts(150, 0), 2, b"b"),
+        )
+        .unwrap();
+        hs.insert(
+            1,
+            KIND_PRIMARY,
+            b"C",
+            &inline_entry(ts(100, 0), Ts::MAX, 3, b"c"),
+        )
+        .unwrap();
+
+        let result = hs.gc_pass(ts(100, 0)).unwrap();
+        assert_eq!(result.entries_deleted, 1, "only A expires at ort=100");
+
+        assert!(
+            hs.probe_primary(1, b"A", ts(200, 0)).unwrap().is_none(),
+            "A should be GC'd"
+        );
+        assert!(
+            hs.probe_primary(1, b"B", ts(200, 0)).unwrap().is_some(),
+            "B has stop_ts=150 > ort=100; must be retained"
+        );
+        assert!(
+            hs.probe_primary(1, b"C", ts(200, 0)).unwrap().is_some(),
+            "C has stop_ts=Ts::MAX (live head); must be retained"
+        );
+    }
+
+    /// Plan T8 acceptance bullet 1: overflow-bearing entries get their
+    /// refcount decremented by RAII on GC. At refcount 0 the page is
+    /// enqueued on the allocator's deferred-free queue and counted in
+    /// `pages_freed`.
+    #[test]
+    fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_deferred_free() {
+        use crate::storage::allocator::AllocatorHandle;
+        use crate::storage::header::FileHeader;
+        use std::sync::Arc;
+
+        let alloc = Arc::new(AllocatorHandle::new(FileHeader::new(0, 0, 0)));
+        // Seed a logical +1 refcount on first_page=777 — simulates the
+        // refcount "owned by the history entry" convention (plan §T7 bullet
+        // 909). This matches what a real reconciliation-path insert would
+        // have done.
+        alloc.set_overflow_refcount_for_test(777, 1);
+
+        let mut hs = HistoryStore::create(MemPageStore::new())
+            .unwrap()
+            .with_overflow_allocator(Arc::clone(&alloc));
+        let overflow_entry = VersionEntry {
+            start_ts: ts(10, 0),
+            stop_ts: ts(20, 0), // expired at ort=100
+            txn_id: 42,
+            data: VersionData::Overflow(crate::mvcc::version::OverflowRef::from_existing_refcount(
+                777,
+                2048,
+                (*alloc).clone(),
+            )),
+            is_tombstone: false,
+        };
+        // Insert serializes the bytes; re-seed the refcount post-insert to
+        // match the "caller leaks its OverflowRef" production semantics.
+        hs.insert(1, KIND_PRIMARY, b"K", &overflow_entry).unwrap();
+        std::mem::forget(overflow_entry);
+        assert_eq!(alloc.overflow_refcount(777), 1);
+
+        let before_depth = alloc.deferred_free_queue().depth();
+        let result = hs.gc_pass(ts(100, 0)).unwrap();
+        assert_eq!(result.entries_deleted, 1);
+        assert_eq!(
+            result.pages_freed, 1,
+            "refcount hit 0 → one page counted as freed"
+        );
+        assert_eq!(
+            alloc.overflow_refcount(777),
+            0,
+            "RAII decref must bring refcount to 0"
+        );
+        assert_eq!(
+            alloc.deferred_free_queue().depth(),
+            before_depth + 1,
+            "refcount 0 drop must enqueue first_page for deferred free"
+        );
+    }
+
+    /// GC counter ticks exactly once per `gc_pass` invocation, even when
+    /// the scan found nothing to delete.
+    #[test]
+    fn gc_pass_noop_still_ticks_counter() {
+        let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
+        hs.insert(
+            1,
+            KIND_PRIMARY,
+            b"K",
+            &inline_entry(ts(10, 0), Ts::MAX, 1, b"live"),
+        )
+        .unwrap();
+
+        crate::mvcc::metrics::reset_history_store_gc_passes();
+        let result = hs.gc_pass(ts(1000, 0)).unwrap();
+        assert_eq!(result.entries_deleted, 0);
+        assert_eq!(
+            crate::mvcc::metrics::history_store_gc_passes_snapshot(),
+            1,
+            "gc_passes counter ticks on every call (even no-op)"
+        );
     }
 }

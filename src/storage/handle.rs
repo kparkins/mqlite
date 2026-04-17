@@ -331,7 +331,10 @@ impl BufferPoolHandle {
         db_page_count: u32,
     ) -> Result<bool> {
         match &self.journal {
-            None => Ok(false),
+            None => {
+                crate::mvcc::metrics::record_journal_commit();
+                Ok(false)
+            }
             Some(journal) => {
                 let journal_page_size = match page_size {
                     PageSize::Small4k => JournalPageSize::Small4k,
@@ -340,7 +343,10 @@ impl BufferPoolHandle {
                 let mut guard = journal
                     .lock()
                     .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                guard.commit(page_number, journal_page_size, page_data, db_page_count)
+                let result =
+                    guard.commit(page_number, journal_page_size, page_data, db_page_count)?;
+                crate::mvcc::metrics::record_journal_commit();
+                Ok(result)
             }
         }
     }
@@ -483,7 +489,9 @@ impl BufferPoolHandle {
                 let mut guard = journal
                     .lock()
                     .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                guard.append_chain_commit(commit_ts, refcount_deltas, page_writes)
+                let offset = guard.append_chain_commit(commit_ts, refcount_deltas, page_writes)?;
+                crate::mvcc::metrics::record_journal_chain_commit_frame();
+                Ok(offset)
             }
         }
     }

@@ -59,6 +59,31 @@ impl OverflowRef {
         })
     }
 
+    /// Construct an `OverflowRef` that takes logical ownership of an
+    /// already-held refcount slot on `first_page` WITHOUT bumping the
+    /// refcount. The caller asserts the underlying refcount is `>= 1`
+    /// (typically: the entry is materialized from a persisted history-store
+    /// tree cell whose insertion never dropped its producer's
+    /// `OverflowRef`). On `Drop`, the standard RAII decref runs and the
+    /// page is enqueued for deferred free if the post-decrement refcount
+    /// is 0. This is the canonical entry point for the history-store GC
+    /// path — `src/storage/history_store.rs::HistoryStore::gc_pass`.
+    pub(crate) fn from_existing_refcount(
+        first_page: u32,
+        total_length: u64,
+        allocator: AllocatorHandle,
+    ) -> Self {
+        debug_assert!(
+            allocator.overflow_refcount(first_page) >= 1,
+            "from_existing_refcount on first_page {first_page} with refcount < 1"
+        );
+        Self {
+            first_page,
+            total_length,
+            allocator,
+        }
+    }
+
     /// Page number of the first page in the chain.
     pub fn first_page(&self) -> u32 {
         self.first_page

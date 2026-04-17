@@ -239,7 +239,9 @@ impl TimestampOracle {
     /// In the single-node default (T12.A) this is a no-op: we have no peers
     /// whose timestamps could outrun ours. Callers pass the received Ts
     /// anyway so the signature is stable when multi-node is wired in later.
+    /// Ticks `mvcc.hlc.advance_events_total` per call.
     pub fn advance(&self, _received: Ts) -> Result<()> {
+        crate::mvcc::metrics::record_hlc_advance();
         Ok(())
     }
 
