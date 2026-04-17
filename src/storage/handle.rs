@@ -12,7 +12,7 @@
 //!
 //! The intent is that `DatabaseInner` holds a single
 //! `Arc<BufferPoolHandle>` and all storage-engine layers (B+ tree, catalog,
-//! WAL flush path) interact with pages exclusively through this handle.
+//! journal flush path) interact with pages exclusively through this handle.
 //!
 //! ## API
 //!
@@ -39,8 +39,8 @@ use crate::error::{Error, Result};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::buffer_pool::{BufferPool, PageSource, PageSize, PinnedPage};
 use crate::storage::header::FileHeader;
-use crate::wal::WalManager;
-use crate::wal::wal_file::WalPageSize;
+use crate::journal::JournalManager;
+use crate::journal::log_file::JournalPageSize;
 
 // ---------------------------------------------------------------------------
 // BufferPoolPageSource — PageSource adapter for BufferPool
@@ -101,18 +101,18 @@ pub(crate) struct BufferPoolHandle {
     allocator: AllocatorHandle,
     /// `PageSource` adapter that routes allocator I/O through the pool.
     pool_io: BufferPoolPageSource,
-    /// Optional WAL manager; `None` for in-memory / test handles.
-    wal: Option<Arc<Mutex<WalManager>>>,
-    /// Dedicated fd for writing checkpointed WAL pages back to the main file.
+    /// Optional journal manager; `None` for in-memory / test handles.
+    journal: Option<Arc<Mutex<JournalManager>>>,
+    /// Dedicated fd for writing checkpointed journal pages back to the main file.
     /// Shared with `ClientInner`; held here so `with_txn` can trigger an
-    /// emergency checkpoint when the WAL SHM approaches its frame-count limit.
-    wal_main_file: Option<Arc<Mutex<File>>>,
+    /// emergency checkpoint when the journal SHM approaches its frame-count limit.
+    journal_main_file: Option<Arc<Mutex<File>>>,
 }
 
 impl BufferPoolHandle {
-    /// Create a `BufferPoolHandle` without a WAL — test-only.
+    /// Create a `BufferPoolHandle` without a journal — test-only.
     ///
-    /// Production code always wires a WAL via [`Self::with_wal`].
+    /// Production code always wires a journal via [`Self::with_journal`].
     #[cfg(test)]
     pub(crate) fn new(pool: Arc<BufferPool>, header: FileHeader) -> Self {
         let allocator = AllocatorHandle::new(header);
@@ -121,20 +121,20 @@ impl BufferPoolHandle {
             pool,
             allocator,
             pool_io,
-            wal: None,
-            wal_main_file: None,
+            journal: None,
+            journal_main_file: None,
         }
     }
 
-    /// Create a `BufferPoolHandle` with an attached [`WalManager`].
+    /// Create a `BufferPoolHandle` with an attached [`JournalManager`].
     ///
     /// All txn methods (`begin_txn`, `commit_txn`, `rollback_txn`,
-    /// `checkpoint_through_wal`) become active when a WAL is present.
-    pub(crate) fn with_wal(
+    /// `checkpoint_through_journal`) become active when a journal is present.
+    pub(crate) fn with_journal(
         pool: Arc<BufferPool>,
         header: FileHeader,
-        wal: Arc<Mutex<WalManager>>,
-        wal_main_file: Arc<Mutex<File>>,
+        journal: Arc<Mutex<JournalManager>>,
+        journal_main_file: Arc<Mutex<File>>,
     ) -> Self {
         let allocator = AllocatorHandle::new(header);
         let pool_io = BufferPoolPageSource::new(Arc::clone(&pool));
@@ -142,8 +142,8 @@ impl BufferPoolHandle {
             pool,
             allocator,
             pool_io,
-            wal: Some(wal),
-            wal_main_file: Some(wal_main_file),
+            journal: Some(journal),
+            journal_main_file: Some(journal_main_file),
         }
     }
 
@@ -243,34 +243,34 @@ impl BufferPoolHandle {
     }
 
     // -----------------------------------------------------------------------
-    // WAL transaction primitives
+    // Journal transaction primitives
     // -----------------------------------------------------------------------
 
-    /// Snapshot the WAL write cursor as the begin-of-transaction mark.
+    /// Snapshot the journal write cursor as the begin-of-transaction mark.
     ///
-    /// Returns `Some(cursor)` when a WAL is attached, `None` for WAL-less
+    /// Returns `Some(cursor)` when a journal is attached, `None` for journal-less
     /// handles (in-memory / test).  The returned value must be passed to
     /// [`rollback_txn`](Self::rollback_txn) on failure.
     pub(crate) fn begin_txn(&self) -> Result<Option<u64>> {
-        match &self.wal {
+        match &self.journal {
             None => Ok(None),
-            Some(wal) => {
-                let guard = wal
+            Some(journal) => {
+                let guard = journal
                     .lock()
-                    .map_err(|_| Error::Internal("WAL mutex poisoned".into()))?;
+                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
                 Ok(Some(guard.write_cursor()))
             }
         }
     }
 
-    /// Write the commit frame to the WAL.
+    /// Write the commit frame to the journal.
     ///
     /// `page_number` / `page_size` / `page_data` identify the committing page
     /// (typically the catalog root, which every write transaction touches).
     /// `db_page_count` is the total database page count after this txn.
     ///
-    /// Returns `true` if the WAL SHM index is nearly full (emergency
-    /// checkpoint signal); `false` otherwise or when no WAL is attached.
+    /// Returns `true` if the journal SHM index is nearly full (emergency
+    /// checkpoint signal); `false` otherwise or when no journal is attached.
     pub(crate) fn commit_txn(
         &self,
         page_number: u32,
@@ -278,68 +278,68 @@ impl BufferPoolHandle {
         page_data: &[u8],
         db_page_count: u32,
     ) -> Result<bool> {
-        match &self.wal {
+        match &self.journal {
             None => Ok(false),
-            Some(wal) => {
-                let wal_page_size = match page_size {
-                    PageSize::Small4k => WalPageSize::Small4k,
-                    PageSize::Large32k => WalPageSize::Large32k,
+            Some(journal) => {
+                let journal_page_size = match page_size {
+                    PageSize::Small4k => JournalPageSize::Small4k,
+                    PageSize::Large32k => JournalPageSize::Large32k,
                 };
-                let mut guard = wal
+                let mut guard = journal
                     .lock()
-                    .map_err(|_| Error::Internal("WAL mutex poisoned".into()))?;
-                guard.commit(page_number, wal_page_size, page_data, db_page_count)
+                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+                guard.commit(page_number, journal_page_size, page_data, db_page_count)
             }
         }
     }
 
-    /// Roll back a transaction by truncating the WAL and discarding dirty
+    /// Roll back a transaction by truncating the journal and discarding dirty
     /// buffer pool frames.
     ///
     /// `mark` is the cursor value returned by the paired [`begin_txn`](Self::begin_txn)
-    /// call.  When `mark` is `None` (no WAL attached), only dirty frames are
+    /// call.  When `mark` is `None` (no journal attached), only dirty frames are
     /// dropped from the pool.
     pub(crate) fn rollback_txn(&self, mark: Option<u64>) -> Result<()> {
-        if let (Some(mark), Some(wal)) = (mark, &self.wal) {
-            let mut guard = wal
+        if let (Some(mark), Some(journal)) = (mark, &self.journal) {
+            let mut guard = journal
                 .lock()
-                .map_err(|_| Error::Internal("WAL mutex poisoned".into()))?;
+                .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
             guard.truncate_to(mark)?;
         }
         self.pool.drop_all_dirty()
     }
 
-    /// Checkpoint using the `wal_main_file` handle stored on this handle.
+    /// Checkpoint using the `journal_main_file` handle stored on this handle.
     ///
-    /// Returns `Ok(false)` when no WAL is attached. Used by [`with_txn`] after
-    /// a commit frame signals the WAL SHM is near full, and by
+    /// Returns `Ok(false)` when no journal is attached. Used by [`with_txn`] after
+    /// a commit frame signals the journal SHM is near full, and by
     /// [`with_txn`]'s callers that do not hold the main-file fd directly.
     pub(crate) fn emergency_checkpoint(&self) -> Result<bool> {
-        let Some(file_mutex) = self.wal_main_file.as_ref() else {
+        let Some(file_mutex) = self.journal_main_file.as_ref() else {
             return Ok(false);
         };
         let mut guard = file_mutex
             .lock()
-            .map_err(|_| Error::Internal("WAL main-file mutex poisoned".into()))?;
-        self.checkpoint_through_wal(&mut guard)?;
+            .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
+        self.checkpoint_through_journal(&mut guard)?;
         Ok(true)
     }
 
-    /// Checkpoint all WAL frames into `main_file` and reset the WAL.
+    /// Checkpoint all journal frames into `main_file` and reset the journal.
     ///
     /// Reads the current [`FileHeader`] from the allocator, passes it to
-    /// [`WalManager::checkpoint`] (which may update `total_page_count`), then
+    /// [`JournalManager::checkpoint`] (which may update `total_page_count`), then
     /// writes the updated count back into the allocator header.
     ///
-    /// No-op when no WAL is attached.
-    pub(crate) fn checkpoint_through_wal(&self, main_file: &mut File) -> Result<()> {
-        match &self.wal {
+    /// No-op when no journal is attached.
+    pub(crate) fn checkpoint_through_journal(&self, main_file: &mut File) -> Result<()> {
+        match &self.journal {
             None => Ok(()),
-            Some(wal) => {
+            Some(journal) => {
                 let mut header = self.allocator.with_header(|h| h.clone())?;
-                let mut guard = wal
+                let mut guard = journal
                     .lock()
-                    .map_err(|_| Error::Internal("WAL mutex poisoned".into()))?;
+                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
                 guard.checkpoint(main_file, &mut header)?;
                 drop(guard);
                 // Propagate total_page_count update back into the allocator.

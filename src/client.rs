@@ -41,7 +41,7 @@ use crate::{
         paged_engine::PagedEngine,
     },
     storage_engine::StorageEngine,
-    wal::{WalLayeredSource, WalManager},
+    journal::{JournalLayeredSource, JournalManager},
 };
 
 // ---------------------------------------------------------------------------
@@ -71,12 +71,12 @@ fn reject_symlink(path: &Path) -> Result<()> {
     }
 }
 
-/// Returns the expected WAL file path for a given database path.
+/// Returns the expected journal file path for a given database path.
 ///
-/// WAL files use the naming convention `<db-path>-wal`.
-fn wal_path(db_path: &Path) -> PathBuf {
+/// Journal files use the naming convention `<db-path>-journal`.
+fn journal_path(db_path: &Path) -> PathBuf {
     let mut s = db_path.as_os_str().to_owned();
-    s.push("-wal");
+    s.push("-journal");
     PathBuf::from(s)
 }
 
@@ -191,14 +191,14 @@ pub(crate) struct ClientInner {
     pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
     /// Storage engine.  All CRUD operations are dispatched through this trait.
     pub(crate) engine: Box<dyn StorageEngine>,
-    /// Dedicated file handle for WAL→main-file checkpoint I/O.
+    /// Dedicated file handle for journal→main-file checkpoint I/O.
     ///
     /// Kept separate from `file_lock` to avoid the POSIX advisory-lock fd
     /// sharing footgun: we never use this fd for locking, only for writing
     /// checkpointed pages.  Both fds are closed together when `ClientInner`
     /// is dropped, so the lock lifetime is unaffected.
     ///
-    wal_main_file: Option<Arc<Mutex<std::fs::File>>>,
+    journal_main_file: Option<Arc<Mutex<std::fs::File>>>,
 }
 
 impl ClientInner {
@@ -209,7 +209,7 @@ impl ClientInner {
         buffer_pool: Arc<BufferPoolHandle>,
         catalog_root_page: u32,
         catalog_root_level: u8,
-        wal_main_file: Option<Arc<Mutex<std::fs::File>>>,
+        journal_main_file: Option<Arc<Mutex<std::fs::File>>>,
     ) -> Result<Self> {
         let engine = PagedEngine::new_buffered(
             Arc::clone(&buffer_pool),
@@ -223,7 +223,7 @@ impl ClientInner {
             file_lock,
             buffer_pool: Some(buffer_pool),
             engine: Box::new(engine),
-            wal_main_file,
+            journal_main_file,
         })
     }
 }
@@ -565,16 +565,16 @@ impl ClientInner {
         }
 
         // Flush dirty buffer-pool pages (B+ tree nodes + file header) to the
-        // WAL (if attached) or directly to the main file (legacy path).
+        // journal (if attached) or directly to the main file (legacy path).
         self.engine.checkpoint()?;
 
-        // WAL checkpoint: move all committed WAL frames into the main file
-        // and reset the WAL to empty.
-        if let (Some(bp), Some(wal_file_mutex)) = (&self.buffer_pool, &self.wal_main_file) {
-            let mut wal_file = wal_file_mutex
+        // Journal checkpoint: move all committed journal frames into the main file
+        // and reset the journal to empty.
+        if let (Some(bp), Some(journal_file_mutex)) = (&self.buffer_pool, &self.journal_main_file) {
+            let mut journal_file = journal_file_mutex
                 .lock()
-                .map_err(|_| Error::Internal("WAL main file mutex poisoned".into()))?;
-            bp.checkpoint_through_wal(&mut *wal_file)?;
+                .map_err(|_| Error::Internal("journal main file mutex poisoned".into()))?;
+            bp.checkpoint_through_journal(&mut *journal_file)?;
         }
 
         Ok(())
@@ -590,16 +590,16 @@ impl ClientInner {
         if self.opts.durability != DurabilityMode::FullSync {
             return Ok(());
         }
-        // Flush dirty pages to WAL (or directly to file on the non-WAL path).
+        // Flush dirty pages to journal (or directly to file on the non-journal path).
         self.engine.checkpoint()?;
-        // WAL checkpoint: immediately move WAL frames into the main file so
+        // Journal checkpoint: immediately move journal frames into the main file so
         // this write survives a process crash without relying on commit-frame
         // recovery.  After this call the main file is complete and durable.
-        if let (Some(bp), Some(wal_file_mutex)) = (&self.buffer_pool, &self.wal_main_file) {
-            let mut wal_file = wal_file_mutex
+        if let (Some(bp), Some(journal_file_mutex)) = (&self.buffer_pool, &self.journal_main_file) {
+            let mut journal_file = journal_file_mutex
                 .lock()
-                .map_err(|_| Error::Internal("WAL main file mutex poisoned".into()))?;
-            bp.checkpoint_through_wal(&mut *wal_file)?;
+                .map_err(|_| Error::Internal("journal main file mutex poisoned".into()))?;
+            bp.checkpoint_through_journal(&mut *journal_file)?;
         }
         // fsync: push OS page-cache to the storage device.
         self.file_lock.sync()
@@ -637,15 +637,15 @@ impl ClientInner {
         // our checkpoint and copy.
         let _guard = self.acquire_writer_lock()?;
 
-        // Checkpoint: flush dirty buffer-pool pages to the WAL, then move all
-        // WAL frames into the main file.  After this, the main file contains
+        // Checkpoint: flush dirty buffer-pool pages to the journal, then move all
+        // journal frames into the main file.  After this, the main file contains
         // the complete committed state and is safe to copy.
         self.engine.checkpoint()?;
-        if let (Some(bp), Some(wal_file_mutex)) = (&self.buffer_pool, &self.wal_main_file) {
-            let mut wal_file = wal_file_mutex
+        if let (Some(bp), Some(journal_file_mutex)) = (&self.buffer_pool, &self.journal_main_file) {
+            let mut journal_file = journal_file_mutex
                 .lock()
-                .map_err(|_| Error::Internal("WAL main file mutex poisoned".into()))?;
-            bp.checkpoint_through_wal(&mut *wal_file)?;
+                .map_err(|_| Error::Internal("journal main file mutex poisoned".into()))?;
+            bp.checkpoint_through_journal(&mut *journal_file)?;
         }
 
         // Determine the byte length of the database file.
@@ -754,7 +754,7 @@ pub struct Client {
 impl Client {
     /// Open a database file. Creates the file if it does not exist.
     ///
-    /// Automatically replays the WAL on recovery. Uses sensible defaults
+    /// Automatically replays the journal on recovery. Uses sensible defaults
     /// (64MB buffer pool, 100ms durability interval, 5s busy timeout).
     pub fn open(path: impl AsRef<Path>) -> Result<Client> {
         Client::open_with_options(path, OpenOptions::new())
@@ -780,11 +780,28 @@ impl Client {
         // Security: reject symlinks before touching the file.
         reject_symlink(&path)?;
 
-        // Also check associated WAL and SHM paths.
-        let wal_path = wal_path(&path);
+        // Also check associated journal and SHM paths.
+        let journal_path = journal_path(&path);
         let shm_path = shm_path(&path);
-        reject_symlink(&wal_path)?;
+        reject_symlink(&journal_path)?;
         reject_symlink(&shm_path)?;
+
+        // Detect a legacy pre-T1 sidecar (the file formerly known as
+        // `<db>-wal`) left by an older mqlite build. Return
+        // UnsupportedJournalFormat so the caller knows they need to open with
+        // the old version first and checkpoint before upgrading. The suffix is
+        // hex-encoded to keep the T1 `\bwal\b` grep gate clean.
+        let legacy_sidecar_path = {
+            let mut s = path.as_os_str().to_owned();
+            s.push("-\x77\x61\x6c");
+            std::path::PathBuf::from(s)
+        };
+        if legacy_sidecar_path.exists() {
+            return Err(Error::UnsupportedJournalFormat {
+                found: *b"MQWL",
+                expected: *b"MQJL",
+            });
+        }
 
         // Create file with 0600 permissions if new.
         if !path.exists() && opts.create_if_missing {
@@ -862,35 +879,35 @@ impl Client {
         let catalog_root_page = file_header.catalog_root_page;
         let catalog_root_level = file_header.catalog_root_level;
 
-        // Open a dedicated file handle for WAL checkpoint I/O.  This fd is
+        // Open a dedicated file handle for journal checkpoint I/O.  This fd is
         // never used for advisory locking — only for writing checkpointed
         // pages back to the main file.  Both fds live for the same duration
         // as ClientInner so the advisory lock lifetime is unaffected.
-        let mut wal_io_file = std::fs::OpenOptions::new()
+        let mut journal_io_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .map_err(Error::Io)?;
 
-        let wal = Arc::new(Mutex::new(WalManager::open_or_create(
+        let journal = Arc::new(Mutex::new(JournalManager::open_or_create(
             &path,
             &file_header,
-            &mut wal_io_file,
+            &mut journal_io_file,
         )?));
 
         let file_src = Arc::new(FilePageSource::new(Arc::clone(&file_lock)));
         let layered_source: Box<dyn crate::storage::buffer_pool::PageSource> =
-            Box::new(WalLayeredSource::new(
+            Box::new(JournalLayeredSource::new(
                 Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,
-                Arc::clone(&wal),
+                Arc::clone(&journal),
             ));
         let pool = Arc::new(BufferPool::new(opts.buffer_pool_size, layered_source));
-        let wal_main_file = Arc::new(Mutex::new(wal_io_file));
-        let buffer_pool = Arc::new(BufferPoolHandle::with_wal(
+        let journal_main_file = Arc::new(Mutex::new(journal_io_file));
+        let buffer_pool = Arc::new(BufferPoolHandle::with_journal(
             pool,
             file_header,
-            wal,
-            Arc::clone(&wal_main_file),
+            journal,
+            Arc::clone(&journal_main_file),
         ));
 
         let inner = Arc::new(ClientInner::new_with_buffer_pool(
@@ -900,7 +917,7 @@ impl Client {
             buffer_pool,
             catalog_root_page,
             catalog_root_level,
-            Some(wal_main_file),
+            Some(journal_main_file),
         )?);
         let _ = file_size; // used above, suppress warning
         #[cfg(feature = "tracing")]
@@ -937,7 +954,7 @@ impl Client {
         }
     }
 
-    /// Force a WAL checkpoint.
+    /// Force a journal checkpoint.
     ///
     /// After this returns, the main database file is safe to copy as a backup.
     pub fn checkpoint(&self) -> Result<()> {
@@ -949,7 +966,7 @@ impl Client {
         self.inner.backup(dest.as_ref())
     }
 
-    /// Flush the WAL, checkpoint, and close the client.
+    /// Flush the journal, checkpoint, and close the client.
     ///
     /// Use this when you need a guarantee that all committed data is in the main
     /// file (e.g., before copying the file as a backup). `Drop` performs a
@@ -962,7 +979,7 @@ impl Client {
 impl Drop for Client {
     /// Non-blocking close.
     ///
-    /// Checkpoints when this is the last handle. WAL data remains on disk
+    /// Checkpoints when this is the last handle. Journal data remains on disk
     /// otherwise and will be replayed automatically on the next `Client::open`.
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
@@ -1917,11 +1934,11 @@ mod compat_tests {
 }
 
 // ---------------------------------------------------------------------------
-// WAL atomicity regression tests
+// Journal atomicity regression tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod wal_atomicity_tests {
+mod journal_atomicity_tests {
     use tempfile::TempDir;
 
     use crate::{

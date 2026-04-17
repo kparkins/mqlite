@@ -196,7 +196,7 @@ struct ServerState {
     next_connection_id: Arc<AtomicI32>,
 
     /// Path to the database file.
-    /// Used to locate the WAL file (`<path>-wal`) for `serverStatus`.
+    /// Used to locate the journal file (`<path>-journal`) for `serverStatus`.
     db_path: Option<std::path::PathBuf>,
 
     /// `topologyVersion.processId` — a random [`ObjectId`] generated once at
@@ -274,17 +274,17 @@ impl ServerState {
         self.start_time.elapsed().as_secs() as i64
     }
 
-    /// Return the size of the WAL file in bytes, or 0 if absent.
-    fn wal_file_size(&self) -> u64 {
-        let wal_path = match &self.db_path {
+    /// Return the size of the journal file in bytes, or 0 if absent.
+    fn journal_file_size(&self) -> u64 {
+        let journal_path = match &self.db_path {
             Some(p) => {
                 let mut s = p.as_os_str().to_owned();
-                s.push("-wal");
+                s.push("-journal");
                 std::path::PathBuf::from(s)
             }
             None => return 0,
         };
-        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&journal_path).map(|m| m.len()).unwrap_or(0)
     }
 
     /// Total number of connections that have been opened since server start.
@@ -905,18 +905,18 @@ fn handle_build_info() -> Document {
 
 /// `serverStatus` — runtime diagnostic statistics.
 ///
-/// Returns uptime, WAL file size, connection count, and placeholder buffer pool
+/// Returns uptime, journal file size, connection count, and placeholder buffer pool
 /// stats sourced from internal server state (not the public `stats()` API,
 /// which is deferred to Phase 2 per api.md).
 ///
 /// Data sources:
 /// - **uptime**: elapsed seconds since `WireProtocol::bind()`.
-/// - **WAL size**: `std::fs::metadata("<db>-wal")?.len()` — best-effort, 0 if absent.
+/// - **journal size**: `std::fs::metadata("<db>-journal")?.len()` — best-effort, 0 if absent.
 /// - **connections.current**: approximate (counts connections opened, not live ones).
 /// - **buffer pool**: placeholder zeros (pool instrumentation is Phase 2).
 fn handle_server_status(state: &ServerState) -> Document {
     let uptime_secs = state.uptime_secs();
-    let wal_size = state.wal_file_size() as i64;
+    let journal_size = state.journal_file_size() as i64;
     let total_conns = state.total_connections();
 
     doc! {
@@ -939,9 +939,9 @@ fn handle_server_status(state: &ServerState) -> Document {
             "supportsCommittedReads": false,
             "readOnly": false,
         },
-        // WAL-based storage stats.
+        // Journal-based storage stats.
         "mqlite": {
-            "walFileSizeBytes": wal_size,
+            "journalFileSizeBytes": journal_size,
         },
         // Placeholder buffer pool stats (Phase 2: pool instrumentation).
         "bufferPool": {
@@ -970,7 +970,7 @@ fn handle_list_databases(state: &ServerState) -> Document {
     // Remove internal engine namespaces that are not user databases.
     db_set.remove("$");
 
-    let size_on_disk = state.wal_file_size() as i64;
+    let size_on_disk = state.journal_file_size() as i64;
 
     let databases: bson::Array = db_set
         .into_iter()

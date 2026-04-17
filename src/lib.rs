@@ -74,16 +74,16 @@
 //!
 //! ```text
 //! Client::open("myapp.mqlite")
-//!   ├─ Creates myapp.mqlite        (main database file)
-//!   ├─ Creates myapp.mqlite-wal    (write-ahead log; accumulates writes)
-//!   └─ Creates myapp.mqlite-shm   (WAL shared-memory index; deleted on clean close)
+//!   ├─ Creates myapp.mqlite            (main database file)
+//!   ├─ Creates myapp.mqlite-journal    (write-ahead journal; accumulates writes)
+//!   └─ Creates myapp.mqlite-shm       (journal shared-memory index; deleted on clean close)
 //!
 //! Client::close(self)             (blocking flush + checkpoint)
-//!   └─ myapp.mqlite-wal is checkpointed into myapp.mqlite and removed
+//!   └─ myapp.mqlite-journal is checkpointed into myapp.mqlite and removed
 //!      → "single file" state
 //!
 //! drop(client)                    (non-blocking)
-//!   └─ myapp.mqlite-wal remains on disk
+//!   └─ myapp.mqlite-journal remains on disk
 //!      → Replayed automatically on next Client::open
 //! ```
 //!
@@ -132,7 +132,7 @@ mod storage_engine;
 mod update_operators;
 mod validation;
 #[allow(dead_code)]
-mod wal;
+mod journal;
 
 // Wire protocol shim (feature-gated)
 #[cfg(feature = "wire")]

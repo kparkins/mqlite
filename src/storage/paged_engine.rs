@@ -390,7 +390,7 @@ impl BpBackend {
     /// Run `f` inside a WAL transaction boundary.
     ///
     /// On `Ok`: flushes dirty pages (they land in the WAL as non-commit frames
-    /// via `WalLayeredSource`), then emits a final commit frame tagged with
+    /// via `JournalLayeredSource`), then emits a final commit frame tagged with
     /// `total_page_count` so recovery knows the txn is durable.
     ///
     /// On `Err`: truncates the WAL back to the snapshot cursor and drops all

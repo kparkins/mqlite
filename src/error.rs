@@ -191,6 +191,21 @@ pub enum Error {
         /// Human-readable suggestion listing supported alternatives.
         suggestion: String,
     },
+
+    /// The journal file's magic bytes or format version does not match what this build supports.
+    /// Typically produced when opening a pre-T1 database whose stale `-wal` sidecar is still on
+    /// disk, or a T1+ journal from a future format version.
+    #[error(
+        "UnsupportedJournalFormat: found magic {found:?}, expected {expected:?}.\n\
+         The journal sidecar on disk does not match what this build of mqlite supports. \
+         This typically means the database was created by an older or newer mqlite version."
+    )]
+    UnsupportedJournalFormat {
+        /// Magic bytes found in the on-disk journal (or legacy `-wal`) sidecar.
+        found: [u8; 4],
+        /// Magic bytes this build expects (`MQJL`).
+        expected: [u8; 4],
+    },
 }
 
 impl Error {

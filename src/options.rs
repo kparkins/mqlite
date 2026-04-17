@@ -49,10 +49,10 @@ pub struct OpenOptions {
     pub buffer_pool_size: usize,
     /// Durability mode. Default: `Interval(100ms)`.
     pub durability: DurabilityMode,
-    /// WAL auto-checkpoint threshold in pages. Default: 1000.
-    pub wal_auto_checkpoint: u32,
-    /// WAL max size in bytes before forced checkpoint. Default: 100MB.
-    pub wal_max_size: u64,
+    /// Journal auto-checkpoint threshold in pages. Default: 1000.
+    pub journal_auto_checkpoint: u32,
+    /// Journal max size in bytes before forced checkpoint. Default: 100MB.
+    pub journal_max_size: u64,
     /// Timeout for acquiring the writer lock. Default: 5 seconds.
     /// Set to `Duration::ZERO` for immediate failure (SQLite-style SQLITE_BUSY).
     pub busy_timeout: Duration,
@@ -73,8 +73,8 @@ impl Default for OpenOptions {
         OpenOptions {
             buffer_pool_size: 64 * 1024 * 1024, // 64MB
             durability: DurabilityMode::default(),
-            wal_auto_checkpoint: 1000,
-            wal_max_size: 100 * 1024 * 1024, // 100MB
+            journal_auto_checkpoint: 1000,
+            journal_max_size: 100 * 1024 * 1024, // 100MB
             busy_timeout: Duration::from_secs(5),
             busy_handler: None,
             read_only: false,
@@ -102,15 +102,15 @@ impl OpenOptions {
         self
     }
 
-    /// Set the WAL auto-checkpoint threshold in pages.
-    pub fn wal_auto_checkpoint(mut self, pages: u32) -> Self {
-        self.wal_auto_checkpoint = pages;
+    /// Set the journal auto-checkpoint threshold in pages.
+    pub fn journal_auto_checkpoint(mut self, pages: u32) -> Self {
+        self.journal_auto_checkpoint = pages;
         self
     }
 
-    /// Set the maximum WAL size in bytes before a forced checkpoint.
-    pub fn wal_max_size(mut self, bytes: u64) -> Self {
-        self.wal_max_size = bytes;
+    /// Set the maximum journal size in bytes before a forced checkpoint.
+    pub fn journal_max_size(mut self, bytes: u64) -> Self {
+        self.journal_max_size = bytes;
         self
     }
 

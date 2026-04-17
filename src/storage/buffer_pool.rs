@@ -480,7 +480,7 @@ impl BufferPool {
     /// Discard all dirty, unpinned frames in both partitions without writing
     /// them to disk.
     ///
-    /// Called by the WAL rollback path after [`WalManager::truncate_to`] so
+    /// Called by the journal rollback path after [`crate::journal::JournalManager::truncate_to`] so
     /// that stale in-memory writes are not mistaken for committed data.
     pub(crate) fn drop_all_dirty(&self) -> Result<()> {
         self.inner_4k
