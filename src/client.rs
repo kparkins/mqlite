@@ -987,6 +987,21 @@ impl Client {
     pub fn close(self) -> Result<()> {
         self.inner.checkpoint()
     }
+
+    /// Test-only accessor for the MVCC `ReadViewRegistry` backing this client.
+    ///
+    /// Exposed for integration tests (plan §T9 `drop_collection` barrier
+    /// verification) that need to register external `ReadView`s and watch
+    /// them get force-expired on the engine's drop path. Returns `None`
+    /// when the client has no attached buffer pool (legacy in-memory
+    /// engines that predate the MVCC rollout).
+    #[doc(hidden)]
+    pub fn __read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
+        self.inner
+            .buffer_pool
+            .as_ref()
+            .map(|bp| Arc::clone(bp.read_view_registry()))
+    }
 }
 
 impl Drop for Client {

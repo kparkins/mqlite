@@ -2037,6 +2037,17 @@ impl StorageEngine for PagedEngine {
     fn drop_namespace(&self, ns: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let bp = &mut *inner;
+        // Plan §T9 drop_collection barrier: force-expire ALL active
+        // ReadViews GLOBALLY before `free_subtree` walks the leaves. In
+        // v1 ReadViews are collection-agnostic, so any open reader could
+        // observe this collection at its `read_ts`. `force_expire_all`
+        // flips `poisoned = true` then spins per-view until
+        // `pin_ops_in_flight == 0`, guaranteeing no concurrent pin walk
+        // touches the about-to-be-freed leaves. The writer mutex
+        // (position 6) is held around the barrier to block any
+        // `WriteTxn::begin` / `ReadView::open` from interleaving between
+        // the drain and the tree-freeing step.
+        bp.handle.read_view_registry().force_expire_all();
         bp.with_txn(|bp| {
                 // Collect page-root info from the catalog before removing entries.
                 // We need this to free the B+ tree pages after the catalog entries

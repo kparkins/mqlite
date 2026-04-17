@@ -172,35 +172,86 @@ Opening a `ReadView` inserts into the registry. Dropping a `ReadView` removes it
 
 ## Required Changes Summary
 
-### Phase 1 — Foundation
+> **Status as of 2026-04-16**: All phases below shipped across commits T0…T9
+> on the MVCC branch. See `docs/adr/0001-mvcc.md` for the accepted ADR, and
+> `.omc/plans/mvcc-wiredtiger.md` for the task-by-task acceptance evidence.
 
-1. **Rename WAL → Journal** (mechanical rename, no behavior change). All references to `WalManager`, `wal_file`, `wal_path`, `-wal` suffix updated throughout.
+### Phase 1 — Foundation (shipped T0/T1/T2)
 
-2. **Add `src/mvcc/` module** with:
-   - `timestamp.rs` — `TimestampOracle` (`AtomicU64`)
-   - `version.rs` — `VersionEntry`, `VersionChain`
-   - `read_view.rs` — `ReadView`, `ReadViewRegistry`
-   - `transaction.rs` — `WriteTxn`
+1. **WAL → Journal rename** — `src/journal/` is the sole survivor of the
+   old `src/wal/` tree; the `-wal` sidecar is renamed on open for
+   backwards compatibility with pre-T0 database files.
 
-3. **Add `version_chains` to `BufferPool` page frames** (`src/storage/buffer_pool.rs`). Each `PageFrame` gains `version_chains: HashMap<Vec<u8>, VecDeque<VersionEntry>>`. This is the most invasive single change.
+2. **`src/mvcc/` module** ships with:
+   - `timestamp.rs` — HLC oracle `Ts { physical_ms, logical }`,
+     floored on open to the successor of the last durable commit.
+   - `version.rs` — `VersionEntry`, `OverflowRef` (RAII decref),
+     `VersionData::{Inline, Overflow}`.
+   - `read_view.rs` — `ReadView` with `poisoned` / `pin_ops_in_flight`
+     atomics, `ReadViewRegistry` keyed by `txn_id` holding `Weak<ReadView>`
+     slots, `ChainSnapshot` (S13 atomic-handoff pin protocol).
+   - `transaction.rs` — `WriteTxn::begin` drains the deferred-free queue
+     before allocating; staged primary + sec-index writes commit under a
+     single `commit_ts`.
+   - `deferred_free.rs` — writer-drained queue of overflow first-pages
+     whose refcount hit zero on the reader path.
 
-### Phase 2 — Read Path
+3. **`version_chains` on buffer-pool frames** — each `PageFrame` owns its
+   per-user-key version chains; reconciliation on eviction walks them
+   against `ReadViewRegistry::oldest_required_ts()`.
 
-4. **Add `ReadView` parameter to `BTree` read methods** (`src/storage/btree.rs`). `get(key, view: &ReadView)` and `range_scan(start, end, view: &ReadView)` walk the page frame's version chain before returning a cell value.
+### Phase 2 — Read Path (shipped T3/T3.5/T3.75/T5')
 
-5. **Remove `RwLock` read path from `PagedEngine`** (`src/storage/paged_engine.rs`). `find`, `find_one`, `count`, `list_indexes` no longer acquire `inner.read()`. They open a `ReadView`, read using the view, close the view. Writers still acquire `inner.write()` for serialization of the write path (until write-write conflict detection is added).
+4. **`ReadView` threaded through BTree reads** — `get` / `range_scan` walk
+   the chain for visibility before falling back to the history store.
+   The split-migration and merge-path guards landed at
+   `src/storage/btree.rs:1281,1308` (T3.5).
 
-### Phase 3 — Write Path
+5. **RwLock read path removed from `PagedEngine`** (T5'). `find`,
+   `find_one`, `count`, `list_indexes`, `aggregate` open a `ReadView`,
+   read lock-free, and drop the view. Writers acquire only the writer
+   serialization mutex (position 6).
 
-6. **Add `WriteTxn` to `BpBackend::with_txn`** (`src/storage/paged_engine.rs`). Writes buffer `VersionEntry` values with `stop_ts = u64::MAX` (pending). On commit, assign `commit_ts` from the oracle, finalize entries, set `stop_ts` on the previous head of each chain.
+### Phase 3 — Write Path (shipped T5'/T6)
 
-7. **Add reconciliation to buffer pool eviction** (`src/storage/buffer_pool.rs`). Before writing a dirty page to the journal, reconcile its version chains against `oldest_required_ts` from the `ReadViewRegistry`.
+6. **`WriteTxn` on `BpBackend::with_txn`** — staged primary + sec-index
+   writes plus refcount deltas for overflow pins are atomically stamped
+   with the same `commit_ts` (no half-committed witness).
 
-### Phase 4 — History Store & GC
+7. **Reconciliation on eviction** — `BufferPool::reconcile_frame_at`
+   drops versions older than `oldest_required_ts` and pushes cold
+   entries into the history store before the page flushes to the
+   journal.
 
-8. **Add `src/storage/history_store.rs`**. A single B-tree with `(ns_id, doc_id, start_ts)` keys. Version chain eviction pushes old entries here. `ReadView` probes here on cache miss.
+### Phase 4 — History Store & GC (shipped T7/T8)
 
-9. **Add GC pass** triggered after checkpoint or when history store exceeds a size threshold. Deletes entries with `stop_ts <= oldest_required_ts`.
+8. **`src/storage/history_store.rs`** — a dedicated B-tree keyed by
+   `(ns_id, kind, user_key, start_ts_BE)`. Readers probe it on chain
+   miss; kind-tagging keeps primary and sec-index entries disjoint.
+
+9. **GC pass** — runs from `checkpoint()` against
+   `ReadViewRegistry::oldest_required_ts()`; deletes entries whose
+   `stop_ts <= oldest_required_ts`.
+
+### Phase 5 — Barriers, counters, ADR (shipped T8/T9)
+
+10. **12 mandatory + 5 diagnostic MVCC counters** wired through the
+    metrics surface (`mvcc.reconcile.*`, `mvcc.history_store.*`,
+    `mvcc.read_view.*`, `overflow.pages_in_use`, …). Four deferred
+    sampling sites are listed in ADR 0001 §6.
+
+11. **`drop_collection` force-expire barrier** (T9) — acquires writer
+    serialization (6), force-expires every live `ReadView` via the
+    registry (5), waits for `pin_ops_in_flight == 0`, then invokes
+    `free_subtree` under the same writer serialization. Post-barrier,
+    pre-opened views surface `Error::ReadViewExpired` on next use.
+
+12. **Feature flag removed.** `feature = "mvcc"` no longer exists —
+    MVCC is unconditional. Verified by `rg 'feature = "mvcc"'` → 0
+    matches in `Cargo.toml`, `src/`, and `tests/`.
+
+13. **ADR 0001 accepted** — see `docs/adr/0001-mvcc.md` for decision
+    record, lock order, alternatives, and post-v1 deferred items.
 
 ---
 

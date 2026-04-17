@@ -56,7 +56,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use crate::mvcc::metrics;
@@ -125,16 +125,37 @@ impl ReadView {
     /// `oldest_required_ts()` horizon.
     ///
     /// T4 adds only the primitive; T5' wires real reader paths through
-    /// this entry point.
+    /// this entry point. T9 upgrades the registry slot to also track a
+    /// `Weak<ReadView>` so `drop_collection`'s barrier can iterate live
+    /// views and force-expire them.
     pub fn open(registry: Arc<ReadViewRegistry>, read_ts: Ts, txn_id: u64) -> Arc<Self> {
-        registry.register(txn_id, read_ts);
-        Arc::new(Self {
+        let view = Arc::new(Self {
             read_ts,
             txn_id,
             poisoned: AtomicBool::new(false),
             pin_ops_in_flight: AtomicU32::new(0),
-            registry: Some(registry),
-        })
+            registry: Some(Arc::clone(&registry)),
+        });
+        registry.register(txn_id, read_ts, Arc::downgrade(&view));
+        view
+    }
+
+    /// True iff this view has been force-expired (plan §T9). Readers MUST
+    /// check this before acting on a cached `ReadView`; the engine returns
+    /// `Error::ReadViewExpired` on any subsequent operation.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Return `Err(Error::ReadViewExpired)` if this view has been
+    /// force-expired, else `Ok(())`. Called at the top of reader paths
+    /// that want to surface the expiry as a user-visible error.
+    pub fn check_active(&self) -> crate::error::Result<()> {
+        if self.is_poisoned() {
+            Err(crate::error::Error::ReadViewExpired)
+        } else {
+            Ok(())
+        }
     }
 
     /// Force-expire. Iter-4 "subtraction" force-expiry: we DO NOT walk any
@@ -226,7 +247,15 @@ impl Drop for ReadView {
 /// at the top of this file. `oldest_required_ts()` must be snapshotted
 /// BEFORE any partition mutex is acquired in a reconciliation path.
 pub struct ReadViewRegistry {
-    inner: Mutex<BTreeMap<u64, Ts>>,
+    inner: Mutex<BTreeMap<u64, RegistrySlot>>,
+}
+
+/// Registry entry: the view's `read_ts` plus a `Weak` back-pointer used
+/// by `force_expire_all` (plan §T9) to iterate live views. `Weak` avoids
+/// keeping the view alive past the caller's last `Arc` reference.
+struct RegistrySlot {
+    read_ts: Ts,
+    view: Weak<ReadView>,
 }
 
 impl std::fmt::Debug for ReadViewRegistry {
@@ -246,12 +275,13 @@ impl ReadViewRegistry {
         })
     }
 
-    /// Insert `(txn_id → read_ts)`. Overwrites any prior entry for the
-    /// same `txn_id` (callers must keep `txn_id` unique across concurrently
-    /// live views). Refreshes `mvcc.active_read_views` gauge.
-    pub fn register(&self, txn_id: u64, read_ts: Ts) {
+    /// Insert `(txn_id → read_ts, Weak<ReadView>)`. Overwrites any prior
+    /// entry for the same `txn_id` (callers must keep `txn_id` unique
+    /// across concurrently live views). Refreshes
+    /// `mvcc.active_read_views` gauge.
+    pub(crate) fn register(&self, txn_id: u64, read_ts: Ts, view: Weak<ReadView>) {
         let mut guard = self.inner.lock().unwrap();
-        guard.insert(txn_id, read_ts);
+        guard.insert(txn_id, RegistrySlot { read_ts, view });
         metrics::set_active_read_views(guard.len() as u64);
     }
 
@@ -266,7 +296,34 @@ impl ReadViewRegistry {
     /// Smallest `read_ts` across all live views, or `Ts::MAX` if empty.
     pub fn oldest_required_ts(&self) -> Ts {
         let guard = self.inner.lock().unwrap();
-        guard.values().copied().min().unwrap_or(Ts::MAX)
+        guard.values().map(|s| s.read_ts).min().unwrap_or(Ts::MAX)
+    }
+
+    /// Force-expire EVERY registered `ReadView` (plan §T9
+    /// `drop_collection` barrier). Snapshots all `Weak<ReadView>` handles
+    /// under the registry mutex, releases the mutex, then upgrades each
+    /// `Weak` and calls `force_expire` on any upgradable view — which
+    /// flips `poisoned` and spins until the view's `pin_ops_in_flight`
+    /// drains to zero.
+    ///
+    /// The snapshot-then-release pattern is required to avoid a reentrant
+    /// acquisition: `Arc::drop` of a view calls `registry.unregister`
+    /// which would re-enter this mutex. By dropping the upgraded `Arc`s
+    /// outside the mutex we guarantee no nested lock.
+    ///
+    /// Caller must hold the writer serialization mutex (position 6) to
+    /// prevent new `ReadView::open` races from observing a half-drained
+    /// state (plan line 1032).
+    pub fn force_expire_all(&self) {
+        let views: Vec<Weak<ReadView>> = {
+            let guard = self.inner.lock().unwrap();
+            guard.values().map(|s| s.view.clone()).collect()
+        };
+        for w in views {
+            if let Some(v) = w.upgrade() {
+                v.force_expire();
+            }
+        }
     }
 
     /// Number of live views. Mainly for tests / observability.

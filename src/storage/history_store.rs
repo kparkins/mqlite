@@ -786,6 +786,7 @@ mod tests {
     /// the delete-count invariant).
     #[test]
     fn gc_pass_deletes_exactly_the_expired_entries() {
+        let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
         let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
         // 10_000 entries keyed by (ns=1, KIND_PRIMARY, i-big-endian)
         // with distinct start_ts per entry. stop_ts == start_ts + 1 so
@@ -835,6 +836,7 @@ mod tests {
     /// looks stale by oracle time.
     #[test]
     fn gc_pass_respects_active_readview_horizon() {
+        let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
         let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
         // Reader's `ort = Ts{100,0}`. Two entries:
         //   A: stop_ts = 50 (expired — visible to no live reader)
@@ -885,6 +887,7 @@ mod tests {
     /// `pages_freed`.
     #[test]
     fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_deferred_free() {
+        let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
         use crate::storage::allocator::AllocatorHandle;
         use crate::storage::header::FileHeader;
         use std::sync::Arc;
@@ -939,6 +942,7 @@ mod tests {
     /// the scan found nothing to delete.
     #[test]
     fn gc_pass_noop_still_ticks_counter() {
+        let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
         let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
         hs.insert(
             1,

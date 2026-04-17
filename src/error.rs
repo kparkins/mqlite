@@ -231,6 +231,19 @@ pub enum Error {
          OverflowRef retention."
     )]
     RefcountOverflow,
+
+    /// The `ReadView` has been force-expired by the engine.
+    ///
+    /// Returned when a reader tries to use a `ReadView` whose `poisoned`
+    /// flag was set by `ReadViewRegistry::force_expire_all` — e.g. during
+    /// a `drop_collection` barrier (plan §T9). The caller must open a new
+    /// `ReadView` to continue reading.
+    #[error(
+        "ReadViewExpired — this ReadView was force-expired by the engine \
+         (drop_collection barrier or forced expiry). Open a new ReadView \
+         to continue reading."
+    )]
+    ReadViewExpired,
 }
 
 impl Error {

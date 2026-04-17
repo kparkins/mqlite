@@ -332,6 +332,14 @@ pub fn reset_history_store_gc_passes() {
     HISTORY_STORE_GC_PASSES_TOTAL.store(0, Ordering::Relaxed);
 }
 
+/// Test-only serialization lock shared by every test that resets and asserts
+/// on `HISTORY_STORE_GC_PASSES_TOTAL`. Because tests run in parallel within a
+/// single process, concurrent reset-then-assert sequences on the same global
+/// counter race. All tests that reset this counter must hold this mutex for
+/// the duration of their reset → record → snapshot sequence.
+#[cfg(test)]
+pub(crate) static GC_PASSES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ===========================================================================
 // D1 — mvcc.reconcile.duration_ms_p99  (gauge, diagnostic)
 // ===========================================================================
@@ -584,6 +592,7 @@ mod tests {
 
     #[test]
     fn history_store_gc_passes_counter() {
+        let _lock = GC_PASSES_TEST_LOCK.lock().unwrap();
         reset_history_store_gc_passes();
         record_history_store_gc_pass();
         assert_eq!(history_store_gc_passes_snapshot(), 1);

@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 /// # let client = Client::open(dir.path().join("db.mqlite"))?;
 /// # let db = client.database("test");
 /// # let col = db.collection::<bson::Document>("orders");
-/// let cursor = col.find(doc! { "status": "pending" })?;
+/// let cursor = col.find(doc! { "status": "pending" }).run()?;
 /// let plan = cursor.explain()?;
 /// println!("Plan: {}", plan.plan);
 /// println!("Index used: {:?}", plan.index_used);
@@ -57,7 +57,7 @@ pub struct ExplainResult {
 /// # let client = Client::open(dir.path().join("db.mqlite"))?;
 /// # let db = client.database("test");
 /// # let collection = db.collection::<bson::Document>("users");
-/// let cursor = collection.find(doc! {})?;
+/// let cursor = collection.find(doc! {}).run()?;
 /// for result in cursor {
 ///     let doc = result?;
 ///     println!("{:?}", doc);
@@ -156,7 +156,7 @@ impl<T> Cursor<T> {
     /// # let client = Client::open(dir.path().join("db.mqlite"))?;
     /// # let db = client.database("test");
     /// # let col = db.collection::<bson::Document>("logs");
-    /// let cursor = col.find(doc! { "level": "error" })?;
+    /// let cursor = col.find(doc! { "level": "error" }).run()?;
     /// let plan = cursor.explain()?;
     /// assert_eq!(plan.full_scan, true);
     /// assert!(plan.index_used.is_none());
