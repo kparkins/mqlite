@@ -43,6 +43,7 @@ use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
 use crate::key_encoding::{encode_compound_key, COMPOUND_SEP};
+use crate::mvcc::transaction::{SecIndexOp, WriteTxn};
 use crate::storage::btree::{BTree, BTreePageStore, CellValue};
 use crate::storage::catalog::IndexEntry;
 
@@ -248,23 +249,28 @@ pub(crate) fn check_unique_constraint<S: BTreePageStore>(
 // Core index maintenance operations
 // ---------------------------------------------------------------------------
 
-/// Insert index entries for a newly inserted document.
+/// Stage index-insert entries for a newly inserted document (MVCC T5').
+///
+/// Runtime runtime path: keys are computed, unique-constraint pre-check runs
+/// against the durable `index_tree`, and the resulting writes are staged into
+/// the active `WriteTxn`. The `install_pending_sec_index` pass at commit time
+/// drains the buffer and performs the actual `BTree::insert` on each key.
 ///
 /// Returns `true` if the document triggered multikey behaviour (i.e. the index
-/// metadata's `multikey` flag should be set to `true`).
-///
-/// For **sparse** indexes, documents missing the indexed field(s) are silently
-/// skipped.
+/// metadata's `multikey` flag should be set to `true`). For **sparse** indexes,
+/// documents missing the indexed field(s) are silently skipped.
 ///
 /// # Errors
 ///
 /// - `Error::DuplicateKey` if `index_entry.unique` and the secondary key
-///   already exists for a different document.
+///   already exists for a different document (either in the durable tree or
+///   already staged by this same txn).
 pub(crate) fn update_index_on_insert<S: BTreePageStore>(
     doc: &Document,
     doc_id: &Bson,
-    index_tree: &mut BTree<S>,
+    index_tree: &BTree<S>,
     index_entry: &IndexEntry,
+    txn: &mut WriteTxn,
 ) -> Result<bool> {
     let (keys, is_multikey) =
         build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
@@ -288,61 +294,134 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
             })
             .collect();
         check_unique_constraint(index_tree, &index_entry.key_pattern, &field_values, doc_id)?;
+        // In-txn conflict: a prior `stage_sec_index_insert` on the same
+        // index whose key falls within this doc's unique prefix range
+        // claims the same unique slot. Secondary keys are
+        // `compound_field_vals | COMPOUND_SEP | _id`, so compare by
+        // prefix (field values only), not full key equality — the `_id`
+        // suffix differs when two distinct docs collide on a unique field.
+        let (range_start, range_end) = unique_range(&field_values);
+        for pending in &txn.pending_sec_index {
+            if pending.index_root_page == index_entry.root_page
+                && matches!(pending.op, SecIndexOp::Insert { .. })
+                && pending.key.as_slice() >= range_start.as_slice()
+                && pending.key.as_slice() < range_end.as_slice()
+            {
+                return Err(Error::DuplicateKey {
+                    detail: format!(
+                        "unique index '{}' — in-txn conflict",
+                        index_entry.name
+                    ),
+                });
+            }
+        }
     }
 
     // Serialize _id once; reused for every key (multikey may have several).
     let id_bytes = bson::to_vec(&bson::doc! { "_id": doc_id.clone() })
         .map_err(Error::BsonSerialization)?;
 
+    // Multikey arrays can emit duplicate compound keys (e.g. `["a", "a"]`);
+    // the legacy direct-write path silently swallowed these via `Err(Dup)`
+    // on the second insert. In the staged model we dedupe up front so the
+    // commit-time install doesn't see duplicates from the same doc.
+    let staged_keys: Vec<Vec<u8>> = if is_multikey {
+        let mut seen = std::collections::HashSet::new();
+        keys.into_iter().filter(|k| seen.insert(k.clone())).collect()
+    } else {
+        keys
+    };
+
+    for key in staged_keys {
+        txn.stage_sec_index_insert(index_entry.root_page, key, id_bytes.clone());
+    }
+
+    Ok(is_multikey)
+}
+
+/// Stage index-delete entries for a deleted document (MVCC T5').
+///
+/// Idempotent at install time: a delete of an already-absent key is silently
+/// swallowed by the commit-time install pass.
+pub(crate) fn update_index_on_delete(
+    doc: &Document,
+    doc_id: &Bson,
+    index_entry: &IndexEntry,
+    txn: &mut WriteTxn,
+) -> Result<()> {
+    let (keys, _) =
+        build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
+
+    for key in keys {
+        txn.stage_sec_index_delete(index_entry.root_page, key);
+    }
+    Ok(())
+}
+
+/// Stage index-update entries when a document is replaced (MVCC T5').
+///
+/// Stages the old document's keys for deletion, then the new document's
+/// keys for insertion. The commit-time install pass runs them in order so
+/// the net effect is an overwrite; when `old_key == new_key` the delete +
+/// insert pair reduces to the new value.
+pub(crate) fn update_index_on_update<S: BTreePageStore>(
+    old_doc: &Document,
+    new_doc: &Document,
+    old_id: &Bson,
+    new_id: &Bson,
+    index_tree: &BTree<S>,
+    index_entry: &IndexEntry,
+    txn: &mut WriteTxn,
+) -> Result<bool> {
+    update_index_on_delete(old_doc, old_id, index_entry, txn)?;
+    update_index_on_insert(new_doc, new_id, index_tree, index_entry, txn)
+}
+
+/// Direct-insert variant used by `build_index` (one-shot index build during
+/// `create_index`). Unlike `update_index_on_insert`, this mutates the tree
+/// in place rather than staging through a `WriteTxn` — a full-collection
+/// build would otherwise accumulate every document's key in
+/// `pending_sec_index` for one monolithic install, which is wasteful when
+/// the tree is empty and no concurrent readers exist.
+fn update_index_on_insert_direct<S: BTreePageStore>(
+    doc: &Document,
+    doc_id: &Bson,
+    index_tree: &mut BTree<S>,
+    index_entry: &IndexEntry,
+) -> Result<bool> {
+    let (keys, is_multikey) =
+        build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
+
+    if keys.is_empty() {
+        return Ok(false);
+    }
+
+    if index_entry.unique && !is_multikey {
+        let null_bson = Bson::Null;
+        let field_values: Vec<(&Bson, bool)> = index_entry
+            .key_pattern
+            .iter()
+            .map(|(field, dir)| {
+                let ascending = !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
+                let val = extract_field_value(doc, field).unwrap_or(&null_bson);
+                (val, ascending)
+            })
+            .collect();
+        check_unique_constraint(index_tree, &index_entry.key_pattern, &field_values, doc_id)?;
+    }
+
+    let id_bytes = bson::to_vec(&bson::doc! { "_id": doc_id.clone() })
+        .map_err(Error::BsonSerialization)?;
+
     for key in &keys {
         match index_tree.insert(key, &id_bytes) {
             Ok(()) => {}
-            // Duplicate array elements produce the same compound key; silently skip.
             Err(Error::DuplicateKey { .. }) if is_multikey => {}
             Err(e) => return Err(e),
         }
     }
 
     Ok(is_multikey)
-}
-
-/// Remove index entries for a deleted document.
-///
-/// Silently ignores entries that are already absent (idempotent).
-pub(crate) fn update_index_on_delete<S: BTreePageStore>(
-    doc: &Document,
-    doc_id: &Bson,
-    index_tree: &mut BTree<S>,
-    index_entry: &IndexEntry,
-) -> Result<()> {
-    let (keys, _) = build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
-
-    for key in &keys {
-        index_tree.delete(key)?;
-    }
-    Ok(())
-}
-
-/// Update index entries when a document is replaced or modified in place.
-///
-/// Removes the old document's entries, then inserts the new document's entries.
-///
-/// Returns `true` if the updated document triggered multikey behaviour.
-///
-/// # Errors
-///
-/// - `Error::DuplicateKey` if `index_entry.unique` and the new secondary key
-///   already belongs to a different document.
-pub(crate) fn update_index_on_update<S: BTreePageStore>(
-    old_doc: &Document,
-    new_doc: &Document,
-    old_id: &Bson,
-    new_id: &Bson,
-    index_tree: &mut BTree<S>,
-    index_entry: &IndexEntry,
-) -> Result<bool> {
-    update_index_on_delete(old_doc, old_id, index_tree, index_entry)?;
-    update_index_on_insert(new_doc, new_id, index_tree, index_entry)
 }
 
 /// Build (or rebuild) a secondary index by scanning all documents in the
@@ -390,7 +469,8 @@ where
             Error::Internal("document missing '_id' field during index build".into())
         })?;
 
-        let is_multikey = update_index_on_insert(&doc, doc_id, index_tree, index_entry)?;
+        let is_multikey =
+            update_index_on_insert_direct(&doc, doc_id, index_tree, index_entry)?;
         if is_multikey {
             any_multikey = true;
         }
@@ -416,6 +496,67 @@ mod tests {
 
     fn fresh_tree() -> BTree<MemPageStore> {
         BTree::create(MemPageStore::new()).expect("create tree")
+    }
+
+    /// Drain a `WriteTxn`'s pending sec-index writes into `tree`, mirroring
+    /// the commit-time `install_pending_sec_index` pass. Lets tests keep
+    /// observable tree-state assertions after staging.
+    fn install_pending<S: BTreePageStore>(
+        txn: &mut WriteTxn,
+        tree: &mut BTree<S>,
+    ) -> Result<()> {
+        let writes = std::mem::take(&mut txn.pending_sec_index);
+        for w in writes {
+            match w.op {
+                SecIndexOp::Insert { id_bytes } => {
+                    tree.insert(&w.key, &id_bytes)?;
+                }
+                SecIndexOp::Delete => {
+                    let _ = tree.delete(&w.key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage + install helper for insert tests.
+    fn stage_insert<S: BTreePageStore>(
+        doc: &Document,
+        doc_id: &Bson,
+        tree: &mut BTree<S>,
+        entry: &IndexEntry,
+    ) -> Result<bool> {
+        let mut txn = WriteTxn::new(0);
+        let r = update_index_on_insert(doc, doc_id, tree, entry, &mut txn)?;
+        install_pending(&mut txn, tree)?;
+        Ok(r)
+    }
+
+    /// Stage + install helper for delete tests.
+    fn stage_delete<S: BTreePageStore>(
+        doc: &Document,
+        doc_id: &Bson,
+        tree: &mut BTree<S>,
+        entry: &IndexEntry,
+    ) -> Result<()> {
+        let mut txn = WriteTxn::new(0);
+        update_index_on_delete(doc, doc_id, entry, &mut txn)?;
+        install_pending(&mut txn, tree)
+    }
+
+    /// Stage + install helper for update tests.
+    fn stage_update<S: BTreePageStore>(
+        old_doc: &Document,
+        new_doc: &Document,
+        old_id: &Bson,
+        new_id: &Bson,
+        tree: &mut BTree<S>,
+        entry: &IndexEntry,
+    ) -> Result<bool> {
+        let mut txn = WriteTxn::new(0);
+        let r = update_index_on_update(old_doc, new_doc, old_id, new_id, tree, entry, &mut txn)?;
+        install_pending(&mut txn, tree)?;
+        Ok(r)
     }
 
     fn make_index_entry(key_pattern: Document, unique: bool, sparse: bool) -> IndexEntry {
@@ -622,7 +763,7 @@ mod tests {
         let doc = doc! { "_id": id.clone(), "email": "a@test.com" };
         let entry = make_index_entry(doc! { "email": 1 }, false, false);
 
-        let multikey = update_index_on_insert(&doc, &id, &mut tree, &entry).unwrap();
+        let multikey = stage_insert(&doc, &id, &mut tree, &entry).unwrap();
         assert!(!multikey);
 
         // Verify the entry exists in the tree.
@@ -639,7 +780,7 @@ mod tests {
         let entry = make_index_entry(doc! { "tags": 1 }, false, false);
 
         // Should succeed even though two identical keys are produced.
-        let multikey = update_index_on_insert(&doc, &id, &mut tree, &entry).unwrap();
+        let multikey = stage_insert(&doc, &id, &mut tree, &entry).unwrap();
         assert!(multikey);
     }
 
@@ -650,7 +791,7 @@ mod tests {
         let doc = doc! { "_id": id.clone(), "name": "Alice" }; // no "score"
         let entry = make_index_entry(doc! { "score": 1 }, false, true /* sparse */);
 
-        let multikey = update_index_on_insert(&doc, &id, &mut tree, &entry).unwrap();
+        let multikey = stage_insert(&doc, &id, &mut tree, &entry).unwrap();
         assert!(!multikey);
 
         // Tree should be empty.
@@ -673,8 +814,8 @@ mod tests {
 
         let entry = make_index_entry(doc! { "email": 1 }, true /* unique */, false);
 
-        update_index_on_insert(&doc1, &id1, &mut tree, &entry).unwrap();
-        let result = update_index_on_insert(&doc2, &id2, &mut tree, &entry);
+        stage_insert(&doc1, &id1, &mut tree, &entry).unwrap();
+        let result = stage_insert(&doc2, &id2, &mut tree, &entry);
 
         assert!(
             matches!(result, Err(Error::DuplicateKey { .. })),
@@ -693,8 +834,8 @@ mod tests {
 
         let entry = make_index_entry(doc! { "email": 1 }, true, false);
 
-        update_index_on_insert(&doc1, &id1, &mut tree, &entry).unwrap();
-        update_index_on_insert(&doc2, &id2, &mut tree, &entry).unwrap(); // must succeed
+        stage_insert(&doc1, &id1, &mut tree, &entry).unwrap();
+        stage_insert(&doc2, &id2, &mut tree, &entry).unwrap(); // must succeed
     }
 
     #[test]
@@ -706,11 +847,64 @@ mod tests {
         let doc = doc! { "_id": id.clone(), "email": "a@test.com" };
         let entry = make_index_entry(doc! { "email": 1 }, true, false);
 
-        update_index_on_insert(&doc, &id, &mut tree, &entry).unwrap();
+        stage_insert(&doc, &id, &mut tree, &entry).unwrap();
         // Second insert (same _id): unique check passes, BTree DuplicateKey error.
-        let result = update_index_on_insert(&doc, &id, &mut tree, &entry);
+        let result = stage_insert(&doc, &id, &mut tree, &entry);
         // BTree-level duplicate, not a unique-constraint violation.
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // MVCC T5' — staging-specific behaviours (sub-step 5)
+    // -----------------------------------------------------------------------
+
+    /// In-txn conflict: two stage_insert calls with the same unique key in
+    /// the same txn must be caught by the `pending_sec_index` scan in
+    /// `update_index_on_insert` — the durable tree is still empty at that
+    /// point so `check_unique_constraint` would otherwise pass.
+    #[test]
+    fn staged_unique_in_txn_conflict() {
+        let tree = fresh_tree();
+        let entry = make_index_entry(doc! { "email": 1 }, true /* unique */, false);
+        let id1 = Bson::ObjectId(ObjectId::new());
+        let id2 = Bson::ObjectId(ObjectId::new());
+        let doc1 = doc! { "_id": id1.clone(), "email": "dup@test.com" };
+        let doc2 = doc! { "_id": id2.clone(), "email": "dup@test.com" };
+
+        let mut txn = WriteTxn::new(0);
+        update_index_on_insert(&doc1, &id1, &tree, &entry, &mut txn)
+            .expect("first insert stages cleanly");
+        let result = update_index_on_insert(&doc2, &id2, &tree, &entry, &mut txn);
+        assert!(
+            matches!(result, Err(Error::DuplicateKey { .. })),
+            "second staged insert with same unique key must fail as in-txn conflict"
+        );
+    }
+
+    /// Multikey dedupe happens at stage time via `HashSet`: duplicate array
+    /// elements (e.g. `tags: ["rust", "rust"]`) produce a single
+    /// `SecIndexWrite` in `pending_sec_index`, not two.
+    #[test]
+    fn staged_multikey_dedupe_single_pending_entry() {
+        let tree = fresh_tree();
+        let entry = make_index_entry(doc! { "tags": 1 }, false, false);
+        let id = Bson::Int32(1);
+        let doc = doc! { "_id": id.clone(), "tags": ["rust", "rust", "db"] };
+
+        let mut txn = WriteTxn::new(0);
+        let is_multikey = update_index_on_insert(&doc, &id, &tree, &entry, &mut txn)
+            .expect("stage multikey insert");
+        assert!(is_multikey);
+        assert_eq!(
+            txn.pending_sec_index.len(),
+            2,
+            "three array elems with one dup should yield two staged writes (rust, db)",
+        );
+        // All staged ops are Inserts targeting this index's root_page.
+        for w in &txn.pending_sec_index {
+            assert_eq!(w.index_root_page, entry.root_page);
+            assert!(matches!(w.op, SecIndexOp::Insert { .. }));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -724,8 +918,8 @@ mod tests {
         let doc = doc! { "_id": id.clone(), "email": "del@test.com" };
         let entry = make_index_entry(doc! { "email": 1 }, false, false);
 
-        update_index_on_insert(&doc, &id, &mut tree, &entry).unwrap();
-        update_index_on_delete(&doc, &id, &mut tree, &entry).unwrap();
+        stage_insert(&doc, &id, &mut tree, &entry).unwrap();
+        stage_delete(&doc, &id, &mut tree, &entry).unwrap();
 
         let all = tree.range_scan(None, None).unwrap();
         assert!(all.is_empty(), "entry should be removed after delete");
@@ -738,12 +932,12 @@ mod tests {
         let doc = doc! { "_id": id.clone(), "tags": ["a", "b", "c"] };
         let entry = make_index_entry(doc! { "tags": 1 }, false, false);
 
-        update_index_on_insert(&doc, &id, &mut tree, &entry).unwrap();
+        stage_insert(&doc, &id, &mut tree, &entry).unwrap();
 
         let before = tree.range_scan(None, None).unwrap();
         assert_eq!(before.len(), 3);
 
-        update_index_on_delete(&doc, &id, &mut tree, &entry).unwrap();
+        stage_delete(&doc, &id, &mut tree, &entry).unwrap();
 
         let after = tree.range_scan(None, None).unwrap();
         assert!(after.is_empty(), "all multikey entries should be removed");
@@ -761,8 +955,8 @@ mod tests {
         let new_doc = doc! { "_id": id.clone(), "email": "new@test.com" };
         let entry = make_index_entry(doc! { "email": 1 }, false, false);
 
-        update_index_on_insert(&old_doc, &id, &mut tree, &entry).unwrap();
-        update_index_on_update(&old_doc, &new_doc, &id, &id, &mut tree, &entry).unwrap();
+        stage_insert(&old_doc, &id, &mut tree, &entry).unwrap();
+        stage_update(&old_doc, &new_doc, &id, &id, &mut tree, &entry).unwrap();
 
         let all = tree.range_scan(None, None).unwrap();
         assert_eq!(all.len(), 1, "exactly one entry after update");
@@ -898,9 +1092,9 @@ mod tests {
         let doc2 = doc! { "_id": id2.clone(), "score": 100 };
         let doc3 = doc! { "_id": id3.clone(), "score": 200 };
 
-        update_index_on_insert(&doc1, &id1, &mut tree, &entry).unwrap();
-        update_index_on_insert(&doc2, &id2, &mut tree, &entry).unwrap();
-        update_index_on_insert(&doc3, &id3, &mut tree, &entry).unwrap();
+        stage_insert(&doc1, &id1, &mut tree, &entry).unwrap();
+        stage_insert(&doc2, &id2, &mut tree, &entry).unwrap();
+        stage_insert(&doc3, &id3, &mut tree, &entry).unwrap();
 
         // Use unique_range to scan all entries for score=100.
         let score_100 = Bson::Int32(100);

@@ -9,6 +9,7 @@
 //! See `.omc/plans/mvcc-wiredtiger.md` for the full design.
 
 pub mod deferred_free;
+pub mod metrics;
 pub mod read_view;
 pub mod timestamp;
 pub mod transaction;
@@ -17,10 +18,15 @@ pub mod version;
 #[allow(unused_imports)]
 pub use deferred_free::DeferredFreeQueue;
 #[allow(unused_imports)]
+pub use metrics::{
+    record_secondary_index_tombstone_hit, reset_secondary_index_tombstone_hits,
+    secondary_index_tombstone_hits_snapshot,
+};
+#[allow(unused_imports)]
 pub use read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
 #[allow(unused_imports)]
 pub use timestamp::{HlcState, TimestampOracle, Ts};
 #[allow(unused_imports)]
-pub use transaction::WriteTxn;
+pub(crate) use transaction::{PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite, WriteTxn};
 #[allow(unused_imports)]
 pub use version::{OverflowRef, VersionData, VersionEntry};

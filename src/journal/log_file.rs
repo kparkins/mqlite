@@ -636,6 +636,95 @@ impl ChainCommitFrame {
 }
 
 // ---------------------------------------------------------------------------
+// try_skip_chain_commit — scan retrofit helper (MVCC T5'/T6)
+// ---------------------------------------------------------------------------
+
+/// Peek at the current position and skip over a `ChainCommitFrame` if one is
+/// present, returning the number of bytes consumed.
+///
+/// Legacy `JournalFrameHeader` and `ChainCommitFrame` cohabit the same
+/// append-only log. Every scanner that iterates frames linearly must call
+/// this helper before falling through to `JournalFrameHeader::read`; a
+/// ChainCommit frame interpreted as a legacy header errors out on the
+/// `page_size` field (invalid) and corrupts any `truncate_to` / recovery
+/// scan.
+///
+/// ## Disambiguation
+///
+/// A legacy frame with `page_number == 2` has an identical first 4 bytes
+/// (`[2, 0, 0, 0]`) to a `ChainCommit` header prefix. To tell them apart
+/// without re-opening the format lock, this helper performs the full
+/// `ChainCommitFrame::decode` CRC check. Matching CRCs for a 32+ byte
+/// header on random legacy data is astronomically unlikely (~1 in 2^32).
+///
+/// ## Cursor semantics
+///
+/// - On `Ok(Some(n))`: the reader is positioned at the next frame, and `n`
+///   is the number of bytes the `ChainCommit` consumed.
+/// - On `Ok(None)`: the reader is restored to its original position. The
+///   caller proceeds to `JournalFrameHeader::read` as before.
+/// - On `Err`: the reader position is undefined; the caller should treat
+///   the scan as aborted.
+pub(crate) fn try_skip_chain_commit<R: Read + Seek>(
+    r: &mut R,
+    expected_salt1: u32,
+    expected_salt2: u32,
+) -> Result<Option<u64>> {
+    let start = r.stream_position().map_err(Error::Io)?;
+
+    // Read the fixed 32-byte header prefix first. Cheaper rejects happen
+    // in this prefix before we commit to reading a full variable-length
+    // frame.
+    let mut header = [0u8; CHAIN_COMMIT_FIXED_HEADER_LEN];
+    match r.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+            return Ok(None);
+        }
+        Err(e) => return Err(Error::Io(e)),
+    }
+
+    // Quick reject: frame_kind discriminant and reserved-zero bytes.
+    if header[0] != FRAME_KIND_CHAIN_COMMIT
+        || header[1] != 0
+        || header[2] != 0
+        || header[3] != 0
+    {
+        r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+        return Ok(None);
+    }
+
+    let total_frame_bytes =
+        u32::from_le_bytes(header[4..8].try_into().expect("4 bytes")) as usize;
+    // §A.2 minimum is 40 bytes (32 header + 4 write_count + 4 CRC).
+    if !(40..=CHAIN_COMMIT_MAX_FRAME_SIZE).contains(&total_frame_bytes) {
+        r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+        return Ok(None);
+    }
+
+    // Read the rest into a contiguous buffer for the full decode+CRC check.
+    let mut full = vec![0u8; total_frame_bytes];
+    full[..CHAIN_COMMIT_FIXED_HEADER_LEN].copy_from_slice(&header);
+    match r.read_exact(&mut full[CHAIN_COMMIT_FIXED_HEADER_LEN..]) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+            return Ok(None);
+        }
+        Err(e) => return Err(Error::Io(e)),
+    }
+
+    match ChainCommitFrame::decode(&full, expected_salt1, expected_salt2)? {
+        Some(_) => Ok(Some(total_frame_bytes as u64)),
+        None => {
+            r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -903,6 +992,97 @@ mod tests {
             ChainCommitFrame::decode(&bytes, frame.salt1, frame.salt2).unwrap().is_none(),
             "length prefix above MAX must reject before reading any count"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // try_skip_chain_commit — scan retrofit helper
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn try_skip_chain_commit_advances_past_valid_frame() {
+        let frame = sample_chain_commit();
+        let bytes = frame.encode().unwrap();
+        let mut cursor = std::io::Cursor::new(bytes.clone());
+        let n = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2)
+            .unwrap()
+            .expect("valid frame must be skipped");
+        assert_eq!(n as usize, bytes.len());
+        assert_eq!(cursor.position() as usize, bytes.len());
+    }
+
+    #[test]
+    fn try_skip_chain_commit_rewinds_on_legacy_frame() {
+        // A legacy JournalFrameHeader should NOT look like a ChainCommit —
+        // helper must restore position and return None.
+        let legacy = JournalFrameHeader {
+            page_number: 42,
+            db_page_count: 100,
+            salt1: 0xDEAD_BEEF,
+            salt2: 0xCAFE_BABE,
+            page_size: JournalPageSize::Small4k,
+        };
+        let page_data = vec![0u8; PAGE_SIZE_INTERNAL as usize];
+        let mut buf = Vec::new();
+        legacy.write(&mut buf, &page_data).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = try_skip_chain_commit(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
+        assert!(result.is_none(), "legacy page_number=42 frame must not look like ChainCommit");
+        assert_eq!(cursor.position(), 0, "cursor must be restored on non-ChainCommit");
+    }
+
+    #[test]
+    fn try_skip_chain_commit_disambiguates_legacy_page_number_two() {
+        // Legacy frame with page_number=2: first 4 bytes are [2,0,0,0], the
+        // same as a ChainCommit header prefix. CRC check must reject.
+        let legacy = JournalFrameHeader {
+            page_number: 2,
+            db_page_count: 1,
+            salt1: 0xDEAD_BEEF,
+            salt2: 0xCAFE_BABE,
+            page_size: JournalPageSize::Small4k,
+        };
+        let page_data = vec![0xAAu8; PAGE_SIZE_INTERNAL as usize];
+        let mut buf = Vec::new();
+        legacy.write(&mut buf, &page_data).unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = try_skip_chain_commit(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
+        assert!(
+            result.is_none(),
+            "page_number=2 legacy frame must be rejected via CRC disambiguation"
+        );
+        assert_eq!(cursor.position(), 0);
+    }
+
+    #[test]
+    fn try_skip_chain_commit_rewinds_on_salt_mismatch() {
+        let frame = sample_chain_commit();
+        let bytes = frame.encode().unwrap();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let result = try_skip_chain_commit(&mut cursor, 0, 0).unwrap();
+        assert!(result.is_none(), "wrong salts must return None");
+        assert_eq!(cursor.position(), 0, "cursor restored on salt mismatch");
+    }
+
+    #[test]
+    fn try_skip_chain_commit_rewinds_on_truncated_buffer() {
+        let frame = sample_chain_commit();
+        let bytes = frame.encode().unwrap();
+        // Truncate inside the variable tail.
+        let truncated = bytes[..bytes.len() - 10].to_vec();
+        let mut cursor = std::io::Cursor::new(truncated);
+        let result = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2).unwrap();
+        assert!(result.is_none(), "truncated frame must return None");
+        assert_eq!(cursor.position(), 0);
+    }
+
+    #[test]
+    fn try_skip_chain_commit_handles_eof() {
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let result = try_skip_chain_commit(&mut cursor, 1, 2).unwrap();
+        assert!(result.is_none(), "EOF returns None");
+        assert_eq!(cursor.position(), 0);
     }
 
     #[test]

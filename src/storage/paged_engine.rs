@@ -29,7 +29,8 @@
 //! [`select_plan`]: crate::query::planner::select_plan
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bson::{Bson, Document};
@@ -37,6 +38,9 @@ use bson::{Bson, Document};
 use crate::error::{Error, Result};
 use crate::index::{IndexInfo, IndexModel};
 use crate::key_encoding::{encode_compound_key, encode_key, COMPOUND_SEP};
+use crate::mvcc::read_view::{ReadView, ReadViewRegistry};
+use crate::mvcc::timestamp::TimestampOracle;
+use crate::mvcc::transaction::WriteTxn;
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
     ReturnDocument, UpdateOptions,
@@ -248,12 +252,15 @@ fn apply_projection_to_doc(mut doc: Document, proj: &Document) -> Document {
 /// indexes; violated constraints return [`Error::DuplicateKey`] before the
 /// tree is modified.
 ///
-/// Returns the `_id` BSON value.
+/// Returns `(id_bson, encoded_key, bson_bytes, tree_root_page)` so callers
+/// can stage the MVCC primary-chain entry via `WriteTxn::stage_primary_insert`
+/// after the on-disk cell lands. `tree_root_page` is sampled AFTER the insert
+/// so any root split is reflected.
 fn btree_insert_doc<S: BTreePageStore>(
     tree: &mut BTree<S>,
     doc: &mut Document,
     unique_specs: &[(String, Vec<String>, bool)],
-) -> Result<Bson> {
+) -> Result<(Bson, Vec<u8>, Vec<u8>, u32)> {
     validate_document(doc)?;
     let id_bson = ensure_id(doc);
     // Check secondary unique constraints before touching the tree.
@@ -266,19 +273,21 @@ fn btree_insert_doc<S: BTreePageStore>(
         },
         other => other,
     })?;
-    Ok(id_bson)
+    let tree_root = tree.root_page;
+    Ok((id_bson, key, bson_bytes, tree_root))
 }
 
-/// Scan every leaf in `tree` and return `(encoded_id_key, Document)` pairs
-/// that satisfy `filter`.
+/// MVCC-aware collection scan. For each key visible at `view.read_ts` (or
+/// the on-disk cell when no chain entry is present), decode the value as
+/// BSON and retain rows that satisfy `filter`.
 fn btree_collscan<S: BTreePageStore>(
     tree: &BTree<S>,
     filter: &Document,
+    view: &ReadView,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
-    let pairs = tree.range_scan(None, None)?;
+    let pairs = tree.range_scan_mvcc(None, None, view)?;
     let mut result = Vec::new();
-    for (key, cv) in pairs {
-        let bson_bytes = resolve_cell(tree, cv)?;
+    for (key, bson_bytes) in pairs {
         let doc: Document = bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
         if eval_filter(&doc, filter)? {
             result.push((key, doc));
@@ -329,6 +338,24 @@ struct BpBackend {
     catalog: Catalog<BufferPoolPageStore>,
     /// Cached data trees (loaded lazily from the catalog on first access).
     data_trees: HashMap<String, BTree<BufferPoolPageStore>>,
+    /// HLC oracle issuing commit timestamps for MVCC ChainCommit frames.
+    /// Fresh on construction; recovery from journal arrives in T7.
+    oracle: Arc<TimestampOracle>,
+    /// Tracks live reader `ReadView`s so the writer / reconciliation path
+    /// can compute `oldest_required_ts()`. Readers open a view here before
+    /// consulting MVCC chain snapshots.
+    read_view_registry: Arc<ReadViewRegistry>,
+    /// Monotonic writer-transaction identifier source. Increments per
+    /// `with_txn` call; wraps only after 2⁶⁴ txns (practical infinity).
+    txn_counter: AtomicU64,
+    /// The `WriteTxn` currently owned by an in-flight `with_txn` call, or
+    /// `None` outside any writer boundary. Phase 5 wires this slot so
+    /// writer-side helpers (sec-index `maintain_*`, future primary chain
+    /// population) can stage overflow pins, refcount deltas, page writes,
+    /// and pending sec-index mutations on the active txn. Always `None`
+    /// before the first `with_txn` call and between calls; the
+    /// `&mut self` receiver on `with_txn` prevents reentrant writers.
+    active_txn: Option<WriteTxn>,
 }
 
 impl BpBackend {
@@ -359,6 +386,10 @@ impl BpBackend {
             handle,
             catalog,
             data_trees: HashMap::new(),
+            oracle: Arc::new(TimestampOracle::new()),
+            read_view_registry: ReadViewRegistry::new(),
+            txn_counter: AtomicU64::new(1),
+            active_txn: None,
         };
         // For a new database, persist the freshly-allocated catalog root
         // to the file header immediately (will be written to disk on flush).
@@ -371,6 +402,16 @@ impl BpBackend {
     /// Create a new [`BufferPoolPageStore`] backed by this handle.
     fn new_store(&self) -> BufferPoolPageStore {
         BufferPoolPageStore::new(Arc::clone(&self.handle))
+    }
+
+    /// Open a snapshot [`ReadView`] for a reader path. The view registers
+    /// itself with [`BpBackend::read_view_registry`] for its lifetime and
+    /// is timestamped with the oracle's current `read_ts`. The `txn_id` is
+    /// pulled from `txn_counter` so concurrent reader views remain unique.
+    fn open_read_view(&self) -> Arc<ReadView> {
+        let txn_id = self.txn_counter.fetch_add(1, Ordering::Relaxed);
+        let read_ts = self.oracle.now();
+        ReadView::open(Arc::clone(&self.read_view_registry), read_ts, txn_id)
     }
 
     /// Update `FileHeader::catalog_root_page` and `catalog_root_level` to
@@ -403,11 +444,98 @@ impl BpBackend {
         F: FnOnce(&mut Self) -> Result<T>,
     {
         let mark = self.handle.begin_txn()?;
+        // Begin MVCC write txn. Drains the deferred-free queue under
+        // `AllocatorHandle::state` so any refcount-0 pages from earlier
+        // reader drops return to the free list before this commit
+        // allocates. A failure here must roll back the WAL mark.
+        let txn_id = self.txn_counter.fetch_add(1, Ordering::Relaxed);
+        let txn = match WriteTxn::begin(
+            txn_id,
+            self.handle.allocator(),
+            self.handle.page_source(),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = self.handle.rollback_txn(mark);
+                return Err(e);
+            }
+        };
+        // Stash the active WriteTxn in BpBackend so writer-side helpers
+        // (sec-index maintain_*, future primary chain population) can reach
+        // it via `active_txn_mut()` for staging. `&mut self` on `with_txn`
+        // prevents reentrant writers, so a single-slot `Option` is safe.
+        debug_assert!(self.active_txn.is_none(), "with_txn is not reentrant");
+        self.active_txn = Some(txn);
         let result = f(self);
+        // Take the txn back out of the slot regardless of outcome so
+        // commit/rollback run exactly once and the slot is empty before
+        // the next `with_txn`.
+        let mut txn = self
+            .active_txn
+            .take()
+            .expect("active_txn slot emptied by closure — invariant broken");
         match result {
             Ok(value) => {
+                // Phase 6 sub-step 5: drain the staged secondary-index
+                // writes and install them into the real BTrees *before*
+                // the WAL flush + commit frames. Install failures (e.g. a
+                // unique-constraint violation that slipped past the
+                // stage-time pre-check) must abort the txn, which means
+                // they have to happen on the "still rollbackable" side of
+                // `commit_txn` below. `txn.pending_sec_index` is emptied
+                // via `take` so `txn.commit` sees no stale writes.
+                let sec_writes = std::mem::take(&mut txn.pending_sec_index);
+                if let Err(e) = self.install_pending_sec_index(sec_writes) {
+                    drop(txn);
+                    let _ = self.handle.rollback_txn(mark);
+                    return Err(e);
+                }
+                // Phase 6 sub-step 2: pre-allocate the commit_ts so staged
+                // primary writes install with the correct `start_ts`, then
+                // install them at each key's leaf chain head. Failures here
+                // also roll back the WAL mark — the on-disk cell mutation
+                // lands with the WAL rollback, not with the chain-install.
+                let primary_writes = std::mem::take(&mut txn.pending_primary);
+                if !primary_writes.is_empty() {
+                    let txn_id = txn.txn_id;
+                    let commit_ts = match txn.allocate_commit_ts(&self.oracle) {
+                        Ok(ts) => ts,
+                        Err(e) => {
+                            drop(txn);
+                            let _ = self.handle.rollback_txn(mark);
+                            return Err(e);
+                        }
+                    };
+                    if let Err(e) =
+                        self.install_pending_primary(primary_writes, commit_ts, txn_id)
+                    {
+                        drop(txn);
+                        let _ = self.handle.rollback_txn(mark);
+                        return Err(e);
+                    }
+                }
                 // Flush dirty pages to the WAL as non-commit frames.
                 self.handle.flush()?;
+                // MVCC WriteTxn commit (§T5'): emit one ChainCommit frame
+                // carrying commit_ts + (currently empty) refcount_deltas +
+                // page_writes + pending_sec_index. The journal scanners were
+                // retrofitted (Phase 6 sub-step 1) to skip ChainCommit
+                // frames via CRC-based disambiguation, so emission here is
+                // safe alongside the legacy per-page commit frame below.
+                //
+                // `installed` is the pending `OverflowRef` vec transferred
+                // out of the txn. Phase 5 writer callsites stage no
+                // overflow chains, so `installed` is empty today and the
+                // drop is a no-op; Phase 6 (chain population) will move
+                // each ref into its installed VersionEntry before drop so
+                // the refcount stays at ≥ 1 post-commit.
+                //
+                // `sec_index` is empty here — we already drained it above
+                // via `mem::take` and installed the writes. Kept in the
+                // return tuple for future phases that may consume it at
+                // commit time.
+                let (_commit_ts, _installed, _sec_index) =
+                    txn.commit(&self.oracle, &self.handle)?;
                 // Emit a commit frame. Use page 0 (header, 32k) — it is always
                 // part of any write txn because the allocator touches it.
                 let db_page_count = self
@@ -430,10 +558,26 @@ impl BpBackend {
                 Ok(value)
             }
             Err(e) => {
+                // Abort path: drop the WriteTxn so RAII decrefs any pending
+                // OverflowRefs (enqueuing each chain's first page to the
+                // deferred-free queue for a future writer to reclaim).
+                drop(txn);
                 let _ = self.handle.rollback_txn(mark);
                 Err(e)
             }
         }
+    }
+
+    /// Mutable reference to the in-flight `WriteTxn`, if any.
+    ///
+    /// Returns `Some(&mut WriteTxn)` while a `with_txn` body is executing
+    /// (writer-side staging: `attach_overflow`, `push_page_write`,
+    /// `push_refcount_delta`, `stage_sec_index_*`). Returns `None` outside
+    /// any writer boundary. Phase 5 scaffolds the accessor; Phase 6 wires
+    /// the actual consumers (primary chain install + sec-index rewrite).
+    #[allow(dead_code)]
+    pub(crate) fn active_txn_mut(&mut self) -> Option<&mut WriteTxn> {
+        self.active_txn.as_mut()
     }
 
     /// Return a mutable reference to the data tree for `ns`.
@@ -591,7 +735,14 @@ impl BpBackend {
         Ok(doc.get("_id").cloned().unwrap_or(Bson::Null))
     }
 
-    /// Maintain all secondary indexes after a document insert.
+    /// Maintain all secondary indexes after a document insert (MVCC T5').
+    ///
+    /// Stages index writes through the active `WriteTxn`. Actual tree
+    /// mutation is deferred to `install_pending_sec_index` at commit time;
+    /// `idx_tree` serves only as a reader for the unique-constraint
+    /// pre-check. `sync_index_entry` is still called because the
+    /// `multikey` flag can flip based on this document's key build, and
+    /// the catalog must reflect that regardless of install timing.
     fn maintain_secondary_on_insert(
         &mut self,
         ns: &str,
@@ -601,8 +752,11 @@ impl BpBackend {
         let entries = self.catalog.list_indexes(ns)?;
         for entry in entries {
             let store = self.new_store();
-            let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-            let is_multikey = update_index_on_insert(doc, doc_id, &mut idx_tree, &entry)?;
+            let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+            let txn = self.active_txn.as_mut().expect(
+                "maintain_secondary_on_insert must run inside with_txn",
+            );
+            let is_multikey = update_index_on_insert(doc, doc_id, &idx_tree, &entry, txn)?;
             self.sync_index_entry(
                 &entry,
                 idx_tree.root_page,
@@ -613,7 +767,9 @@ impl BpBackend {
         Ok(())
     }
 
-    /// Maintain all secondary indexes after a document delete.
+    /// Maintain all secondary indexes after a document delete (MVCC T5').
+    ///
+    /// Stages delete mutations through the active `WriteTxn`.
     fn maintain_secondary_on_delete(
         &mut self,
         ns: &str,
@@ -622,20 +778,18 @@ impl BpBackend {
     ) -> Result<()> {
         let entries = self.catalog.list_indexes(ns)?;
         for entry in entries {
-            let store = self.new_store();
-            let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-            update_index_on_delete(doc, doc_id, &mut idx_tree, &entry)?;
-            self.sync_index_entry(
-                &entry,
-                idx_tree.root_page,
-                idx_tree.root_level,
-                false,
-            )?;
+            let txn = self.active_txn.as_mut().expect(
+                "maintain_secondary_on_delete must run inside with_txn",
+            );
+            update_index_on_delete(doc, doc_id, &entry, txn)?;
+            // Root/level unchanged by staging; only sync if needed to
+            // preserve multikey (false — delete never flips multikey).
+            self.sync_index_entry(&entry, entry.root_page, entry.root_level, false)?;
         }
         Ok(())
     }
 
-    /// Maintain all secondary indexes when a document is replaced.
+    /// Maintain all secondary indexes when a document is replaced (MVCC T5').
     fn maintain_secondary_on_update(
         &mut self,
         ns: &str,
@@ -647,9 +801,13 @@ impl BpBackend {
         let entries = self.catalog.list_indexes(ns)?;
         for entry in entries {
             let store = self.new_store();
-            let mut idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-            let is_multikey =
-                update_index_on_update(old_doc, new_doc, old_id, new_id, &mut idx_tree, &entry)?;
+            let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+            let txn = self.active_txn.as_mut().expect(
+                "maintain_secondary_on_update must run inside with_txn",
+            );
+            let is_multikey = update_index_on_update(
+                old_doc, new_doc, old_id, new_id, &idx_tree, &entry, txn,
+            )?;
             self.sync_index_entry(
                 &entry,
                 idx_tree.root_page,
@@ -657,6 +815,191 @@ impl BpBackend {
                 is_multikey,
             )?;
         }
+        Ok(())
+    }
+
+    /// Drain the given `SecIndexWrite` batch and perform the actual
+    /// `BTree::insert` / `delete` into each target index tree (MVCC T5').
+    ///
+    /// Called once per `WriteTxn` at commit time, before the ChainCommit
+    /// and legacy commit frames are emitted. A failure here (e.g. a
+    /// unique-constraint violation slipped past the stage-time pre-check)
+    /// aborts the commit via `with_txn`'s error arm.
+    ///
+    /// Delete semantics: idempotent — `BTree::delete` on an absent key
+    /// returns `Err(KeyNotFound)`, which we swallow to match the legacy
+    /// direct-write behavior.
+    ///
+    /// Per-index state tracking: B+ tree splits update the root page; we
+    /// thread the current root through a per-`index_root_page` state map
+    /// so multiple staged writes into the same index see each other's
+    /// splits. After all writes land we sync each modified index's root
+    /// back to the catalog.
+    fn install_pending_sec_index(
+        &mut self,
+        writes: Vec<crate::mvcc::SecIndexWrite>,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        use crate::mvcc::SecIndexOp;
+        use std::collections::HashMap;
+
+        // Build a reverse lookup: orig root_page → IndexEntry. Single
+        // catalog pass; typical runtime has few indexes.
+        let mut entry_by_root: HashMap<u32, crate::storage::catalog::IndexEntry> =
+            HashMap::new();
+        let collections = self.catalog.list_collections()?;
+        for coll in &collections {
+            for entry in self.catalog.list_indexes(&coll.name)? {
+                entry_by_root.insert(entry.root_page, entry);
+            }
+        }
+
+        // Per-index mutable state as writes accumulate root changes.
+        struct TreeState {
+            current_root: u32,
+            current_level: u8,
+            entry: crate::storage::catalog::IndexEntry,
+        }
+        let mut states: HashMap<u32, TreeState> = HashMap::new();
+
+        for write in writes {
+            let state = match states.get_mut(&write.index_root_page) {
+                Some(s) => s,
+                None => {
+                    let entry = entry_by_root
+                        .get(&write.index_root_page)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::Internal(format!(
+                                "pending sec-index write references unknown root_page {}",
+                                write.index_root_page
+                            ))
+                        })?;
+                    states.insert(
+                        write.index_root_page,
+                        TreeState {
+                            current_root: entry.root_page,
+                            current_level: entry.root_level,
+                            entry,
+                        },
+                    );
+                    states
+                        .get_mut(&write.index_root_page)
+                        .expect("just inserted")
+                }
+            };
+
+            let store = self.new_store();
+            let mut idx_tree =
+                BTree::open(store, state.current_root, state.current_level);
+            match write.op {
+                SecIndexOp::Insert { id_bytes } => {
+                    idx_tree.insert(&write.key, &id_bytes)?;
+                }
+                SecIndexOp::Delete => {
+                    // `BTree::delete` returns `Ok(false)` for an absent
+                    // key; legacy `update_index_on_delete` was idempotent,
+                    // so we swallow that case here too.
+                    let _ = idx_tree.delete(&write.key)?;
+                }
+            }
+            state.current_root = idx_tree.root_page;
+            state.current_level = idx_tree.root_level;
+        }
+
+        for (_, state) in states {
+            self.sync_index_entry(
+                &state.entry,
+                state.current_root,
+                state.current_level,
+                state.entry.multikey,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Install staged primary-tree writes as fresh heads on each key's
+    /// per-leaf version chain (MVCC T5' sub-step 2).
+    ///
+    /// For each `PrimaryWrite`:
+    /// 1. Resolve the current tree by namespace (so in-txn root splits
+    ///    between stage and install time are transparently followed).
+    /// 2. Walk from the current root to the owning leaf via
+    ///    [`BTree::find_leaf`].
+    /// 3. Pin the leaf (`fetch_page`) so `take_chain` / `put_chain` reach
+    ///    the resident frame. The pin drops at end of iteration.
+    /// 4. Take the existing chain (or start an empty one), advance the
+    ///    prior head's `stop_ts` to `commit_ts` via [`Arc::make_mut`]
+    ///    (CoW — concurrent `ChainSnapshot` holders keep their frozen
+    ///    view), then `push_front` a fresh `VersionEntry` carrying
+    ///    `commit_ts` and this txn's `txn_id`.
+    /// 5. `put_chain` the updated `Arc<VecDeque<VersionEntry>>` back onto
+    ///    the frame.
+    ///
+    /// If the namespace isn't cached in `data_trees` (collection dropped
+    /// mid-txn), the write is silently skipped — the dual-write on-disk
+    /// cell remains authoritative under current semantics, and the chain
+    /// entry would be referencing a dead tree root anyway.
+    fn install_pending_primary(
+        &mut self,
+        writes: Vec<crate::mvcc::PrimaryWrite>,
+        commit_ts: crate::mvcc::Ts,
+        txn_id: u64,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        use crate::mvcc::{PrimaryOp, Ts, VersionData, VersionEntry};
+        use std::collections::VecDeque;
+
+        for write in writes {
+            // Resolve current tree and find the owning leaf.
+            let leaf_page = match self.data_trees.get(&write.ns) {
+                Some(tree) => tree.find_leaf(&write.key)?,
+                None => continue,
+            };
+
+            // Pin the leaf so the chain helpers operate on a resident
+            // frame. Pin auto-unpins at end of scope.
+            let _pin = self.handle.fetch_page(leaf_page, PageSize::Large32k)?;
+
+            // Take the existing chain (or start fresh). `Arc::make_mut`
+            // gives CoW: if a concurrent `ChainSnapshot` is holding a
+            // reader view, their Arc count > 1 and the make_mut deep-clones;
+            // otherwise we mutate in-place.
+            let mut chain_arc = self
+                .handle
+                .pool()
+                .take_chain(leaf_page, &write.key)?
+                .unwrap_or_else(|| std::sync::Arc::new(VecDeque::new()));
+            {
+                let chain_mut = std::sync::Arc::make_mut(&mut chain_arc);
+                if let Some(prev_head) = chain_mut.front_mut() {
+                    prev_head.stop_ts = commit_ts;
+                }
+                let (data, is_tombstone) = match write.op {
+                    PrimaryOp::Insert { data } => (VersionData::Inline(data), false),
+                    PrimaryOp::Update { data } => (VersionData::Inline(data), false),
+                    PrimaryOp::Delete => (VersionData::Inline(Vec::new()), true),
+                };
+                chain_mut.push_front(VersionEntry {
+                    start_ts: commit_ts,
+                    stop_ts: Ts::MAX,
+                    txn_id,
+                    data,
+                    is_tombstone,
+                });
+            }
+            self.handle
+                .pool()
+                .put_chain(leaf_page, write.key, chain_arc)?;
+        }
+
         Ok(())
     }
 
@@ -1000,7 +1343,7 @@ impl BpBackend {
 /// - **Writers** (`insert`, `update`, `delete`, `create_index`, etc.) acquire an
 ///   exclusive write lock — one writer at a time, writers never block readers.
 pub(crate) struct PagedEngine {
-    inner: RwLock<BpBackend>,
+    inner: Mutex<BpBackend>,
 }
 
 impl PagedEngine {
@@ -1016,7 +1359,7 @@ impl PagedEngine {
     ) -> Result<Self> {
         let backend = BpBackend::new(handle, catalog_root_page, catalog_root_level)?;
         Ok(PagedEngine {
-            inner: RwLock::new(backend),
+            inner: Mutex::new(backend),
         })
     }
 }
@@ -1031,14 +1374,19 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn insert(&self, ns: &str, mut doc: Document) -> Result<Bson> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let bp = &mut *inner;
         bp.with_txn(|bp| {
             // Insert into the primary (data) tree.  Unique-constraint
             // checking for secondary indexes happens below after the
             // secondary index trees are maintained.
-            let tree = bp.tree_or_create(ns)?;
-            let id = btree_insert_doc(tree, &mut doc, &[])?;
+            let (id, key, bson_bytes, _tree_root) = {
+                let tree = bp.tree_or_create(ns)?;
+                btree_insert_doc(tree, &mut doc, &[])?
+            };
+            bp.active_txn_mut()
+                .expect("insert must run inside with_txn")
+                .stage_primary_insert(ns.to_string(), key, bson_bytes);
             bp.sync_data_root(ns)?;
             // Maintain secondary indexes (includes unique-constraint
             // enforcement via the index B+ trees themselves).
@@ -1053,7 +1401,7 @@ impl StorageEngine for PagedEngine {
 
     fn find(&self, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>> {
         // Read-only: acquire a shared read lock so concurrent readers don't block.
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.lock().unwrap();
         let bp = &*inner;
         let matched: Vec<Document> = {
             // Try an index scan first; fall back to a full collection scan.
@@ -1062,10 +1410,13 @@ impl StorageEngine for PagedEngine {
             } else {
                 match bp.open_tree_for_read(ns)? {
                     None => return Ok(Vec::new()),
-                    Some(tree) => btree_collscan(&tree, filter)?
-                        .into_iter()
-                        .map(|(_, doc)| doc)
-                        .collect(),
+                    Some(tree) => {
+                        let view = bp.open_read_view();
+                        btree_collscan(&tree, filter, &view)?
+                            .into_iter()
+                            .map(|(_, doc)| doc)
+                            .collect()
+                    }
                 }
             }
         };
@@ -1107,9 +1458,10 @@ impl StorageEngine for PagedEngine {
             ));
         }
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let (matched_pairs, tree_exists): (Vec<(Vec<u8>, Document)>, bool) = {
             let bp = &mut *inner;
+            let view = bp.open_read_view();
             match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
@@ -1122,7 +1474,7 @@ impl StorageEngine for PagedEngine {
                         upserted_id: None,
                     });
                 }
-                Some(tree) => (btree_collscan(tree, filter)?, true),
+                Some(tree) => (btree_collscan(tree, filter, &view)?, true),
             }
         };
 
@@ -1156,9 +1508,17 @@ impl StorageEngine for PagedEngine {
                     bp.maintain_secondary_on_update(
                         ns, &before, &doc, &before_id, &new_id,
                     )?;
-                    if let Some(tree) = bp.tree_mut(ns)? {
+                    let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
                         tree.delete(&key)?;
                         tree.insert(&key, &new_bytes)?;
+                        true
+                    } else {
+                        false
+                    };
+                    if tree_exists {
+                        bp.active_txn_mut()
+                            .expect("update must run inside with_txn")
+                            .stage_primary_update(ns.to_string(), key, new_bytes);
                     }
                     bp.sync_data_root(ns)?;
                 }
@@ -1176,15 +1536,16 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
         // Collect (key, doc) pairs to delete; we need the doc for index maintenance.
         let pairs_to_delete: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
+            let view = bp.open_read_view();
             match bp.tree(ns)? {
                 None => return Ok(DeleteResult { deleted_count: 0 }),
                 Some(tree) => {
-                    let pairs = btree_collscan(tree, filter)?;
+                    let pairs = btree_collscan(tree, filter, &view)?;
                     if many {
                         pairs
                     } else {
@@ -1201,8 +1562,16 @@ impl StorageEngine for PagedEngine {
             for (key, doc) in &pairs_to_delete {
                 let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
                 bp.maintain_secondary_on_delete(ns, doc, &doc_id)?;
-                if let Some(tree) = bp.tree_mut(ns)? {
+                let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
                     tree.delete(key)?;
+                    true
+                } else {
+                    false
+                };
+                if tree_exists {
+                    bp.active_txn_mut()
+                        .expect("delete must run inside with_txn")
+                        .stage_primary_delete(ns.to_string(), key.clone());
                 }
                 bp.sync_data_root(ns)?;
             }
@@ -1218,12 +1587,13 @@ impl StorageEngine for PagedEngine {
 
     fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
         // Read-only: shared read lock for concurrent reader support.
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.lock().unwrap();
         let bp = &*inner;
         match bp.open_tree_for_read(ns)? {
             None => Ok(0),
             Some(tree) => {
-                let pairs = btree_collscan(&tree, filter)?;
+                let view = bp.open_read_view();
+                let pairs = btree_collscan(&tree, filter, &view)?;
                 Ok(pairs.len() as u64)
             }
         }
@@ -1246,9 +1616,10 @@ impl StorageEngine for PagedEngine {
             ));
         }
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let mut matched: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
+            let view = bp.open_read_view();
             match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
@@ -1257,7 +1628,7 @@ impl StorageEngine for PagedEngine {
                     }
                     return Ok(None);
                 }
-                Some(tree) => btree_collscan(tree, filter)?,
+                Some(tree) => btree_collscan(tree, filter, &view)?,
             }
         };
 
@@ -1283,9 +1654,17 @@ impl StorageEngine for PagedEngine {
         let bp = &mut *inner;
         bp.with_txn(|bp| {
             bp.maintain_secondary_on_update(ns, &before, &doc, &before_id, &new_id)?;
-            if let Some(tree) = bp.tree_mut(ns)? {
+            let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
                 tree.delete(&key)?;
                 tree.insert(&key, &new_bytes)?;
+                true
+            } else {
+                false
+            };
+            if tree_exists {
+                bp.active_txn_mut()
+                    .expect("find_one_and_update must run inside with_txn")
+                    .stage_primary_update(ns.to_string(), key, new_bytes);
             }
             bp.sync_data_root(ns)?;
             Ok(())
@@ -1307,12 +1686,13 @@ impl StorageEngine for PagedEngine {
         filter: &Document,
         opts: &FindOneAndDeleteOptions,
     ) -> Result<Option<Document>> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let mut matched: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
+            let view = bp.open_read_view();
             match bp.tree(ns)? {
                 None => return Ok(None),
-                Some(tree) => btree_collscan(tree, filter)?,
+                Some(tree) => btree_collscan(tree, filter, &view)?,
             }
         };
 
@@ -1330,8 +1710,16 @@ impl StorageEngine for PagedEngine {
         let bp = &mut *inner;
         bp.with_txn(|bp| {
             bp.maintain_secondary_on_delete(ns, &doc, &doc_id)?;
-            if let Some(tree) = bp.tree_mut(ns)? {
+            let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
                 tree.delete(&key)?;
+                true
+            } else {
+                false
+            };
+            if tree_exists {
+                bp.active_txn_mut()
+                    .expect("find_one_and_delete must run inside with_txn")
+                    .stage_primary_delete(ns.to_string(), key);
             }
             bp.sync_data_root(ns)?;
             Ok(())
@@ -1351,9 +1739,10 @@ impl StorageEngine for PagedEngine {
         replacement: &Document,
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let mut matched: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
+            let view = bp.open_read_view();
             match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
@@ -1362,7 +1751,7 @@ impl StorageEngine for PagedEngine {
                     }
                     return Ok(None);
                 }
-                Some(tree) => btree_collscan(tree, filter)?,
+                Some(tree) => btree_collscan(tree, filter, &view)?,
             }
         };
 
@@ -1399,9 +1788,17 @@ impl StorageEngine for PagedEngine {
                 &original_id,
                 &original_id,
             )?;
-            if let Some(tree) = bp.tree_mut(ns)? {
+            let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
                 tree.delete(&old_key)?;
                 tree.insert(&new_key, &new_bytes)?;
+                true
+            } else {
+                false
+            };
+            if tree_exists {
+                bp.active_txn_mut()
+                    .expect("find_one_and_replace must run inside with_txn")
+                    .stage_primary_update(ns.to_string(), new_key, new_bytes);
             }
             bp.sync_data_root(ns)?;
             Ok(())
@@ -1425,7 +1822,7 @@ impl StorageEngine for PagedEngine {
             .clone()
             .unwrap_or_else(|| generate_index_name(&model.keys));
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let bp = &mut *inner;
         {
             // Ensure the collection exists in the catalog first.
@@ -1493,18 +1890,20 @@ impl StorageEngine for PagedEngine {
                 detail: "drop of '_id_' index is not permitted".to_string(),
             });
         }
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let bp = &mut *inner;
-        let removed = bp.catalog.drop_index(ns, name)?;
-        if removed {
-            bp.sync_catalog_root()?;
-            Ok(())
-        } else {
-            Err(Error::Internal(format!(
-                "index '{}' not found on '{}'",
-                name, ns
-            )))
-        }
+        bp.with_txn(|bp| {
+            let removed = bp.catalog.drop_index(ns, name)?;
+            if removed {
+                bp.sync_catalog_root()?;
+                Ok(())
+            } else {
+                Err(Error::Internal(format!(
+                    "index '{}' not found on '{}'",
+                    name, ns
+                )))
+            }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1512,7 +1911,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.lock().unwrap();
         let bp = &*inner;
         let entries = bp.catalog.list_indexes(ns)?;
         Ok(entries
@@ -1531,7 +1930,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn create_namespace(&self, ns: &str) -> Result<()> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let bp = &mut *inner;
         bp.with_txn(|bp| {
             if bp.catalog.get_collection(ns)?.is_some() {
@@ -1554,7 +1953,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn drop_namespace(&self, ns: &str) -> Result<()> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let bp = &mut *inner;
         bp.with_txn(|bp| {
                 // Collect page-root info from the catalog before removing entries.
@@ -1613,7 +2012,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_namespaces(&self) -> Result<Vec<String>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.lock().unwrap();
         let bp = &*inner;
         let entries = bp.catalog.list_collections()?;
         Ok(entries.into_iter().map(|e| e.name).collect())
@@ -1624,7 +2023,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn checkpoint(&self) -> Result<()> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.lock().unwrap();
         let bp = &*inner;
         // Ensure the catalog root is in the file header before flush.
         bp.sync_catalog_root()?;
@@ -1664,11 +2063,16 @@ impl PagedEngine {
         let mut new_doc = upsert_base_from_filter(filter);
         apply_update(&mut new_doc, update, true)?;
         let id = {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             let bp = &mut *inner;
             bp.with_txn(|bp| {
-                let tree = bp.tree_or_create(ns)?;
-                let id = btree_insert_doc(tree, &mut new_doc, &[])?;
+                let (id, key, bson_bytes, _tree_root) = {
+                    let tree = bp.tree_or_create(ns)?;
+                    btree_insert_doc(tree, &mut new_doc, &[])?
+                };
+                bp.active_txn_mut()
+                    .expect("upsert must run inside with_txn")
+                    .stage_primary_insert(ns.to_string(), key, bson_bytes);
                 bp.sync_data_root(ns)?;
                 bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
                 Ok(id)
@@ -1692,11 +2096,16 @@ impl PagedEngine {
         let mut new_doc = upsert_base_from_filter(filter);
         apply_update(&mut new_doc, update, true)?;
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             let bp = &mut *inner;
             bp.with_txn(|bp| {
-                let tree = bp.tree_or_create(ns)?;
-                let id = btree_insert_doc(tree, &mut new_doc, &[])?;
+                let (id, key, bson_bytes, _tree_root) = {
+                    let tree = bp.tree_or_create(ns)?;
+                    btree_insert_doc(tree, &mut new_doc, &[])?
+                };
+                bp.active_txn_mut()
+                    .expect("fam_upsert_update must run inside with_txn")
+                    .stage_primary_insert(ns.to_string(), key, bson_bytes);
                 bp.sync_data_root(ns)?;
                 bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
                 Ok(())
@@ -1717,11 +2126,16 @@ impl PagedEngine {
     ) -> Result<Option<Document>> {
         let mut new_doc = replacement.clone();
         {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             let bp = &mut *inner;
             bp.with_txn(|bp| {
-                let tree = bp.tree_or_create(ns)?;
-                let id = btree_insert_doc(tree, &mut new_doc, &[])?;
+                let (id, key, bson_bytes, _tree_root) = {
+                    let tree = bp.tree_or_create(ns)?;
+                    btree_insert_doc(tree, &mut new_doc, &[])?
+                };
+                bp.active_txn_mut()
+                    .expect("fam_upsert_replace must run inside with_txn")
+                    .stage_primary_insert(ns.to_string(), key, bson_bytes);
                 bp.sync_data_root(ns)?;
                 bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
                 Ok(())
@@ -2055,7 +2469,7 @@ mod tests {
 
         // Record total page count before drop.
         let total_before = {
-            let inner = e.inner.read().unwrap();
+            let inner = e.inner.lock().unwrap();
             inner
                 .handle
                 .allocator()
@@ -2067,7 +2481,7 @@ mod tests {
 
         // Free page count should have increased (pages returned to free list).
         let free_after = {
-            let inner = e.inner.read().unwrap();
+            let inner = e.inner.lock().unwrap();
             inner
                 .handle
                 .allocator()
@@ -2169,7 +2583,7 @@ mod tests {
         e.checkpoint().unwrap();
 
         let page_count_after_create = {
-            let inner = e.inner.read().unwrap();
+            let inner = e.inner.lock().unwrap();
             inner
                 .handle
                 .allocator()
@@ -2187,7 +2601,7 @@ mod tests {
         e.checkpoint().unwrap();
 
         let page_count_after_recreate = {
-            let inner = e.inner.read().unwrap();
+            let inner = e.inner.lock().unwrap();
             inner
                 .handle
                 .allocator()
@@ -2565,16 +2979,17 @@ mod tests {
         let reader = thread::spawn(move || {
             // Acquire the read lock (shared) and hold it while the writer
             // is trying to proceed.
-            let inner = e_reader.inner.read().unwrap();
+            let inner = e_reader.inner.lock().unwrap();
 
             // Tell the writer we're inside the read section.
             barrier_reader.wait();
 
             // Do the actual scan while holding the read lock.
+            let view = inner.open_read_view();
             let matched = inner
                 .open_tree_for_read("test.snap")
                 .unwrap()
-                .map(|t| btree_collscan(&t, &doc! {}).unwrap())
+                .map(|t| btree_collscan(&t, &doc! {}, &view).unwrap())
                 .unwrap_or_default();
             drop(inner); // release read lock
             matched

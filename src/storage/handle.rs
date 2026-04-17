@@ -368,6 +368,40 @@ impl BufferPoolHandle {
     pub(crate) fn pool(&self) -> &Arc<BufferPool> {
         &self.pool
     }
+
+    /// Borrow the `BufferPoolPageSource` routing allocator I/O through the pool.
+    ///
+    /// Used by writer-path code that needs a `PageSource` for
+    /// [`AllocatorHandle::drain_free_queue`] without re-constructing one.
+    pub(crate) fn page_source(&self) -> &BufferPoolPageSource {
+        &self.pool_io
+    }
+
+    /// Append an MVCC `ChainCommit` frame (Format Lock §A.2).
+    ///
+    /// `commit_ts` is the transaction's commit timestamp from the
+    /// [`TimestampOracle`](crate::mvcc::timestamp::TimestampOracle).
+    /// `refcount_deltas` carries overflow-chain refcount adjustments;
+    /// `page_writes` carries any durable page-writes this commit installs.
+    ///
+    /// Returns the byte offset at which the frame was written. No-op
+    /// (returns `Ok(0)`) on journal-less handles.
+    pub(crate) fn append_chain_commit(
+        &self,
+        commit_ts: crate::mvcc::timestamp::Ts,
+        refcount_deltas: Vec<(u32, i32)>,
+        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
+    ) -> Result<u64> {
+        match &self.journal {
+            None => Ok(0),
+            Some(journal) => {
+                let mut guard = journal
+                    .lock()
+                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+                guard.append_chain_commit(commit_ts, refcount_deltas, page_writes)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

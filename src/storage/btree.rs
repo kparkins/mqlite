@@ -29,8 +29,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::mvcc::read_view::ChainSnapshot;
-use crate::mvcc::version::VersionEntry;
+use crate::mvcc::read_view::{ChainSnapshot, ReadView};
+use crate::mvcc::version::{VersionData, VersionEntry};
 use crate::storage::page::{
     internal_page_checksum, leaf_page_checksum, overflow_page_checksum, InternalPageHeader,
     LeafPageHeader, OverflowPageHeader, INTERNAL_HEADER_SIZE, LEAF_FLAG_HAS_OVERFLOW,
@@ -954,6 +954,60 @@ impl<S: BTreePageStore> BTree<S> {
         read_overflow_chain(&self.store, first_page, total_length)
     }
 
+    /// MVCC-aware point lookup (T5' sub-step 3).
+    ///
+    /// Consults the owning leaf frame's version chain via `ChainSnapshot`
+    /// first; if a [`VersionEntry`] visible to `view` exists for `key`,
+    /// its payload is returned (respecting `is_tombstone`). Otherwise the
+    /// on-disk cell is used — this is the dual-write intermediate state
+    /// (T5' has both the in-memory chain and the on-disk cell; T6
+    /// reconciliation will collapse them). Pre-MVCC keys that never got a
+    /// staged write flow through the on-disk fallback.
+    ///
+    /// Not yet called from the engine's reader paths — those route through
+    /// `range_scan_mvcc` via `btree_collscan`. Kept as a T5' acceptance
+    /// deliverable and for future point-lookup fast-paths (T6+).
+    #[allow(dead_code)]
+    pub(crate) fn get_mvcc(
+        &self,
+        key: &[u8],
+        view: &ReadView,
+    ) -> Result<Option<Vec<u8>>> {
+        let leaf_page = self.find_leaf(key)?;
+        let (buf, snap) = self.store.read_leaf(leaf_page)?;
+        if let Some(snap) = snap.as_ref() {
+            if let Some(entry) = snap.visible_at(key, view) {
+                if entry.is_tombstone {
+                    return Ok(None);
+                }
+                return Ok(Some(match &entry.data {
+                    VersionData::Inline(v) => v.clone(),
+                    VersionData::Overflow(oref) => read_overflow_chain(
+                        &self.store,
+                        oref.first_page(),
+                        oref.total_length() as u32,
+                    )?,
+                }));
+            }
+        }
+        // Fall back to the on-disk cell (dual-write intermediate).
+        let node = LeafNode::parse(&buf[..])?;
+        match node.binary_search(key) {
+            Ok(i) => match &node.cells[i].value {
+                CellValue::Inline(v) => Ok(Some(v.clone())),
+                CellValue::Overflow {
+                    first_page,
+                    total_length,
+                } => Ok(Some(read_overflow_chain(
+                    &self.store,
+                    *first_page,
+                    *total_length,
+                )?)),
+            },
+            Err(_) => Ok(None),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Insert
     // -----------------------------------------------------------------------
@@ -1610,12 +1664,96 @@ impl<S: BTreePageStore> BTree<S> {
         Ok(results)
     }
 
+    /// MVCC-aware range scan (T5' sub-step 3).
+    ///
+    /// Walks sibling leaves like [`BTree::range_scan`], but for each
+    /// candidate cell consults the frame's `ChainSnapshot` via
+    /// [`ChainSnapshot::visible_at`]: a visible [`VersionEntry`] wins
+    /// (returning its resolved inline/overflow bytes, or skipping on
+    /// tombstone); otherwise the on-disk cell value is yielded.
+    ///
+    /// Unlike the legacy `range_scan` which hands back `CellValue`
+    /// placeholders for overflow payloads, this path fully resolves every
+    /// row to `Vec<u8>` so chain-sourced and cell-sourced values share one
+    /// shape at the call site. Keys are returned in ascending order.
+    pub(crate) fn range_scan_mvcc(
+        &self,
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+        view: &ReadView,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        let first_leaf = match start_key {
+            Some(k) => self.find_leaf(k)?,
+            None => self.leftmost_leaf()?,
+        };
+
+        let mut cur_page = first_leaf;
+        'outer: while cur_page != 0 {
+            let (buf, snap) = self.store.read_leaf(cur_page)?;
+            let node = LeafNode::parse(&buf[..])?;
+
+            let start_idx = match start_key {
+                Some(k) => match node.binary_search(k) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                },
+                None => 0,
+            };
+
+            for i in start_idx..node.cells.len() {
+                let cell = &node.cells[i];
+                if let Some(ek) = end_key {
+                    if cell.key.as_slice() > ek {
+                        break 'outer;
+                    }
+                }
+
+                // Chain-first: a visible VersionEntry wins over the on-disk
+                // cell. If the entry is a tombstone, skip the key entirely.
+                let chain_hit = snap
+                    .as_ref()
+                    .and_then(|s| s.visible_at(&cell.key, view));
+                if let Some(entry) = chain_hit {
+                    if entry.is_tombstone {
+                        continue;
+                    }
+                    let bytes = match &entry.data {
+                        VersionData::Inline(v) => v.clone(),
+                        VersionData::Overflow(oref) => read_overflow_chain(
+                            &self.store,
+                            oref.first_page(),
+                            oref.total_length() as u32,
+                        )?,
+                    };
+                    results.push((cell.key.clone(), bytes));
+                    continue;
+                }
+
+                // Fall back to the on-disk cell.
+                let bytes = match &cell.value {
+                    CellValue::Inline(v) => v.clone(),
+                    CellValue::Overflow {
+                        first_page,
+                        total_length,
+                    } => read_overflow_chain(&self.store, *first_page, *total_length)?,
+                };
+                results.push((cell.key.clone(), bytes));
+            }
+
+            cur_page = node.next_leaf_page;
+        }
+
+        Ok(results)
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
     /// Traverse from the root to the leaf page that should contain `key`.
-    fn find_leaf(&self, key: &[u8]) -> Result<u32> {
+    pub(crate) fn find_leaf(&self, key: &[u8]) -> Result<u32> {
         let mut page = self.root_page;
         let mut level = self.root_level;
 

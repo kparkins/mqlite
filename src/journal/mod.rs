@@ -49,8 +49,8 @@ use crate::storage::page::PAGE_SIZE_LEAF;
 
 use self::shm::ShmIndex;
 use self::log_file::{
-    JournalFrameHeader, JournalHeader, JournalPageSize, JOURNAL_FRAME_HEADER_SIZE,
-    JOURNAL_HEADER_SIZE,
+    try_skip_chain_commit, JournalFrameHeader, JournalHeader, JournalPageSize,
+    JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -219,6 +219,24 @@ impl JournalManager {
 
         loop {
             let frame_offset = write_cursor;
+
+            // MVCC T5'/T6: peek for a `ChainCommit` frame first. These carry
+            // no legacy `JournalFrameHeader` and would crash the scan if
+            // parsed as one. `try_skip_chain_commit` advances the reader
+            // past a valid ChainCommit and returns its length; otherwise
+            // it restores position and returns None for legacy fall-through.
+            journal_file
+                .seek(SeekFrom::Start(frame_offset))
+                .map_err(Error::Io)?;
+            if let Some(n) = try_skip_chain_commit(&mut journal_file, salt1, salt2)? {
+                // ChainCommit frame replay is a no-op for the page-replay
+                // loop (it carries no single page_number). Recovery of
+                // version-chain state arrives in T7; for now we only need
+                // to step past the frame without corrupting write_cursor.
+                write_cursor += n;
+                continue;
+            }
+
             let frame_opt =
                 JournalFrameHeader::read(&mut journal_file, salt1, salt2)?;
             let frame_hdr = match frame_opt {
@@ -340,6 +358,41 @@ impl JournalManager {
         self.append_frame(page_number, 0, page_size, page_data)
     }
 
+    /// Append an MVCC `ChainCommit` frame to the journal (Format Lock §A.2).
+    ///
+    /// Emits one `ChainCommitFrame` carrying `commit_ts`, `refcount_deltas`,
+    /// and zero or more `page_writes`. The frame is written at the current
+    /// `write_cursor`; the cursor advances past the encoded frame. An
+    /// `fsync`-equivalent `flush()` is called before the cursor advances so
+    /// the frame is durable before any later frames can overwrite its tail.
+    ///
+    /// The SHM index is NOT updated — `ChainCommit` frames carry no single
+    /// page number (every `page_writes` entry has its own). Recovery scans
+    /// `ChainCommit` frames linearly.
+    pub(crate) fn append_chain_commit(
+        &mut self,
+        commit_ts: crate::mvcc::timestamp::Ts,
+        refcount_deltas: Vec<(u32, i32)>,
+        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
+    ) -> Result<u64> {
+        let frame = crate::journal::log_file::ChainCommitFrame {
+            salt1: self.salt1,
+            salt2: self.salt2,
+            commit_ts,
+            refcount_deltas,
+            page_writes,
+        };
+        let bytes = frame.encode()?;
+        let frame_offset = self.write_cursor;
+        self.journal_file
+            .seek(SeekFrom::Start(frame_offset))
+            .map_err(Error::Io)?;
+        self.journal_file.write_all(&bytes).map_err(Error::Io)?;
+        self.journal_file.flush().map_err(Error::Io)?;
+        self.write_cursor += bytes.len() as u64;
+        Ok(frame_offset)
+    }
+
     /// Append a commit journal frame, completing the current transaction.
     ///
     /// `db_page_count` is the total number of database pages after this commit
@@ -458,6 +511,15 @@ impl JournalManager {
             self.journal_file
                 .seek(SeekFrom::Start(cursor))
                 .map_err(Error::Io)?;
+
+            // MVCC T5'/T6: skip ChainCommit frames — they carry no
+            // page_number and are invisible to the per-page linear scan.
+            if let Some(n) =
+                try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
+            {
+                cursor += n;
+                continue;
+            }
 
             let frame_opt =
                 JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?;
@@ -639,6 +701,17 @@ impl JournalManager {
             self.journal_file
                 .seek(SeekFrom::Start(scan))
                 .map_err(Error::Io)?;
+
+            // MVCC T5'/T6: ChainCommit frames are part of the durable log
+            // but carry no `page_number` for the SHM index. Skip past them
+            // so `JournalFrameHeader::read` below sees only legacy frames.
+            if let Some(n) =
+                try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
+            {
+                scan += n;
+                continue;
+            }
+
             let frame_opt =
                 JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?;
             let frame_hdr = match frame_opt {
