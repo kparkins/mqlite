@@ -19,8 +19,12 @@ pub mod version;
 pub use deferred_free::DeferredFreeQueue;
 #[allow(unused_imports)]
 pub use metrics::{
-    record_secondary_index_tombstone_hit, reset_secondary_index_tombstone_hits,
-    secondary_index_tombstone_hits_snapshot,
+    deferred_free_queue_depth_snapshot, overflow_pages_freed_snapshot,
+    reconcile_entries_dropped_snapshot, record_overflow_page_freed,
+    record_reconcile_entries_dropped, record_secondary_index_tombstone_hit,
+    reset_deferred_free_queue_depth, reset_overflow_pages_freed,
+    reset_reconcile_entries_dropped, reset_secondary_index_tombstone_hits,
+    secondary_index_tombstone_hits_snapshot, set_deferred_free_queue_depth,
 };
 #[allow(unused_imports)]
 pub use read_view::{ChainSnapshot, ReadView, ReadViewRegistry};

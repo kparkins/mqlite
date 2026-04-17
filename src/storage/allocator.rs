@@ -428,10 +428,15 @@ impl AllocatorHandle {
     /// drained into a Vec before `state` is locked, so the two locks are
     /// never held simultaneously.
     ///
+    /// Ticks `mvcc.overflow.pages_freed_total` per freed page and refreshes
+    /// the `mvcc.deferred_free_queue_depth` gauge with the post-drain
+    /// queue size (accounts for requeued entries).
+    ///
     /// Returns the number of pages actually freed.
     pub(crate) fn drain_free_queue(&self, io: &dyn PageSource) -> Result<usize> {
         let pages = self.deferred_free_queue.take_all();
         if pages.is_empty() {
+            crate::mvcc::metrics::set_deferred_free_queue_depth(0);
             return Ok(0);
         }
 
@@ -452,6 +457,7 @@ impl AllocatorHandle {
                 let mut table = self.overflow_refcounts.lock().unwrap();
                 table.remove(&page);
                 freed += 1;
+                crate::mvcc::metrics::record_overflow_page_freed();
             } else {
                 requeue.push(page);
             }
@@ -463,6 +469,9 @@ impl AllocatorHandle {
         if !requeue.is_empty() {
             self.deferred_free_queue.push_many(requeue);
         }
+        crate::mvcc::metrics::set_deferred_free_queue_depth(
+            self.deferred_free_queue.depth() as u64,
+        );
         Ok(freed)
     }
 

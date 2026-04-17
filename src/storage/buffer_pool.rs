@@ -47,8 +47,27 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::mvcc::read_view::{ChainSnapshot, ReadView};
+use crate::mvcc::metrics;
+use crate::mvcc::read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
+use crate::mvcc::timestamp::Ts;
 use crate::mvcc::version::VersionEntry;
+use crate::storage::allocator::AllocatorHandle;
+
+// ---------------------------------------------------------------------------
+// Main buffer-pool sharding (T6 / S12)
+// ---------------------------------------------------------------------------
+
+/// Number of independent main buffer pools in the engine.
+///
+/// The MVCC design (plan §T6, S12 criterion) mandates a single main pool
+/// (two size-class partitions live *inside* that pool). T7 adds a dedicated
+/// history-store pool but does not change this count. A second main pool
+/// would require a second lock-order position at level 3 / 4 — intentionally
+/// ruled out. Changes to this constant must be accompanied by a lock-order
+/// audit; the compile-time assertion in
+/// `tests/partition_pool_sharding_invariant.rs` guards the invariant.
+#[allow(dead_code)]
+pub(crate) const N_MAIN_POOLS: usize = 1;
 
 // ---------------------------------------------------------------------------
 // Page size
@@ -174,6 +193,13 @@ impl Partition {
     }
 
     /// Evict the frame at `idx`, flushing to disk if dirty.
+    ///
+    /// Lock-order note (T6): any caller that reaches this method along a
+    /// reconciliation path MUST have snapshotted
+    /// `ReadViewRegistry::oldest_required_ts()` *before* acquiring the
+    /// partition mutex (see `BufferPool::reconcile`). Registry (position 5)
+    /// is below the partition mutex (positions 3/4) in the total order, so
+    /// re-acquiring it while holding the partition lock is forbidden.
     fn evict_frame(&mut self, idx: usize, io: &dyn PageSource, size: PageSize) -> Result<()> {
         if let Some(frame) = &self.frames[idx] {
             let was_dirty = frame.dirty;
@@ -611,6 +637,117 @@ impl BufferPool {
             .as_ref()
             .expect("page_map invariant: frame must exist at mapped slot");
         Ok(frame.version_chains.is_empty())
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconciliation (T6)
+    // -----------------------------------------------------------------------
+
+    /// Reconcile the per-key version chains on leaf page `page`.
+    ///
+    /// Walks every chain on the frame and drops entries whose `stop_ts`
+    /// is `<= oldest_required_ts` — no live reader can see them, so they
+    /// are pure garbage. A chain that collapses to a single head entry
+    /// (`stop_ts == Ts::MAX`) is removed from the frame entirely: the
+    /// dual-write invariant guarantees the on-disk cell already reflects
+    /// that head, so the chain is redundant.
+    ///
+    /// `OverflowRef::Drop` RAII runs on every dropped `VersionEntry`. When
+    /// a drop brings an overflow refcount to 0, the page is enqueued on
+    /// `DeferredFreeQueue` (lock position 1.5 — a leaf mutex, safe to
+    /// acquire transiently while holding the partition mutex at position 3).
+    /// After releasing the partition mutex, the caller's writer-serialization
+    /// context guarantees it is safe to drain the queue via
+    /// `AllocatorHandle::drain_free_queue`.
+    ///
+    /// **Lock-order contract (T4 / T6):**
+    /// 1. `ReadViewRegistry::oldest_required_ts()` is snapshotted *before*
+    ///    acquiring the partition mutex. Position 5 is below positions 3/4
+    ///    in the total order; re-acquiring it under the partition mutex is
+    ///    forbidden.
+    /// 2. The partition mutex is released before `drain_free_queue` is
+    ///    invoked, so the allocator-state mutex (position 2) is never
+    ///    nested under a partition mutex (positions 3/4).
+    ///
+    /// Returns the number of `VersionEntry` objects dropped.
+    #[allow(dead_code)] // wired into eviction path by T7
+    pub(crate) fn reconcile(
+        &self,
+        page: u32,
+        registry: &ReadViewRegistry,
+        allocator: &AllocatorHandle,
+    ) -> Result<usize> {
+        // 1. Snapshot the horizon BEFORE any partition latch.
+        let ort = registry.oldest_required_ts();
+
+        // 2. Walk chains under the partition mutex. `Arc::make_mut` clones
+        //    only if a snapshot reader still holds the previous Arc — the
+        //    old chain keeps its pinned refcounts, the reader stays safe,
+        //    and we mutate a fresh copy in-place.
+        let dropped = {
+            let mut guard = self
+                .inner_32k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            let Some(&idx) = guard.page_map.get(&page) else {
+                return Ok(0);
+            };
+            let frame = guard.frames[idx]
+                .as_mut()
+                .expect("page_map invariant: frame must exist at mapped slot");
+
+            let mut dropped_count = 0usize;
+            let keys: Vec<Vec<u8>> = frame.version_chains.keys().cloned().collect();
+
+            for key in keys {
+                let Some(chain_arc) = frame.version_chains.get_mut(&key) else {
+                    continue;
+                };
+                let before = chain_arc.len();
+
+                // Retain the live head (`stop_ts == Ts::MAX`) unconditionally
+                // and any committed-replaced entry whose `stop_ts` is still
+                // above the horizon (so some reader can still see it).
+                // Entries with `stop_ts <= ort && stop_ts < Ts::MAX` are
+                // invisible to every live reader and get dropped.
+                let chain_mut = Arc::make_mut(chain_arc);
+                chain_mut.retain(|e| e.stop_ts == Ts::MAX || e.stop_ts > ort);
+
+                let after = chain_arc.len();
+                dropped_count += before - after;
+
+                // Collapse-if-head-only: the dual-write invariant means the
+                // on-disk cell mirrors the head. A single entry with
+                // stop_ts == Ts::MAX is therefore redundant.
+                let collapse = chain_arc.len() == 1
+                    && chain_arc
+                        .front()
+                        .map(|e| e.stop_ts == Ts::MAX && !e.is_tombstone)
+                        .unwrap_or(false);
+                if collapse {
+                    frame.version_chains.remove(&key);
+                } else if chain_arc.is_empty() {
+                    // A chain whose only entry was a tombstone that has
+                    // aged out also drops away.
+                    frame.version_chains.remove(&key);
+                }
+            }
+
+            dropped_count
+        };
+
+        // 3. Tick the reconcile counter and refresh the queue-depth gauge
+        //    using the current queue size (drain below is authoritative).
+        metrics::record_reconcile_entries_dropped(dropped as u64);
+        metrics::set_deferred_free_queue_depth(
+            allocator.deferred_free_queue().depth() as u64,
+        );
+
+        // 4. Writer-serialized drain — caller holds the writer lock. The
+        //    drain re-checks refcount under Acquire before freeing.
+        allocator.drain_free_queue(self.io.as_ref())?;
+
+        Ok(dropped)
     }
 
     // -----------------------------------------------------------------------
@@ -1164,5 +1301,261 @@ mod tests {
 
         let page = pool.pin(99, PageSize::Large32k).unwrap();
         assert_eq!(page.page_number(), 99);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconciliation (T6)
+    // -----------------------------------------------------------------------
+
+    mod reconcile {
+        use super::*;
+        use crate::mvcc::metrics;
+        use crate::mvcc::read_view::{ReadView, ReadViewRegistry};
+        use crate::mvcc::timestamp::Ts;
+        use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry};
+        use crate::storage::allocator::AllocatorHandle;
+        use crate::storage::header::FileHeader;
+
+        fn ts(ms: u64) -> Ts {
+            Ts {
+                physical_ms: ms,
+                logical: 0,
+            }
+        }
+
+        fn fresh_allocator() -> AllocatorHandle {
+            AllocatorHandle::new(FileHeader::new(0, 0, 0))
+        }
+
+        /// Allocator whose header reports enough pages to legally free
+        /// high-numbered overflow pages (the free-list link write goes to
+        /// the pool's MockIo which tolerates any page number).
+        fn allocator_with_capacity(total_pages: u32) -> AllocatorHandle {
+            let alloc = fresh_allocator();
+            alloc
+                .update_header(|h| h.total_page_count = total_pages)
+                .unwrap();
+            alloc
+        }
+
+        /// Build a fresh pool + allocator pair and pin leaf page `page`
+        /// so a version chain can be attached to the resident frame.
+        fn pool_with_resident_leaf(page: u32) -> (BufferPool, AllocatorHandle, Arc<MockIo>) {
+            let io = MockIo::new();
+            let pool = desktop_pool(Arc::clone(&io));
+            // Force the frame resident (PinnedPage dropped immediately; the
+            // frame stays in the pool because the pool is large).
+            let _p = pool.pin(page, PageSize::Large32k).unwrap();
+            drop(_p);
+            let alloc = fresh_allocator();
+            (pool, alloc, io)
+        }
+
+        fn install_chain(pool: &BufferPool, page: u32, key: &[u8], chain: VecDeque<VersionEntry>) {
+            pool.put_chain(page, key.to_vec(), Arc::new(chain)).unwrap();
+        }
+
+        fn entry_inline(start: Ts, stop: Ts, txn: u64, payload: &[u8]) -> VersionEntry {
+            VersionEntry {
+                start_ts: start,
+                stop_ts: stop,
+                txn_id: txn,
+                data: VersionData::Inline(payload.to_vec()),
+                is_tombstone: false,
+            }
+        }
+
+        fn tombstone(start: Ts, stop: Ts, txn: u64) -> VersionEntry {
+            VersionEntry {
+                start_ts: start,
+                stop_ts: stop,
+                txn_id: txn,
+                data: VersionData::Inline(Vec::new()),
+                is_tombstone: true,
+            }
+        }
+
+        #[test]
+        fn drops_entries_below_oldest_required_ts() {
+            let (pool, alloc, _io) = pool_with_resident_leaf(1);
+            let registry = ReadViewRegistry::new();
+            // No live readers → ort = Ts::MAX. Retain rule: keep the live
+            // head and anything with stop_ts > ort; drop the rest. A
+            // 10-entry chain (1 head + 9 aged) collapses entirely because
+            // the lone survivor (head, stop_ts == Ts::MAX) matches the
+            // on-disk cell.
+            let mut chain = VecDeque::new();
+            // Head — most recent
+            chain.push_back(entry_inline(ts(100), Ts::MAX, 1, b"head"));
+            // Nine older entries with concrete stop_ts values
+            for i in 0..9 {
+                chain.push_back(entry_inline(
+                    ts(10 + i),
+                    ts(20 + i),
+                    1 + i as u64,
+                    format!("v{i}").as_bytes(),
+                ));
+            }
+            install_chain(&pool, 1, b"K", chain);
+
+            let dropped = pool.reconcile(1, &registry, &alloc).unwrap();
+            assert_eq!(dropped, 9, "nine aged entries must drop");
+
+            // Only the head (Ts::MAX) survived — and because it's the only
+            // entry and non-tombstone, the chain was collapsed entirely.
+            assert!(pool.chains_empty(1).unwrap());
+        }
+
+        #[test]
+        fn retains_entries_needed_by_live_reader() {
+            let (pool, alloc, _io) = pool_with_resident_leaf(2);
+            let registry = Arc::new(ReadViewRegistry::new());
+            // Reader pinned at ts=5 — any entry whose stop_ts > ts(5) must
+            // survive.
+            let _view = ReadView::open(Arc::clone(&registry), ts(5), 77);
+
+            let mut chain = VecDeque::new();
+            chain.push_back(entry_inline(ts(100), Ts::MAX, 1, b"head"));
+            chain.push_back(entry_inline(ts(50), ts(100), 2, b"middle")); // stop_ts > 5 — keep
+            chain.push_back(entry_inline(ts(1), ts(3), 3, b"gone")); // stop_ts < 5 — drop
+            install_chain(&pool, 2, b"K", chain);
+
+            metrics::reset_reconcile_entries_dropped();
+            let dropped = pool.reconcile(2, &registry, &alloc).unwrap();
+            assert_eq!(dropped, 1);
+
+            // Chain survives because it has > 1 entry now.
+            assert!(!pool.chains_empty(2).unwrap());
+        }
+
+        #[test]
+        fn collapse_when_only_head_entry_remains() {
+            let (pool, alloc, _io) = pool_with_resident_leaf(3);
+            let registry = ReadViewRegistry::new();
+
+            let mut chain = VecDeque::new();
+            chain.push_back(entry_inline(ts(100), Ts::MAX, 1, b"head"));
+            chain.push_back(entry_inline(ts(10), ts(20), 2, b"old"));
+            install_chain(&pool, 3, b"K", chain);
+
+            let dropped = pool.reconcile(3, &registry, &alloc).unwrap();
+            assert_eq!(dropped, 1);
+            // Single head collapsed.
+            assert!(pool.chains_empty(3).unwrap());
+        }
+
+        #[test]
+        fn no_collapse_when_head_is_tombstone() {
+            let (pool, alloc, _io) = pool_with_resident_leaf(4);
+            let registry = ReadViewRegistry::new();
+
+            let mut chain = VecDeque::new();
+            chain.push_back(tombstone(ts(100), Ts::MAX, 1));
+            chain.push_back(entry_inline(ts(10), ts(20), 2, b"old"));
+            install_chain(&pool, 4, b"K", chain);
+
+            let dropped = pool.reconcile(4, &registry, &alloc).unwrap();
+            assert_eq!(dropped, 1);
+            // Tombstone-only chain still needed to override on-disk cell —
+            // do not collapse.
+            assert!(!pool.chains_empty(4).unwrap());
+        }
+
+        #[test]
+        fn reconciles_multi_key_frame_independently() {
+            let (pool, alloc, _io) = pool_with_resident_leaf(5);
+            let registry = ReadViewRegistry::new();
+
+            let mut c_a = VecDeque::new();
+            c_a.push_back(entry_inline(ts(100), Ts::MAX, 1, b"A-head"));
+            c_a.push_back(entry_inline(ts(10), ts(20), 2, b"A-old"));
+            install_chain(&pool, 5, b"A", c_a);
+
+            let mut c_b = VecDeque::new();
+            c_b.push_back(entry_inline(ts(200), Ts::MAX, 3, b"B-head"));
+            c_b.push_back(entry_inline(ts(30), ts(40), 4, b"B-old-1"));
+            c_b.push_back(entry_inline(ts(50), ts(60), 5, b"B-old-2"));
+            install_chain(&pool, 5, b"B", c_b);
+
+            let dropped = pool.reconcile(5, &registry, &alloc).unwrap();
+            // 1 + 2 = 3 older entries dropped; both chains collapse.
+            assert_eq!(dropped, 3);
+            assert!(pool.chains_empty(5).unwrap());
+        }
+
+        #[test]
+        fn overflow_refs_drop_and_enqueue_when_no_readers() {
+            let io = MockIo::new();
+            let pool = desktop_pool(Arc::clone(&io));
+            let _p = pool.pin(6, PageSize::Large32k).unwrap();
+            drop(_p);
+            // Allocator with enough "pages" on the header so `free_32k`
+            // accepts page 777 — the MockIo underneath accepts any write.
+            let alloc = allocator_with_capacity(1024);
+            let registry = ReadViewRegistry::new();
+
+            // Overflow-backed entry that will age out.
+            let oref = OverflowRef::new_owned(777, 1024, alloc.clone()).unwrap();
+            assert_eq!(alloc.overflow_refcount(777), 1);
+
+            let mut chain = VecDeque::new();
+            chain.push_back(entry_inline(ts(200), Ts::MAX, 10, b"head")); // live
+            chain.push_back(VersionEntry {
+                start_ts: ts(10),
+                stop_ts: ts(20),
+                txn_id: 11,
+                data: VersionData::Overflow(oref),
+                is_tombstone: false,
+            });
+            install_chain(&pool, 6, b"K", chain);
+            assert_eq!(alloc.overflow_refcount(777), 1);
+
+            // No live readers → ort = Ts::MAX → older entry drops, its
+            // OverflowRef decrefs to 0, page 777 lands on the deferred-free
+            // queue, and drain_free_queue releases it to the allocator's
+            // free list.
+            let depth_before = metrics::overflow_pages_freed_snapshot();
+            let dropped = pool.reconcile(6, &registry, &alloc).unwrap();
+            assert_eq!(dropped, 1);
+            assert_eq!(alloc.overflow_refcount(777), 0);
+            assert!(
+                metrics::overflow_pages_freed_snapshot() > depth_before,
+                "drain must record at least one freed page"
+            );
+            assert_eq!(
+                alloc.deferred_free_queue().depth(),
+                0,
+                "queue drained"
+            );
+        }
+
+        #[test]
+        fn reconcile_non_resident_page_is_noop() {
+            let io = MockIo::new();
+            let pool = desktop_pool(Arc::clone(&io));
+            let alloc = fresh_allocator();
+            let registry = ReadViewRegistry::new();
+            // Page 99 was never pinned — not resident.
+            let dropped = pool.reconcile(99, &registry, &alloc).unwrap();
+            assert_eq!(dropped, 0);
+        }
+
+        #[test]
+        fn sec_index_tombstone_chain_retains_when_reader_active() {
+            // Tombstone-only chain with a single tombstone entry whose
+            // stop_ts = Ts::MAX (live). A reader at ts=50 must still see
+            // the tombstone — reconcile must leave it in place.
+            let (pool, alloc, _io) = pool_with_resident_leaf(7);
+            let registry = Arc::new(ReadViewRegistry::new());
+            let _view = ReadView::open(Arc::clone(&registry), ts(50), 500);
+
+            let mut chain = VecDeque::new();
+            chain.push_back(tombstone(ts(100), Ts::MAX, 1));
+            install_chain(&pool, 7, b"sec-idx-key", chain);
+
+            let dropped = pool.reconcile(7, &registry, &alloc).unwrap();
+            assert_eq!(dropped, 0);
+            assert!(!pool.chains_empty(7).unwrap());
+        }
     }
 }
