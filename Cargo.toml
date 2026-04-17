@@ -16,6 +16,9 @@ tracing = ["dep:tracing"]
 # Exposes internal functions (eval_filter, etc.) for fuzz targets.
 # Do NOT enable in production builds.
 fuzz = []
+# Enables loom-based concurrency stress tests. Run with:
+#   RUSTFLAGS="--cfg loom" cargo test --release --features loom-tests --test loom_common
+loom-tests = []
 
 [dependencies]
 bson = { version = "2", features = ["serde_with"] }
@@ -38,11 +41,8 @@ tracing = { version = "0.1", optional = true }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+loom = "0.7"
 
 [[example]]
 name = "wire_server"
 required-features = ["wire"]
-
-[[bench]]
-name = "core"
-harness = false

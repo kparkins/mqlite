@@ -164,6 +164,22 @@ pub(crate) struct FindOptions {
     pub batch_size: Option<u32>,
 }
 
+impl FindOptions {
+    pub fn new() -> Self {
+        FindOptions::default()
+    }
+
+    pub fn sort(mut self, sort: Document) -> Self {
+        self.sort = Some(sort);
+        self
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+}
+
 /// Options for `update_one` and `update_many` operations.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UpdateOptions {
