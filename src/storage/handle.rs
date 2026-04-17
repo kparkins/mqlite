@@ -36,6 +36,7 @@ use std::fs::File;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::mvcc::read_view::ReadViewRegistry;
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::buffer_pool::{BufferPool, PageSource, PageSize, PinnedPage};
 use crate::storage::header::FileHeader;
@@ -98,9 +99,24 @@ impl PageSource for BufferPoolPageSource {
 /// See the module-level documentation for the full API overview.
 pub(crate) struct BufferPoolHandle {
     pool: Arc<BufferPool>,
+    /// Dedicated MVCC history-store buffer pool (plan §T7 "NON-NEGOTIABLE").
+    ///
+    /// Holds the history-store B-tree's cached pages. Lock-order position **1**
+    /// (outermost) — partition mutexes on this pool are acquired BEFORE any
+    /// main-pool partition mutex (positions 3/4), so reconciliation evicting
+    /// a main-data leaf can install an aged `VersionEntry` here without
+    /// re-entering the main-data partition. The non-recursion invariant is
+    /// also checked at runtime via the thread-local sentinel in
+    /// `crate::storage::history_store`.
+    history_pool: Arc<BufferPool>,
     allocator: AllocatorHandle,
     /// `PageSource` adapter that routes allocator I/O through the pool.
     pool_io: BufferPoolPageSource,
+    /// Registry of live reader `ReadView`s; [`ReadViewRegistry::oldest_required_ts`]
+    /// feeds every chain-reconciliation path. Eager construction here (vs. on
+    /// `BpBackend`) lets [`fetch_page`](Self::fetch_page) reconcile evictions
+    /// on the buffer-pool miss path (plan T7 defect #2).
+    read_view_registry: Arc<ReadViewRegistry>,
     /// Optional journal manager; `None` for in-memory / test handles.
     journal: Option<Arc<Mutex<JournalManager>>>,
     /// Dedicated fd for writing checkpointed journal pages back to the main file.
@@ -114,13 +130,19 @@ impl BufferPoolHandle {
     ///
     /// Production code always wires a journal via [`Self::with_journal`].
     #[cfg(test)]
-    pub(crate) fn new(pool: Arc<BufferPool>, header: FileHeader) -> Self {
+    pub(crate) fn new(
+        pool: Arc<BufferPool>,
+        history_pool: Arc<BufferPool>,
+        header: FileHeader,
+    ) -> Self {
         let allocator = AllocatorHandle::new(header);
         let pool_io = BufferPoolPageSource::new(Arc::clone(&pool));
         Self {
             pool,
+            history_pool,
             allocator,
             pool_io,
+            read_view_registry: ReadViewRegistry::new(),
             journal: None,
             journal_main_file: None,
         }
@@ -132,6 +154,7 @@ impl BufferPoolHandle {
     /// `checkpoint_through_journal`) become active when a journal is present.
     pub(crate) fn with_journal(
         pool: Arc<BufferPool>,
+        history_pool: Arc<BufferPool>,
         header: FileHeader,
         journal: Arc<Mutex<JournalManager>>,
         journal_main_file: Arc<Mutex<File>>,
@@ -140,8 +163,10 @@ impl BufferPoolHandle {
         let pool_io = BufferPoolPageSource::new(Arc::clone(&pool));
         Self {
             pool,
+            history_pool,
             allocator,
             pool_io,
+            read_view_registry: ReadViewRegistry::new(),
             journal: Some(journal),
             journal_main_file: Some(journal_main_file),
         }
@@ -165,7 +190,18 @@ impl BufferPoolHandle {
         page_number: u32,
         size: PageSize,
     ) -> Result<PinnedPage<'a>> {
-        self.pool.pin(page_number, size)
+        // Non-recursion invariant (plan §T7): reconciliation while evicting a
+        // main-data leaf installs aged entries into `history_pool`. If the
+        // history store could somehow re-enter fetch_page on the main pool we
+        // would risk partition-lock recursion. The depth sentinel catches that
+        // in debug builds.
+        debug_assert!(
+            crate::storage::history_store::history_store_depth() == 0,
+            "BufferPoolHandle::fetch_page entered from within HistoryStore body \
+             — non-recursion invariant violated (plan §T7)"
+        );
+        self.pool
+            .pin_with_reconcile(page_number, size, &self.read_view_registry, &self.allocator)
     }
 
     // -----------------------------------------------------------------------
@@ -203,6 +239,22 @@ impl BufferPoolHandle {
             page.data_mut().fill(0);
         } // unpin — dirty bit persists in the pool
 
+        Ok(page_no)
+    }
+
+    /// Allocate a new page and pin it zeroed on the dedicated history-store
+    /// pool (plan §T7). File-level allocation still goes through the single
+    /// per-file `AllocatorHandle`, so history pages and main-data pages share
+    /// one disjoint page-number namespace.
+    pub(crate) fn alloc_page_history(&self, size: PageSize) -> Result<u32> {
+        let page_no = match size {
+            PageSize::Small4k => self.allocator.alloc_4k(&self.pool_io)?,
+            PageSize::Large32k => self.allocator.alloc_32k(&self.pool_io)?,
+        };
+        {
+            let mut page = self.history_pool.pin(page_no, size)?;
+            page.data_mut().fill(0);
+        }
         Ok(page_no)
     }
 
@@ -369,12 +421,45 @@ impl BufferPoolHandle {
         &self.pool
     }
 
+    /// Borrow the dedicated MVCC history-store [`BufferPool`] (plan §T7).
+    ///
+    /// A separate pool guarantees that `history_store` I/O never invalidates
+    /// main-data frames and — combined with the outermost lock-order position —
+    /// keeps reconciliation's installation of aged entries on a path that
+    /// never re-enters the main pool's partition mutexes.
+    #[allow(dead_code)]
+    pub(crate) fn history_pool(&self) -> &Arc<BufferPool> {
+        &self.history_pool
+    }
+
+    /// Borrow the shared [`ReadViewRegistry`].
+    pub(crate) fn read_view_registry(&self) -> &Arc<ReadViewRegistry> {
+        &self.read_view_registry
+    }
+
     /// Borrow the `BufferPoolPageSource` routing allocator I/O through the pool.
     ///
     /// Used by writer-path code that needs a `PageSource` for
     /// [`AllocatorHandle::drain_free_queue`] without re-constructing one.
     pub(crate) fn page_source(&self) -> &BufferPoolPageSource {
         &self.pool_io
+    }
+
+    /// Highest `ChainCommit::commit_ts` that the journal observed during
+    /// recovery, or `None` when no journal is attached or it carried no
+    /// ChainCommit frames. The MVCC backend folds this into
+    /// `TimestampOracle::set_min` at construction so post-recovery commits
+    /// are strictly above every durable pre-crash commit (plan T7).
+    pub(crate) fn recovered_max_commit_ts(&self) -> Result<Option<crate::mvcc::timestamp::Ts>> {
+        match &self.journal {
+            None => Ok(None),
+            Some(journal) => {
+                let guard = journal
+                    .lock()
+                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+                Ok(guard.recovered_max_commit_ts())
+            }
+        }
     }
 
     /// Append an MVCC `ChainCommit` frame (Format Lock §A.2).
@@ -461,8 +546,12 @@ mod tests {
             default_sizes::DESKTOP,
             Box::new(ArcIo(Arc::clone(&io))),
         ));
+        let history_pool = Arc::new(BufferPool::new(
+            default_sizes::IOT,
+            Box::new(ArcIo(Arc::clone(&io))),
+        ));
         let header = FileHeader::new_now();
-        let handle = BufferPoolHandle::new(pool, header);
+        let handle = BufferPoolHandle::new(pool, history_pool, header);
         (io, handle)
     }
 

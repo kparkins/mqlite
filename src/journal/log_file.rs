@@ -659,8 +659,10 @@ impl ChainCommitFrame {
 ///
 /// ## Cursor semantics
 ///
-/// - On `Ok(Some(n))`: the reader is positioned at the next frame, and `n`
-///   is the number of bytes the `ChainCommit` consumed.
+/// - On `Ok(Some((n, commit_ts)))`: the reader is positioned at the next
+///   frame, `n` is the number of bytes the `ChainCommit` consumed, and
+///   `commit_ts` is the decoded commit timestamp (carried out so recovery
+///   can fold it into `TimestampOracle::set_min`).
 /// - On `Ok(None)`: the reader is restored to its original position. The
 ///   caller proceeds to `JournalFrameHeader::read` as before.
 /// - On `Err`: the reader position is undefined; the caller should treat
@@ -669,7 +671,7 @@ pub(crate) fn try_skip_chain_commit<R: Read + Seek>(
     r: &mut R,
     expected_salt1: u32,
     expected_salt2: u32,
-) -> Result<Option<u64>> {
+) -> Result<Option<(u64, Ts)>> {
     let start = r.stream_position().map_err(Error::Io)?;
 
     // Read the fixed 32-byte header prefix first. Cheaper rejects happen
@@ -716,7 +718,7 @@ pub(crate) fn try_skip_chain_commit<R: Read + Seek>(
     }
 
     match ChainCommitFrame::decode(&full, expected_salt1, expected_salt2)? {
-        Some(_) => Ok(Some(total_frame_bytes as u64)),
+        Some(frame) => Ok(Some((total_frame_bytes as u64, frame.commit_ts))),
         None => {
             r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
             Ok(None)
@@ -1001,13 +1003,15 @@ mod tests {
     #[test]
     fn try_skip_chain_commit_advances_past_valid_frame() {
         let frame = sample_chain_commit();
+        let expected_ts = frame.commit_ts;
         let bytes = frame.encode().unwrap();
         let mut cursor = std::io::Cursor::new(bytes.clone());
-        let n = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2)
+        let (n, ts) = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2)
             .unwrap()
             .expect("valid frame must be skipped");
         assert_eq!(n as usize, bytes.len());
         assert_eq!(cursor.position() as usize, bytes.len());
+        assert_eq!(ts, expected_ts, "commit_ts must be carried out of the scan");
     }
 
     #[test]

@@ -31,6 +31,18 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::mvcc::read_view::{ChainSnapshot, ReadView};
 use crate::mvcc::version::{VersionData, VersionEntry};
+
+/// Reader-path history fallthrough (plan §T7).
+///
+/// Bound to a specific `(ns_id, kind_tag)` at the call site — the BTree
+/// layer only sees an opaque probe object and walks `(key, read_ts)`.
+/// A `None` return means "no entry ≤ read_ts"; a `Some(entry)` return
+/// means the probe found the newest visible history version (tombstones
+/// included — the caller treats tombstones as "key absent").
+pub(crate) trait HistoryProbe {
+    fn probe(&self, key: &[u8], read_ts: crate::mvcc::timestamp::Ts)
+        -> Result<Option<VersionEntry>>;
+}
 use crate::storage::page::{
     internal_page_checksum, leaf_page_checksum, overflow_page_checksum, InternalPageHeader,
     LeafPageHeader, OverflowPageHeader, INTERNAL_HEADER_SIZE, LEAF_FLAG_HAS_OVERFLOW,
@@ -972,11 +984,29 @@ impl<S: BTreePageStore> BTree<S> {
         &self,
         key: &[u8],
         view: &ReadView,
+        history: Option<&dyn HistoryProbe>,
     ) -> Result<Option<Vec<u8>>> {
         let leaf_page = self.find_leaf(key)?;
         let (buf, snap) = self.store.read_leaf(leaf_page)?;
         if let Some(snap) = snap.as_ref() {
             if let Some(entry) = snap.visible_at(key, view) {
+                if entry.is_tombstone {
+                    return Ok(None);
+                }
+                return Ok(Some(match &entry.data {
+                    VersionData::Inline(v) => v.clone(),
+                    VersionData::Overflow(oref) => read_overflow_chain(
+                        &self.store,
+                        oref.first_page(),
+                        oref.total_length() as u32,
+                    )?,
+                }));
+            }
+        }
+        // Plan §T7: history fallthrough. The chain had no entry visible at
+        // `view.read_ts` — an evicted entry in the history store might.
+        if let Some(probe) = history {
+            if let Some(entry) = probe.probe(key, view.read_ts)? {
                 if entry.is_tombstone {
                     return Ok(None);
                 }
@@ -1681,6 +1711,7 @@ impl<S: BTreePageStore> BTree<S> {
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
         view: &ReadView,
+        history: Option<&dyn HistoryProbe>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -1729,6 +1760,28 @@ impl<S: BTreePageStore> BTree<S> {
                     };
                     results.push((cell.key.clone(), bytes));
                     continue;
+                }
+
+                // Plan §T7: history fallthrough before falling back to the
+                // on-disk cell. A visible evicted entry in the history store
+                // is preferred over the cell (which reflects the latest
+                // committed baseline, not necessarily visible at `read_ts`).
+                if let Some(probe) = history {
+                    if let Some(entry) = probe.probe(&cell.key, view.read_ts)? {
+                        if entry.is_tombstone {
+                            continue;
+                        }
+                        let bytes = match &entry.data {
+                            VersionData::Inline(v) => v.clone(),
+                            VersionData::Overflow(oref) => read_overflow_chain(
+                                &self.store,
+                                oref.first_page(),
+                                oref.total_length() as u32,
+                            )?,
+                        };
+                        results.push((cell.key.clone(), bytes));
+                        continue;
+                    }
                 }
 
                 // Fall back to the on-disk cell.

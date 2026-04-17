@@ -440,7 +440,11 @@ mod tests {
             default_sizes::DESKTOP,
             Box::new(ArcIo(Arc::clone(&io))),
         ));
-        Arc::new(BufferPoolHandle::new(pool, FileHeader::new(0, 0, 0)))
+        let history_pool = Arc::new(BufferPool::new(
+            default_sizes::IOT,
+            Box::new(ArcIo(Arc::clone(&io))),
+        ));
+        Arc::new(BufferPoolHandle::new(pool, history_pool, FileHeader::new(0, 0, 0)))
     }
 
     // -----------------------------------------------------------------------

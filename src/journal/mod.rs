@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::mvcc::timestamp::Ts;
 use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 use crate::storage::page::PAGE_SIZE_LEAF;
@@ -83,6 +84,12 @@ pub(crate) struct JournalManager {
     /// Carried forward across commits; `None` if no commit has occurred yet
     /// in this journal.
     last_committed_db_page_count: Option<u32>,
+    /// Highest `commit_ts` observed on any durable `ChainCommit` frame
+    /// during recovery (`recover_existing`). `None` when the journal was
+    /// freshly created or carried no ChainCommit frames. The MVCC backend
+    /// reads this via [`recovered_max_commit_ts`](Self::recovered_max_commit_ts)
+    /// to floor [`TimestampOracle`] (plan T7 "journal-tail scan").
+    recovered_max_commit_ts: Option<Ts>,
 }
 
 impl JournalManager {
@@ -147,6 +154,7 @@ impl JournalManager {
             checkpoint_seq: 0,
             write_cursor: JOURNAL_HEADER_SIZE as u64,
             last_committed_db_page_count: None,
+            recovered_max_commit_ts: None,
         })
     }
 
@@ -216,6 +224,11 @@ impl JournalManager {
             Vec::new(); // (page_num, size, data, offset)
         let mut write_cursor = JOURNAL_HEADER_SIZE as u64;
         let mut last_committed_db_page_count: Option<u32> = None;
+        // MVCC T7 — journal-tail HLC oracle recovery. Fold every ChainCommit
+        // frame's `commit_ts` into a running max. The backend reads the max
+        // via `recovered_max_commit_ts` after `open_or_create` returns and
+        // floors `TimestampOracle` at `max.successor()`.
+        let mut max_commit_ts: Option<Ts> = None;
 
         loop {
             let frame_offset = write_cursor;
@@ -228,12 +241,19 @@ impl JournalManager {
             journal_file
                 .seek(SeekFrom::Start(frame_offset))
                 .map_err(Error::Io)?;
-            if let Some(n) = try_skip_chain_commit(&mut journal_file, salt1, salt2)? {
+            if let Some((n, commit_ts)) =
+                try_skip_chain_commit(&mut journal_file, salt1, salt2)?
+            {
                 // ChainCommit frame replay is a no-op for the page-replay
-                // loop (it carries no single page_number). Recovery of
-                // version-chain state arrives in T7; for now we only need
-                // to step past the frame without corrupting write_cursor.
+                // loop (it carries no single page_number). Version-chain
+                // state is rebuilt on demand; the only recovery-critical
+                // datum is `commit_ts`, which folds into `max_commit_ts`
+                // so the HLC oracle lifts above every durable commit.
                 write_cursor += n;
+                max_commit_ts = Some(match max_commit_ts {
+                    Some(prev) if prev >= commit_ts => prev,
+                    _ => commit_ts,
+                });
                 continue;
             }
 
@@ -335,6 +355,7 @@ impl JournalManager {
             checkpoint_seq,
             write_cursor,
             last_committed_db_page_count,
+            recovered_max_commit_ts: max_commit_ts,
         }))
     }
 
@@ -514,7 +535,7 @@ impl JournalManager {
 
             // MVCC T5'/T6: skip ChainCommit frames — they carry no
             // page_number and are invisible to the per-page linear scan.
-            if let Some(n) =
+            if let Some((n, _commit_ts)) =
                 try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
             {
                 cursor += n;
@@ -662,6 +683,16 @@ impl JournalManager {
         &self.shm
     }
 
+    /// Highest `ChainCommit::commit_ts` observed during recovery, or `None`
+    /// when the journal was freshly created or carried no ChainCommit
+    /// frames. The MVCC backend uses this to floor the HLC oracle at
+    /// `max.successor()` so that every post-recovery `commit()` is
+    /// strictly greater than any durable commit from the previous
+    /// lifetime (plan T7 — "journal-tail scan, HLC-aware").
+    pub(crate) fn recovered_max_commit_ts(&self) -> Option<Ts> {
+        self.recovered_max_commit_ts
+    }
+
     // -----------------------------------------------------------------------
     // Rollback
     // -----------------------------------------------------------------------
@@ -705,7 +736,7 @@ impl JournalManager {
             // MVCC T5'/T6: ChainCommit frames are part of the durable log
             // but carry no `page_number` for the SHM index. Skip past them
             // so `JournalFrameHeader::read` below sees only legacy frames.
-            if let Some(n) =
+            if let Some((n, _commit_ts)) =
                 try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
             {
                 scan += n;
@@ -1460,6 +1491,83 @@ mod tests {
         assert!(mgr.truncate_to(cur + 1).is_err());
         assert!(mgr.truncate_to(0).is_err());
         drop(mgr);
+        drop(main_file);
+        drop(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // T7 — HLC oracle recovery: ChainCommit frames fold into
+    // `recovered_max_commit_ts` across reopen.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recovered_max_commit_ts_none_on_fresh_journal() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+        let mgr =
+            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        assert_eq!(mgr.recovered_max_commit_ts(), None);
+        drop(mgr);
+        drop(main_file);
+        drop(dir);
+    }
+
+    #[test]
+    fn recovered_max_commit_ts_folds_across_reopen() {
+        use crate::mvcc::timestamp::Ts;
+
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+
+        // Lifetime 1 — append three ChainCommit frames with non-monotonic ts;
+        // `open_or_create` in the second lifetime must return the max.
+        let mut mgr =
+            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        mgr.append_chain_commit(Ts { physical_ms: 50, logical: 0 }, vec![], vec![])
+            .unwrap();
+        mgr.append_chain_commit(Ts { physical_ms: 150, logical: 0 }, vec![], vec![])
+            .unwrap();
+        mgr.append_chain_commit(Ts { physical_ms: 100, logical: 7 }, vec![], vec![])
+            .unwrap();
+        drop(mgr);
+
+        let mgr2 =
+            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        assert_eq!(
+            mgr2.recovered_max_commit_ts(),
+            Some(Ts { physical_ms: 150, logical: 0 }),
+            "recovery must fold max(commit_ts) across ChainCommit frames"
+        );
+        drop(mgr2);
+        drop(main_file);
+        drop(dir);
+    }
+
+    #[test]
+    fn recovered_max_commit_ts_compares_logical_component() {
+        use crate::mvcc::timestamp::Ts;
+
+        let (dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+
+        let mut mgr =
+            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        mgr.append_chain_commit(Ts { physical_ms: 200, logical: 3 }, vec![], vec![])
+            .unwrap();
+        mgr.append_chain_commit(Ts { physical_ms: 200, logical: 9 }, vec![], vec![])
+            .unwrap();
+        mgr.append_chain_commit(Ts { physical_ms: 200, logical: 1 }, vec![], vec![])
+            .unwrap();
+        drop(mgr);
+
+        let mgr2 =
+            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        assert_eq!(
+            mgr2.recovered_max_commit_ts(),
+            Some(Ts { physical_ms: 200, logical: 9 }),
+            "tie-breaking on logical component required for HLC recovery"
+        );
+        drop(mgr2);
         drop(main_file);
         drop(dir);
     }

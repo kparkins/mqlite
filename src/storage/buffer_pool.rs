@@ -259,6 +259,94 @@ impl Partition {
         Ok(idx)
     }
 
+    /// Identical to `pin_page` but, on a cache miss, inline-reconciles the
+    /// victim frame's version chains against `ort` BEFORE evicting it.
+    ///
+    /// Returns `(frame_idx, entries_dropped)`. `ort` must be snapshotted
+    /// from `ReadViewRegistry::oldest_required_ts()` OUTSIDE the partition
+    /// mutex (position 5 < positions 3/4 — see lock-order doc at top).
+    fn pin_page_reconciling(
+        &mut self,
+        page_number: u32,
+        ort: Ts,
+        io: &dyn PageSource,
+        size: PageSize,
+    ) -> Result<(usize, usize)> {
+        // Cache hit — no victim, no reconciliation.
+        if let Some(&idx) = self.page_map.get(&page_number) {
+            let frame = self.frames[idx]
+                .as_mut()
+                .expect("page_map invariant: frame must exist at mapped slot");
+            frame.pin_count += 1;
+            frame.ref_bit = true;
+            return Ok((idx, 0));
+        }
+
+        let idx = self.find_victim().ok_or_else(|| {
+            Error::Internal(
+                "buffer pool exhausted: all frames are pinned; \
+                 unpin unused pages or increase buffer_pool_size"
+                    .into(),
+            )
+        })?;
+
+        // Prune the victim's chains against the snapshotted horizon before
+        // it is evicted. Entries with `stop_ts <= ort && stop_ts < Ts::MAX`
+        // are invisible to every live reader; retain only the live head
+        // and committed-replaced entries above the horizon.
+        let dropped = self.reconcile_frame_at(idx, ort);
+
+        // Evict current occupant (if any)
+        self.evict_frame(idx, io, size)?;
+
+        // Load from disk
+        let mut data = vec![0u8; self.page_size].into_boxed_slice();
+        io.read_page(page_number, size, &mut data)?;
+
+        self.frames[idx] = Some(Frame {
+            page_number,
+            data,
+            pin_count: 1,
+            dirty: false,
+            ref_bit: true,
+            version_chains: HashMap::new(),
+        });
+        self.page_map.insert(page_number, idx);
+
+        Ok((idx, dropped))
+    }
+
+    /// Prune the frame at slot `idx`'s version chains against horizon `ort`.
+    /// Returns the number of `VersionEntry` objects dropped. No-op if the
+    /// slot is empty.
+    fn reconcile_frame_at(&mut self, idx: usize, ort: Ts) -> usize {
+        let Some(frame) = self.frames[idx].as_mut() else {
+            return 0;
+        };
+        let mut dropped = 0usize;
+        let keys: Vec<Vec<u8>> = frame.version_chains.keys().cloned().collect();
+        for key in keys {
+            let Some(chain_arc) = frame.version_chains.get_mut(&key) else {
+                continue;
+            };
+            let before = chain_arc.len();
+            let chain_mut = Arc::make_mut(chain_arc);
+            chain_mut.retain(|e| e.stop_ts == Ts::MAX || e.stop_ts > ort);
+            let after = chain_arc.len();
+            dropped += before - after;
+
+            let collapse = chain_arc.len() == 1
+                && chain_arc
+                    .front()
+                    .map(|e| e.stop_ts == Ts::MAX && !e.is_tombstone)
+                    .unwrap_or(false);
+            if collapse || chain_arc.is_empty() {
+                frame.version_chains.remove(&key);
+            }
+        }
+        dropped
+    }
+
     /// Decrement `pin_count`; optionally mark the frame dirty.
     fn unpin_page(&mut self, page_number: u32, dirty: bool) -> Result<()> {
         let idx = self.page_map.get(&page_number).copied().ok_or_else(|| {
@@ -505,6 +593,73 @@ impl BufferPool {
         })
     }
 
+    /// Pin `page_number` with chain reconciliation on the miss path (T7).
+    ///
+    /// Identical to [`BufferPool::pin`] on a cache hit. On a miss, the
+    /// chosen victim frame's version chains are pruned against the current
+    /// `ReadViewRegistry` horizon BEFORE eviction, so aged entries never
+    /// outlive the frame that hosts them. After the pin returns, the
+    /// writer-serialized [`DeferredFreeQueue`] drain is invoked to reclaim
+    /// overflow pages whose refcount reached zero as a side-effect of the
+    /// prune.
+    ///
+    /// **Lock-order contract (T4 / T6 / T7):**
+    /// 1. `ReadViewRegistry::oldest_required_ts()` is snapshotted BEFORE
+    ///    the partition mutex. Position 5 is below positions 3/4 in the
+    ///    total order.
+    /// 2. The partition mutex is released before `drain_free_queue` is
+    ///    invoked, so the allocator-state mutex (position 2) is never
+    ///    nested under a partition mutex (positions 3/4).
+    ///
+    /// Callers with access to a `ReadViewRegistry` and `AllocatorHandle`
+    /// (the high-level reader/writer paths via `BufferPoolHandle`) must
+    /// prefer this over `pin` so that eviction never drops a frame whose
+    /// chains still carry versions visible to no live reader.
+    pub(crate) fn pin_with_reconcile<'a>(
+        &'a self,
+        page_number: u32,
+        size: PageSize,
+        registry: &ReadViewRegistry,
+        allocator: &AllocatorHandle,
+    ) -> Result<PinnedPage<'a>> {
+        // 1. Snapshot the horizon BEFORE any partition latch.
+        let ort = registry.oldest_required_ts();
+
+        let (lock, size_enum) = match size {
+            PageSize::Small4k => (&self.inner_4k, PageSize::Small4k),
+            PageSize::Large32k => (&self.inner_32k, PageSize::Large32k),
+        };
+
+        // 2. Pin + reconcile victim under the partition lock.
+        let (ptr, dropped) = {
+            let mut guard = lock
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            let (idx, dropped) =
+                guard.pin_page_reconciling(page_number, ort, self.io.as_ref(), size_enum)?;
+            // SAFETY: Vec backing does not reallocate (fixed capacity);
+            // eviction is prevented by pin_count > 0 set above.
+            (guard.data_ptr_mut(idx), dropped)
+        };
+
+        // 3. Tick counters + drain deferred-free queue outside the latch.
+        if dropped > 0 {
+            metrics::record_reconcile_entries_dropped(dropped as u64);
+        }
+        metrics::set_deferred_free_queue_depth(
+            allocator.deferred_free_queue().depth() as u64,
+        );
+        allocator.drain_free_queue(self.io.as_ref())?;
+
+        Ok(PinnedPage {
+            pool: self,
+            page_number,
+            page_size: size_enum,
+            ptr,
+            dirty: false,
+        })
+    }
+
     /// Write all dirty pages in both partitions to disk and clear dirty bits.
     ///
     /// Must be called before a WAL checkpoint or `Database::close` to ensure
@@ -670,7 +825,6 @@ impl BufferPool {
     ///    nested under a partition mutex (positions 3/4).
     ///
     /// Returns the number of `VersionEntry` objects dropped.
-    #[allow(dead_code)] // wired into eviction path by T7
     pub(crate) fn reconcile(
         &self,
         page: u32,
@@ -780,6 +934,8 @@ pub(crate) mod default_sizes {
     pub const DESKTOP: usize = 64 * 1024 * 1024;
     /// Server deployments: 256 MiB.
     pub const SERVER: usize = 256 * 1024 * 1024;
+    /// Dedicated history-store pool (plan §T7): 8 MiB default.
+    pub const HISTORY: usize = 8 * 1024 * 1024;
 }
 
 // ---------------------------------------------------------------------------

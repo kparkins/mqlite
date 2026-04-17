@@ -46,7 +46,7 @@ use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::btree::BTreePageStore;
-use crate::storage::buffer_pool::PageSize;
+use crate::storage::buffer_pool::{PageSize, PinnedPage};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
@@ -66,18 +66,50 @@ const LEAF_SIZE: usize = PAGE_SIZE_LEAF as usize;
 /// See the module-level documentation for design details.
 pub(crate) struct BufferPoolPageStore {
     handle: Arc<BufferPoolHandle>,
+    /// When `true`, all page pins / allocations are routed through
+    /// [`BufferPoolHandle::history_pool`] instead of the main pool. Pages
+    /// allocated by a history-routed store live in a disjoint cache so that
+    /// reconciliation installing aged entries into the history store never
+    /// re-enters main-pool partition mutexes (plan §T7 lock-order).
+    is_history: bool,
 }
 
 impl BufferPoolPageStore {
-    /// Create a `BufferPoolPageStore` backed by `handle`.
+    /// Create a `BufferPoolPageStore` backed by `handle`'s main pool.
     pub(crate) fn new(handle: Arc<BufferPoolHandle>) -> Self {
-        Self { handle }
+        Self { handle, is_history: false }
+    }
+
+    /// Create a `BufferPoolPageStore` backed by `handle`'s dedicated
+    /// history-store pool (plan §T7).
+    pub(crate) fn new_history(handle: Arc<BufferPoolHandle>) -> Self {
+        Self { handle, is_history: true }
     }
 
     /// Borrow the underlying [`BufferPoolHandle`].
     #[allow(dead_code)]
     pub(crate) fn handle(&self) -> &Arc<BufferPoolHandle> {
         &self.handle
+    }
+
+    /// Fetch a page through the appropriate pool. History-routed stores
+    /// bypass chain reconciliation (no MVCC version chains live on history
+    /// pages) and pin directly on `history_pool`.
+    fn fetch<'a>(&'a self, page: u32, size: PageSize) -> Result<PinnedPage<'a>> {
+        if self.is_history {
+            self.handle.history_pool().pin(page, size)
+        } else {
+            self.handle.fetch_page(page, size)
+        }
+    }
+
+    /// Allocate a page and pin it zeroed on the appropriate pool.
+    fn alloc(&self, size: PageSize) -> Result<u32> {
+        if self.is_history {
+            self.handle.alloc_page_history(size)
+        } else {
+            self.handle.alloc_page(size)
+        }
     }
 }
 
@@ -87,7 +119,7 @@ impl BTreePageStore for BufferPoolPageStore {
     // -----------------------------------------------------------------------
 
     fn read_internal(&self, page: u32) -> Result<Box<[u8; INTERNAL_SIZE]>> {
-        let pinned = self.handle.fetch_page(page, PageSize::Small4k)?;
+        let pinned = self.fetch(page, PageSize::Small4k)?;
         let mut buf = Box::new([0u8; INTERNAL_SIZE]);
         buf.copy_from_slice(pinned.data());
         Ok(buf)
@@ -98,13 +130,17 @@ impl BTreePageStore for BufferPoolPageStore {
         &self,
         page: u32,
     ) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
-        let pinned = self.handle.fetch_page(page, PageSize::Large32k)?;
+        let pinned = self.fetch(page, PageSize::Large32k)?;
         let mut buf = Box::new([0u8; LEAF_SIZE]);
         buf.copy_from_slice(pinned.data());
         // The page is pinned — the frame is guaranteed resident, so we can
-        // snapshot its MVCC chains before unpinning. T3.75 supplies
-        // `view = None`; T4+ will thread the reader's Arc<ReadView> through.
-        let snap = self.handle.pool().snapshot_chains(page, None)?;
+        // snapshot its MVCC chains before unpinning. History-routed stores
+        // never carry version chains, so we skip the snapshot on them.
+        let snap = if self.is_history {
+            None
+        } else {
+            self.handle.pool().snapshot_chains(page, None)?
+        };
         Ok((buf, snap))
         // pinned auto-unpins here
     }
@@ -114,14 +150,14 @@ impl BTreePageStore for BufferPoolPageStore {
     // -----------------------------------------------------------------------
 
     fn write_internal(&mut self, page: u32, data: &[u8; INTERNAL_SIZE]) -> Result<()> {
-        let mut pinned = self.handle.fetch_page(page, PageSize::Small4k)?;
+        let mut pinned = self.fetch(page, PageSize::Small4k)?;
         pinned.data_mut().copy_from_slice(data);
         Ok(())
         // pinned auto-unpins here; dirty bit set by data_mut()
     }
 
     fn write_leaf(&mut self, page: u32, data: &[u8; LEAF_SIZE]) -> Result<()> {
-        let mut pinned = self.handle.fetch_page(page, PageSize::Large32k)?;
+        let mut pinned = self.fetch(page, PageSize::Large32k)?;
         pinned.data_mut().copy_from_slice(data);
         Ok(())
     }
@@ -131,11 +167,11 @@ impl BTreePageStore for BufferPoolPageStore {
     // -----------------------------------------------------------------------
 
     fn alloc_internal(&mut self) -> Result<u32> {
-        self.handle.alloc_page(PageSize::Small4k)
+        self.alloc(PageSize::Small4k)
     }
 
     fn alloc_leaf(&mut self) -> Result<u32> {
-        self.handle.alloc_page(PageSize::Large32k)
+        self.alloc(PageSize::Large32k)
     }
 
     // -----------------------------------------------------------------------
@@ -232,9 +268,16 @@ mod tests {
 
     fn make_store() -> BufferPoolPageStore {
         let io = MockIo::new();
-        let pool = Arc::new(BufferPool::new(default_sizes::DESKTOP, Box::new(ArcIo(io))));
+        let pool = Arc::new(BufferPool::new(
+            default_sizes::DESKTOP,
+            Box::new(ArcIo(Arc::clone(&io))),
+        ));
+        let history_pool = Arc::new(BufferPool::new(
+            default_sizes::IOT,
+            Box::new(ArcIo(Arc::clone(&io))),
+        ));
         let header = FileHeader::new_now();
-        let handle = Arc::new(BufferPoolHandle::new(pool, header));
+        let handle = Arc::new(BufferPoolHandle::new(pool, history_pool, header));
         BufferPoolPageStore::new(handle)
     }
 

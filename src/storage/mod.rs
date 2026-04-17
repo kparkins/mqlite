@@ -11,6 +11,7 @@ pub(crate) mod catalog;
 pub(crate) mod file_io;
 pub(crate) mod handle;
 pub(crate) mod header;
+pub(crate) mod history_store;
 pub(crate) mod lock;
 pub(crate) mod oid;
 pub(crate) mod page;

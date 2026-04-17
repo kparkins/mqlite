@@ -902,9 +902,22 @@ impl Client {
                 Arc::clone(&journal),
             ));
         let pool = Arc::new(BufferPool::new(opts.buffer_pool_size, layered_source));
+        // Dedicated history-store buffer pool (plan §T7 NON-NEGOTIABLE).
+        // Sized conservatively; routes through the same journal-layered source so
+        // recovered history pages are visible after checkpoint.
+        let history_source: Box<dyn crate::storage::buffer_pool::PageSource> =
+            Box::new(JournalLayeredSource::new(
+                Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,
+                Arc::clone(&journal),
+            ));
+        let history_pool = Arc::new(BufferPool::new(
+            crate::storage::buffer_pool::default_sizes::HISTORY,
+            history_source,
+        ));
         let journal_main_file = Arc::new(Mutex::new(journal_io_file));
         let buffer_pool = Arc::new(BufferPoolHandle::with_journal(
             pool,
+            history_pool,
             file_header,
             journal,
             Arc::clone(&journal_main_file),

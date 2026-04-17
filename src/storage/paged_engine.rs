@@ -38,7 +38,7 @@ use bson::{Bson, Document};
 use crate::error::{Error, Result};
 use crate::index::{IndexInfo, IndexModel};
 use crate::key_encoding::{encode_compound_key, encode_key, COMPOUND_SEP};
-use crate::mvcc::read_view::{ReadView, ReadViewRegistry};
+use crate::mvcc::read_view::ReadView;
 use crate::mvcc::timestamp::TimestampOracle;
 use crate::mvcc::transaction::WriteTxn;
 use crate::options::{
@@ -53,6 +53,7 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog, IndexEntry};
 use crate::storage::handle::BufferPoolHandle;
+use crate::storage::history_store::HistoryStore;
 use crate::storage::oid::ObjectIdGenerator;
 use crate::storage::secondary_index::{
     build_index, generate_index_name, update_index_on_delete, update_index_on_insert,
@@ -279,13 +280,17 @@ fn btree_insert_doc<S: BTreePageStore>(
 
 /// MVCC-aware collection scan. For each key visible at `view.read_ts` (or
 /// the on-disk cell when no chain entry is present), decode the value as
-/// BSON and retain rows that satisfy `filter`.
+/// BSON and retain rows that satisfy `filter`. The optional `history`
+/// probe (plan §T7) is consulted when neither the chain nor a newer
+/// version is visible, so readers can still see entries evicted from
+/// memory chains into the history store.
 fn btree_collscan<S: BTreePageStore>(
     tree: &BTree<S>,
     filter: &Document,
     view: &ReadView,
+    history: Option<&dyn crate::storage::btree::HistoryProbe>,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
-    let pairs = tree.range_scan_mvcc(None, None, view)?;
+    let pairs = tree.range_scan_mvcc(None, None, view, history)?;
     let mut result = Vec::new();
     for (key, bson_bytes) in pairs {
         let doc: Document = bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
@@ -294,6 +299,41 @@ fn btree_collscan<S: BTreePageStore>(
         }
     }
     Ok(result)
+}
+
+/// Derive a stable `ns_id: u32` from a collection / namespace name.
+///
+/// FNV-1a 32-bit. Used purely as a key-space partitioning hint for the
+/// history store; collisions just mean two collections share a key
+/// prefix in the history B-tree, which is harmless because the
+/// remaining key material (kind-tag + user key) already disambiguates.
+fn ns_id_for(ns: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in ns.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Bind the primary-key probe path of a [`HistoryStore`] to a fixed
+/// `(ns_id, KIND_PRIMARY)` so the BTree layer sees a key-only probe.
+struct PrimaryHistoryProbe<S: BTreePageStore> {
+    store: Arc<std::sync::Mutex<HistoryStore<S>>>,
+    ns_id: u32,
+}
+
+impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryProbe<S> {
+    fn probe(
+        &self,
+        key: &[u8],
+        read_ts: crate::mvcc::timestamp::Ts,
+    ) -> Result<Option<crate::mvcc::version::VersionEntry>> {
+        let guard = self.store.lock().map_err(|_| {
+            Error::Internal("history_store mutex poisoned".into())
+        })?;
+        guard.probe_primary(self.ns_id, key, read_ts)
+    }
 }
 
 /// Apply sort/skip/limit/projection to a list of matched documents.
@@ -339,12 +379,17 @@ struct BpBackend {
     /// Cached data trees (loaded lazily from the catalog on first access).
     data_trees: HashMap<String, BTree<BufferPoolPageStore>>,
     /// HLC oracle issuing commit timestamps for MVCC ChainCommit frames.
-    /// Fresh on construction; recovery from journal arrives in T7.
+    /// Floored at open time to `journal.recovered_max_commit_ts().successor()`
+    /// (plan T7) so post-recovery commits are strictly above every durable
+    /// pre-crash commit.
     oracle: Arc<TimestampOracle>,
-    /// Tracks live reader `ReadView`s so the writer / reconciliation path
-    /// can compute `oldest_required_ts()`. Readers open a view here before
-    /// consulting MVCC chain snapshots.
-    read_view_registry: Arc<ReadViewRegistry>,
+    /// MVCC history store (plan §T7). Reconciliation pushes aged version
+    /// entries here when a leaf is evicted; reader probes here on
+    /// buffer-pool misses whose chain snapshot is empty. Routed through
+    /// [`BufferPoolHandle::history_pool`]. Wrapped in `Arc<Mutex<_>>` so
+    /// the writer-path (future reconciliation) and reader-path probes
+    /// can hold disjoint borrows of the `BpBackend` simultaneously.
+    history_store: Arc<std::sync::Mutex<HistoryStore<BufferPoolPageStore>>>,
     /// Monotonic writer-transaction identifier source. Increments per
     /// `with_txn` call; wraps only after 2⁶⁴ txns (practical infinity).
     txn_counter: AtomicU64,
@@ -382,12 +427,29 @@ impl BpBackend {
             |_page| true,
         )?;
         let _ = used_backup; // noted for tracing/logging if needed
+        // T7 — journal-tail HLC oracle recovery: floor the oracle above
+        // every durable ChainCommit from the previous lifetime. Missing
+        // `successor()` (saturated `Ts::MAX`) is a hard error per plan.
+        let oracle = Arc::new(TimestampOracle::new());
+        if let Some(max_ts) = handle.recovered_max_commit_ts()? {
+            match max_ts.successor() {
+                Some(next) => oracle.set_min(next),
+                None => return Err(Error::TimestampExhausted),
+            }
+        }
+        // Plan §T7: construct the history store on the dedicated
+        // history-routed page store. A fresh tree is built every open — the
+        // previous lifetime's entries are not persisted across restart
+        // because reconciliation repopulates it lazily (plan deferral 905).
+        let history_store_inner = HistoryStore::create(
+            BufferPoolPageStore::new_history(Arc::clone(&handle)),
+        )?;
         let backend = Self {
             handle,
             catalog,
             data_trees: HashMap::new(),
-            oracle: Arc::new(TimestampOracle::new()),
-            read_view_registry: ReadViewRegistry::new(),
+            oracle,
+            history_store: Arc::new(std::sync::Mutex::new(history_store_inner)),
             txn_counter: AtomicU64::new(1),
             active_txn: None,
         };
@@ -405,13 +467,26 @@ impl BpBackend {
     }
 
     /// Open a snapshot [`ReadView`] for a reader path. The view registers
-    /// itself with [`BpBackend::read_view_registry`] for its lifetime and
+    /// itself with the handle-owned [`ReadViewRegistry`] for its lifetime and
     /// is timestamped with the oracle's current `read_ts`. The `txn_id` is
     /// pulled from `txn_counter` so concurrent reader views remain unique.
     fn open_read_view(&self) -> Arc<ReadView> {
         let txn_id = self.txn_counter.fetch_add(1, Ordering::Relaxed);
         let read_ts = self.oracle.now();
-        ReadView::open(Arc::clone(&self.read_view_registry), read_ts, txn_id)
+        ReadView::open(
+            Arc::clone(self.handle.read_view_registry()),
+            read_ts,
+            txn_id,
+        )
+    }
+
+    /// Bind a primary-key probe of the [`HistoryStore`] to `ns` so reader
+    /// paths can fall through on chain misses (plan §T7).
+    fn primary_history_probe(&self, ns: &str) -> PrimaryHistoryProbe<BufferPoolPageStore> {
+        PrimaryHistoryProbe {
+            store: Arc::clone(&self.history_store),
+            ns_id: ns_id_for(ns),
+        }
     }
 
     /// Update `FileHeader::catalog_root_page` and `catalog_root_level` to
@@ -1412,7 +1487,8 @@ impl StorageEngine for PagedEngine {
                     None => return Ok(Vec::new()),
                     Some(tree) => {
                         let view = bp.open_read_view();
-                        btree_collscan(&tree, filter, &view)?
+                        let probe = bp.primary_history_probe(ns);
+                        btree_collscan(&tree, filter, &view, Some(&probe))?
                             .into_iter()
                             .map(|(_, doc)| doc)
                             .collect()
@@ -1462,6 +1538,7 @@ impl StorageEngine for PagedEngine {
         let (matched_pairs, tree_exists): (Vec<(Vec<u8>, Document)>, bool) = {
             let bp = &mut *inner;
             let view = bp.open_read_view();
+            let probe = bp.primary_history_probe(ns);
             match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
@@ -1474,7 +1551,7 @@ impl StorageEngine for PagedEngine {
                         upserted_id: None,
                     });
                 }
-                Some(tree) => (btree_collscan(tree, filter, &view)?, true),
+                Some(tree) => (btree_collscan(tree, filter, &view, Some(&probe))?, true),
             }
         };
 
@@ -1542,10 +1619,11 @@ impl StorageEngine for PagedEngine {
         let pairs_to_delete: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
             let view = bp.open_read_view();
+            let probe = bp.primary_history_probe(ns);
             match bp.tree(ns)? {
                 None => return Ok(DeleteResult { deleted_count: 0 }),
                 Some(tree) => {
-                    let pairs = btree_collscan(tree, filter, &view)?;
+                    let pairs = btree_collscan(tree, filter, &view, Some(&probe))?;
                     if many {
                         pairs
                     } else {
@@ -1593,7 +1671,8 @@ impl StorageEngine for PagedEngine {
             None => Ok(0),
             Some(tree) => {
                 let view = bp.open_read_view();
-                let pairs = btree_collscan(&tree, filter, &view)?;
+                let probe = bp.primary_history_probe(ns);
+                let pairs = btree_collscan(&tree, filter, &view, Some(&probe))?;
                 Ok(pairs.len() as u64)
             }
         }
@@ -1620,6 +1699,7 @@ impl StorageEngine for PagedEngine {
         let mut matched: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
             let view = bp.open_read_view();
+            let probe = bp.primary_history_probe(ns);
             match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
@@ -1628,7 +1708,7 @@ impl StorageEngine for PagedEngine {
                     }
                     return Ok(None);
                 }
-                Some(tree) => btree_collscan(tree, filter, &view)?,
+                Some(tree) => btree_collscan(tree, filter, &view, Some(&probe))?,
             }
         };
 
@@ -1690,9 +1770,10 @@ impl StorageEngine for PagedEngine {
         let mut matched: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
             let view = bp.open_read_view();
+            let probe = bp.primary_history_probe(ns);
             match bp.tree(ns)? {
                 None => return Ok(None),
-                Some(tree) => btree_collscan(tree, filter, &view)?,
+                Some(tree) => btree_collscan(tree, filter, &view, Some(&probe))?,
             }
         };
 
@@ -1743,6 +1824,7 @@ impl StorageEngine for PagedEngine {
         let mut matched: Vec<(Vec<u8>, Document)> = {
             let bp = &mut *inner;
             let view = bp.open_read_view();
+            let probe = bp.primary_history_probe(ns);
             match bp.tree(ns)? {
                 None => {
                     if opts.upsert {
@@ -1751,7 +1833,7 @@ impl StorageEngine for PagedEngine {
                     }
                     return Ok(None);
                 }
-                Some(tree) => btree_collscan(tree, filter, &view)?,
+                Some(tree) => btree_collscan(tree, filter, &view, Some(&probe))?,
             }
         };
 
@@ -2365,8 +2447,12 @@ mod tests {
             default_sizes::DESKTOP,
             Box::new(ArcIo(Arc::clone(&io))),
         ));
+        let history_pool = Arc::new(BufferPool::new(
+            default_sizes::IOT,
+            Box::new(ArcIo(Arc::clone(&io))),
+        ));
         let header = FileHeader::new_now();
-        let handle = Arc::new(BufferPoolHandle::new(pool, header));
+        let handle = Arc::new(BufferPoolHandle::new(pool, history_pool, header));
         let engine = PagedEngine::new_buffered(handle, 0, 0)
             .expect("create buffered engine");
         (engine, io)
@@ -2399,7 +2485,11 @@ mod tests {
             default_sizes::DESKTOP,
             Box::new(ArcIo(Arc::clone(io))),
         ));
-        let handle = Arc::new(BufferPoolHandle::new(pool, header));
+        let history_pool = Arc::new(BufferPool::new(
+            default_sizes::IOT,
+            Box::new(ArcIo(Arc::clone(io))),
+        ));
+        let handle = Arc::new(BufferPoolHandle::new(pool, history_pool, header));
         PagedEngine::new_buffered(handle, catalog_root_page, catalog_root_level)
             .expect("reopen buffered engine")
     }
@@ -2989,7 +3079,7 @@ mod tests {
             let matched = inner
                 .open_tree_for_read("test.snap")
                 .unwrap()
-                .map(|t| btree_collscan(&t, &doc! {}, &view).unwrap())
+                .map(|t| btree_collscan(&t, &doc! {}, &view, None).unwrap())
                 .unwrap_or_default();
             drop(inner); // release read lock
             matched
