@@ -9,22 +9,23 @@ How to safely copy, back up, monitor, and recover mqlite database files.
 mqlite is advertised as a **single-file database**. The fine print:
 
 > A mqlite database is a single file **after a clean close**.
-> During normal operation, two additional files may be present.
+> During normal operation, one additional file may be present.
 
 ```
 myapp.mqlite          ← Main database file (always present)
 myapp.mqlite-wal      ← Write-ahead log (present during write activity)
-myapp.mqlite-shm      ← WAL shared-memory index (present while any handle is open)
 ```
 
 | File | When present | Role |
 |------|-------------|------|
 | `myapp.mqlite` | Always | Persistent B-tree pages. The "real" database. |
 | `myapp.mqlite-wal` | After any write, until checkpointed | Uncommitted and unmerged write pages. |
-| `myapp.mqlite-shm` | While a `Client` handle is open | In-memory WAL index, memory-mapped from this file. Deleted on clean close. |
 
-**During normal operation** all three files form a single logical unit. Never
-copy or move them individually — always treat the `.mqlite`, `-wal`, and `-shm`
+The page-offset lookup index used by readers lives **only in memory** — it is
+rebuilt from a journal scan on every open. There is no on-disk sidecar for it.
+
+**During normal operation** the two files form a single logical unit. Never
+copy or move them individually — always treat the `.mqlite` and `-wal`
 files as a group.
 
 ---
@@ -35,8 +36,7 @@ files as a group.
 
 1. All committed WAL pages are merged into `myapp.mqlite`.
 2. The WAL file is removed.
-3. The SHM file is removed.
-4. The OS advisory lock is released.
+3. The OS advisory lock is released.
 
 After `close()` returns, `myapp.mqlite` is the sole file on disk and can be
 copied safely.
@@ -56,8 +56,8 @@ fn write_and_close() -> mqlite::Result<()> {
 ```
 
 > **`Drop` vs `close()`:** Dropping a `Client` handle is non-blocking. It
-> releases the OS lock but does **not** checkpoint the WAL. The WAL and SHM
-> files remain on disk. This is safe — the next `open()` replays the WAL
+> releases the OS lock but does **not** checkpoint the WAL. The WAL file
+> remains on disk. This is safe — the next `open()` replays the WAL
 > automatically — but it means `Drop` does not produce a single-file state.
 > Call `close()` explicitly when you need one.
 
@@ -84,7 +84,7 @@ use std::fs;
 fn cold_backup(src: &str, dst: &str) -> mqlite::Result<()> {
     // Open, force a clean close, then copy.
     let client = Client::open(src)?;
-    client.close()?; // checkpoint + remove WAL/SHM
+    client.close()?; // checkpoint + remove WAL
 
     fs::copy(src, dst)?;
     println!("Backup written to {dst}");
@@ -92,16 +92,15 @@ fn cold_backup(src: &str, dst: &str) -> mqlite::Result<()> {
 }
 ```
 
-**Important:** Verify that `src-wal` and `src-shm` do **not** exist after
-`close()`. If they do, a crash occurred between the checkpoint and the file
-removal — open and close the database again before copying.
+**Important:** Verify that `src-wal` does **not** exist after `close()`. If
+it does, a crash occurred between the checkpoint and the file removal — open
+and close the database again before copying.
 
 ```rust
 use std::path::Path;
 
 fn assert_single_file(path: &str) {
     assert!(!Path::new(&format!("{path}-wal")).exists(), "WAL still present");
-    assert!(!Path::new(&format!("{path}-shm")).exists(), "SHM still present");
 }
 ```
 
@@ -208,7 +207,7 @@ fn report_db_size(path: &str) {
 ## After a Crash: Automatic WAL Recovery
 
 If the process is killed or the host crashes while mqlite is open, the WAL
-and SHM files remain on disk. The next `Client::open()` automatically:
+file remains on disk. The next `Client::open()` automatically:
 
 1. Detects the leftover WAL.
 2. Replays committed transactions from the WAL into memory.
@@ -222,9 +221,6 @@ No manual intervention is required.
 let client = mqlite::Client::open("myapp.mqlite")?;
 // All committed data is available.
 ```
-
-The SHM file is re-created if it is absent. Its absence does not indicate data
-loss.
 
 > **Committed vs uncommitted at crash time:**
 > Transactions that were committed (i.e., the write operation returned `Ok`)
@@ -255,7 +251,6 @@ In read-only mode:
 - WAL replay is skipped (reads from the last checkpointed state in the main file).
 - No write operations are permitted.
 - No OS exclusive lock is acquired (multiple read-only opens can coexist).
-- The SHM file is not created.
 
 This is useful for forensic inspection or for opening a database on a
 read-only filesystem (e.g., a mounted backup volume or a CD-ROM image).
@@ -269,7 +264,7 @@ read-only filesystem (e.g., a mounted backup volume or a CD-ROM image).
 The WAL protocol relies on:
 1. **Atomic file renames** (used during checkpoints).
 2. **Reliable `fcntl`/`LockFileEx` advisory locks** (used for writer exclusivity).
-3. **Memory-mapped I/O** on the SHM file.
+3. **Durable `fsync` semantics** for the WAL file.
 
 Network filesystems frequently fail to provide all three guarantees. The result
 is database corruption that may not be detected immediately.

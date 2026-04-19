@@ -121,7 +121,7 @@ pub(crate) struct BufferPoolHandle {
     journal: Option<Arc<Mutex<JournalManager>>>,
     /// Dedicated fd for writing checkpointed journal pages back to the main file.
     /// Shared with `ClientInner`; held here so `with_txn` can trigger an
-    /// emergency checkpoint when the journal SHM approaches its frame-count limit.
+    /// emergency checkpoint when the journal index reaches its hot-threshold.
     journal_main_file: Option<Arc<Mutex<File>>>,
 }
 
@@ -321,8 +321,9 @@ impl BufferPoolHandle {
     /// (typically the catalog root, which every write transaction touches).
     /// `db_page_count` is the total database page count after this txn.
     ///
-    /// Returns `true` if the journal SHM index is nearly full (emergency
-    /// checkpoint signal); `false` otherwise or when no journal is attached.
+    /// Returns `true` if the journal index has reached its hot-threshold
+    /// (emergency checkpoint signal); `false` otherwise or when no journal
+    /// is attached.
     pub(crate) fn commit_txn(
         &self,
         page_number: u32,
@@ -370,8 +371,8 @@ impl BufferPoolHandle {
     /// Checkpoint using the `journal_main_file` handle stored on this handle.
     ///
     /// Returns `Ok(false)` when no journal is attached. Used by [`with_txn`] after
-    /// a commit frame signals the journal SHM is near full, and by
-    /// [`with_txn`]'s callers that do not hold the main-file fd directly.
+    /// a commit frame signals the journal index has reached its hot-threshold,
+    /// and by [`with_txn`]'s callers that do not hold the main-file fd directly.
     pub(crate) fn emergency_checkpoint(&self) -> Result<bool> {
         let Some(file_mutex) = self.journal_main_file.as_ref() else {
             return Ok(false);

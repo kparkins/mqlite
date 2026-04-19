@@ -5,33 +5,28 @@
 //!
 //! ## Overview
 //!
-//! The journal implements crash-safe durability using a three-file model:
+//! The journal implements crash-safe durability using a two-file model:
 //!
 //! | File | Purpose |
 //! |------|---------|
 //! `db.mqlite` | Main database file (pages after last checkpoint) |
 //! `db.mqlite-journal` | Append-only log of modified pages |
-//! `db.mqlite-shm` | Journal index hash table + reader/writer coordination |
 //!
-//! On clean close, [`JournalManager::close_and_cleanup`] checkpoints all journal
-//! pages into the main file and deletes the journal and SHM files, leaving only
+//! Lookup acceleration is provided by a **volatile in-memory** journal index
+//! ([`shm::JournalIndex`]) — a `page_number -> latest journal frame offset`
+//! map rebuilt from a journal scan on every open. There is no on-disk
+//! sidecar for the index. This matches the WiredTiger/MongoDB model: the
+//! journal is the only durable artifact, the index is a pure cache.
+//!
+//! Durability is provided by `flush()`-ing the journal file after every
+//! commit frame and every `ChainCommit` frame, so the next open's recovery
+//! scan can replay any committed batch and discard any trailing
+//! uncommitted frames.
+//!
+//! On clean close, [`JournalManager::close_and_cleanup`] checkpoints all
+//! journal pages into the main file and deletes the journal, leaving only
 //! `db.mqlite`.
-//!
-//! ## Phase 1 Implementation
-//!
-//! - hq-dz9: Journal and SHM implementation
-//!
-//! ## Fallback: Linear Journal Scan
-//!
-//! Per scale.md §Decision Trigger: if the SHM hash-table-based journal index
-//! proves unworkable (correctness or platform issues), fall back to a linear
-//! journal scan for page lookups.  The linear scan is O(journal frames) per page read
-//! but requires no SHM file.  It is acceptable for Phase 1 if the journal is
-//! aggressively checkpointed (every ~100 pages).  The [`JournalManager::read_page_linear`]
-//! method implements this fallback.
 
-// Phase 1: journal is implemented but not yet wired into the write/read paths.
-// Allow dead_code until the database handle integrates the journal in a later phase.
 #[allow(dead_code)]
 pub(crate) mod shm;
 #[allow(dead_code)]
@@ -48,7 +43,8 @@ use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 use crate::storage::page::PAGE_SIZE_LEAF;
 
-use self::shm::ShmIndex;
+use self::shm::JournalIndex;
+
 use self::log_file::{
     try_skip_chain_commit, JournalFrameHeader, JournalHeader, JournalPageSize,
     JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
@@ -58,7 +54,7 @@ use self::log_file::{
 // JournalManager
 // ---------------------------------------------------------------------------
 
-/// Manages the journal and shared memory journal index for one database.
+/// Manages the journal and its in-memory page-offset index for one database.
 ///
 /// Created via [`JournalManager::open_or_create`].  On clean shutdown call
 /// [`JournalManager::close_and_cleanup`]; on crash, the next `open_or_create`
@@ -66,12 +62,11 @@ use self::log_file::{
 pub(crate) struct JournalManager {
     /// Path to the `.mqlite-journal` file.
     journal_path: PathBuf,
-    /// Path to the `.mqlite-shm` file.
-    shm_path: PathBuf,
     /// Open handle to the journal file (positioned at the write cursor).
     journal_file: File,
-    /// In-memory journal index (SHM).
-    shm: ShmIndex,
+    /// In-memory `page_number -> journal frame offset` index, rebuilt from
+    /// a journal scan on open and maintained in-place. Not persisted.
+    index: JournalIndex,
     /// Salt 1 from the main file header (stored in every journal frame).
     salt1: u32,
     /// Salt 2 from the main file header.
@@ -113,7 +108,6 @@ impl JournalManager {
         main_file: &mut File,
     ) -> Result<Self> {
         let journal_path = journal_path_for(db_path);
-        let shm_path = shm_path_for(db_path);
         let salt1 = main_header.wal_salt1;
         let salt2 = main_header.wal_salt2;
 
@@ -121,7 +115,7 @@ impl JournalManager {
         if journal_path.exists() {
             // Try to recover it.
             let recovered =
-                Self::recover_existing(&journal_path, &shm_path, salt1, salt2, main_file)?;
+                Self::recover_existing(&journal_path, salt1, salt2, main_file)?;
             if let Some(mgr) = recovered {
                 return Ok(mgr);
             }
@@ -146,9 +140,8 @@ impl JournalManager {
 
         Ok(Self {
             journal_path,
-            shm_path,
             journal_file,
-            shm: ShmIndex::new(),
+            index: JournalIndex::new(),
             salt1,
             salt2,
             checkpoint_seq: 0,
@@ -165,7 +158,6 @@ impl JournalManager {
     /// case where the journal had no committed frames).
     fn recover_existing(
         journal_path: &Path,
-        shm_path: &Path,
         salt1: u32,
         salt2: u32,
         main_file: &mut File,
@@ -184,7 +176,6 @@ impl JournalManager {
                 // Empty or truncated journal — delete and recreate.
                 drop(journal_file);
                 let _ = std::fs::remove_file(journal_path);
-                let _ = std::fs::remove_file(shm_path);
                 return Ok(None);
             }
             Err(e) => return Err(Error::Io(e)),
@@ -196,7 +187,6 @@ impl JournalManager {
                 // Corrupt journal header — treat as stale and delete.
                 drop(journal_file);
                 let _ = std::fs::remove_file(journal_path);
-                let _ = std::fs::remove_file(shm_path);
                 return Ok(None);
             }
         };
@@ -205,7 +195,6 @@ impl JournalManager {
         if journal_header.salt1 != salt1 || journal_header.salt2 != salt2 {
             drop(journal_file);
             let _ = std::fs::remove_file(journal_path);
-            let _ = std::fs::remove_file(shm_path);
             return Ok(None);
         }
 
@@ -219,7 +208,7 @@ impl JournalManager {
         // Scan frames: collect committed batches.
         // A "batch" is a sequence of non-commit frames followed by one commit frame.
         // On recovery we apply each committed batch to the main file.
-        let mut shm = ShmIndex::new();
+        let mut index = JournalIndex::new();
         let mut pending: Vec<(u32, JournalPageSize, Vec<u8>, u64)> =
             Vec::new(); // (page_num, size, data, offset)
         let mut write_cursor = JOURNAL_HEADER_SIZE as u64;
@@ -300,8 +289,8 @@ impl JournalManager {
                 for (pn, ps, data, off) in &pending {
                     // Write page to main file.
                     write_page_to_main(main_file, *pn, ps.bytes(), data)?;
-                    // Update SHM index.
-                    shm.insert(*pn, *off);
+                    // Update in-memory index.
+                    index.insert(*pn, *off);
                 }
                 last_committed_db_page_count = Some(db_page_count);
                 #[cfg(feature = "tracing")]
@@ -325,9 +314,8 @@ impl JournalManager {
             main_file.flush().map_err(Error::Io)?;
         }
 
-        // Rebuild SHM — we built it during scan above.
-        // Persist SHM to disk.
-        shm.save(shm_path)?;
+        // The in-memory index was rebuilt during the scan above; nothing
+        // to persist (the journal itself is the only durable artifact).
 
         // Reposition journal file at write cursor for new appends.
         journal_file
@@ -347,9 +335,8 @@ impl JournalManager {
 
         Ok(Some(JournalManager {
             journal_path: journal_path.to_path_buf(),
-            shm_path: shm_path.to_path_buf(),
             journal_file,
-            shm,
+            index,
             salt1,
             salt2,
             checkpoint_seq,
@@ -387,9 +374,9 @@ impl JournalManager {
     /// `fsync`-equivalent `flush()` is called before the cursor advances so
     /// the frame is durable before any later frames can overwrite its tail.
     ///
-    /// The SHM index is NOT updated — `ChainCommit` frames carry no single
-    /// page number (every `page_writes` entry has its own). Recovery scans
-    /// `ChainCommit` frames linearly.
+    /// The in-memory index is NOT updated — `ChainCommit` frames carry no
+    /// single page number (every `page_writes` entry has its own). Recovery
+    /// scans `ChainCommit` frames linearly.
     pub(crate) fn append_chain_commit(
         &mut self,
         commit_ts: crate::mvcc::timestamp::Ts,
@@ -419,8 +406,9 @@ impl JournalManager {
     /// `db_page_count` is the total number of database pages after this commit
     /// (stored in the commit frame so recovery can update the main file header).
     ///
-    /// After this call, the SHM index is updated and flushed.  Returns `true`
-    /// if an emergency checkpoint should be triggered (journal index is 75% full).
+    /// After this call, the in-memory index is updated.  Returns `true`
+    /// if an emergency checkpoint should be triggered (the journal index
+    /// has reached the hot-threshold).
     pub(crate) fn commit(
         &mut self,
         page_number: u32,
@@ -435,9 +423,8 @@ impl JournalManager {
         let offset = self.append_frame(page_number, db_page_count, page_size, page_data)?;
         self.last_committed_db_page_count = Some(db_page_count);
 
-        // Update SHM index with the commit frame's page.
-        let emergency = self.shm.insert(page_number, offset);
-        self.shm.save(&self.shm_path)?;
+        // Update the in-memory index with the commit frame's page.
+        let emergency = self.index.insert(page_number, offset);
 
         Ok(emergency)
     }
@@ -469,11 +456,12 @@ impl JournalManager {
 
         self.write_cursor += (JOURNAL_FRAME_HEADER_SIZE + page_size.bytes()) as u64;
 
-        // Update SHM index for non-commit frames too (so readers can see
-        // in-progress writes within the same process — single-process Phase 1).
-        // For multi-process, this would only happen after commit.
+        // Update the in-memory index for non-commit frames too so reads
+        // through `JournalLayeredSource` see in-progress writes within the
+        // same process. Only the journal file is durable; the index lives
+        // in memory and is rebuilt on open.
         if db_page_count == 0 {
-            self.shm.insert(page_number, frame_offset);
+            self.index.insert(page_number, frame_offset);
         }
 
         Ok(frame_offset)
@@ -488,9 +476,9 @@ impl JournalManager {
     /// Returns the page data if found, or `None` if the page should be read
     /// from the main file.
     ///
-    /// Uses the SHM hash table for O(1) lookup.
+    /// Uses the in-memory journal index for O(1) lookup.
     pub(crate) fn read_page(&mut self, page_number: u32) -> Result<Option<Vec<u8>>> {
-        let frame_offset = match self.shm.lookup(page_number) {
+        let frame_offset = match self.index.lookup(page_number) {
             Some(off) => off,
             None => return Ok(None),
         };
@@ -579,7 +567,7 @@ impl JournalManager {
     ///
     /// After a successful checkpoint:
     /// 1. The journal file is truncated to just the header.
-    /// 2. The SHM index is cleared.
+    /// 2. The in-memory journal index is cleared.
     /// 3. The checkpoint sequence counter is incremented.
     ///
     /// `main_file` must be open for read/write.
@@ -593,8 +581,8 @@ impl JournalManager {
         #[cfg(feature = "tracing")]
         let _journal_size_before = self.write_cursor;
 
-        // Collect all entries from the SHM index.
-        let entries: Vec<(u32, u64)> = self.shm.iter_entries().collect();
+        // Collect all entries from the in-memory index.
+        let entries: Vec<(u32, u64)> = self.index.iter_entries().collect();
 
         // For each indexed page, read the journal frame and write to main file.
         for (page_number, frame_offset) in &entries {
@@ -628,9 +616,8 @@ impl JournalManager {
         // Reset journal to empty (truncate to just the header).
         self.truncate_journal()?;
 
-        // Clear SHM index.
-        self.shm.clear_index();
-        self.shm.save(&self.shm_path)?;
+        // Clear the in-memory index.
+        self.index.clear_index();
 
         #[cfg(feature = "tracing")]
         {
@@ -647,7 +634,7 @@ impl JournalManager {
         Ok(())
     }
 
-    /// Checkpoint all journal frames, then delete the journal and SHM files.
+    /// Checkpoint all journal frames, then delete the journal file.
     ///
     /// Called on clean database close.  After this returns, only the main
     /// `.mqlite` file remains.
@@ -663,9 +650,6 @@ impl JournalManager {
         drop(self.journal_file);
         let _ = std::fs::remove_file(&self.journal_path);
 
-        // Delete SHM file.
-        let _ = std::fs::remove_file(&self.shm_path);
-
         Ok(())
     }
 
@@ -678,9 +662,9 @@ impl JournalManager {
         self.write_cursor
     }
 
-    /// Return a reference to the SHM index (for inspection in tests).
-    pub(crate) fn shm(&self) -> &ShmIndex {
-        &self.shm
+    /// Return a reference to the in-memory journal index (for inspection in tests).
+    pub(crate) fn index(&self) -> &JournalIndex {
+        &self.index
     }
 
     /// Highest `ChainCommit::commit_ts` observed during recovery, or `None`
@@ -697,8 +681,8 @@ impl JournalManager {
     // Rollback
     // -----------------------------------------------------------------------
 
-    /// Truncate the journal file back to `cursor` bytes and rebuild the SHM index
-    /// so it reflects only the surviving frames.
+    /// Truncate the journal file back to `cursor` bytes and rebuild the
+    /// in-memory index so it reflects only the surviving frames.
     ///
     /// `cursor` must be a byte offset previously obtained from
     /// [`write_cursor`](Self::write_cursor) at the start of a transaction.
@@ -706,7 +690,7 @@ impl JournalManager {
     /// primitive used by [`crate::storage::paged_engine::PagedEngine`] when a
     /// mutator returns an error.
     ///
-    /// The SHM index is rebuilt by a linear scan over the surviving frame
+    /// The index is rebuilt by a linear scan over the surviving frame
     /// range — O(surviving frames) — which is correct regardless of whether
     /// the dropped frames were commit or non-commit frames.
     pub(crate) fn truncate_to(&mut self, cursor: u64) -> Result<()> {
@@ -722,7 +706,7 @@ impl JournalManager {
         self.journal_file.flush().map_err(Error::Io)?;
         self.write_cursor = cursor;
 
-        self.shm.clear_index();
+        self.index.clear_index();
         self.journal_file
             .seek(SeekFrom::Start(JOURNAL_HEADER_SIZE as u64))
             .map_err(Error::Io)?;
@@ -734,8 +718,8 @@ impl JournalManager {
                 .map_err(Error::Io)?;
 
             // MVCC T5'/T6: ChainCommit frames are part of the durable log
-            // but carry no `page_number` for the SHM index. Skip past them
-            // so `JournalFrameHeader::read` below sees only legacy frames.
+            // but carry no `page_number` for the in-memory index. Skip past
+            // them so `JournalFrameHeader::read` below sees only legacy frames.
             if let Some((n, _commit_ts)) =
                 try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
             {
@@ -749,14 +733,13 @@ impl JournalManager {
                 None => break,
                 Some(h) => h,
             };
-            self.shm.insert(frame_hdr.page_number, scan);
+            self.index.insert(frame_hdr.page_number, scan);
             if frame_hdr.db_page_count > 0 {
                 latest_commit_pages = Some(frame_hdr.db_page_count);
             }
             scan += (JOURNAL_FRAME_HEADER_SIZE + frame_hdr.page_size.bytes()) as u64;
         }
         self.last_committed_db_page_count = latest_commit_pages;
-        self.shm.save(&self.shm_path)?;
         Ok(())
     }
 
@@ -870,13 +853,6 @@ pub(crate) fn journal_path_for(db_path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Derive the SHM path from the main database path.
-pub(crate) fn shm_path_for(db_path: &Path) -> PathBuf {
-    let mut p = db_path.as_os_str().to_owned();
-    p.push("-shm");
-    PathBuf::from(p)
-}
-
 // ---------------------------------------------------------------------------
 // Internal I/O helper
 // ---------------------------------------------------------------------------
@@ -958,7 +934,6 @@ mod tests {
             journal_path_for(db),
             PathBuf::from("/tmp/foo.mqlite-journal")
         );
-        assert_eq!(shm_path_for(db), PathBuf::from("/tmp/foo.mqlite-shm"));
     }
 
     // -----------------------------------------------------------------------
@@ -966,7 +941,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn open_creates_journal_and_shm_paths() {
+    fn open_creates_journal_file() {
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
@@ -975,9 +950,43 @@ mod tests {
 
         let jp = journal_path_for(&db_path);
         assert!(jp.exists(), "journal file must be created");
-        // SHM is persisted only after first commit, so we don't check it here.
 
         drop(mgr);
+        drop(main_file);
+        drop(dir);
+    }
+
+    /// Regression: no `.mqlite-shm` sidecar must ever be created. The journal
+    /// index is in-memory only.
+    #[test]
+    fn no_shm_file_created_in_any_phase() {
+        let (dir, db_path, mut main_file) = make_db_file();
+        main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
+        let mut header = make_header();
+        let shm_sidecar = {
+            let mut p = db_path.as_os_str().to_owned();
+            p.push("-shm");
+            PathBuf::from(p)
+        };
+
+        let mut mgr =
+            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        assert!(!shm_sidecar.exists(), "no -shm after open");
+
+        mgr.append_non_commit(1, JournalPageSize::Small4k, &make_page_4k(0x01))
+            .unwrap();
+        assert!(!shm_sidecar.exists(), "no -shm after append");
+
+        mgr.commit(2, JournalPageSize::Small4k, &make_page_4k(0x02), 5)
+            .unwrap();
+        assert!(!shm_sidecar.exists(), "no -shm after commit");
+
+        mgr.checkpoint(&mut main_file, &mut header).unwrap();
+        assert!(!shm_sidecar.exists(), "no -shm after checkpoint");
+
+        mgr.close_and_cleanup(&mut main_file, &mut header).unwrap();
+        assert!(!shm_sidecar.exists(), "no -shm after clean close");
+
         drop(main_file);
         drop(dir);
     }
@@ -1034,7 +1043,7 @@ mod tests {
         mgr.append_non_commit(5, JournalPageSize::Small4k, &page_v2)
             .unwrap();
 
-        // SHM lookup returns offset of latest (second) frame.
+        // Index lookup returns offset of latest (second) frame.
         let result = mgr.read_page(5).unwrap().unwrap();
         assert_eq!(result[0], 0x02);
     }
@@ -1093,7 +1102,7 @@ mod tests {
 
         // Journal should be reset.
         assert_eq!(mgr.write_cursor, JOURNAL_HEADER_SIZE as u64);
-        assert_eq!(mgr.shm.occupied_count(), 0);
+        assert_eq!(mgr.index.occupied_count(), 0);
     }
 
     #[test]
@@ -1198,10 +1207,10 @@ mod tests {
         main_file2.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 0xCC, "committed page must be present");
 
-        // Page 2 (uncommitted) — SHM should NOT have it after recovery.
+        // Page 2 (uncommitted) — index should NOT have it after recovery.
         assert!(
-            mgr2.shm().lookup(2).is_none(),
-            "uncommitted page must not be in SHM after recovery"
+            mgr2.index().lookup(2).is_none(),
+            "uncommitted page must not be in journal index after recovery"
         );
     }
 
@@ -1236,7 +1245,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn close_and_cleanup_removes_journal_and_shm() {
+    fn close_and_cleanup_removes_journal() {
         let (dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let mut header = make_header();
@@ -1248,12 +1257,11 @@ mod tests {
             .unwrap();
 
         let jp = journal_path_for(&db_path);
-        let sp = shm_path_for(&db_path);
 
         mgr.close_and_cleanup(&mut main_file, &mut header).unwrap();
 
         assert!(!jp.exists(), "journal must be deleted after clean close");
-        assert!(!sp.exists(), "SHM must be deleted after clean close");
+        let _ = dir;
     }
 
     // -----------------------------------------------------------------------
@@ -1597,7 +1605,7 @@ mod crash_recovery_tests {
     //!      (a) Database opens without error after crash.
     //!      (b) Journal replay does not fail (covered by (a) succeeding).
     //!      (c) Committed data is present in the main file.
-    //!      (d) Uncommitted data does not appear (no phantom pages in journal SHM).
+    //!      (d) Uncommitted data does not appear (no phantom pages in the journal index).
     //!      (e) Index pages are absent when the index build was uncommitted.
 
     use std::fs::OpenOptions;
@@ -1819,9 +1827,9 @@ mod crash_recovery_tests {
         if matches!(scenario, Scenario::InsertAtFrame10) {
             for i in 0u32..10 {
                 let page_no = EPOCH2_START + i;
-                if journal.shm().lookup(page_no).is_some() {
+                if journal.index().lookup(page_no).is_some() {
                     return Err(Error::Internal(format!(
-                        "condition (d) FAIL: uncommitted page {} in journal SHM after recovery [InsertAtFrame10 seed {}]",
+                        "condition (d) FAIL: uncommitted page {} in journal index after recovery [InsertAtFrame10 seed {}]",
                         page_no, seed
                     )));
                 }
@@ -1830,9 +1838,9 @@ mod crash_recovery_tests {
 
         if matches!(scenario, Scenario::InsertAtFrame100) {
             for page_no in EPOCH2_START..EPOCH2_END {
-                if journal.shm().lookup(page_no).is_some() {
+                if journal.index().lookup(page_no).is_some() {
                     return Err(Error::Internal(format!(
-                        "condition (d) FAIL: uncommitted page {} in journal SHM after recovery [InsertAtFrame100 seed {}]",
+                        "condition (d) FAIL: uncommitted page {} in journal index after recovery [InsertAtFrame100 seed {}]",
                         page_no, seed
                     )));
                 }
@@ -1841,9 +1849,9 @@ mod crash_recovery_tests {
 
         if matches!(scenario, Scenario::IndexBuildAtStart | Scenario::IndexBuildMidway | Scenario::IndexBuildAtEnd) {
             for page_no in INDEX_START..INDEX_END {
-                if journal.shm().lookup(page_no).is_some() {
+                if journal.index().lookup(page_no).is_some() {
                     return Err(Error::Internal(format!(
-                        "condition (e) FAIL: uncommitted index page {} in journal SHM after recovery [scenario {:?} seed {}]",
+                        "condition (e) FAIL: uncommitted index page {} in journal index after recovery [scenario {:?} seed {}]",
                         page_no, scenario, seed
                     )));
                 }

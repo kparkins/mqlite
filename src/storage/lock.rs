@@ -27,9 +27,9 @@
 //!
 //! ## WAL integration
 //!
-//! In the full Phase 1 WAL implementation, the writer lock must be acquired
-//! **before** appending any frames to the WAL and released **after** the WAL
-//! frame commit and SHM WAL index update complete.  In the current (stub)
+//! In the full journal implementation, the writer lock must be acquired
+//! **before** appending any frames to the journal and released **after** the
+//! commit frame and in-memory index update complete.  In the current (stub)
 //! phase, the lock is held for the entire lifetime of the database handle.
 //!
 //! ## Platform implementations

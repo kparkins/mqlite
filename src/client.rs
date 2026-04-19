@@ -117,15 +117,6 @@ fn enrich_path(e: Error, path: &Path) -> Error {
     }
 }
 
-/// Returns the expected shared-memory file path for a given database path.
-///
-/// SHM files use the naming convention `<db-path>-shm`.
-fn shm_path(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_owned();
-    s.push("-shm");
-    PathBuf::from(s)
-}
-
 /// Create (or open) a database file with restricted permissions (`0600`).
 fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
@@ -780,11 +771,9 @@ impl Client {
         // Security: reject symlinks before touching the file.
         reject_symlink(&path)?;
 
-        // Also check associated journal and SHM paths.
+        // Also check the associated journal path.
         let journal_path = journal_path(&path);
-        let shm_path = shm_path(&path);
         reject_symlink(&journal_path)?;
-        reject_symlink(&shm_path)?;
 
         // Detect a legacy pre-T1 sidecar (the file formerly known as
         // `<db>-wal`) left by an older mqlite build. Return
