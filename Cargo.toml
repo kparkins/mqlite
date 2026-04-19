@@ -56,3 +56,6 @@ loom = "0.7"
 [[example]]
 name = "wire_server"
 required-features = ["wire"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

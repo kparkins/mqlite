@@ -10,13 +10,8 @@
 //! `ChainSnapshot::new`; no reader may ever observe a "missing / mismatched"
 //! visible version for its timestamp.
 //!
-//! `#[ignore]` so it only runs under:
-//!
-//! ```bash
-//! cargo test --release --test reconcile_race -- --ignored
-//! ```
-//!
-//! Default duration ~60 s; override via `MQLITE_RECONCILE_SOAK_SECS`.
+//! Default duration 3s for CI; override via `MQLITE_RECONCILE_SOAK_SECS`
+//! for a longer soak.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -143,12 +138,11 @@ fn soak_duration() -> Duration {
     let secs = std::env::var("MQLITE_RECONCILE_SOAK_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(3);
     Duration::from_secs(secs)
 }
 
 #[test]
-#[ignore = "60s soak; run explicitly with --ignored"]
 fn readers_never_observe_missing_version_under_reconcile() {
     let chains = Arc::new(Mutex::new(seeded_chain_map(ts(1))));
     let registry = Arc::new(ReadViewRegistry::new());

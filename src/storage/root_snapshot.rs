@@ -31,7 +31,6 @@ pub(crate) struct PublishedIndex {
     pub key_pattern: Document,
     pub unique: bool,
     pub sparse: bool,
-    pub multikey: bool,
     /// Lifecycle state. Query planning must skip any index whose state
     /// is not `Ready` — the contents may be incomplete.
     pub state: IndexState,
@@ -42,20 +41,6 @@ pub(crate) struct PublishedIndex {
 pub(crate) struct PublishedSnapshot {
     /// Commit timestamp of the txn that produced this snapshot.
     pub publish_ts: Ts,
-    /// Catalog root as of this snapshot (for future metadata probes).
-    pub catalog_root_page: u32,
-    pub catalog_root_level: u8,
     /// One entry per live namespace.
     pub namespaces: HashMap<String, NamespaceSnapshot>,
-}
-
-impl PublishedSnapshot {
-    pub fn empty(publish_ts: Ts, catalog_root_page: u32, catalog_root_level: u8) -> Self {
-        Self {
-            publish_ts,
-            catalog_root_page,
-            catalog_root_level,
-            namespaces: HashMap::new(),
-        }
-    }
 }

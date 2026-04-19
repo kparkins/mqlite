@@ -725,7 +725,6 @@ fn build_snapshot_from_catalog(
                 key_pattern: idx.key_pattern.clone(),
                 unique: idx.unique,
                 sparse: idx.sparse,
-                multikey: idx.multikey,
                 state: idx.state,
             });
         }
@@ -737,8 +736,6 @@ fn build_snapshot_from_catalog(
     }
     Ok(PublishedSnapshot {
         publish_ts,
-        catalog_root_page: catalog.root_page(),
-        catalog_root_level: catalog.root_level(),
         namespaces,
     })
 }
@@ -1223,6 +1220,7 @@ impl PagedEngine {
     /// If `catalog_root_page == 0` the database is new and an empty catalog
     /// will be created. Otherwise the catalog is opened at the given root.
     /// `busy_timeout` + `busy_handler` migrated from ClientInner (PR 8).
+    #[cfg(test)]
     pub(crate) fn new_buffered(
         handle: Arc<BufferPoolHandle>,
         catalog_root_page: u32,
@@ -1917,26 +1915,6 @@ impl PagedEngine {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Read-only catalog helpers (used by try_index_scan_ro etc.)
-    // -----------------------------------------------------------------------
-
-    /// Open a data tree for reading from `md` (non-mutating).
-    fn open_tree_for_read(
-        md: &MetadataState,
-        shared: &SharedState,
-        ns: &str,
-    ) -> Result<Option<BTree<BufferPoolPageStore>>> {
-        if let Some(entry) = md.catalog.lock().expect("catalog poisoned").get_collection(ns)? {
-            Ok(Some(BTree::open(
-                new_store(shared),
-                entry.data_root_page,
-                entry.data_root_level,
-            )))
-        } else {
-            Ok(None)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3080,7 +3058,9 @@ mod tests {
         for i in [3i32, 1, 2] {
             e.insert("test.c", doc! { "v": i }).unwrap();
         }
-        let opts = FindOptions::new().sort(doc! { "v": 1 }).limit(2);
+        let mut opts = FindOptions::new();
+        opts.sort = Some(doc! { "v": 1 });
+        opts.limit = Some(2);
         let results = e.find("test.c", &doc! {}, &opts).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].get_i32("v").unwrap(), 1);

@@ -3,6 +3,7 @@
 debug
 target
 .omc/
+.qwen/
 .designs/
 .claude/
 .opencode/

@@ -120,12 +120,6 @@ impl<T> Cursor<T> {
         }
     }
 
-    /// Create an empty, already-exhausted cursor.  Useful in tests.
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self::new(vec![], 0)
-    }
-
     /// Returns `true` if the cursor has no remaining documents to return.
     ///
     /// A cursor becomes exhausted when the internal buffer is empty.  This is

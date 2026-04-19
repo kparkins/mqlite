@@ -1269,7 +1269,6 @@ mod tests {
 
     #[test]
     fn handle_update_header_marks_dirty_and_persists() {
-        let io = MockIo::new();
         let hdr = fresh_header();
         let handle = AllocatorHandle::new(hdr);
 

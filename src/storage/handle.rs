@@ -461,6 +461,7 @@ impl BufferPoolHandle {
     ///
     /// Used by writer-path code that needs a `PageSource` for
     /// [`AllocatorHandle::drain_free_queue`] without re-constructing one.
+    #[cfg(test)]
     pub(crate) fn page_source(&self) -> &BufferPoolPageSource {
         &self.pool_io
     }
@@ -558,7 +559,7 @@ mod tests {
     struct ArcIo(Arc<MockIo>);
 
     impl PageSource for ArcIo {
-        fn read_page(&self, pn: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
+        fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
             let pages = self.0.pages.lock().unwrap();
             if let Some(data) = pages.get(&pn) {
                 let copy_len = buf.len().min(data.len());

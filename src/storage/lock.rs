@@ -163,14 +163,6 @@ pub(crate) trait FileLock: Send + Sync {
     /// Same POSIX footgun caveat as [`write_at`](FileLock::write_at) — use
     /// this instead of opening a new fd while the lock is held.
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
-
-    /// Flush kernel page-cache dirty data to the underlying storage device
-    /// (`fsync(2)` on Unix).
-    ///
-    /// Called by the `FullSync` durability path after every write commit to
-    /// guarantee data survives a process crash.  No-op on platforms without
-    /// file-based locking (e.g. the `NoopFileLock` stub).
-    fn sync(&self) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,11 +201,6 @@ impl FileLock for NoopFileLock {
         Err(Error::Internal(
             "NoopFileLock::read_exact_at: no backing file on this platform".into(),
         ))
-    }
-
-    fn sync(&self) -> Result<()> {
-        // No backing file — sync is a no-op.
-        Ok(())
     }
 }
 
@@ -374,17 +361,6 @@ impl FileLock for PosixFileLock {
             Err(e) => Err(Error::Io(e)),
         }
     }
-
-    fn sync(&self) -> Result<()> {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: fd is valid for the lifetime of self.file.
-        let ret = unsafe { libc::fsync(self.file.as_raw_fd()) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(Error::Io(std::io::Error::last_os_error()))
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,11 +428,6 @@ impl FileLock for WindowsFileLock {
 
     fn release(&self) -> Result<()> {
         // TODO (hq-dr9): implement using UnlockFileEx().
-        Ok(())
-    }
-
-    fn sync(&self) -> Result<()> {
-        // TODO (hq-dr9): implement using FlushFileBuffers() for FullSync.
         Ok(())
     }
 }

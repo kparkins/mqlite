@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn append_and_read_4k() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
         let mut mgr =
@@ -1038,7 +1038,7 @@ mod tests {
 
     #[test]
     fn append_and_read_32k() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
         let mut mgr =
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn latest_write_wins() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
         let mut mgr =
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn commit_frame_marks_transaction_boundary() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
         let mut mgr =
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn checkpoint_writes_pages_to_main_file() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         // Pre-allocate main file large enough
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
 
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn checkpoint_increments_sequence() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let mut header = make_header();
         let mut mgr =
@@ -1152,7 +1152,7 @@ mod tests {
 
     #[test]
     fn recovery_replays_committed_frames() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let header = make_header();
 
@@ -1176,7 +1176,7 @@ mod tests {
             .write(true)
             .open(&db_path)
             .unwrap();
-        let mgr2 =
+        let _mgr2 =
             JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
 
         // Both pages should have been replayed into main file at 32 KB slots.
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn recovery_discards_uncommitted_frames() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let header = make_header();
 
@@ -1240,18 +1240,18 @@ mod tests {
 
     #[test]
     fn stale_journal_is_deleted_on_open() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
         // Create journal with original salts.
         {
-            let mgr =
+            let _mgr =
                 JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
         }
         assert!(journal_path_for(&db_path).exists());
 
         // Reopen with different salts (simulates a different database open).
-        let mut different_header =
+        let different_header =
             FileHeader::new(1_700_000_000_001, 0x1111_1111, 0x2222_2222);
         let mgr2 = JournalManager::open_or_create(
             &db_path,
@@ -1294,7 +1294,7 @@ mod tests {
 
     #[test]
     fn linear_scan_finds_committed_pages() {
-        let (dir, db_path, mut main_file) = make_db_file();
+        let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
         let mut mgr =
@@ -1640,7 +1640,7 @@ mod crash_recovery_tests {
     use crate::storage::header::FileHeader;
     use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
     use crate::journal::log_file::JournalPageSize;
-    use crate::journal::{journal_path_for, write_page_to_main, JournalManager};
+    use crate::journal::{write_page_to_main, JournalManager};
 
     const CYCLES_PER_SCENARIO: u32 = 50;
     const EPOCH1_START: u32 = 1;

@@ -13,19 +13,19 @@ mqlite is advertised as a **single-file database**. The fine print:
 
 ```
 myapp.mqlite          ← Main database file (always present)
-myapp.mqlite-wal      ← Write-ahead log (present during write activity)
+myapp.mqlite-journal  ← Write journal (present during write activity)
 ```
 
 | File | When present | Role |
 |------|-------------|------|
 | `myapp.mqlite` | Always | Persistent B-tree pages. The "real" database. |
-| `myapp.mqlite-wal` | After any write, until checkpointed | Uncommitted and unmerged write pages. |
+| `myapp.mqlite-journal` | After any write, until checkpointed | Uncommitted and unmerged write pages. |
 
 The page-offset lookup index used by readers lives **only in memory** — it is
 rebuilt from a journal scan on every open. There is no on-disk sidecar for it.
 
 **During normal operation** the two files form a single logical unit. Never
-copy or move them individually — always treat the `.mqlite` and `-wal`
+copy or move them individually — always treat the `.mqlite` and `-journal`
 files as a group.
 
 ---
@@ -34,8 +34,8 @@ files as a group.
 
 `Client::close()` performs a **blocking checkpoint + flush**:
 
-1. All committed WAL pages are merged into `myapp.mqlite`.
-2. The WAL file is removed.
+1. All committed journal pages are merged into `myapp.mqlite`.
+2. The journal file is removed.
 3. The OS advisory lock is released.
 
 After `close()` returns, `myapp.mqlite` is the sole file on disk and can be
@@ -56,8 +56,8 @@ fn write_and_close() -> mqlite::Result<()> {
 ```
 
 > **`Drop` vs `close()`:** Dropping a `Client` handle is non-blocking. It
-> releases the OS lock but does **not** checkpoint the WAL. The WAL file
-> remains on disk. This is safe — the next `open()` replays the WAL
+> releases the OS lock but does **not** checkpoint the journal. The journal
+> file remains on disk. This is safe — the next `open()` replays the journal
 > automatically — but it means `Drop` does not produce a single-file state.
 > Call `close()` explicitly when you need one.
 
@@ -84,7 +84,7 @@ use std::fs;
 fn cold_backup(src: &str, dst: &str) -> mqlite::Result<()> {
     // Open, force a clean close, then copy.
     let client = Client::open(src)?;
-    client.close()?; // checkpoint + remove WAL
+    client.close()?; // checkpoint + remove journal
 
     fs::copy(src, dst)?;
     println!("Backup written to {dst}");
@@ -92,15 +92,15 @@ fn cold_backup(src: &str, dst: &str) -> mqlite::Result<()> {
 }
 ```
 
-**Important:** Verify that `src-wal` does **not** exist after `close()`. If
-it does, a crash occurred between the checkpoint and the file removal — open
-and close the database again before copying.
+**Important:** Verify that `src-journal` does **not** exist after `close()`.
+If it does, a crash occurred between the checkpoint and the file removal —
+open and close the database again before copying.
 
 ```rust
 use std::path::Path;
 
 fn assert_single_file(path: &str) {
-    assert!(!Path::new(&format!("{path}-wal")).exists(), "WAL still present");
+    assert!(!Path::new(&format!("{path}-journal")).exists(), "journal still present");
 }
 ```
 
@@ -109,14 +109,14 @@ fn assert_single_file(path: &str) {
 ## Checkpoint-Then-Copy
 
 If closing the database is not an option (e.g., the app is running), you can
-checkpoint the WAL into the main file without closing:
+checkpoint the journal into the main file without closing:
 
 ```rust
 use mqlite::{Client, Database};
 use std::fs;
 
 fn checkpoint_backup(client: &Client, src: &str, dst: &str) -> mqlite::Result<()> {
-    // Flush all committed WAL pages to the main file.
+    // Flush all committed journal pages to the main file.
     // After this, myapp.mqlite contains all committed data.
     client.checkpoint()?;
 
@@ -134,7 +134,7 @@ fn checkpoint_backup(client: &Client, src: &str, dst: &str) -> mqlite::Result<()
   same process, so the copy happens when no writes are in flight.
 - ⚠️ Multi-process setups: A second process could start writing between
   `checkpoint()` and the `fs::copy`. In this case the copy may include a
-  partial WAL. Use a hot backup (see below) or a cold backup instead.
+  partial journal. Use a hot backup (see below) or a cold backup instead.
 
 ---
 
@@ -178,23 +178,23 @@ fn report_db_size(path: &str) {
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let wal_path = format!("{path}-wal");
-    let wal_bytes = fs::metadata(&wal_path)
+    let journal_path = format!("{path}-journal");
+    let journal_bytes = fs::metadata(&journal_path)
         .map(|m| m.len())
         .unwrap_or(0);
 
-    println!("Main file : {:.1} MB", main_bytes as f64 / 1_048_576.0);
-    println!("WAL file  : {:.1} MB", wal_bytes as f64 / 1_048_576.0);
-    println!("Total     : {:.1} MB", (main_bytes + wal_bytes) as f64 / 1_048_576.0);
+    println!("Main file    : {:.1} MB", main_bytes as f64 / 1_048_576.0);
+    println!("Journal file : {:.1} MB", journal_bytes as f64 / 1_048_576.0);
+    println!("Total        : {:.1} MB", (main_bytes + journal_bytes) as f64 / 1_048_576.0);
 }
 ```
 
-**WAL size behaviour:**
-- The WAL grows with each write and shrinks (to zero) after a checkpoint.
-- Auto-checkpoint triggers when the WAL reaches `wal_auto_checkpoint` pages
-  (default: 1,000 pages ≈ 4 MB) or `wal_max_size` bytes (default: 100 MB).
-- A large WAL does not affect read correctness but does slow reads (the reader
-  must scan the WAL for page versions).
+**Journal size behaviour:**
+- The journal grows with each write and shrinks (to zero) after a checkpoint.
+- Auto-checkpoint triggers when the journal reaches `journal_auto_checkpoint`
+  pages (default: 1,000 pages ≈ 4 MB) or `journal_max_size` bytes (default: 100 MB).
+- A large journal does not affect read correctness but does slow reads (the
+  reader must scan the journal for page versions).
 
 **Main file size behaviour:**
 - The main file **never shrinks automatically** in Phase 1. Deleted documents

@@ -23,7 +23,7 @@
 //! per-test isolation:
 //!
 //! ```text
-//! cargo test --test mwmr_edge_pr6_7 -- --test-threads=1
+//! cargo test --test mwmr_txn_rollback_allocator_edges -- --test-threads=1
 //! ```
 //!
 //! Expected result: 7 PASS, 1 FAIL (TC4 — engine bug).

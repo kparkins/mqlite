@@ -181,6 +181,7 @@ const DATA_KIND_INLINE: u8 = 0;
 const DATA_KIND_OVERFLOW: u8 = 1;
 
 /// Serialize a `VersionEntry` to the history-store value layout.
+#[cfg(test)]
 pub(crate) fn encode_version_entry_value(entry: &VersionEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + 12 + 8 + 1 + 1 + 16);
     out.extend_from_slice(&entry.start_ts.to_le_bytes());
@@ -321,6 +322,7 @@ impl<S: BTreePageStore> HistoryStore<S> {
     }
 
     /// Insert a version entry at `(ns, kind, key_bytes, entry.start_ts)`.
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         ns_id: u32,

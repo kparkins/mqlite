@@ -121,7 +121,6 @@ impl PageSource for FilePageSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::lock::NoopFileLock;
     use std::sync::Mutex;
 
     // -----------------------------------------------------------------------
@@ -180,11 +179,6 @@ mod tests {
                 )));
             }
             buf.copy_from_slice(&data[start..end]);
-            Ok(())
-        }
-
-        fn sync(&self) -> Result<()> {
-            // In-memory mock has no backing file to sync.
             Ok(())
         }
     }

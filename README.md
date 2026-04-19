@@ -61,21 +61,24 @@ fn main() -> mqlite::Result<()> {
 | File | When present | Meaning |
 |------|-------------|---------|
 | `myapp.mqlite` | Always | Main database file |
-| `myapp.mqlite-wal` | During write activity | Write-ahead log (WAL); safe to leave — replayed on next open |
+| `myapp.mqlite-journal` | During write activity | Append-only write journal; safe to leave — replayed on next open |
 
 A "single-file database" means a single file **after a clean close** (`Client::close()`).
-Dropping the handle is non-blocking and leaves the WAL on disk; the next open recovers it.
+Dropping the handle is non-blocking and leaves the journal on disk; the next open recovers it.
 
 ## Documentation
 
 - [API Reference (docs.rs)](https://docs.rs/mqlite)
+- [Architecture](ARCHITECTURE.md) — block diagrams and lock order
 - [Compatibility Matrix](docs/COMPATIBILITY.md)
+- [Concurrency Guide](docs/CONCURRENCY.md)
 - [Error Guide](docs/ERRORS.md)
-- [Migration Guide](docs/MIGRATION.md)
-- [Wire Protocol Security Advisory](docs/WIRE-SECURITY.md)
-- [Test Double Cookbook](docs/TEST-DOUBLE-COOKBOOK.md)
 - [File Management Guide](docs/FILE-MANAGEMENT.md)
 - [IoT and Embedded Deployment Guide](docs/IOT-DEPLOYMENT.md)
+- [Migration Guide](docs/MIGRATION.md) (from the MongoDB Rust driver)
+- [Test Double Cookbook](docs/TEST-DOUBLE-COOKBOOK.md)
+- [Wire Protocol Security Advisory](docs/WIRE-SECURITY.md)
+- ADRs: [0001 MVCC](docs/adr/0001-mvcc.md), [0002 MWMR](docs/adr/0002-mwmr.md)
 
 ## License
 

@@ -925,6 +925,7 @@ impl BufferPool {
     ///    nested under a partition mutex (positions 3/4).
     ///
     /// Returns the number of `VersionEntry` objects dropped.
+    #[cfg(test)]
     pub(crate) fn reconcile(
         &self,
         page: u32,

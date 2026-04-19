@@ -1834,7 +1834,7 @@ mod tests {
 
     #[test]
     fn unsupported_operator_has_code_9() {
-        use crate::error::{codes, Error};
+        use crate::error::codes;
         let result = eval_filter(&doc! { "a": 1 }, &doc! { "$expr": { "$gt": ["$a", 0] } });
         let err = result.unwrap_err();
         assert_eq!(
