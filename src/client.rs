@@ -19,7 +19,6 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Instant,
 };
 
 use crate::{
@@ -141,41 +140,31 @@ fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
 /// Internal shared state for a [`Client`].
 ///
 /// Wrapped in `Arc` and shared across [`Client`] clones, [`Database`] handles,
-/// and [`crate::collection::Collection`] handles.  This is the single-writer
-/// multi-reader (SWMR) synchronization point.
+/// and [`crate::collection::Collection`] handles.
 ///
-/// ## Locking hierarchy
+/// ## Locking (PR 8 — MWMR v1)
 ///
-/// 1. **`file_lock`** (OS advisory lock) — serializes writers *across processes*.
-/// 2. **`writer_lock`** (in-process `Mutex`) — serializes concurrent writer
-///    threads within a single process.
-///
-/// Callers acquiring both locks must always take `writer_lock` *after*
-/// `file_lock` to avoid deadlocks.
+/// Cross-process locking is still provided by `file_lock` (OS advisory).
+/// In-process writer serialization was historically handled by
+/// `writer_lock: Mutex<()>` here in `ClientInner`. PR 8 moves that
+/// responsibility into the engine's per-namespace lanes: two writers on
+/// DIFFERENT namespaces now overlap; same-namespace writers serialize on
+/// an engine-owned lane mutex. Busy-timeout + busy-handler configuration
+/// is plumbed into `PagedEngine::new_buffered_with_busy`.
 ///
 /// ## Storage engine
 ///
 /// `engine` is a `Box<dyn StorageEngine>` — the concrete type is always
-/// [`PagedEngine`] in Phase 1, but `ClientInner` never knows this.  This
-/// abstraction lets future phases swap in a different engine without changing
-/// the public API layer.
+/// [`PagedEngine`] in Phase 1, but `ClientInner` never knows this.
 pub(crate) struct ClientInner {
     /// Path to the database file.
     pub path: Option<PathBuf>,
     /// Configuration options.
     pub opts: OpenOptions,
-    /// In-process writer mutex — one write at a time within this process.
-    ///
-    /// `PagedEngine` already serialises all access via its own `Mutex`, but
-    /// `writer_lock` provides an extra guarantee: multi-step operations in
-    /// `ClientInner` (e.g., `insert_many`) are atomic at the process level.
-    /// This will be revisited in Phase 1.6 (SWMR).
-    writer_lock: Mutex<()>,
     /// OS advisory file lock.
     ///
     /// Stored as `Arc` so the same fd can be shared with the `FilePageSource`
-    /// backing the buffer pool.  Opening a second fd would release the POSIX
-    /// advisory lock when the second fd is closed (POSIX footgun).
+    /// backing the buffer pool.
     file_lock: Arc<dyn FileLock>,
     /// Buffer pool handle — file I/O infrastructure wired in by R1.1.
     #[allow(dead_code)]
@@ -183,12 +172,6 @@ pub(crate) struct ClientInner {
     /// Storage engine.  All CRUD operations are dispatched through this trait.
     pub(crate) engine: Box<dyn StorageEngine>,
     /// Dedicated file handle for journal→main-file checkpoint I/O.
-    ///
-    /// Kept separate from `file_lock` to avoid the POSIX advisory-lock fd
-    /// sharing footgun: we never use this fd for locking, only for writing
-    /// checkpointed pages.  Both fds are closed together when `ClientInner`
-    /// is dropped, so the lock lifetime is unaffected.
-    ///
     journal_main_file: Option<Arc<Mutex<std::fs::File>>>,
 }
 
@@ -202,15 +185,16 @@ impl ClientInner {
         catalog_root_level: u8,
         journal_main_file: Option<Arc<Mutex<std::fs::File>>>,
     ) -> Result<Self> {
-        let engine = PagedEngine::new_buffered(
+        let engine = PagedEngine::new_buffered_with_busy(
             Arc::clone(&buffer_pool),
             catalog_root_page,
             catalog_root_level,
+            opts.busy_timeout,
+            opts.busy_handler.clone(),
         )?;
         Ok(ClientInner {
             path,
             opts,
-            writer_lock: Mutex::new(()),
             file_lock,
             buffer_pool: Some(buffer_pool),
             engine: Box::new(engine),
@@ -229,64 +213,6 @@ impl ClientInner {
 // ---------------------------------------------------------------------------
 
 impl ClientInner {
-    /// Acquire the in-process writer lock, respecting the configured
-    /// `busy_timeout` and `busy_handler`.
-    ///
-    /// Uses a spin-loop with `try_lock()` instead of a blocking `lock()` so
-    /// that reader threads (which hold no writer lock) are never delayed by
-    /// this wait.  Writer threads spin briefly, then return
-    /// [`Error::WriterBusy`] on timeout.
-    fn acquire_writer_lock(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
-        // Fast path: try without any spin first.
-        match self.writer_lock.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(e)) => {
-                return Err(Error::Internal(format!("writer_lock poisoned: {e}")));
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-
-        let timeout = self.opts.busy_timeout;
-
-        // If a custom busy handler is configured, delegate to it.
-        if let Some(handler) = &self.opts.busy_handler {
-            let mut attempts: u32 = 0;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                match self.writer_lock.try_lock() {
-                    Ok(guard) => return Ok(guard),
-                    Err(std::sync::TryLockError::Poisoned(e)) => {
-                        return Err(Error::Internal(format!("writer_lock poisoned: {e}")));
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) => {}
-                }
-                if !handler.0(attempts) {
-                    return Err(Error::WriterBusy);
-                }
-                attempts = attempts.saturating_add(1);
-            }
-        }
-
-        // Default: spin until busy_timeout expires.
-        if timeout.is_zero() {
-            return Err(Error::WriterBusy);
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            match self.writer_lock.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(std::sync::TryLockError::Poisoned(e)) => {
-                    return Err(Error::Internal(format!("writer_lock poisoned: {e}")));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(Error::WriterBusy);
-            }
-        }
-    }
-
     pub(crate) fn insert_one<T: serde::Serialize>(
         &self,
         name: &str,
@@ -296,7 +222,7 @@ impl ClientInner {
         tracing::debug!(target: "mqlite", collection = name, doc_count = 1u64, "mqlite::insert");
 
         let bson_doc = bson::to_document(doc).map_err(Error::BsonSerialization)?;
-        let _guard = self.acquire_writer_lock()?;
+        // PR 8: per-namespace lanes inside the engine serialize same-ns writers.
         let id = self.engine.insert(name, bson_doc)?;
         let oid = match id {
             Bson::ObjectId(o) => o,
@@ -327,8 +253,6 @@ impl ClientInner {
             doc_count = docs.len() as u64,
             "mqlite::insert"
         );
-
-        let _guard = self.acquire_writer_lock()?;
         let mut inserted_ids: HashMap<usize, Bson> = HashMap::new();
         let mut errors: Vec<BulkWriteError> = Vec::new();
 
@@ -434,7 +358,6 @@ impl ClientInner {
         update: Document,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.update(name, &filter, &update, &opts, false)
     }
 
@@ -445,17 +368,14 @@ impl ClientInner {
         update: Document,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.update(name, &filter, &update, &opts, true)
     }
 
     pub(crate) fn delete_one(&self, name: &str, filter: Document) -> Result<DeleteResult> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.delete(name, &filter, false)
     }
 
     pub(crate) fn delete_many(&self, name: &str, filter: Document) -> Result<DeleteResult> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.delete(name, &filter, true)
     }
 
@@ -466,7 +386,6 @@ impl ClientInner {
         update: Document,
         opts: FindOneAndUpdateOptions,
     ) -> Result<Option<T>> {
-        let _guard = self.acquire_writer_lock()?;
         match self
             .engine
             .find_one_and_update_doc(name, &filter, &update, &opts)?
@@ -484,7 +403,6 @@ impl ClientInner {
         filter: Document,
         opts: FindOneAndDeleteOptions,
     ) -> Result<Option<T>> {
-        let _guard = self.acquire_writer_lock()?;
         match self.engine.find_one_and_delete_doc(name, &filter, &opts)? {
             None => Ok(None),
             Some(doc) => bson::from_document(doc)
@@ -501,7 +419,6 @@ impl ClientInner {
         opts: FindOneAndReplaceOptions,
     ) -> Result<Option<T>> {
         let replacement_doc = bson::to_document(replacement).map_err(Error::BsonSerialization)?;
-        let _guard = self.acquire_writer_lock()?;
         match self
             .engine
             .find_one_and_replace_doc(name, &filter, &replacement_doc, &opts)?
@@ -523,12 +440,10 @@ impl ClientInner {
     }
 
     pub(crate) fn create_index(&self, name: &str, model: IndexModel) -> Result<String> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.create_index(name, &model)
     }
 
     pub(crate) fn drop_index(&self, name: &str, index_name: &str) -> Result<()> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.drop_index(name, index_name)
     }
 
@@ -541,12 +456,10 @@ impl ClientInner {
     }
 
     pub(crate) fn drop_collection(&self, name: &str) -> Result<()> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.drop_namespace(name)
     }
 
     pub(crate) fn create_collection(&self, name: &str) -> Result<()> {
-        let _guard = self.acquire_writer_lock()?;
         self.engine.create_namespace(name)
     }
 
@@ -577,23 +490,20 @@ impl ClientInner {
     /// Called after every write operation when
     /// [`DurabilityMode::FullSync`] is active.  This is the MF-5 guarantee:
     /// after this method returns, the written data survives a process crash.
+    ///
+    /// # Durability model
+    ///
+    /// Writers append frames to the journal (including a `ChainCommit` frame)
+    /// inline before returning to the caller. The journal IS the durability
+    /// point: once the journal is fsync'd the commit is crash-safe. Moving
+    /// journal frames into the main file (checkpoint) is an admin operation
+    /// that runs via `checkpoint()` or on drop — it is NOT required for
+    /// per-write crash safety.
     fn flush_and_sync_if_fullsync(&self) -> Result<()> {
         if self.opts.durability != DurabilityMode::FullSync {
             return Ok(());
         }
-        // Flush dirty pages to journal (or directly to file on the non-journal path).
-        self.engine.checkpoint()?;
-        // Journal checkpoint: immediately move journal frames into the main file so
-        // this write survives a process crash without relying on commit-frame
-        // recovery.  After this call the main file is complete and durable.
-        if let (Some(bp), Some(journal_file_mutex)) = (&self.buffer_pool, &self.journal_main_file) {
-            let mut journal_file = journal_file_mutex
-                .lock()
-                .map_err(|_| Error::Internal("journal main file mutex poisoned".into()))?;
-            bp.checkpoint_through_journal(&mut *journal_file)?;
-        }
-        // fsync: push OS page-cache to the storage device.
-        self.file_lock.sync()
+        self.engine.journal_sync()
     }
 
     pub(crate) fn backup(&self, dest: &Path) -> Result<()> {
@@ -626,7 +536,6 @@ impl ClientInner {
 
         // Acquire the in-process writer lock so no writes can interleave with
         // our checkpoint and copy.
-        let _guard = self.acquire_writer_lock()?;
 
         // Checkpoint: flush dirty buffer-pool pages to the journal, then move all
         // journal frames into the main file.  After this, the main file contains
@@ -858,6 +767,8 @@ impl Client {
         //
         // For an existing file, the catalog root page is read from the file header.
         // For a new file, catalog_root_page == 0 means a fresh catalog is created.
+        // Read the initial file header (used to set salt values for the journal
+        // and to locate the catalog B+ tree root page).
         let file_header = if file_size == 0 {
             FileHeader::new_now()
         } else {
@@ -865,8 +776,6 @@ impl Client {
             file_lock.read_exact_at(0, &mut hdr_buf)?;
             FileHeader::from_bytes(&hdr_buf).unwrap_or_else(|_| FileHeader::new_now())
         };
-        let catalog_root_page = file_header.catalog_root_page;
-        let catalog_root_level = file_header.catalog_root_level;
 
         // Open a dedicated file handle for journal checkpoint I/O.  This fd is
         // never used for advisory locking — only for writing checkpointed
@@ -878,11 +787,38 @@ impl Client {
             .open(&path)
             .map_err(Error::Io)?;
 
-        let journal = Arc::new(Mutex::new(JournalManager::open_or_create(
+        let journal_mgr = JournalManager::open_or_create(
             &path,
             &file_header,
             &mut journal_io_file,
-        )?));
+        )?;
+
+        // Re-read the file header after journal recovery — but ONLY when
+        // recovery actually wrote committed page frames to the main file.
+        // `open_or_create` may have replayed journal frames into the main file
+        // (including page 0), making the catalog_root_page / catalog_root_level
+        // we read before recovery stale.  Re-reading via `journal_io_file` gives
+        // us the post-recovery header.
+        //
+        // When no pages were replayed (clean close, empty journal, or no journal)
+        // the pre-recovery header is already correct — and for NEW files
+        // (file_size == 0) re-reading would return the header written by
+        // `write_initial_header` (a different `FileHeader::new_now()` call with
+        // different random salts), breaking the journal's salt check on the very
+        // next open.
+        let file_header = if journal_mgr.did_recover_pages() {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut hdr_buf = [0u8; HEADER_PAGE_SIZE];
+            journal_io_file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+            journal_io_file.read_exact(&mut hdr_buf).map_err(Error::Io)?;
+            FileHeader::from_bytes(&hdr_buf).unwrap_or(file_header)
+        } else {
+            file_header
+        };
+        let catalog_root_page = file_header.catalog_root_page;
+        let catalog_root_level = file_header.catalog_root_level;
+
+        let journal = Arc::new(Mutex::new(journal_mgr));
 
         let file_src = Arc::new(FilePageSource::new(Arc::clone(&file_lock)));
         let layered_source: Box<dyn crate::storage::buffer_pool::PageSource> =

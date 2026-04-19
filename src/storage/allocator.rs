@@ -492,6 +492,51 @@ impl AllocatorHandle {
         Ok(freed)
     }
 
+    /// Drain the deferred-free queue but hand the 0-refcount pages to the
+    /// caller as a plain `Vec<u32>` rather than freeing them to the
+    /// allocator (plan §M4b).
+    ///
+    /// Writer-txn `begin` uses this so the drained pages become
+    /// `PageOrigin::DeferredFree` reservations on the txn's overlay.
+    /// On commit the overlay translates each reservation into a proper
+    /// `free_*` call; on rollback the reservation pushes the page back
+    /// onto the queue, preserving the "concurrent readers must observe
+    /// refcount before free" invariant.
+    ///
+    /// Refcount recheck uses Acquire ordering (matches `drain_free_queue`).
+    /// Entries whose refcount is still non-zero are re-enqueued.
+    ///
+    /// Precondition: caller holds writer serialization (same as
+    /// `drain_free_queue`).
+    pub(crate) fn drain_deferred_free_reservations(&self) -> Vec<u32> {
+        let pages = self.deferred_free_queue.take_all();
+        if pages.is_empty() {
+            crate::mvcc::metrics::set_deferred_free_queue_depth(0);
+            return Vec::new();
+        }
+        let mut ready = Vec::new();
+        let mut requeue: Vec<u32> = Vec::new();
+        for page in pages {
+            let cnt = self.overflow_refcount(page);
+            if cnt == 0 {
+                // Drop the refcount entry — the page is no longer live.
+                #[allow(clippy::unwrap_used)]
+                let mut table = self.overflow_refcounts.lock().unwrap();
+                table.remove(&page);
+                ready.push(page);
+            } else {
+                requeue.push(page);
+            }
+        }
+        if !requeue.is_empty() {
+            self.deferred_free_queue.push_many(requeue);
+        }
+        crate::mvcc::metrics::set_deferred_free_queue_depth(
+            self.deferred_free_queue.depth() as u64,
+        );
+        ready
+    }
+
     /// Test-only: force-set the refcount for a page (used by CAS-saturation
     /// contract tests).
     #[cfg(test)]

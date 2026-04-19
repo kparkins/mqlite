@@ -16,4 +16,6 @@ pub(crate) mod lock;
 pub(crate) mod oid;
 pub(crate) mod page;
 pub(crate) mod paged_engine;
+pub(crate) mod root_snapshot;
 pub(crate) mod secondary_index;
+pub(crate) mod txn_page_store;

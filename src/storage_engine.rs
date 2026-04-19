@@ -191,6 +191,13 @@ pub trait StorageEngine: Send + Sync {
     /// is safe to copy as a backup.
     fn checkpoint(&self) -> Result<()>;
 
+    /// fsync the journal — make all committed-but-unsynced txns durable.
+    ///
+    /// On FullSync writes this is called per write instead of a full
+    /// checkpoint. The journal IS the durability point; main-file checkpoint
+    /// runs separately via `checkpoint()` (admin) or background GC.
+    fn journal_sync(&self) -> Result<()>;
+
     /// Flush, checkpoint, and release all engine resources.
     ///
     /// After `close()` returns, the engine must not be used again.  Calling

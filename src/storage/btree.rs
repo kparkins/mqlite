@@ -67,6 +67,13 @@ const OVERFLOW_PAGE_DATA: usize = PAGE_SIZE_LEAF as usize - OVERFLOW_HEADER_SIZE
 /// merge-or-redistribute operation.
 const MIN_LEAF_CELLS: usize = 4;
 
+/// Non-root leaves also try to stay at least half full by bytes.
+///
+/// Leaf cells are variable-sized, so count-only balancing can choose a merge
+/// that overflows the 32 KB page even though the sibling pair could be safely
+/// redistributed.
+const MIN_LEAF_BYTES: usize = PAGE_SIZE_LEAF as usize / 2;
+
 // ---------------------------------------------------------------------------
 // Page store abstraction
 // ---------------------------------------------------------------------------
@@ -147,6 +154,31 @@ pub(crate) trait BTreePageStore {
 
     /// True iff no version chains are attached to leaf `page`.
     fn chains_empty(&self, page: u32) -> Result<bool>;
+
+    /// Clear ALL version chains attached to leaf `page`.
+    ///
+    /// Used by the overflow-chain free path: overflow pages are allocated
+    /// from the same 32 KB leaf pool as data leaves, so a page that was
+    /// previously a data leaf may carry stale `version_chains` entries
+    /// when reborn as an overflow page. Clearing those entries before
+    /// `free_leaf` keeps the T3.5 guard sound.
+    ///
+    /// No-op if the frame is not currently resident — there are no
+    /// chains to clear in that case.
+    fn clear_chains(&mut self, page: u32) -> Result<()>;
+
+    /// Remove and return every version chain currently attached to leaf
+    /// `page`. Used by the leaf-merge path to migrate the residual chains
+    /// for keys whose cells were already removed earlier in the same txn
+    /// (e.g. by `delete_from_leaf`) onto the merged-into sibling — those
+    /// tombstone-eligible chains must remain visible to MVCC readers
+    /// whose ReadView predates the delete commit.
+    ///
+    /// Returns an empty vector if the frame is not resident.
+    fn take_all_chains(
+        &mut self,
+        page: u32,
+    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +305,22 @@ impl BTreePageStore for MemPageStore {
             .leaf_chains
             .get(&page)
             .map_or(true, |m| m.is_empty()))
+    }
+
+    fn clear_chains(&mut self, page: u32) -> Result<()> {
+        self.leaf_chains.remove(&page);
+        Ok(())
+    }
+
+    fn take_all_chains(
+        &mut self,
+        page: u32,
+    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
+        Ok(self
+            .leaf_chains
+            .remove(&page)
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default())
     }
 }
 
@@ -489,6 +537,13 @@ struct LeafNode {
 }
 
 impl LeafNode {
+    /// Total bytes used by `cells` when encoded into a leaf page.
+    fn used_bytes_for_cells(cells: &[LeafCell]) -> usize {
+        LEAF_HEADER_SIZE
+            + cells.len() * 2 // one u16 pointer per cell
+            + cells.iter().map(|c| c.encoded_size()).sum::<usize>()
+    }
+
     /// Parse a 32 KB leaf page buffer into a [`LeafNode`].
     fn parse(data: &[u8]) -> Result<Self> {
         let hdr = LeafPageHeader::from_bytes(data)?;
@@ -683,9 +738,7 @@ impl LeafNode {
 
     /// Total bytes used in the page (header + pointer array + cell data).
     fn used_bytes(&self) -> usize {
-        LEAF_HEADER_SIZE
-            + self.cells.len() * 2 // one u16 pointer per cell
-            + self.cells.iter().map(|c| c.encoded_size()).sum::<usize>()
+        Self::used_bytes_for_cells(&self.cells)
     }
 
     /// Available free bytes in the page.
@@ -697,6 +750,11 @@ impl LeafNode {
     fn can_insert(&self, cell_size: usize) -> bool {
         // Need room for the cell data AND a 2-byte cell pointer.
         self.free_bytes() >= cell_size + 2
+    }
+
+    /// Returns `true` when a non-root leaf should be rebalanced.
+    fn needs_rebalance(&self) -> bool {
+        self.cells.len() < MIN_LEAF_CELLS || self.used_bytes() < MIN_LEAF_BYTES
     }
 
     /// Binary-search for `key`.  Returns `Ok(idx)` if found, `Err(idx)` for
@@ -783,6 +841,11 @@ fn free_overflow_chain<S: BTreePageStore>(store: &mut S, first_page: u32) -> Res
         let (buf, _) = store.read_leaf(cur)?;
         let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
         let next = hdr.next_overflow_page;
+        // Overflow pages carry no MVCC data; clear any stale chain
+        // remnants from a prior data-leaf life of this page number so
+        // the T3.5 `chains_empty` guard inside `free_leaf` paths does
+        // not trip. The frame may not be resident — that's a no-op.
+        store.clear_chains(cur)?;
         store.free_leaf(cur)?;
         cur = next;
     }
@@ -818,6 +881,47 @@ fn free_subtree<S: BTreePageStore>(store: &mut S, page: u32, level: u8) -> Resul
         store.free_internal(page)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Empty-page seed helpers (Bug A fix — §M4a/M4b)
+// ---------------------------------------------------------------------------
+//
+// Used by `TxnPageStore::alloc_leaf` / `alloc_internal` to seed the
+// per-txn overlay with a valid empty-page image immediately after a
+// fresh page is returned from the base allocator. Without the seed, any
+// subsequent in-txn read of the page falls through the overlay to the
+// shared buffer-pool frame, which still holds zero bytes (or stale
+// bytes if the page was recycled from the free list). The decoder
+// rejects that as "unknown cell value type 0x00" or "expected leaf
+// page type 0x02, found 0x00".
+//
+// The empty-leaf seed is also used for fresh pages that the caller
+// will immediately repurpose as overflow pages: `write_overflow_chain`
+// writes the full page (zero-init buffer + header + payload), so the
+// seed bytes are replaced before any read sees them as overflow.
+
+/// Build the bytes of a valid empty 32 KB leaf page (zero cells,
+/// no sibling links, no flags).
+pub(crate) fn empty_leaf_page_bytes() -> Result<[u8; PAGE_SIZE_LEAF as usize]> {
+    let node = LeafNode {
+        flags: 0,
+        next_leaf_page: 0,
+        prev_leaf_page: 0,
+        cells: Vec::new(),
+    };
+    node.encode()
+}
+
+/// Build the bytes of a valid empty 4 KB internal page (level 0,
+/// zero entries, zero rightmost child).
+pub(crate) fn empty_internal_page_bytes() -> Result<[u8; PAGE_SIZE_INTERNAL as usize]> {
+    let node = InternalNode {
+        level: 0,
+        entries: Vec::new(),
+        rightmost_child: 0,
+    };
+    node.encode()
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,9 +1418,9 @@ impl<S: BTreePageStore> BTree<S> {
     ///
     /// Overflow chains are freed when a cell with an overflow pointer is deleted.
     ///
-    /// After deletion, if a leaf falls below [`MIN_LEAF_CELLS`], the tree
-    /// attempts to redistribute from or merge with a sibling.  Parent separator
-    /// keys are updated accordingly.
+    /// After deletion, if a non-root leaf falls below the minimum occupancy by
+    /// cell count or byte usage, the tree attempts to redistribute from or
+    /// merge with a sibling. Parent separator keys are updated accordingly.
     pub(crate) fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let mut path: Vec<(u32, usize)> = Vec::new();
         let found = self.delete_subtree(self.root_page, self.root_level, key, &mut path)?;
@@ -1369,7 +1473,7 @@ impl<S: BTreePageStore> BTree<S> {
         self.store.write_leaf(page, &encoded)?;
 
         // Check for underflow and potentially merge/redistribute.
-        if node.cells.len() < MIN_LEAF_CELLS && !path.is_empty() {
+        if node.needs_rebalance() && !path.is_empty() {
             self.handle_leaf_underflow(page, node, path)?;
         }
 
@@ -1390,223 +1494,275 @@ impl<S: BTreePageStore> BTree<S> {
 
         let key_count = parent.entries.len();
 
-        // Try left sibling (child_idx - 1).
+        // Prefer rebalancing with the left sibling. The decision is byte-aware:
+        // merge only if the combined cells fit in one 32 KB leaf; otherwise
+        // repartition the pair across the two existing pages.
         if child_idx > 0 {
             let left_sibling_idx = child_idx - 1;
             let left_page = parent.child_at(left_sibling_idx);
             let (left_buf, _) = self.store.read_leaf(left_page)?;
-            let mut left_node = LeafNode::parse(&left_buf[..])?;
+            let left_node = LeafNode::parse(&left_buf[..])?;
 
-            // Redistribute: move last cell of left sibling to front of our node.
-            if left_node.cells.len() > MIN_LEAF_CELLS {
-                let moved = left_node.cells.pop().unwrap();
-                let new_sep = moved.key.clone();
-                // T3.5: migrate the moved cell's version chain (if any).
-                if let Some(chain) = self.store.take_chain(left_page, &moved.key)? {
-                    self.store.put_chain(page, moved.key.clone(), chain)?;
-                }
-                let mut new_node = node.clone();
-                new_node.cells.insert(0, moved);
-
-                // Update separator key in parent: the key at (left_sibling_idx) in parent's
-                // entries separates left_sibling and `page`.
-                // parent.entries[left_sibling_idx] is the key to the LEFT of `page`'s entry...
-                // Wait: parent.entries[child_idx-1] separates child_idx-1 and child_idx.
-                // Specifically, parent.entries[child_idx-1].0 is the separator key such that
-                // keys in child_at(child_idx-1) < separator <= keys in child_at(child_idx).
-                // After moving, the new separator is new_sep (= moved.key).
-                let mut new_parent = parent.clone();
-                new_parent.entries[left_sibling_idx].0 = new_sep;
-
-                let left_enc = left_node.encode()?;
-                let node_enc = new_node.encode()?;
-                let parent_enc = new_parent.encode()?;
-                self.store.write_leaf(left_page, &left_enc)?;
-                self.store.write_leaf(page, &node_enc)?;
-                self.store.write_internal(parent_page, &parent_enc)?;
-                return Ok(());
+            if Self::can_merge_leaves(&left_node, &node) {
+                return self.merge_leaf_into_left(
+                    parent_page,
+                    child_idx,
+                    path,
+                    left_page,
+                    left_node,
+                    page,
+                    node,
+                );
             }
+
+            return self.redistribute_leaf_pair(
+                left_page,
+                left_node,
+                page,
+                node,
+                parent_page,
+                left_sibling_idx,
+            );
         }
 
-        // Try right sibling (child_idx + 1).
+        // No left sibling: repair against the right sibling.
         if child_idx < key_count {
-            // Note: key_count = parent.entries.len(), and total children = key_count + 1.
-            // child_idx + 1 is valid if child_idx + 1 <= key_count.
             let right_sibling_idx = child_idx + 1;
             let right_page = parent.child_at(right_sibling_idx);
             let (right_buf, _) = self.store.read_leaf(right_page)?;
-            let mut right_node = LeafNode::parse(&right_buf[..])?;
+            let right_node = LeafNode::parse(&right_buf[..])?;
 
-            if right_node.cells.len() > MIN_LEAF_CELLS {
-                let moved = right_node.cells.remove(0);
-                let new_sep = right_node.cells[0].key.clone(); // new separator is new first key of right
-                // T3.5: migrate the moved cell's version chain (if any).
-                if let Some(chain) = self.store.take_chain(right_page, &moved.key)? {
-                    self.store.put_chain(page, moved.key.clone(), chain)?;
-                }
-                let mut new_node = node.clone();
-                new_node.cells.push(moved);
+            if Self::can_merge_leaves(&node, &right_node) {
+                return self.merge_leaf_into_right(
+                    parent_page,
+                    path,
+                    page,
+                    node,
+                    right_page,
+                    right_node,
+                );
+            }
 
-                // Separator key between `page` and right_page is parent.entries[child_idx].0.
-                let mut new_parent = parent.clone();
-                new_parent.entries[child_idx].0 = new_sep;
+            return self.redistribute_leaf_pair(
+                page,
+                node,
+                right_page,
+                right_node,
+                parent_page,
+                child_idx,
+            );
+        }
 
-                let right_enc = right_node.encode()?;
-                let node_enc = new_node.encode()?;
-                let parent_enc = new_parent.encode()?;
-                self.store.write_leaf(right_page, &right_enc)?;
-                self.store.write_leaf(page, &node_enc)?;
-                self.store.write_internal(parent_page, &parent_enc)?;
-                return Ok(());
+        Err(Error::Internal(
+            "leaf underflow reached a parent with no siblings".into(),
+        ))
+    }
+
+    fn can_merge_leaves(left: &LeafNode, right: &LeafNode) -> bool {
+        left.used_bytes() + right.used_bytes() - LEAF_HEADER_SIZE <= PAGE_SIZE_LEAF as usize
+    }
+
+    fn choose_leaf_redistribution_split(
+        cells: &[LeafCell],
+        original_left_len: usize,
+    ) -> Option<usize> {
+        let mut best: Option<((usize, usize, usize), usize)> = None;
+
+        for split_at in 1..cells.len() {
+            let left_used = LeafNode::used_bytes_for_cells(&cells[..split_at]);
+            let right_used = LeafNode::used_bytes_for_cells(&cells[split_at..]);
+            if left_used > PAGE_SIZE_LEAF as usize || right_used > PAGE_SIZE_LEAF as usize {
+                continue;
+            }
+
+            let deficit = MIN_LEAF_BYTES.saturating_sub(left_used)
+                + MIN_LEAF_BYTES.saturating_sub(right_used);
+            let imbalance = left_used.abs_diff(right_used);
+            let movement = split_at.abs_diff(original_left_len);
+            let score = (deficit, imbalance, movement);
+
+            match &best {
+                Some((best_score, _)) if *best_score <= score => {}
+                _ => best = Some((score, split_at)),
             }
         }
 
-        // Merge: prefer merging with left sibling; fall back to right.
-        if child_idx > 0 {
-            // Merge page into left sibling.
-            let left_sibling_idx = child_idx - 1;
-            let left_page = parent.child_at(left_sibling_idx);
-            let (left_buf, _) = self.store.read_leaf(left_page)?;
-            let mut left_node = LeafNode::parse(&left_buf[..])?;
+        best.map(|(_, split_at)| split_at)
+    }
 
-            // T3.5: migrate version chains for every cell moving into the
-            // left sibling BEFORE we free `page`. Chains for keys not backed
-            // by a live cell intentionally stay on `page` so the guard below
-            // fails loudly rather than silently leaking a refcount.
-            for cell in &node.cells {
-                if let Some(chain) = self.store.take_chain(page, &cell.key)? {
-                    self.store.put_chain(left_page, cell.key.clone(), chain)?;
-                }
+    fn move_all_leaf_chains(&mut self, from_page: u32, to_page: u32) -> Result<()> {
+        for (key, chain) in self.store.take_all_chains(from_page)? {
+            self.store.put_chain(to_page, key, chain)?;
+        }
+        Ok(())
+    }
+
+    fn redistribute_leaf_chains(
+        &mut self,
+        left_page: u32,
+        right_page: u32,
+        separator_key: &[u8],
+    ) -> Result<()> {
+        let mut chains = self.store.take_all_chains(left_page)?;
+        chains.extend(self.store.take_all_chains(right_page)?);
+
+        for (key, chain) in chains {
+            if key.as_slice() < separator_key {
+                self.store.put_chain(left_page, key, chain)?;
+            } else {
+                self.store.put_chain(right_page, key, chain)?;
             }
-
-            left_node.cells.extend(node.cells);
-            left_node.next_leaf_page = node.next_leaf_page;
-
-            // Update former right sibling's prev pointer.
-            if node.next_leaf_page != 0 {
-                let (next_buf, _) = self.store.read_leaf(node.next_leaf_page)?;
-                let mut next_node = LeafNode::parse(&next_buf[..])?;
-                next_node.prev_leaf_page = left_page;
-                let enc = next_node.encode()?;
-                self.store.write_leaf(node.next_leaf_page, &enc)?;
-            }
-
-            let left_enc = left_node.encode()?;
-            self.store.write_leaf(left_page, &left_enc)?;
-            // T3.5 guard (MAJOR-5): free_leaf must never be called on a leaf
-            // whose version_chains map is still non-empty.
-            if !self.store.chains_empty(page)? {
-                return Err(Error::Internal(
-                    "free_leaf called with non-empty version chain".into(),
-                ));
-            }
-            self.store.free_leaf(page)?;
-
-            // Remove separator key from parent: the separator between left_sibling and page
-            // is parent.entries[left_sibling_idx].
-            self.remove_from_parent(parent_page, left_sibling_idx, path)?;
-        } else {
-            // child_idx == 0: merge page with right sibling.
-            let right_page = parent.child_at(1);
-            let (right_buf, _) = self.store.read_leaf(right_page)?;
-            let mut right_node = LeafNode::parse(&right_buf[..])?;
-
-            // T3.5: migrate version chains for every cell moving into the
-            // right sibling BEFORE we free `page`. See merge-into-left above.
-            for cell in &node.cells {
-                if let Some(chain) = self.store.take_chain(page, &cell.key)? {
-                    self.store.put_chain(right_page, cell.key.clone(), chain)?;
-                }
-            }
-
-            let mut merged_cells = node.cells.clone();
-            merged_cells.extend(right_node.cells.drain(..));
-            right_node.cells = merged_cells;
-            right_node.prev_leaf_page = node.prev_leaf_page;
-
-            // Update former left sibling's next pointer (if any).
-            if node.prev_leaf_page != 0 {
-                let (prev_buf, _) = self.store.read_leaf(node.prev_leaf_page)?;
-                let mut prev_node = LeafNode::parse(&prev_buf[..])?;
-                prev_node.next_leaf_page = right_page;
-                let enc = prev_node.encode()?;
-                self.store.write_leaf(node.prev_leaf_page, &enc)?;
-            }
-
-            let right_enc = right_node.encode()?;
-            self.store.write_leaf(right_page, &right_enc)?;
-            // T3.5 guard (MAJOR-5): free_leaf must never be called on a leaf
-            // whose version_chains map is still non-empty.
-            if !self.store.chains_empty(page)? {
-                return Err(Error::Internal(
-                    "free_leaf called with non-empty version chain".into(),
-                ));
-            }
-            self.store.free_leaf(page)?;
-
-            // If page was the root's left child (child_idx == 0), the separator
-            // is parent.entries[0].
-            // Remove separator at index 0 from parent, but also update child pointer:
-            // after removing page, the new leftmost child should be right_page.
-            // parent.entries[0] has child_page = page (old left child).
-            // After merge into right_page, we need to either:
-            //   (a) update parent.entries[0].1 to right_page and remove the separator, or
-            //   (b) just remove entries[0] since right_page becomes the new child_idx=0.
-            // Actually: when we merged page (child_idx=0) INTO right_page (child_idx=1),
-            // parent.entries[0] = (sep_key, page). We need to remove parent.entries[0]
-            // since its child (page) no longer exists.  The former child_idx=1 (right_page)
-            // is now the new leftmost child (child_idx=0), which would be expressed as
-            // parent.entries[0].1 in the updated parent — but we're removing entries[0].
-            // After remove: entries[0] becomes the OLD entries[1] which has child_page
-            // pointing to the new child_idx=2, not right_page.
-            //
-            // Hmm, this is tricky. Let me reconsider.
-            //
-            // parent.entries stores: [(key[0], child[0]), (key[1], child[1]), ..., (key[n-1], child[n-1])]
-            // where child[i] = page to the LEFT of key[i].
-            // rightmost_child = child[n] = page to the RIGHT of all keys.
-            //
-            // When child_idx = 0 (= child[0] = page) is merged into child_idx = 1 (= child[1]):
-            //   - page (child[0]) is freed, merged into right_page (child[1])
-            //   - We need to remove key[0] (= parent.entries[0].0) and update child[1] to
-            //     right_page. But child[1] = parent.entries[1].1 is right_page already!
-            //     Wait: after the merge, child[1] now has the merged data. It's still right_page.
-            //   - Actually, by removing key[0], child[0] becomes the new "missing slot".
-            //     After remove(0): entries becomes [(key[1], child[1]), (key[2], child[2]), ...]
-            //     which means the new leftmost child (before key[1]) is child[1] = right_page. ✓
-            //
-            // Hmm but the semantics of entries[i].1 is "child to LEFT of key[i]".
-            // After removing entries[0]:
-            //   New entries[0] = (key[1], child[1]) = (old key[1], old right_page)
-            //   This means: child to LEFT of key[1] is right_page.
-            //   Is that correct? The old child to left of key[1] was child[1] = right_page. ✓
-            //
-            // But we also need to handle the case where the new child[0] (= right_page) is
-            // referenced as the "child before key[0]" in the new entries. Since we removed
-            // entries[0], the new entries[0] already has child_page = right_page (old child[1]).
-            // This looks correct!
-            //
-            // Ah wait, I see the issue. When merging child_idx=0 into child_idx=1:
-            // - The merged node is right_page (= child_at(1) = parent.entries[1].1 if 1 < n,
-            //   else rightmost_child).
-            // - key[0] was the separator between child[0]=page and child[1]=right_page.
-            // - We need to remove key[0] from the parent.
-            // - remove_from_parent is called with separator_idx = 0.
-            self.remove_from_parent(parent_page, 0, path)?;
         }
 
         Ok(())
     }
 
-    /// Remove the separator key at `separator_idx` from the internal node at `parent_page`.
+    fn redistribute_leaf_pair(
+        &mut self,
+        left_page: u32,
+        mut left_node: LeafNode,
+        right_page: u32,
+        mut right_node: LeafNode,
+        parent_page: u32,
+        separator_idx: usize,
+    ) -> Result<()> {
+        let original_left_len = left_node.cells.len();
+        let mut combined = left_node.cells;
+        combined.extend(right_node.cells);
+
+        let split_at = Self::choose_leaf_redistribution_split(&combined, original_left_len)
+            .ok_or_else(|| Error::Internal("leaf redistribution could not find a valid split".into()))?;
+
+        let right_cells = combined.split_off(split_at);
+        let separator_key = right_cells[0].key.clone();
+
+        left_node.cells = combined;
+        left_node.next_leaf_page = right_page;
+        right_node.cells = right_cells;
+        right_node.prev_leaf_page = left_page;
+
+        self.redistribute_leaf_chains(left_page, right_page, &separator_key)?;
+
+        let left_enc = left_node.encode()?;
+        let right_enc = right_node.encode()?;
+        let parent_buf = self.store.read_internal(parent_page)?;
+        let mut parent = InternalNode::parse(&parent_buf[..])?;
+        parent.entries[separator_idx].0 = separator_key;
+        let parent_enc = parent.encode()?;
+
+        self.store.write_leaf(left_page, &left_enc)?;
+        self.store.write_leaf(right_page, &right_enc)?;
+        self.store.write_internal(parent_page, &parent_enc)?;
+        Ok(())
+    }
+
+    fn merge_leaf_into_left(
+        &mut self,
+        parent_page: u32,
+        child_idx: usize,
+        path: &[(u32, usize)],
+        left_page: u32,
+        mut left_node: LeafNode,
+        page: u32,
+        node: LeafNode,
+    ) -> Result<()> {
+        self.move_all_leaf_chains(page, left_page)?;
+
+        left_node.cells.extend(node.cells);
+        left_node.next_leaf_page = node.next_leaf_page;
+
+        if node.next_leaf_page != 0 {
+            let (next_buf, _) = self.store.read_leaf(node.next_leaf_page)?;
+            let mut next_node = LeafNode::parse(&next_buf[..])?;
+            next_node.prev_leaf_page = left_page;
+            let enc = next_node.encode()?;
+            self.store.write_leaf(node.next_leaf_page, &enc)?;
+        }
+
+        let left_enc = left_node.encode()?;
+        self.store.write_leaf(left_page, &left_enc)?;
+        if !self.store.chains_empty(page)? {
+            return Err(Error::Internal(
+                "free_leaf called with non-empty version chain".into(),
+            ));
+        }
+        self.store.free_leaf(page)?;
+
+        self.redirect_parent_child_pointer(parent_page, child_idx, left_page)?;
+        self.remove_from_parent(parent_page, child_idx - 1, path)
+    }
+
+    fn merge_leaf_into_right(
+        &mut self,
+        parent_page: u32,
+        path: &[(u32, usize)],
+        page: u32,
+        node: LeafNode,
+        right_page: u32,
+        mut right_node: LeafNode,
+    ) -> Result<()> {
+        self.move_all_leaf_chains(page, right_page)?;
+
+        let mut merged_cells = node.cells;
+        merged_cells.extend(right_node.cells);
+        right_node.cells = merged_cells;
+        right_node.prev_leaf_page = node.prev_leaf_page;
+
+        if node.prev_leaf_page != 0 {
+            let (prev_buf, _) = self.store.read_leaf(node.prev_leaf_page)?;
+            let mut prev_node = LeafNode::parse(&prev_buf[..])?;
+            prev_node.next_leaf_page = right_page;
+            let enc = prev_node.encode()?;
+            self.store.write_leaf(node.prev_leaf_page, &enc)?;
+        }
+
+        let right_enc = right_node.encode()?;
+        self.store.write_leaf(right_page, &right_enc)?;
+        if !self.store.chains_empty(page)? {
+            return Err(Error::Internal(
+                "free_leaf called with non-empty version chain".into(),
+            ));
+        }
+        self.store.free_leaf(page)?;
+        self.remove_from_parent(parent_page, 0, path)
+    }
+
+    /// Redirect the child pointer at `child_idx` in the internal node at
+    /// `parent_page` to `new_child`, leaving every other field unchanged.
     ///
-    /// If the parent becomes underfull (or empty), propagates the merge upward
-    /// through `path` (which contains ancestor `(page, child_idx)` pairs).
+    /// Used by the left-sibling merge path to ensure the parent no longer
+    /// references the just-freed leaf after the subsequent separator removal
+    /// shifts slots down.
+    fn redirect_parent_child_pointer(
+        &mut self,
+        parent_page: u32,
+        child_idx: usize,
+        new_child: u32,
+    ) -> Result<()> {
+        let buf = self.store.read_internal(parent_page)?;
+        let mut parent = InternalNode::parse(&buf[..])?;
+        if child_idx < parent.entries.len() {
+            parent.entries[child_idx].1 = new_child;
+        } else {
+            parent.rightmost_child = new_child;
+        }
+        let enc = parent.encode()?;
+        self.store.write_internal(parent_page, &enc)?;
+        Ok(())
+    }
+
+    /// Remove the separator key at `separator_idx` from the internal node at
+    /// `parent_page`.
+    ///
+    /// If that internal node is the tree root and becomes empty, collapse the
+    /// root to its remaining child. Otherwise write the updated node back in
+    /// place; internal-node underflow propagation is still intentionally
+    /// deferred in this implementation.
     fn remove_from_parent(
         &mut self,
         parent_page: u32,
         separator_idx: usize,
-        path: &[(u32, usize)],
+        _path: &[(u32, usize)],
     ) -> Result<()> {
         let buf = self.store.read_internal(parent_page)?;
         let mut parent = InternalNode::parse(&buf[..])?;
@@ -1616,10 +1772,7 @@ impl<S: BTreePageStore> BTree<S> {
         if parent.entries.is_empty() {
             // The root has no more separator keys.  If it's the actual tree root,
             // we make rightmost_child the new root.
-            if path.is_empty() {
-                // This IS the root (path is empty when we're processing the root's child).
-                // Actually path is the ancestors of parent_page, not parent_page's own entry.
-                // When path is empty, parent_page IS the root.
+            if parent_page == self.root_page {
                 self.root_page = parent.rightmost_child;
                 if self.root_level > 0 {
                     self.root_level -= 1;
@@ -2407,6 +2560,16 @@ mod tests {
         tree.find_leaf(k).expect("find_leaf")
     }
 
+    fn leaf_cell_count(tree: &BTree<MemPageStore>, page: u32) -> usize {
+        let (buf, _) = tree.store.read_leaf(page).unwrap();
+        LeafNode::parse(&buf[..]).unwrap().cells.len()
+    }
+
+    fn next_leaf_of(tree: &BTree<MemPageStore>, page: u32) -> u32 {
+        let (buf, _) = tree.store.read_leaf(page).unwrap();
+        LeafNode::parse(&buf[..]).unwrap().next_leaf_page
+    }
+
     // --- T3.5 split: primary-shaped keys -----------------------------------
 
     #[test]
@@ -2582,10 +2745,10 @@ mod tests {
         assert_eq!(alloc.deferred_free_queue().depth(), 2);
     }
 
-    // --- T3.5 merge guard: :1281 (merge-into-left) -------------------------
+    // --- T3.5 merge: orphan chains migrate with merge-into-left ------------
 
     #[test]
-    fn t3_5_merge_into_left_guard_fires_on_orphan_chain() {
+    fn t3_5_merge_into_left_migrates_orphan_chain() {
         let store = MemPageStore::new();
         let mut tree = BTree::create(store).unwrap();
 
@@ -2600,36 +2763,30 @@ mod tests {
         let victim_leaf = leaf_of(&tree, &key(5));
         assert_ne!(victim_leaf, tree.leftmost_leaf().unwrap());
 
-        // Install an orphan chain (key not present in any cell) on the
-        // victim leaf. The per-cell migration will leave it in place, so the
-        // guard right before free_leaf must fire.
+        // Install an orphan chain (key not present in any cell) on the victim
+        // leaf. The merge path must migrate it onto the surviving sibling so
+        // stale readers still descend to the correct frame after the root
+        // collapses.
         tree.store
             .put_chain(victim_leaf, b"orphan-key".to_vec(), chain_with(&[0xEE]))
             .unwrap();
 
-        // Delete cells on the victim leaf until handle_leaf_underflow fires
-        // with merge-into-left.
-        let mut err = None;
-        for i in 3u64..6 {
-            match tree.delete(&key(i)) {
-                Ok(_) => {}
-                Err(e) => {
-                    err = Some(e);
-                    break;
-                }
-            }
-        }
-        let e = err.expect("guard at :1281 should have fired during merge-into-left");
-        assert!(
-            matches!(&e, Error::Internal(s) if s.contains("non-empty version chain")),
-            "expected guard error, got {e:?}"
-        );
+        assert!(tree.delete(&key(5)).unwrap());
+        assert_eq!(tree.root_level, 0, "merge should collapse the two-leaf root");
+        assert_eq!(tree.get(&key(4)).unwrap(), Some(v.clone()));
+
+        let orphan = tree
+            .store
+            .take_chain(tree.root_page, b"orphan-key")
+            .unwrap()
+            .expect("orphan chain survived merge-into-left");
+        assert_eq!(orphan[0].txn_id, 0xEE);
     }
 
-    // --- T3.5 merge guard: :1308 (merge-into-right, child_idx == 0) --------
+    // --- T3.5 merge: orphan chains migrate with merge-into-right -----------
 
     #[test]
-    fn t3_5_merge_into_right_guard_fires_on_orphan_chain() {
+    fn t3_5_merge_into_right_migrates_orphan_chain() {
         let store = MemPageStore::new();
         let mut tree = BTree::create(store).unwrap();
 
@@ -2647,21 +2804,85 @@ mod tests {
             .put_chain(victim_leaf, b"orphan-key".to_vec(), chain_with(&[0xFF]))
             .unwrap();
 
-        let mut err = None;
-        for i in 0u64..3 {
-            match tree.delete(&key(i)) {
-                Ok(_) => {}
-                Err(e) => {
-                    err = Some(e);
-                    break;
-                }
-            }
+        assert!(tree.delete(&key(0)).unwrap());
+        assert_eq!(tree.root_level, 0, "merge should collapse the two-leaf root");
+        assert_eq!(tree.get(&key(1)).unwrap(), Some(v.clone()));
+
+        let orphan = tree
+            .store
+            .take_chain(tree.root_page, b"orphan-key")
+            .unwrap()
+            .expect("orphan chain survived merge-into-right");
+        assert_eq!(orphan[0].txn_id, 0xFF);
+    }
+
+    // --- T3.5 redistribution: avoid oversized merge on left branch ---------
+
+    #[test]
+    fn t3_5_left_underflow_redistributes_when_merge_would_overflow() {
+        let store = MemPageStore::new();
+        let mut tree = BTree::create(store).unwrap();
+
+        let v = vec![0x33u8; 6000];
+        for i in 0u64..7 {
+            tree.insert(&key(i), &v).unwrap();
         }
-        let e = err.expect("guard at :1308 should have fired during merge-into-right");
-        assert!(
-            matches!(&e, Error::Internal(s) if s.contains("non-empty version chain")),
-            "expected guard error, got {e:?}"
+        assert_eq!(tree.root_level, 1);
+
+        let victim_leaf = leaf_of(&tree, &key(6));
+        assert_ne!(victim_leaf, tree.leftmost_leaf().unwrap());
+        assert_eq!(leaf_cell_count(&tree, victim_leaf), 4);
+
+        assert!(tree.delete(&key(6)).unwrap());
+        assert_eq!(
+            tree.root_level, 1,
+            "oversized sibling pair should redistribute instead of collapsing"
         );
+
+        let left = tree.leftmost_leaf().unwrap();
+        let right = next_leaf_of(&tree, left);
+        assert_ne!(right, 0);
+        assert_eq!(leaf_cell_count(&tree, left), 3);
+        assert_eq!(leaf_cell_count(&tree, right), 3);
+
+        for i in 0u64..6 {
+            assert_eq!(tree.get(&key(i)).unwrap(), Some(v.clone()), "key {i} missing");
+        }
+        assert!(tree.get(&key(6)).unwrap().is_none());
+    }
+
+    // --- T3.5 redistribution: avoid oversized merge on right branch --------
+
+    #[test]
+    fn t3_5_right_underflow_redistributes_when_merge_would_overflow() {
+        let store = MemPageStore::new();
+        let mut tree = BTree::create(store).unwrap();
+
+        let v = vec![0x44u8; 6000];
+        for i in 0u64..7 {
+            tree.insert(&key(i), &v).unwrap();
+        }
+        assert_eq!(tree.root_level, 1);
+
+        let victim_leaf = tree.leftmost_leaf().unwrap();
+        assert_eq!(leaf_cell_count(&tree, victim_leaf), 3);
+
+        assert!(tree.delete(&key(0)).unwrap());
+        assert_eq!(
+            tree.root_level, 1,
+            "oversized sibling pair should redistribute instead of collapsing"
+        );
+
+        let left = tree.leftmost_leaf().unwrap();
+        let right = next_leaf_of(&tree, left);
+        assert_ne!(right, 0);
+        assert_eq!(leaf_cell_count(&tree, left), 3);
+        assert_eq!(leaf_cell_count(&tree, right), 3);
+
+        for i in 1u64..7 {
+            assert_eq!(tree.get(&key(i)).unwrap(), Some(v.clone()), "key {i} missing");
+        }
+        assert!(tree.get(&key(0)).unwrap().is_none());
     }
 
     // --- T3.5 chains_empty semantics on absent page ------------------------

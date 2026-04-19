@@ -21,7 +21,9 @@ fuzz = []
 loom-tests = []
 
 [dependencies]
+arc-swap = "1"
 bson = { version = "2", features = ["serde_with"] }
+dashmap = "6"
 regex = "1"
 thiserror = "1"
 crc32c = "0.6.4"

@@ -29,8 +29,13 @@
 //!
 //! Both `BufferPool` and `AllocatorHandle` are `Send + Sync`; `BufferPoolHandle`
 //! inherits this and can be wrapped in `Arc` for sharing across threads.
-//! Single-writer semantics are enforced at the `DatabaseInner` level by its
-//! `writer_lock: Mutex<()>`.
+//! Today all concurrent access (reads and writes) is serialized at the
+//! `PagedEngine` level by `PagedEngine::inner: Mutex<BpBackend>`.
+//!
+//! TODO(mwmr): the `writer_lock: Mutex<()>` at `ClientInner` and the engine-level
+//! mutex will both be retired in PR 8 in favour of per-namespace write lanes
+//! (`ns_lanes: DashMap<String, Arc<Mutex<()>>>`) and a metadata `RwLock`.
+//! See docs/adr/0002-mwmr.md.
 
 use std::fs::File;
 use std::sync::{Arc, Mutex};
@@ -238,6 +243,14 @@ impl BufferPoolHandle {
             let mut page = self.pool.pin(page_no, size)?;
             page.data_mut().fill(0);
         } // unpin — dirty bit persists in the pool
+
+        // Bug B (T3.5): a page reborn from the free list inherits the
+        // version_chains map from its previous occupant. Those entries are
+        // stale (they reference cells that no longer exist on this page)
+        // and must not leak into the new occupant's MVCC bookkeeping —
+        // they would trip the `chains_empty` guard at the next leaf
+        // merge / split. Clear them now while the frame is fresh.
+        self.pool.clear_chains_on_page(page_no, size)?;
 
         Ok(page_no)
     }
@@ -465,6 +478,22 @@ impl BufferPoolHandle {
                     .lock()
                     .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
                 Ok(guard.recovered_max_commit_ts())
+            }
+        }
+    }
+
+    /// fsync the journal file — make all committed-but-unsynced frames durable.
+    ///
+    /// Called by the engine's FullSync hot path. No-op when no journal is
+    /// attached (in-memory / test handles).
+    pub(crate) fn journal_sync(&self) -> Result<()> {
+        match &self.journal {
+            None => Ok(()),
+            Some(journal) => {
+                let guard = journal
+                    .lock()
+                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+                guard.sync_journal()
             }
         }
     }

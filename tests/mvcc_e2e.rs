@@ -132,6 +132,104 @@ fn drop_collection_barrier() {
 }
 
 // ---------------------------------------------------------------------------
+// PR-2 snapshot-isolation regression guard
+// ---------------------------------------------------------------------------
+
+/// Verify that a reader's snapshot of `db_a.docs` remains stable while an
+/// unrelated namespace (`db_b.other`) accumulates 100 inserts concurrently.
+///
+/// Today the engine-global mutex serialises reads, so the test passes
+/// trivially. After PR 4 removes that mutex from the read path, correctness
+/// depends entirely on ReadView `read_ts` pinning. This test will catch any
+/// regression where that pin is not honoured.
+#[test]
+fn reader_stable_across_other_ns_commits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("reader_stable.mqlite");
+
+    // ---- set up the two independent namespaces -------------------------
+    let client_a = Client::open(&db_path).expect("open client_a");
+    let col_a = client_a.database("db_a").collection::<Document>("docs");
+
+    // Seed db_a.docs with 10 documents.
+    for i in 0..10i32 {
+        col_a
+            .insert_one(&doc! { "_id": i, "val": format!("item-{i}") })
+            .expect("seed insert");
+    }
+
+    // Capture the baseline snapshot.
+    let baseline: Vec<Document> = col_a
+        .find(doc! {})
+        .run()
+        .expect("baseline find")
+        .collect::<Result<_, _>>()
+        .expect("baseline collect");
+    assert_eq!(baseline.len(), 10, "baseline must contain exactly 10 docs");
+
+    // ---- background writer into db_b.other ----------------------------
+    // Clone `client_a` so both threads share the SAME engine — that's what
+    // makes this test meaningful post-PR-4: the writer's commits publish
+    // snapshots on the engine the reader is loading from.
+    let writer_client = client_a.clone();
+    let writer_handle: thread::JoinHandle<()> = thread::spawn(move || {
+        let col_b = writer_client.database("db_b").collection::<Document>("other");
+        for j in 0..100i32 {
+            col_b
+                .insert_one(&doc! { "_id": j, "noise": format!("noise-{j}") })
+                .expect("background insert");
+        }
+    });
+
+    // ---- main thread: 20 reads must each equal the baseline ------------
+    for round in 0..20usize {
+        let result: Vec<Document> = col_a
+            .find(doc! {})
+            .run()
+            .expect("mid-write find")
+            .collect::<Result<_, _>>()
+            .expect("mid-write collect");
+        assert_eq!(
+            result.len(),
+            baseline.len(),
+            "round {round}: db_a.docs count must equal baseline ({})",
+            baseline.len(),
+        );
+        assert_eq!(
+            result, baseline,
+            "round {round}: db_a.docs contents must equal baseline byte-for-byte",
+        );
+    }
+
+    // ---- join the writer -----------------------------------------------
+    writer_handle.join().expect("writer thread panicked");
+
+    // ---- one final read on db_a.docs must still equal baseline ---------
+    let final_result: Vec<Document> = col_a
+        .find(doc! {})
+        .run()
+        .expect("final find")
+        .collect::<Result<_, _>>()
+        .expect("final collect");
+    assert_eq!(
+        final_result, baseline,
+        "after writer joined: db_a.docs must still equal baseline",
+    );
+
+    // ---- sanity: db_b.other must contain exactly 100 documents ---------
+    // Use `client_a` directly — it shares an engine with the writer thread,
+    // so it sees the committed state without a reopen.
+    let col_b_check = client_a.database("db_b").collection::<Document>("other");
+    let b_count = col_b_check
+        .count_documents(doc! {})
+        .expect("count db_b.other");
+    assert_eq!(
+        b_count, 100,
+        "db_b.other must contain exactly 100 docs (background writes must have happened)",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. tombstone-elision win
 // ---------------------------------------------------------------------------
 

@@ -213,6 +213,27 @@ impl BTreePageStore for BufferPoolPageStore {
     fn chains_empty(&self, page: u32) -> Result<bool> {
         self.handle.pool().chains_empty(page)
     }
+
+    fn clear_chains(&mut self, page: u32) -> Result<()> {
+        // Overflow pages live on the main 32 KB leaf pool (same
+        // partition as data leaves). History-routed stores never
+        // attach version chains to their pages, so the call is a
+        // no-op there.
+        if self.is_history {
+            return Ok(());
+        }
+        self.handle.pool().clear_chains_on_page(page, PageSize::Large32k)
+    }
+
+    fn take_all_chains(
+        &mut self,
+        page: u32,
+    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
+        if self.is_history {
+            return Ok(Vec::new());
+        }
+        self.handle.pool().take_all_chains_on_page(page)
+    }
 }
 
 // ---------------------------------------------------------------------------

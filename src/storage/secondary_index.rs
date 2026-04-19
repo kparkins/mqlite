@@ -570,6 +570,7 @@ mod tests {
             sparse,
             multikey: false,
             entry_count: 0,
+            state: crate::storage::catalog::IndexState::Ready,
         }
     }
 

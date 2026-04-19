@@ -697,6 +697,50 @@ impl BufferPool {
         Ok(())
     }
 
+    /// Invalidate the cached frame for `page_number` (plan §M4b).
+    ///
+    /// Used by the writer-txn rollback path after returning a page to the
+    /// allocator free list: the previous occupant's frame may still be
+    /// resident with stale content from the failing txn, and the next
+    /// allocator user who recycles this page number must not see it.
+    ///
+    /// Behavior:
+    /// - Page not resident: no-op.
+    /// - Page resident and unpinned: drop the frame (including its dirty
+    ///   data and any version chains — a freshly-allocated page carries
+    ///   no chains worth preserving).
+    /// - Page resident and pinned: this is a programming error — rollback
+    ///   runs after every `PinnedPage` from the txn has dropped, so the
+    ///   pin count must be 0. Returns `Error::Internal` in release; the
+    ///   partition stays untouched.
+    pub(crate) fn invalidate_page(&self, page_number: u32, size: PageSize) -> Result<()> {
+        let lock = match size {
+            PageSize::Small4k => &self.inner_4k,
+            PageSize::Large32k => &self.inner_32k,
+        };
+        let mut guard = lock
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let idx = match guard.page_map.get(&page_number).copied() {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let pin_count = guard.frames[idx]
+            .as_ref()
+            .map(|f| f.pin_count)
+            .unwrap_or(0);
+        if pin_count > 0 {
+            return Err(Error::Internal(format!(
+                "buffer pool invalidate_page: page {page_number} is pinned \
+                 (pin_count = {pin_count}); rollback must run after all \
+                 PinnedPage guards for the txn have dropped"
+            )));
+        }
+        guard.frames[idx] = None;
+        guard.page_map.remove(&page_number);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // MVCC version-chain helpers (T3.5)
     //
@@ -776,6 +820,62 @@ impl BufferPool {
             .as_ref()
             .expect("page_map invariant: frame must exist at mapped slot");
         Ok(Some(ChainSnapshot::new(&frame.version_chains, view)))
+    }
+
+    /// Clear all version chains attached to the resident frame for `page`
+    /// in the partition selected by `size`.
+    ///
+    /// Used by the overflow-chain free path: overflow pages share the
+    /// 32 KB leaf partition with data leaves, so a page reborn as an
+    /// overflow page may inherit stale `version_chains` entries from
+    /// its previous data-leaf life. Clearing them keeps the T3.5
+    /// `chains_empty` guard inside `free_leaf` consumers sound.
+    ///
+    /// No-op when the page is not resident — there are no chains to
+    /// clear in that case.
+    pub(crate) fn clear_chains_on_page(&self, page: u32, size: PageSize) -> Result<()> {
+        let lock = match size {
+            PageSize::Small4k => &self.inner_4k,
+            PageSize::Large32k => &self.inner_32k,
+        };
+        let mut guard = lock
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let Some(&idx) = guard.page_map.get(&page) else {
+            return Ok(());
+        };
+        let frame = guard.frames[idx]
+            .as_mut()
+            .expect("page_map invariant: frame must exist at mapped slot");
+        frame.version_chains.clear();
+        Ok(())
+    }
+
+    /// Drain and return every version chain currently attached to the
+    /// 32 KB leaf frame for `page`. Returns an empty vector if the page
+    /// is not resident.
+    ///
+    /// Used by the leaf-merge migration path to move tombstone-chain
+    /// entries (whose cells were already removed earlier in the txn)
+    /// onto the merged-into sibling so MVCC readers whose ReadView
+    /// predates the delete still observe them.
+    pub(crate) fn take_all_chains_on_page(
+        &self,
+        page: u32,
+    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
+        let mut guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let Some(&idx) = guard.page_map.get(&page) else {
+            return Ok(Vec::new());
+        };
+        let frame = guard.frames[idx]
+            .as_mut()
+            .expect("page_map invariant: frame must exist at mapped slot");
+        Ok(std::mem::take(&mut frame.version_chains)
+            .into_iter()
+            .collect())
     }
 
     /// True if no version chains are attached to leaf page `page` (including

@@ -654,6 +654,19 @@ impl JournalManager {
     }
 
     // -----------------------------------------------------------------------
+    // Durability
+    // -----------------------------------------------------------------------
+
+    /// fsync the journal file, making all committed-but-unsynced frames durable.
+    ///
+    /// Calls `sync_data()` (fdatasync) which is sufficient to guarantee that
+    /// journal frame data survives a process crash. Main-file contents are NOT
+    /// touched — this is the FullSync hot path, not a checkpoint.
+    pub(crate) fn sync_journal(&self) -> Result<()> {
+        self.journal_file.sync_data().map_err(Error::Io)
+    }
+
+    // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------
 
@@ -676,6 +689,17 @@ impl JournalManager {
     pub(crate) fn recovered_max_commit_ts(&self) -> Option<Ts> {
         self.recovered_max_commit_ts
     }
+
+    /// Returns `true` if journal recovery wrote at least one committed page
+    /// batch to the main database file during `open_or_create`.
+    ///
+    /// Used by `Client::open_with_options` to decide whether to re-read page 0
+    /// after recovery (the catalog_root_page in the pre-recovery header may be
+    /// stale if recovery updated page 0).
+    pub(crate) fn did_recover_pages(&self) -> bool {
+        self.last_committed_db_page_count.is_some()
+    }
+
 
     // -----------------------------------------------------------------------
     // Rollback

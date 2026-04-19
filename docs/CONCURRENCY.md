@@ -1,88 +1,32 @@
 # mqlite Concurrency Guide
 
-mqlite uses a **Single-Writer, Multiple-Reader (SWMR)** concurrency model —
-the same model used by SQLite in WAL mode. Understanding it is essential for
-writing correct multi-threaded and multi-process applications.
+mqlite uses **in-process MWMR for readers** (via MVCC version chains) and
+**SWMR for writers** today. Every read operation opens a `ReadView` that
+pins a point-in-time snapshot; concurrent writes do not disturb an
+in-progress read. Writers serialize on a single engine-level mutex. The
+v1 upgrade (see [ADR 0002](adr/0002-mwmr.md)) expands the write path to
+per-namespace write lanes so that writers on different namespaces overlap.
 
 ---
 
-## The SWMR Model
+## Current behavior (T9 shipped)
 
-```
-┌─────────────────────────────────────────────────────┐
-│                  .mqlite file                        │
-│                                                     │
-│  Readers (unlimited) ──────────────────────────►   │
-│  Reader 1: consistent snapshot @ T₁                │
-│  Reader 2: consistent snapshot @ T₁                │
-│  Reader N: consistent snapshot @ T₁                │
-│                                                     │
-│  Writer (one at a time) ───────────────────────►   │
-│  Writer: exclusive write lock, advances T to T₂    │
-└─────────────────────────────────────────────────────┘
-```
+### Readers: MVCC snapshot isolation
 
-**Key properties:**
+When a read operation begins, the engine opens a `ReadView` at the HLC
+oracle's current timestamp and walks per-document version chains held in
+the buffer pool.
 
-| Property | Behavior |
-|----------|----------|
-| Writers | One writer at a time (exclusive) |
-| Readers | Unlimited concurrent readers |
-| Reader/writer isolation | Readers never block writers; writers never block readers |
-| Reader consistency | Each reader sees a consistent snapshot at the moment it started |
-| Writer consistency | Writes are serialized and see all previously committed writes |
-
----
-
-## Writer Exclusivity: Two Cooperating Locks
-
-Two locks work together to enforce the "one writer at a time" rule:
-
-### 1. OS Advisory Lock (cross-process)
-
-At `Client::open()` time, mqlite acquires an OS-level advisory lock on the
-`.mqlite` file:
-
-- **Unix**: `fcntl(F_SETLK)` exclusive lock
-- **Windows**: `LockFileEx` exclusive lock
-
-This prevents two separate **processes** from writing simultaneously. The lock
-is held for the lifetime of the `Client` handle and released when the last
-clone is dropped.
-
-> **Important:** POSIX advisory locks are **per-process**, not per-thread. Two
-> threads in the same process would both succeed at `fcntl`, which is why the
-> second lock is needed.
-
-### 2. In-Process `Mutex` (cross-thread)
-
-An `Arc<Mutex<()>>` serializes writer threads within a single process. All
-write operations (`insert_one`, `update_one`, `delete_one`, etc.) acquire this
-mutex before writing.
-
-**Locking order** (always in this order to avoid deadlocks):
-
-```
-OS advisory lock (acquired at open) → writer Mutex (acquired per write)
-```
-
----
-
-## Reader MVCC: Snapshot Isolation
-
-Readers in mqlite use **Multi-Version Concurrency Control (MVCC)**:
-
-- When a read operation begins, it sees the database state at that instant (a
-  "snapshot").
-- Concurrent writes by other threads do not affect an in-progress read.
-- A read that started before a write completes will **not** see the new data —
-  it sees the pre-write snapshot.
-- The next read after a write completes will see the new data.
-
-This means reads are always **consistent** (no torn reads, no phantom reads)
-but may be **stale** if the application requires seeing the latest write.
-
-**Example of snapshot behavior:**
+- **No torn reads, no phantom reads.** Every version entry satisfies
+  `start_ts <= read_ts < stop_ts`; the reader always sees a
+  point-in-time consistent view.
+- **Concurrent writes do not disturb an in-progress read.** A write
+  that commits after a `ReadView` was opened is invisible to that view.
+  The next read (a fresh `ReadView`) will see the new data.
+- **History store fallback.** If a version chain is evicted from the
+  buffer pool before `oldest_required_ts` advances past it, the entry is
+  pushed into a B-tree history store. Readers probe the history store on
+  an in-memory miss.
 
 ```rust
 use mqlite::{Client, doc};
@@ -120,6 +64,68 @@ let result2 = users.find_one(doc! { "_id": 1 })?;
 println!("{:?}", result2.unwrap().get("status")); // "inactive"
 # Ok::<(), mqlite::Error>(())
 ```
+
+### Writers: `WriteTxn` + serialization mutex
+
+Each write operation creates a `WriteTxn` that stages primary-key
+updates, secondary-index updates, and refcount deltas under a single
+`commit_ts`. At commit, all staged changes become atomically visible to
+new `ReadView`s.
+
+**The one remaining concurrency bottleneck**: both readers and writers
+acquire `PagedEngine::inner: Mutex<BpBackend>` (defined at
+`src/storage/paged_engine.rs:1421`). Readers take it for the duration of
+the scan; writers take it for the full `with_txn` call. This means reads
+and writes currently serialize even though MVCC visibility is fully
+functional inside the mutex. Removing the mutex from the read path is the
+primary goal of [ADR 0002](adr/0002-mwmr.md).
+
+**Writer exclusivity** is additionally enforced by an OS-level advisory
+file lock acquired at `Client::open()` time:
+
+- **Unix**: `fcntl(F_SETLK)` exclusive lock
+- **Windows**: `LockFileEx` exclusive lock
+
+This prevents two separate **processes** from writing simultaneously.
+
+> **Important:** POSIX advisory locks are **per-process**, not per-thread.
+> The engine-level mutex handles cross-thread serialization within a
+> single process.
+
+### `drop_collection` force-expire barrier
+
+`drop_collection` is the one DDL operation that cannot proceed while any
+`ReadView` is live on the target collection. At
+`src/storage/paged_engine.rs:2050` the engine calls
+`read_view_registry().force_expire_all()`, which poisons every open
+`ReadView` globally and waits for `pin_ops_in_flight == 0` before freeing
+the collection's B-tree pages.
+
+Any caller that holds a `ReadView` across a `drop_collection` will receive
+`Error::ReadViewExpired` on its next read and must open a fresh view.
+Subsequent reads on the dropped collection return zero rows.
+
+---
+
+## v1-MWMR target
+
+[ADR 0002](adr/0002-mwmr.md) pins the v1 contract:
+
+- **Latest-published-snapshot reads.** Reads call
+  `published.load()` (an `ArcSwap<PublishedSnapshot>`) once per
+  operation and open B-trees from the snapshot's root pages — no engine
+  mutex taken on the read path at all.
+- **Namespace-level write lanes.** A `DashMap<String, Arc<Mutex<()>>>`
+  serializes writers on the same namespace; writers on different
+  namespaces run concurrently.
+- **Global metadata `RwLock` for DDL**, intentionally conservative in
+  v1. `create_index` is the sole exception — it uses a three-phase
+  Reserve/Build/Commit pattern so the build scan holds only the target
+  namespace's lane.
+- **Journal-durable `FullSync`.** A `FullSync` commit fsyncs the journal
+  and returns; main-file checkpointing moves off the hot path.
+
+See [ADR 0002](adr/0002-mwmr.md) for the full decision record.
 
 ---
 
@@ -382,19 +388,19 @@ WAL file is removed.
 **Q: Can readers see partial writes?**
 
 No. MVCC guarantees readers see only fully committed writes. An in-progress
-write is invisible to all readers until it completes.
+write is invisible to all readers until it commits under a single `commit_ts`.
 
 **Q: What happens if my writer panics mid-write?**
 
-The writer `Mutex` is poisoned. Subsequent write attempts will return a
-`Mutex::lock()` poison error wrapped in `Error::Internal`. The WAL ensures
-the database file itself remains consistent — the in-progress write was never
-committed.
+`WriteTxn` rolls back via its `Drop` implementation, so in-progress staged
+changes are discarded. The WAL ensures the database file itself remains
+consistent — the in-progress write was never committed. The engine mutex is
+released normally.
 
 **Q: Is there a way to do multi-document transactions?**
 
-Not in Phase 1. Each `insert_one`, `update_one`, etc. is its own atomic unit.
-Multi-document transaction support is planned for Phase 2.
+Not in v1. Each `insert_one`, `update_one`, etc. is its own atomic unit.
+Multi-document transaction support is out of scope for v1.
 
 ---
 
@@ -404,7 +410,7 @@ Multi-document transaction support is planned for Phase 2.
 |----------|-----|
 | Share database across threads | `client.clone()` (it's already `Arc`-backed) |
 | Serialize writes | mqlite does this automatically |
-| Read without blocking writes | `read_only(true)` or just `find_one` |
+| Read without blocking writes | `read_only(true)` or just `find_one` (today both serialize on the engine mutex; v1 removes the read-path mutex) |
 | Wait for writer lock | `busy_timeout(Duration::from_secs(N))` |
 | Custom retry logic | `busy_handler(|attempts| ...)` |
 | Use in async code | `tokio::task::spawn_blocking` |

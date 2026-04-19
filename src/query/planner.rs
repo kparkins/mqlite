@@ -7,11 +7,13 @@
 //!
 //! ## Index selection rules
 //!
-//! 1. Iterate available indexes in definition order.
-//! 2. For each index, check whether the **leftmost prefix key** appears in the
+//! 1. Check whether the filter admits a direct lookup on the implicit primary
+//!    `_id` key.
+//! 2. Otherwise iterate available indexes in definition order.
+//! 3. For each index, check whether the **leftmost prefix key** appears in the
 //!    filter with an index-eligible operator.
-//! 3. The first matching index wins (MongoDB-style "first usable index").
-//! 4. If no index matches, fall back to [`ScanPlan::CollScan`].
+//! 4. The first matching access path wins.
+//! 5. If no access path matches, fall back to [`ScanPlan::CollScan`].
 //!
 //! ## Index-eligible operators (per field)
 //!
@@ -49,6 +51,11 @@ pub(crate) struct IndexMeta<'a> {
 pub(crate) enum ScanPlan {
     /// Full collection scan — no suitable index found.
     CollScan,
+    /// Direct lookup on the implicit primary `_id` key.
+    PrimaryKeyLookup {
+        /// Extracted `_id` predicate for the lookup.
+        condition: PrimaryKeyCondition,
+    },
     /// Index-accelerated scan.
     IndexScan {
         /// Name of the selected index (used in [`ExplainResult`]).
@@ -85,15 +92,28 @@ pub(crate) enum IndexCondition {
     Any,
 }
 
+/// Primary-key predicates the engine can execute directly against the data tree.
+#[derive(Debug, Clone)]
+pub(crate) enum PrimaryKeyCondition {
+    /// Point equality: `{_id: val}` or `{_id: {$eq: val}}`.
+    Eq(Bson),
+    /// Multi-point lookup: `{_id: {$in: [...]}}`.
+    In(Vec<Bson>),
+}
+
 // ---------------------------------------------------------------------------
 // Plan selection
 // ---------------------------------------------------------------------------
 
 /// Select the best scan plan for `filter` given the available `indexes`.
 ///
-/// Returns the first index that can accelerate the query, or
+/// Returns the best available access path, preferring the implicit primary
+/// `_id` key over secondary indexes, or
 /// [`ScanPlan::CollScan`] if none qualifies.
 pub(crate) fn select_plan(filter: &Document, indexes: &[IndexMeta<'_>]) -> ScanPlan {
+    if let Some(condition) = extract_primary_key_condition(filter) {
+        return ScanPlan::PrimaryKeyLookup { condition };
+    }
     for idx in indexes {
         if let Some((primary_field, condition)) = index_can_accelerate(filter, idx.keys) {
             return ScanPlan::IndexScan {
@@ -109,6 +129,18 @@ pub(crate) fn select_plan(filter: &Document, indexes: &[IndexMeta<'_>]) -> ScanP
 // ---------------------------------------------------------------------------
 // Index eligibility analysis
 // ---------------------------------------------------------------------------
+
+/// Try to extract a direct primary-key predicate from `filter`.
+///
+/// We currently accelerate only equality / `$in` shapes on `_id`. Range and
+/// presence predicates still fall back to the general scan planner.
+fn extract_primary_key_condition(filter: &Document) -> Option<PrimaryKeyCondition> {
+    match extract_field_condition(filter, "_id")? {
+        IndexCondition::Eq(val) => Some(PrimaryKeyCondition::Eq(val)),
+        IndexCondition::In(vals) => Some(PrimaryKeyCondition::In(vals)),
+        IndexCondition::Range { .. } | IndexCondition::Any => None,
+    }
+}
 
 /// Check whether `index_keys` can accelerate `filter`.
 ///
@@ -218,6 +250,36 @@ mod tests {
     }
 
     #[test]
+    fn primary_lookup_for_id_equality_without_indexes() {
+        let plan = select_plan(&doc! { "_id": 7i32 }, &[]);
+        match plan {
+            ScanPlan::PrimaryKeyLookup {
+                condition: PrimaryKeyCondition::Eq(Bson::Int32(7)),
+            } => {}
+            _ => panic!("expected primary-key equality lookup"),
+        }
+    }
+
+    #[test]
+    fn primary_lookup_for_id_in_without_indexes() {
+        let plan = select_plan(&doc! { "_id": { "$in": [1i32, 2i32] } }, &[]);
+        match plan {
+            ScanPlan::PrimaryKeyLookup {
+                condition: PrimaryKeyCondition::In(vals),
+            } => {
+                assert_eq!(vals, vec![Bson::Int32(1), Bson::Int32(2)]);
+            }
+            _ => panic!("expected primary-key $in lookup"),
+        }
+    }
+
+    #[test]
+    fn collscan_for_id_range_without_indexes() {
+        let plan = select_plan(&doc! { "_id": { "$gt": 7i32 } }, &[]);
+        assert!(matches!(plan, ScanPlan::CollScan));
+    }
+
+    #[test]
     fn collscan_when_filter_field_not_indexed() {
         let specs = [("age_1", doc! { "age": 1i32 })];
         let indexes = make_indexes(&specs);
@@ -227,13 +289,21 @@ mod tests {
     }
 
     #[test]
+    fn primary_lookup_beats_secondary_index() {
+        let specs = [("email_1", doc! { "email": 1i32 })];
+        let indexes = make_indexes(&specs);
+        let plan = select_plan(&doc! { "_id": 7i32, "email": "a@b.com" }, &indexes);
+        assert!(matches!(plan, ScanPlan::PrimaryKeyLookup { .. }));
+    }
+
+    #[test]
     fn ixscan_for_equality_on_indexed_field() {
         let specs = [("email_1", doc! { "email": 1i32 })];
         let indexes = make_indexes(&specs);
         let plan = select_plan(&doc! { "email": "a@b.com" }, &indexes);
         match plan {
             ScanPlan::IndexScan { ref index_name, .. } => assert_eq!(index_name, "email_1"),
-            ScanPlan::CollScan => panic!("expected IXSCAN"),
+            ScanPlan::PrimaryKeyLookup { .. } | ScanPlan::CollScan => panic!("expected IXSCAN"),
         }
     }
 
@@ -287,7 +357,7 @@ mod tests {
                 assert_eq!(index_name, "name_1_age_1");
                 assert_eq!(primary_field, "name");
             }
-            ScanPlan::CollScan => panic!("expected IXSCAN"),
+            ScanPlan::PrimaryKeyLookup { .. } | ScanPlan::CollScan => panic!("expected IXSCAN"),
         }
     }
 

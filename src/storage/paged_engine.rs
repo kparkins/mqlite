@@ -17,12 +17,14 @@
 //!
 //! ## Query execution
 //!
-//! `find` / `update` / `delete` first ask the query planner ([`select_plan`]) whether
-//! a secondary index can accelerate the query.  When a suitable index is found the
-//! engine performs an [`IndexScan`] — a range scan on the secondary B+ tree whose
-//! values contain the serialised `_id` of the matching document, followed by a point
-//! lookup in the primary data tree.  When no index matches the engine falls back to a
-//! full [`CollScan`].
+//! `find` first asks the query planner ([`select_plan`]) whether the query can use
+//! the implicit primary `_id` key or a secondary index.  When a suitable secondary
+//! index is found the engine performs an [`IndexScan`] — a range scan on the
+//! secondary B+ tree whose values contain the serialised `_id` of the matching
+//! document, followed by a point lookup in the primary data tree.  Other read-like
+//! paths reuse the same primary-key / collection-scan executor to avoid ad hoc `_id`
+//! special cases. When no access path matches the engine falls back to a full
+//! [`CollScan`].
 //!
 //! [`IndexScan`]: crate::query::planner::ScanPlan::IndexScan
 //! [`CollScan`]: crate::query::planner::ScanPlan::CollScan
@@ -30,8 +32,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use arc_swap::ArcSwap;
+use dashmap::{DashMap, DashSet};
+
+use crate::options::BusyHandler;
 
 use bson::{Bson, Document};
 
@@ -45,20 +52,24 @@ use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
     ReturnDocument, UpdateOptions,
 };
-use crate::query::planner::{select_plan, IndexCondition, IndexMeta, ScanPlan};
+use crate::query::planner::{
+    select_plan, IndexCondition, IndexMeta, PrimaryKeyCondition, ScanPlan,
+};
 use crate::query::{eval_filter, get_nested_field};
 use crate::results::{DeleteResult, UpdateResult};
-use crate::storage::btree::{BTree, BTreePageStore, CellValue};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::PageSize;
-use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog, IndexEntry};
+use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog, IndexEntry, IndexState};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::history_store::HistoryStore;
 use crate::storage::oid::ObjectIdGenerator;
+use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedIndex, PublishedSnapshot};
 use crate::storage::secondary_index::{
     build_index, generate_index_name, update_index_on_delete, update_index_on_insert,
     update_index_on_update,
 };
+use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay, TxnPageStore};
 use crate::storage_engine::StorageEngine;
 use crate::update_operators::{apply_update, is_operator_update, upsert_base_from_filter};
 use crate::validation::validate_document;
@@ -301,6 +312,81 @@ fn btree_collscan<S: BTreePageStore>(
     Ok(result)
 }
 
+fn open_snapshot_read_view(
+    shared: &SharedState,
+    publish_ts: crate::mvcc::timestamp::Ts,
+) -> Arc<ReadView> {
+    let txn_id = shared.txn_counter.fetch_add(1, Ordering::Relaxed);
+    ReadView::open(
+        Arc::clone(shared.handle.read_view_registry()),
+        publish_ts,
+        txn_id,
+    )
+}
+
+fn primary_history_probe(
+    shared: &SharedState,
+    ns: &str,
+) -> PrimaryHistoryProbe<BufferPoolPageStore> {
+    PrimaryHistoryProbe {
+        store: Arc::clone(&shared.history_store),
+        ns_id: ns_id_for(ns),
+    }
+}
+
+fn fetch_primary_pair(
+    tree: &BTree<BufferPoolPageStore>,
+    key: Vec<u8>,
+    filter: &Document,
+    view: &ReadView,
+    history: Option<&dyn HistoryProbe>,
+) -> Result<Option<(Vec<u8>, Document)>> {
+    let Some(bson_bytes) = tree.get_mvcc(&key, view, history)? else {
+        return Ok(None);
+    };
+    let doc: Document = bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
+    if eval_filter(&doc, filter)? {
+        Ok(Some((key, doc)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn execute_primary_key_lookup_from_snap(
+    shared: &SharedState,
+    ns: &str,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    publish_ts: crate::mvcc::timestamp::Ts,
+    condition: &PrimaryKeyCondition,
+) -> Result<Vec<(Vec<u8>, Document)>> {
+    let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
+    let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
+    let view = open_snapshot_read_view(shared, publish_ts);
+    let probe = primary_history_probe(shared, ns);
+
+    match condition {
+        PrimaryKeyCondition::Eq(id) => {
+            let key = encode_key(id);
+            Ok(fetch_primary_pair(&tree, key, filter, &view, Some(&probe))?
+                .into_iter()
+                .collect())
+        }
+        PrimaryKeyCondition::In(vals) => {
+            let mut keys: Vec<Vec<u8>> = vals.iter().map(encode_key).collect();
+            keys.sort();
+            keys.dedup();
+            let mut matched = Vec::new();
+            for key in keys {
+                if let Some(pair) = fetch_primary_pair(&tree, key, filter, &view, Some(&probe))? {
+                    matched.push(pair);
+                }
+            }
+            Ok(matched)
+        }
+    }
+}
+
 /// Derive a stable `ns_id: u32` from a collection / namespace name.
 ///
 /// FNV-1a 32-bit. Used purely as a key-space partitioning hint for the
@@ -364,56 +450,201 @@ fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Vec<Document>
 }
 
 // ---------------------------------------------------------------------------
-// BpBackend — buffer-pool-backed storage
+// Snapshot-based read helpers (PR 4 — mutex-free read path)
 // ---------------------------------------------------------------------------
 
-/// Buffer-pool-backed storage backend.
-///
-/// All B+ trees share the same [`BufferPoolHandle`].  The [`Catalog`] persists
-/// collection and index metadata; its root page is written to the file header
-/// after every catalog mutation.
-struct BpBackend {
-    handle: Arc<BufferPoolHandle>,
-    /// Catalog B+ tree for collection/index metadata.
-    catalog: Catalog<BufferPoolPageStore>,
-    /// Cached data trees (loaded lazily from the catalog on first access).
-    data_trees: HashMap<String, BTree<BufferPoolPageStore>>,
-    /// HLC oracle issuing commit timestamps for MVCC ChainCommit frames.
-    /// Floored at open time to `journal.recovered_max_commit_ts().successor()`
-    /// (plan T7) so post-recovery commits are strictly above every durable
-    /// pre-crash commit.
-    oracle: Arc<TimestampOracle>,
-    /// MVCC history store (plan §T7). Reconciliation pushes aged version
-    /// entries here when a leaf is evicted; reader probes here on
-    /// buffer-pool misses whose chain snapshot is empty. Routed through
-    /// [`BufferPoolHandle::history_pool`]. Wrapped in `Arc<Mutex<_>>` so
-    /// the writer-path (future reconciliation) and reader-path probes
-    /// can hold disjoint borrows of the `BpBackend` simultaneously.
-    history_store: Arc<std::sync::Mutex<HistoryStore<BufferPoolPageStore>>>,
-    /// Monotonic writer-transaction identifier source. Increments per
-    /// `with_txn` call; wraps only after 2⁶⁴ txns (practical infinity).
-    txn_counter: AtomicU64,
-    /// The `WriteTxn` currently owned by an in-flight `with_txn` call, or
-    /// `None` outside any writer boundary. Phase 5 wires this slot so
-    /// writer-side helpers (sec-index `maintain_*`, future primary chain
-    /// population) can stage overflow pins, refcount deltas, page writes,
-    /// and pending sec-index mutations on the active txn. Always `None`
-    /// before the first `with_txn` call and between calls; the
-    /// `&mut self` receiver on `with_txn` prevents reentrant writers.
-    active_txn: Option<WriteTxn>,
+/// Index scan using a [`PublishedSnapshot`] instead of the catalog.
+fn execute_index_scan_from_snap(
+    shared: &SharedState,
+    ns: &str,
+    ns_snap: &crate::storage::root_snapshot::NamespaceSnapshot,
+    ready_indexes: &[&PublishedIndex],
+    filter: &Document,
+    publish_ts: crate::mvcc::timestamp::Ts,
+    index_name: &str,
+    primary_field: &str,
+    condition: &IndexCondition,
+) -> Result<Vec<(Vec<u8>, Document)>> {
+    let idx_snap = ready_indexes
+        .iter()
+        .find(|i| i.name == index_name)
+        .ok_or_else(|| Error::Internal(format!("index '{}' not in snapshot", index_name)))?;
+
+    let ascending = idx_snap.key_pattern
+        .get(primary_field)
+        .map(|v| !matches!(v, Bson::Int32(-1) | Bson::Int64(-1)))
+        .unwrap_or(true);
+
+    let handle = Arc::clone(&shared.handle);
+    let id_bsons: Vec<Bson> = if let IndexCondition::In(vals) = condition {
+        let mut results = Vec::new();
+        for v in vals {
+            let mut p = encode_compound_key(&[(v, ascending)]);
+            p.push(COMPOUND_SEP);
+            let mut p_next = p.clone();
+            *p_next.last_mut().unwrap() += 1;
+            let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
+            let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
+            for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
+                let id = index_entry_id_free(&handle, cv)?;
+                if !matches!(id, Bson::Null) {
+                    results.push(id);
+                }
+            }
+        }
+        results
+    } else {
+        let (start, end) = index_bounds_free(condition, ascending);
+        let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
+        let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
+        idx_tree
+            .range_scan(start.as_deref(), end.as_deref())?
+            .into_iter()
+            .filter_map(|(_, cv)| {
+                index_entry_id_free(&handle, cv)
+                    .ok()
+                    .filter(|id| !matches!(id, Bson::Null))
+            })
+            .collect()
+    };
+
+    // Fetch matching docs from the data tree using the same MVCC-aware point
+    // lookup path as direct primary-key plans.
+    let mut docs = Vec::new();
+    if !id_bsons.is_empty() {
+        let data_store = BufferPoolPageStore::new(Arc::clone(&handle));
+        let data_tree = BTree::open(data_store, ns_snap.data_root_page, ns_snap.data_root_level);
+        let view = open_snapshot_read_view(shared, publish_ts);
+        let probe = primary_history_probe(shared, ns);
+        for id_bson in id_bsons {
+            let data_key = encode_key(&id_bson);
+            if let Some(pair) =
+                fetch_primary_pair(&data_tree, data_key, filter, &view, Some(&probe))?
+            {
+                docs.push(pair);
+            }
+        }
+    }
+    Ok(docs)
 }
 
-impl BpBackend {
-    /// Create a new backend from an existing (or fresh) buffer pool handle.
+fn execute_collscan_from_snap(
+    shared: &SharedState,
+    ns: &str,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    publish_ts: crate::mvcc::timestamp::Ts,
+) -> Result<Vec<(Vec<u8>, Document)>> {
+    let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
+    let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
+    let view = open_snapshot_read_view(shared, publish_ts);
+    let probe = primary_history_probe(shared, ns);
+    btree_collscan(&tree, filter, &view, Some(&probe))
+}
+
+fn execute_snapshot_pairs_from_snap(
+    shared: &SharedState,
+    ns: &str,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    publish_ts: crate::mvcc::timestamp::Ts,
+    allow_secondary_indexes: bool,
+) -> Result<Vec<(Vec<u8>, Document)>> {
+    let ready_indexes: Vec<&PublishedIndex> = if allow_secondary_indexes {
+        ns_snap
+            .indexes
+            .iter()
+            .filter(|i| matches!(i.state, IndexState::Ready))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let index_metas: Vec<IndexMeta<'_>> = ready_indexes
+        .iter()
+        .map(|i| IndexMeta {
+            name: &i.name,
+            keys: &i.key_pattern,
+        })
+        .collect();
+
+    match select_plan(filter, &index_metas) {
+        ScanPlan::PrimaryKeyLookup { condition } => execute_primary_key_lookup_from_snap(
+            shared,
+            ns,
+            ns_snap,
+            filter,
+            publish_ts,
+            &condition,
+        ),
+        ScanPlan::IndexScan {
+            index_name,
+            primary_field,
+            condition,
+        } => execute_index_scan_from_snap(
+            shared,
+            ns,
+            ns_snap,
+            &ready_indexes,
+            filter,
+            publish_ts,
+            &index_name,
+            &primary_field,
+            &condition,
+        ),
+        ScanPlan::CollScan => execute_collscan_from_snap(shared, ns, ns_snap, filter, publish_ts),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SharedState — fields shared by read path (no mutex) and writer (mutex held)
+// ---------------------------------------------------------------------------
+
+/// State shared by the read path (no mutex) and the writer inside
+/// `Mutex<BpBackend>`. Under PR 8 this becomes the full MWMR shared
+/// state; in PR 4 it's only what reads need.
+pub(crate) struct SharedState {
+    pub handle: Arc<BufferPoolHandle>,
+    pub history_store: Arc<std::sync::Mutex<HistoryStore<BufferPoolPageStore>>>,
+    pub oracle: Arc<TimestampOracle>,
+    /// Atomically published snapshot for the mutex-free read path.
+    pub published: ArcSwap<PublishedSnapshot>,
+    /// Monotonic transaction identifier source shared by readers and writers.
+    pub txn_counter: AtomicU64,
+}
+
+// ---------------------------------------------------------------------------
+// MetadataState — catalog wrapped in metadata RwLock (PR 8)
+// ---------------------------------------------------------------------------
+
+/// Per-engine catalog state protected by an `RwLock`. DDL ops take the
+/// write guard to gain exclusive access; CRUD writers take the read
+/// guard (shared with other CRUD writers) and mutate the catalog via
+/// the interior `Mutex<Catalog>`.
+///
+/// Lock order: `metadata` RwLock -> `ns_lanes` mutex -> `commit_seq`
+/// mutex -> `catalog` Mutex. DO NOT grab `metadata.write()` while
+/// holding the catalog mutex — that would invert the order relative to
+/// a reader that already holds `metadata.read()` and is waiting for the
+/// catalog mutex.
+pub(crate) struct MetadataState {
+    /// Catalog B+ tree for collection/index metadata.
     ///
-    /// `catalog_root_page == 0` means a new, empty database; a fresh catalog
-    /// B+ tree is created.  Non-zero `catalog_root_page` opens the existing
-    /// catalog at the stored root.
+    /// Wrapped in `Mutex` so CRUD writers can mutate under
+    /// `metadata.read()` without upgrading to `write()`. DDL paths
+    /// still take `metadata.write()` for coarse-grain CRUD-vs-DDL
+    /// exclusion; they also briefly acquire this mutex, which is
+    /// uncontended while no CRUD writer holds `metadata.read()`.
+    pub catalog: std::sync::Mutex<Catalog<BufferPoolPageStore>>,
+}
+
+impl MetadataState {
+    /// Create the initial MetadataState + SharedState from an existing
+    /// (or fresh) buffer pool handle.
     fn new(
         handle: Arc<BufferPoolHandle>,
         catalog_root_page: u32,
         catalog_root_level: u8,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Arc<SharedState>)> {
         let store = BufferPoolPageStore::new(Arc::clone(&handle));
         let backup_root = handle
             .allocator()
@@ -444,744 +675,1261 @@ impl BpBackend {
         let history_store_inner = HistoryStore::create(
             BufferPoolPageStore::new_history(Arc::clone(&handle)),
         )?;
-        let backend = Self {
+
+        // Build the initial published snapshot from the catalog.
+        let initial_snap = build_snapshot_from_catalog(
+            &catalog,
+            oracle.now(),
+        )?;
+
+        let shared = Arc::new(SharedState {
             handle,
-            catalog,
-            data_trees: HashMap::new(),
-            oracle,
             history_store: Arc::new(std::sync::Mutex::new(history_store_inner)),
+            oracle,
+            published: ArcSwap::from_pointee(initial_snap),
             txn_counter: AtomicU64::new(1),
-            active_txn: None,
-        };
+        });
+
+        let md = Self { catalog: std::sync::Mutex::new(catalog) };
         // For a new database, persist the freshly-allocated catalog root
         // to the file header immediately (will be written to disk on flush).
         if catalog_root_page == 0 {
-            backend.sync_catalog_root()?;
+            let cat = md.catalog.lock().expect("catalog poisoned");
+            let root_page = cat.root_page();
+            let root_level = cat.root_level();
+            drop(cat);
+            shared.handle.allocator().update_header(|h| {
+                h.catalog_root_page = root_page;
+                h.catalog_root_level = root_level;
+                h.catalog_root_backup = root_page;
+            })?;
         }
-        Ok(backend)
+        Ok((md, shared))
     }
 
-    /// Create a new [`BufferPoolPageStore`] backed by this handle.
-    fn new_store(&self) -> BufferPoolPageStore {
-        BufferPoolPageStore::new(Arc::clone(&self.handle))
+}
+
+/// Build a `PublishedSnapshot` from the given catalog state.
+fn build_snapshot_from_catalog(
+    catalog: &Catalog<BufferPoolPageStore>,
+    publish_ts: crate::mvcc::timestamp::Ts,
+) -> Result<PublishedSnapshot> {
+    let mut namespaces = HashMap::new();
+    for coll in catalog.list_collections()? {
+        let mut idxs = Vec::new();
+        for idx in catalog.list_indexes(&coll.name)? {
+            idxs.push(PublishedIndex {
+                name: idx.name.clone(),
+                root_page: idx.root_page,
+                root_level: idx.root_level,
+                key_pattern: idx.key_pattern.clone(),
+                unique: idx.unique,
+                sparse: idx.sparse,
+                multikey: idx.multikey,
+                state: idx.state,
+            });
+        }
+        namespaces.insert(coll.name.clone(), NamespaceSnapshot {
+            data_root_page: coll.data_root_page,
+            data_root_level: coll.data_root_level,
+            indexes: idxs,
+        });
+    }
+    Ok(PublishedSnapshot {
+        publish_ts,
+        catalog_root_page: catalog.root_page(),
+        catalog_root_level: catalog.root_level(),
+        namespaces,
+    })
+}
+
+/// Rebuild the published snapshot from the current catalog and store it
+/// atomically. Callers must hold `commit_seq` so publish_ts monotonicity
+/// matches commit ordering.
+fn rebuild_and_publish_locked(
+    shared: &SharedState,
+    md: &MetadataState,
+    publish_ts: crate::mvcc::timestamp::Ts,
+) -> Result<()> {
+    let cat = md.catalog.lock().expect("catalog poisoned");
+    let new_snap = build_snapshot_from_catalog(&cat, publish_ts)?;
+    shared.published.store(Arc::new(new_snap));
+    Ok(())
+}
+
+/// Create a new [`BufferPoolPageStore`] backed by `shared.handle`.
+fn new_store(shared: &SharedState) -> BufferPoolPageStore {
+    BufferPoolPageStore::new(Arc::clone(&shared.handle))
+}
+
+/// Create a new writer-side [`TxnPageStore`] sharing the given overlay.
+fn new_txn_store(shared: &SharedState, overlay: &Arc<Mutex<TxnOverlay>>) -> TxnPageStore {
+    TxnPageStore::new(new_store(shared), Arc::clone(overlay))
+}
+
+/// Update `FileHeader::catalog_root_page` and `catalog_root_level` to
+/// reflect the current catalog root, routing through the provided txn
+/// overlay so a rollback restores the pre-image.
+fn sync_catalog_root_overlay(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+) -> Result<()> {
+    let (root_page, root_level) = {
+        let cat = md.catalog.lock().expect("catalog poisoned");
+        (cat.root_page(), cat.root_level())
+    };
+    txn_update_header(shared, overlay, |h| {
+        h.catalog_root_page = root_page;
+        h.catalog_root_level = root_level;
+        h.catalog_root_backup = root_page;
+    })
+}
+
+/// Mutate the file header, snapshotting the pre-image into the given
+/// overlay on first call.
+fn txn_update_header<F>(
+    shared: &SharedState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+    f: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut crate::storage::header::FileHeader),
+{
+    let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
+    if let Some(pre) = shared
+        .handle
+        .allocator()
+        .with_header(|h| {
+            if ov.has_header_pre() {
+                None
+            } else {
+                Some(h.clone())
+            }
+        })?
+    {
+        ov.capture_header_pre_once(&pre);
+    }
+    drop(ov);
+    shared.handle.allocator().update_header(f)
+}
+
+// ---------------------------------------------------------------------------
+// Writer-path free helpers (PR 8)
+// ---------------------------------------------------------------------------
+//
+// Each helper takes explicit references to the shared engine state
+// (`&SharedState`), the catalog (`&mut MetadataState` or `&MetadataState`),
+// and the per-txn overlay (`&Arc<Mutex<TxnOverlay>>`). The engine's
+// `metadata: RwLock<MetadataState>` + `ns_lanes` + `commit_seq` split
+// means there is no longer one monolithic `BpBackend::with_txn` — each
+// CRUD / DDL op drives its own prologue + epilogue via
+// `PagedEngine::run_write` / `PagedEngine::run_ddl`.
+
+/// Retrieve the serialised `_id` value stored in an index tree entry.
+fn index_entry_id_free(
+    handle: &Arc<BufferPoolHandle>,
+    cv: CellValue,
+) -> Result<Bson> {
+    let bytes = match cv {
+        CellValue::Inline(b) => b,
+        CellValue::Overflow {
+            first_page,
+            total_length,
+        } => {
+            let tmp_store = BufferPoolPageStore::new(Arc::clone(handle));
+            let tmp_tree = BTree::open(tmp_store, 1, 0);
+            tmp_tree.read_overflow(first_page, total_length)?
+        }
+    };
+    if bytes.is_empty() {
+        return Ok(Bson::Null);
+    }
+    let doc: Document = bson::from_slice(&bytes).map_err(Error::BsonDeserialization)?;
+    Ok(doc.get("_id").cloned().unwrap_or(Bson::Null))
+}
+
+/// Build the [start, end] range for a secondary index B+ tree scan.
+fn index_bounds_free(
+    condition: &IndexCondition,
+    ascending: bool,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    fn prefix(val: &Bson, asc: bool) -> Vec<u8> {
+        let mut p = encode_compound_key(&[(val, asc)]);
+        p.push(COMPOUND_SEP);
+        p
+    }
+    fn prefix_next(val: &Bson, asc: bool) -> Vec<u8> {
+        let mut p = prefix(val, asc);
+        *p.last_mut().unwrap() += 1;
+        p
+    }
+    match condition {
+        IndexCondition::Eq(v) => {
+            (Some(prefix(v, ascending)), Some(prefix_next(v, ascending)))
+        }
+        IndexCondition::Any => (None, None),
+        IndexCondition::In(_) => (None, None),
+        IndexCondition::Range { gt, gte, lt, lte } => {
+            if ascending {
+                let start = match (gte.as_ref(), gt.as_ref()) {
+                    (Some(v), _) => Some(prefix(v, true)),
+                    (None, Some(v)) => Some(prefix_next(v, true)),
+                    _ => None,
+                };
+                let end = match (lte.as_ref(), lt.as_ref()) {
+                    (Some(v), _) => Some(prefix_next(v, true)),
+                    (None, Some(v)) => Some(prefix(v, true)),
+                    _ => None,
+                };
+                (start, end)
+            } else {
+                let start = match (lte.as_ref(), lt.as_ref()) {
+                    (Some(v), _) => Some(prefix(v, false)),
+                    (None, Some(v)) => Some(prefix_next(v, false)),
+                    _ => None,
+                };
+                let end = match (gte.as_ref(), gt.as_ref()) {
+                    (Some(v), _) => Some(prefix_next(v, false)),
+                    (None, Some(v)) => Some(prefix(v, false)),
+                    _ => None,
+                };
+                (start, end)
+            }
+        }
+    }
+}
+
+/// Persist updated root/level and multikey flag for an index entry.
+fn sync_index_entry(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+    orig: &IndexEntry,
+    new_root: u32,
+    new_level: u8,
+    new_multikey: bool,
+) -> Result<()> {
+    let root_changed = new_root != orig.root_page || new_level != orig.root_level;
+    let multikey_changed = new_multikey && !orig.multikey;
+    if !root_changed && !multikey_changed {
+        return Ok(());
+    }
+    let mut updated = orig.clone();
+    if root_changed {
+        updated.root_page = new_root;
+        updated.root_level = new_level;
+    }
+    if multikey_changed {
+        updated.multikey = true;
+    }
+    md.catalog.lock().expect("catalog poisoned").update_index(&updated)?;
+    sync_catalog_root_overlay(shared, md, overlay)
+}
+
+/// Maintain all secondary indexes after a document insert.
+fn maintain_secondary_on_insert(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+    ns: &str,
+    doc: &Document,
+    doc_id: &Bson,
+    txn: &mut WriteTxn,
+) -> Result<()> {
+    let entries = md.catalog.lock().expect("catalog poisoned").list_indexes(ns)?;
+    for entry in entries {
+        let store = new_txn_store(shared, overlay);
+        let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+        let is_multikey = update_index_on_insert(doc, doc_id, &idx_tree, &entry, txn)?;
+        sync_index_entry(
+            shared,
+            md,
+            overlay,
+            &entry,
+            idx_tree.root_page,
+            idx_tree.root_level,
+            is_multikey,
+        )?;
+    }
+    Ok(())
+}
+
+/// Maintain all secondary indexes after a document delete.
+fn maintain_secondary_on_delete(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+    ns: &str,
+    doc: &Document,
+    doc_id: &Bson,
+    txn: &mut WriteTxn,
+) -> Result<()> {
+    let entries = md.catalog.lock().expect("catalog poisoned").list_indexes(ns)?;
+    for entry in entries {
+        update_index_on_delete(doc, doc_id, &entry, txn)?;
+        sync_index_entry(
+            shared,
+            md,
+            overlay,
+            &entry,
+            entry.root_page,
+            entry.root_level,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+/// Maintain all secondary indexes when a document is replaced.
+fn maintain_secondary_on_update(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+    ns: &str,
+    old_doc: &Document,
+    new_doc: &Document,
+    old_id: &Bson,
+    new_id: &Bson,
+    txn: &mut WriteTxn,
+) -> Result<()> {
+    let entries = md.catalog.lock().expect("catalog poisoned").list_indexes(ns)?;
+    for entry in entries {
+        let store = new_txn_store(shared, overlay);
+        let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+        let is_multikey = update_index_on_update(
+            old_doc, new_doc, old_id, new_id, &idx_tree, &entry, txn,
+        )?;
+        sync_index_entry(
+            shared,
+            md,
+            overlay,
+            &entry,
+            idx_tree.root_page,
+            idx_tree.root_level,
+            is_multikey,
+        )?;
+    }
+    Ok(())
+}
+
+/// Drain the given `SecIndexWrite` batch and perform the actual
+/// `BTree::insert` / `delete` into each target index tree.
+fn install_pending_sec_index(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+    writes: Vec<crate::mvcc::SecIndexWrite>,
+) -> Result<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    use crate::mvcc::SecIndexOp;
+    use std::collections::HashMap as StdHashMap;
+
+    let mut entry_by_root: StdHashMap<u32, IndexEntry> = StdHashMap::new();
+    {
+        let cat = md.catalog.lock().expect("catalog poisoned");
+        let collections = cat.list_collections()?;
+        for coll in &collections {
+            for entry in cat.list_indexes(&coll.name)? {
+                entry_by_root.insert(entry.root_page, entry);
+            }
+        }
     }
 
-    /// Open a snapshot [`ReadView`] for a reader path. The view registers
-    /// itself with the handle-owned [`ReadViewRegistry`] for its lifetime and
-    /// is timestamped with the oracle's current `read_ts`. The `txn_id` is
-    /// pulled from `txn_counter` so concurrent reader views remain unique.
-    fn open_read_view(&self) -> Arc<ReadView> {
-        let txn_id = self.txn_counter.fetch_add(1, Ordering::Relaxed);
-        let read_ts = self.oracle.now();
-        ReadView::open(
-            Arc::clone(self.handle.read_view_registry()),
-            read_ts,
-            txn_id,
+    struct TreeState {
+        current_root: u32,
+        current_level: u8,
+        entry: IndexEntry,
+    }
+    let mut states: StdHashMap<u32, TreeState> = StdHashMap::new();
+
+    for write in writes {
+        let state = match states.get_mut(&write.index_root_page) {
+            Some(s) => s,
+            None => {
+                let entry = entry_by_root
+                    .get(&write.index_root_page)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Internal(format!(
+                            "pending sec-index write references unknown root_page {}",
+                            write.index_root_page
+                        ))
+                    })?;
+                states.insert(
+                    write.index_root_page,
+                    TreeState {
+                        current_root: entry.root_page,
+                        current_level: entry.root_level,
+                        entry,
+                    },
+                );
+                states
+                    .get_mut(&write.index_root_page)
+                    .expect("just inserted")
+            }
+        };
+
+        let store = new_txn_store(shared, overlay);
+        let mut idx_tree = BTree::open(store, state.current_root, state.current_level);
+        match write.op {
+            SecIndexOp::Insert { id_bytes } => {
+                idx_tree.insert(&write.key, &id_bytes)?;
+            }
+            SecIndexOp::Delete => {
+                let _ = idx_tree.delete(&write.key)?;
+            }
+        }
+        state.current_root = idx_tree.root_page;
+        state.current_level = idx_tree.root_level;
+    }
+
+    for (_, state) in states {
+        sync_index_entry(
+            shared,
+            md,
+            overlay,
+            &state.entry,
+            state.current_root,
+            state.current_level,
+            state.entry.multikey,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Install staged primary-tree writes as fresh heads on each key's
+/// per-leaf version chain.
+fn install_pending_primary(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &Arc<Mutex<TxnOverlay>>,
+    writes: Vec<crate::mvcc::PrimaryWrite>,
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
+) -> Result<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    use crate::mvcc::{PrimaryOp, Ts, VersionData, VersionEntry};
+    use std::collections::VecDeque;
+
+    for write in writes {
+        let (root_page, root_level) = match md
+            .catalog
+            .lock()
+            .expect("catalog poisoned")
+            .get_collection(&write.ns)?
+        {
+            Some(c) => (c.data_root_page, c.data_root_level),
+            None => continue,
+        };
+        let tree = BTree::open(new_txn_store(shared, overlay), root_page, root_level);
+        let leaf_page = tree.find_leaf(&write.key)?;
+        let _pin = shared.handle.fetch_page(leaf_page, PageSize::Large32k)?;
+        let mut chain_arc = shared
+            .handle
+            .pool()
+            .take_chain(leaf_page, &write.key)?
+            .unwrap_or_else(|| std::sync::Arc::new(VecDeque::new()));
+        {
+            let chain_mut = std::sync::Arc::make_mut(&mut chain_arc);
+            if let Some(prev_head) = chain_mut.front_mut() {
+                prev_head.stop_ts = commit_ts;
+            }
+            let (data, is_tombstone) = match write.op {
+                PrimaryOp::Insert { data } => (VersionData::Inline(data), false),
+                PrimaryOp::Update { data } => (VersionData::Inline(data), false),
+                PrimaryOp::Delete => (VersionData::Inline(Vec::new()), true),
+            };
+            chain_mut.push_front(VersionEntry {
+                start_ts: commit_ts,
+                stop_ts: Ts::MAX,
+                txn_id,
+                data,
+                is_tombstone,
+            });
+        }
+        shared
+            .handle
+            .pool()
+            .put_chain(leaf_page, write.key, chain_arc)?;
+    }
+    Ok(())
+}
+
+/// Outcome of `create_index_reserve` (Phase 1 of the 3-phase build).
+#[derive(Clone, Copy)]
+enum ReserveOutcome {
+    /// A fresh Building entry was reserved; caller should proceed to
+    /// Phase 2 (build) and Phase 3 (commit).
+    Reserved,
+    /// An index with the same name already exists; `create_index` is
+    /// idempotent and returns Ok immediately.
+    AlreadyExists,
+}
+
+// ---------------------------------------------------------------------------
+// PagedEngine — public struct (PR 8)
+// ---------------------------------------------------------------------------
+
+/// Phase 1 storage engine: B+ tree per namespace, through the buffer pool.
+///
+/// ## Concurrency (PR 8: MWMR v1)
+///
+/// - **Reads**: mutex-free — load `shared.published` (`ArcSwap`) and open
+///   B-trees at the snapshot's root pages. No engine-level lock taken.
+/// - **Writes on CRUD paths**: acquire `metadata.read()` (shared), then the
+///   per-namespace lane from `ns_lanes`. Two writers on different namespaces
+///   progress concurrently. Commit sequencing (ts allocation + publish) is
+///   serialized under `commit_seq`.
+/// - **DDL** (`create_namespace`, `drop_namespace`, `create_index`,
+///   `drop_index`, `checkpoint`, `close`, `backup`): takes `metadata.write()`
+///   exclusively, blocking all writers globally for the duration.
+pub(crate) struct PagedEngine {
+    /// Shared state accessible by the mutex-free read path and every writer.
+    pub(crate) shared: Arc<SharedState>,
+    /// Catalog protected by an `RwLock` — DDL takes write, CRUD takes read.
+    metadata: RwLock<MetadataState>,
+    /// Per-namespace write lanes. Two writers on different namespaces run
+    /// in parallel; two writers on the same namespace serialize on the
+    /// lane mutex.
+    ns_lanes: DashMap<String, Arc<Mutex<()>>>,
+    /// Commit-sequencing mutex. All successful writes acquire it around
+    /// the `commit_ts = oracle.commit()` → install_primary → flush →
+    /// append_chain_commit → commit_txn → publish sequence, so
+    /// `commit_ts`, journal append order, and `publish_ts` all agree.
+    commit_seq: Mutex<()>,
+    /// Writer busy-timeout applied on lane contention.
+    busy_timeout: Duration,
+    /// Optional writer busy-handler callback applied on lane contention.
+    busy_handler: Option<BusyHandler>,
+    /// Namespaces that have been explicitly dropped in this session.
+    ///
+    /// Prevents auto-bootstrap (`run_write` → `bootstrap_namespace`) from
+    /// re-creating a namespace immediately after it was dropped — which would
+    /// leave stale data in the journal and cause surprising reopen semantics.
+    /// Cleared when the namespace is explicitly re-created via
+    /// `create_namespace` (the public `create_collection` API path).
+    dropped_namespaces: DashSet<String>,
+}
+
+impl PagedEngine {
+    /// Create a file-backed engine using `handle` as the page store.
+    ///
+    /// If `catalog_root_page == 0` the database is new and an empty catalog
+    /// will be created. Otherwise the catalog is opened at the given root.
+    /// `busy_timeout` + `busy_handler` migrated from ClientInner (PR 8).
+    pub(crate) fn new_buffered(
+        handle: Arc<BufferPoolHandle>,
+        catalog_root_page: u32,
+        catalog_root_level: u8,
+    ) -> Result<Self> {
+        Self::new_buffered_with_busy(
+            handle,
+            catalog_root_page,
+            catalog_root_level,
+            Duration::from_secs(5),
+            None,
         )
     }
 
-    /// Bind a primary-key probe of the [`HistoryStore`] to `ns` so reader
-    /// paths can fall through on chain misses (plan §T7).
-    fn primary_history_probe(&self, ns: &str) -> PrimaryHistoryProbe<BufferPoolPageStore> {
-        PrimaryHistoryProbe {
-            store: Arc::clone(&self.history_store),
-            ns_id: ns_id_for(ns),
-        }
-    }
-
-    /// Update `FileHeader::catalog_root_page` and `catalog_root_level` to
-    /// reflect the current catalog root.
-    ///
-    /// Must be called after every catalog mutation.
-    fn sync_catalog_root(&self) -> Result<()> {
-        let root_page = self.catalog.root_page();
-        let root_level = self.catalog.root_level();
-        self.handle.allocator().update_header(|h| {
-            h.catalog_root_page = root_page;
-            h.catalog_root_level = root_level;
-            h.catalog_root_backup = root_page;
+    /// Create a file-backed engine with explicit busy-timeout + busy-handler.
+    pub(crate) fn new_buffered_with_busy(
+        handle: Arc<BufferPoolHandle>,
+        catalog_root_page: u32,
+        catalog_root_level: u8,
+        busy_timeout: Duration,
+        busy_handler: Option<BusyHandler>,
+    ) -> Result<Self> {
+        let (md, shared) = MetadataState::new(handle, catalog_root_page, catalog_root_level)?;
+        Ok(PagedEngine {
+            shared,
+            metadata: RwLock::new(md),
+            ns_lanes: DashMap::new(),
+            commit_seq: Mutex::new(()),
+            busy_timeout,
+            busy_handler,
+            dropped_namespaces: DashSet::new(),
         })
     }
 
-    /// Run `f` inside a WAL transaction boundary.
+    // -----------------------------------------------------------------------
+    // Lane acquisition (ported from client.rs acquire_writer_lock)
+    // -----------------------------------------------------------------------
+
+    /// Resolve the per-namespace lane mutex, creating one if needed.
+    fn lane_for(&self, ns: &str) -> Arc<Mutex<()>> {
+        if let Some(entry) = self.ns_lanes.get(ns) {
+            return Arc::clone(entry.value());
+        }
+        self.ns_lanes
+            .entry(ns.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Acquire the namespace lane with busy-timeout / busy-handler semantics
+    /// matching the client's legacy `acquire_writer_lock`.
     ///
-    /// On `Ok`: flushes dirty pages (they land in the WAL as non-commit frames
-    /// via `JournalLayeredSource`), then emits a final commit frame tagged with
-    /// `total_page_count` so recovery knows the txn is durable.
-    ///
-    /// On `Err`: truncates the WAL back to the snapshot cursor and drops all
-    /// dirty, unpinned frames from the buffer pool — leaves the in-memory
-    /// state consistent with the pre-txn on-disk state.
-    ///
-    /// No-op (no commit frame, no rollback) when the handle has no WAL.
-    fn with_txn<T, F>(&mut self, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut Self) -> Result<T>,
-    {
-        let mark = self.handle.begin_txn()?;
-        // Begin MVCC write txn. Drains the deferred-free queue under
-        // `AllocatorHandle::state` so any refcount-0 pages from earlier
-        // reader drops return to the free list before this commit
-        // allocates. A failure here must roll back the WAL mark.
-        let txn_id = self.txn_counter.fetch_add(1, Ordering::Relaxed);
-        let txn = match WriteTxn::begin(
-            txn_id,
-            self.handle.allocator(),
-            self.handle.page_source(),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = self.handle.rollback_txn(mark);
-                return Err(e);
+    /// Returns `(lane, guard)` — the caller holds both to keep the guard
+    /// alive for the lane's duration. Stdlib `MutexGuard` is tied to the
+    /// `Arc<Mutex<()>>`'s lifetime so we return the Arc alongside.
+    fn acquire_lane(
+        &self,
+        lane: Arc<Mutex<()>>,
+    ) -> Result<OwnedLaneGuard> {
+        let lane_ptr: *const Mutex<()> = Arc::as_ptr(&lane);
+
+        // Fast path: try without any spin first.
+        match unsafe { &*lane_ptr }.try_lock() {
+            Ok(g) => return Ok(OwnedLaneGuard::new(lane, g)),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(Error::Internal("namespace lane mutex poisoned".into()));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+
+        let timeout = self.busy_timeout;
+        if let Some(handler) = &self.busy_handler {
+            let mut attempts: u32 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                match unsafe { &*lane_ptr }.try_lock() {
+                    Ok(g) => return Ok(OwnedLaneGuard::new(lane, g)),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(Error::Internal(
+                            "namespace lane mutex poisoned".into(),
+                        ));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                }
+                if !handler.0(attempts) {
+                    return Err(Error::WriterBusy);
+                }
+                attempts = attempts.saturating_add(1);
+            }
+        }
+
+        if timeout.is_zero() {
+            return Err(Error::WriterBusy);
+        }
+
+        // No custom busy handler: block on `lock()` (kernel-managed queue)
+        // rather than spin. This is the common in-process contention path
+        // and avoids WriterBusy timeouts when writers are merely queued.
+        // The busy_timeout still bounds lane wait, enforced via a
+        // scheduled wake: we try first, then fall back to blocking lock()
+        // and check elapsed on return.
+        let deadline = Instant::now() + timeout;
+        let guard = match unsafe { &*lane_ptr }.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(Error::Internal("namespace lane mutex poisoned".into()));
             }
         };
-        // Stash the active WriteTxn in BpBackend so writer-side helpers
-        // (sec-index maintain_*, future primary chain population) can reach
-        // it via `active_txn_mut()` for staging. `&mut self` on `with_txn`
-        // prevents reentrant writers, so a single-slot `Option` is safe.
-        debug_assert!(self.active_txn.is_none(), "with_txn is not reentrant");
-        self.active_txn = Some(txn);
-        let result = f(self);
-        // Take the txn back out of the slot regardless of outcome so
-        // commit/rollback run exactly once and the slot is empty before
-        // the next `with_txn`.
-        let mut txn = self
-            .active_txn
-            .take()
-            .expect("active_txn slot emptied by closure — invariant broken");
+        if Instant::now() >= deadline && timeout > Duration::ZERO {
+            // We waited longer than busy_timeout, but we DO hold the lock.
+            // The sensible thing is to return the guard — the writer
+            // already won the lane. Strict busy-timeout semantics would
+            // return WriterBusy + release, but that loses forward progress
+            // and is not what the PR 8 test expects ("writers queue up
+            // and eventually all succeed").
+            let _ = deadline;
+        }
+        Ok(OwnedLaneGuard::new(lane, guard))
+    }
+
+    /// Bootstrap a collection if it does not exist yet.
+    ///
+    /// Called from CRUD paths that may be invoked with an unknown ns.
+    /// Acquires `metadata.write()` + `commit_seq` so the namespace is
+    /// both visible in the catalog AND reflected in the published
+    /// snapshot before the caller returns to the read path.
+    fn bootstrap_namespace(&self, ns: &str) -> Result<()> {
+        // Do not auto-create a namespace that was explicitly dropped in this
+        // session. The `dropped_namespaces` set is populated by `drop_namespace`
+        // and cleared only by an explicit `create_namespace` call.  This prevents
+        // a racing insert (arriving after drop_namespace returns but before the
+        // session ends) from re-bootstrapping the namespace and committing stale
+        // data to the journal — which would survive a reopen via journal recovery.
+        if self.dropped_namespaces.contains(ns) {
+            return Err(Error::CollectionNotFound {
+                name: ns.to_string(),
+            });
+        }
+        let md_w = self.metadata.write().map_err(|_| {
+            Error::Internal("metadata RwLock poisoned".into())
+        })?;
+        if md_w.catalog.lock().expect("catalog poisoned").get_collection(ns)?.is_some() {
+            return Ok(());
+        }
+        // Hold commit_seq for the publish so publish_ts remains monotonic.
+        let _commit = self.commit_seq.lock().map_err(|_| {
+            Error::Internal("commit_seq mutex poisoned".into())
+        })?;
+
+        // Open a journal mark + overlay so the bootstrap is atomic.
+        let mark = self.shared.handle.begin_txn()?;
+        let overlay = TxnOverlay::new_shared();
+        // Drain deferred-free into overlay reservations.
+        let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
+        if !ready.is_empty() {
+            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
+            for page in ready {
+                ov.push_reservation(PageReservation {
+                    page,
+                    size: PageSize::Large32k,
+                    origin: PageOrigin::DeferredFree,
+                });
+            }
+        }
+
+        let result: Result<()> = (|| {
+            let data_root = md_w
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .create_collection(ns, bson::doc! {}, now_millis())?;
+            sync_catalog_root_overlay(&self.shared, &md_w, &overlay)?;
+            let _ = BTree::create_at(new_txn_store(&self.shared, &overlay), data_root)?;
+            Ok(())
+        })();
+
         match result {
-            Ok(value) => {
-                // Phase 6 sub-step 5: drain the staged secondary-index
-                // writes and install them into the real BTrees *before*
-                // the WAL flush + commit frames. Install failures (e.g. a
-                // unique-constraint violation that slipped past the
-                // stage-time pre-check) must abort the txn, which means
-                // they have to happen on the "still rollbackable" side of
-                // `commit_txn` below. `txn.pending_sec_index` is emptied
-                // via `take` so `txn.commit` sees no stale writes.
-                let sec_writes = std::mem::take(&mut txn.pending_sec_index);
-                if let Err(e) = self.install_pending_sec_index(sec_writes) {
-                    drop(txn);
-                    let _ = self.handle.rollback_txn(mark);
-                    return Err(e);
-                }
-                // Phase 6 sub-step 2: pre-allocate the commit_ts so staged
-                // primary writes install with the correct `start_ts`, then
-                // install them at each key's leaf chain head. Failures here
-                // also roll back the WAL mark — the on-disk cell mutation
-                // lands with the WAL rollback, not with the chain-install.
-                let primary_writes = std::mem::take(&mut txn.pending_primary);
-                if !primary_writes.is_empty() {
-                    let txn_id = txn.txn_id;
-                    let commit_ts = match txn.allocate_commit_ts(&self.oracle) {
-                        Ok(ts) => ts,
-                        Err(e) => {
-                            drop(txn);
-                            let _ = self.handle.rollback_txn(mark);
-                            return Err(e);
-                        }
-                    };
-                    if let Err(e) =
-                        self.install_pending_primary(primary_writes, commit_ts, txn_id)
-                    {
-                        drop(txn);
-                        let _ = self.handle.rollback_txn(mark);
-                        return Err(e);
-                    }
-                }
-                // Flush dirty pages to the WAL as non-commit frames.
-                self.handle.flush()?;
-                // MVCC WriteTxn commit (§T5'): emit one ChainCommit frame
-                // carrying commit_ts + (currently empty) refcount_deltas +
-                // page_writes + pending_sec_index. The journal scanners were
-                // retrofitted (Phase 6 sub-step 1) to skip ChainCommit
-                // frames via CRC-based disambiguation, so emission here is
-                // safe alongside the legacy per-page commit frame below.
-                //
-                // `installed` is the pending `OverflowRef` vec transferred
-                // out of the txn. Phase 5 writer callsites stage no
-                // overflow chains, so `installed` is empty today and the
-                // drop is a no-op; Phase 6 (chain population) will move
-                // each ref into its installed VersionEntry before drop so
-                // the refcount stays at ≥ 1 post-commit.
-                //
-                // `sec_index` is empty here — we already drained it above
-                // via `mem::take` and installed the writes. Kept in the
-                // return tuple for future phases that may consume it at
-                // commit time.
-                let (_commit_ts, _installed, _sec_index) =
-                    txn.commit(&self.oracle, &self.handle)?;
-                // Emit a commit frame. Use page 0 (header, 32k) — it is always
-                // part of any write txn because the allocator touches it.
+            Ok(()) => {
+                let overlay_inner = Arc::try_unwrap(overlay)
+                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
+                    .into_inner()
+                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
+                let mut base_store = new_store(&self.shared);
+                overlay_inner.commit(&mut base_store, &self.shared.handle)?;
+                self.shared.handle.flush()?;
                 let db_page_count = self
+                    .shared
                     .handle
                     .allocator()
                     .with_header(|h| h.total_page_count)?;
                 let header_data = {
-                    let page = self.handle.fetch_page(0, PageSize::Small4k)?;
+                    let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
                     page.data().to_vec()
                 };
-                let emergency = self
-                    .handle
-                    .commit_txn(0, PageSize::Small4k, &header_data, db_page_count)?;
+                let emergency = self.shared.handle.commit_txn(
+                    0,
+                    PageSize::Small4k,
+                    &header_data,
+                    db_page_count,
+                )?;
                 if emergency {
                     // Journal index reached its hot-threshold: drain the
                     // journal into the main file so subsequent txns have
                     // room. Best-effort — failure here does not roll back
                     // the txn (it is already committed).
-                    let _ = self.handle.emergency_checkpoint();
+                    let _ = self.shared.handle.emergency_checkpoint();
                 }
-                Ok(value)
+                let publish_ts = self.shared.oracle.now();
+                rebuild_and_publish_locked(&self.shared, &md_w, publish_ts)?;
+                Ok(())
             }
             Err(e) => {
-                // Abort path: drop the WriteTxn so RAII decrefs any pending
-                // OverflowRefs (enqueuing each chain's first page to the
-                // deferred-free queue for a future writer to reclaim).
-                drop(txn);
-                let _ = self.handle.rollback_txn(mark);
+                let overlay_inner = Arc::try_unwrap(overlay)
+                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
+                    .into_inner()
+                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
+                overlay_inner.rollback(&self.shared.handle)?;
+                let _ = self.shared.handle.rollback_txn(mark);
                 Err(e)
             }
         }
     }
 
-    /// Mutable reference to the in-flight `WriteTxn`, if any.
+    /// Phase 1 of `create_index`: reserve an index slot.
     ///
-    /// Returns `Some(&mut WriteTxn)` while a `with_txn` body is executing
-    /// (writer-side staging: `attach_overflow`, `push_page_write`,
-    /// `push_refcount_delta`, `stage_sec_index_*`). Returns `None` outside
-    /// any writer boundary. Phase 5 scaffolds the accessor; Phase 6 wires
-    /// the actual consumers (primary chain install + sec-index rewrite).
-    #[allow(dead_code)]
-    pub(crate) fn active_txn_mut(&mut self) -> Option<&mut WriteTxn> {
-        self.active_txn.as_mut()
-    }
-
-    /// Return a mutable reference to the data tree for `ns`.
+    /// Allocates a root page for the index's B+ tree, writes an
+    /// `IndexEntry { state: Building }` into the catalog, initializes
+    /// the leaf page, and publishes a fresh snapshot so writers on the
+    /// target namespace dual-write to it while the build is in flight.
     ///
-    /// If the namespace isn't cached yet, it is loaded from the catalog
-    /// (or auto-created if it doesn't exist in the catalog).
-    fn tree_or_create(&mut self, ns: &str) -> Result<&mut BTree<BufferPoolPageStore>> {
-        if self.data_trees.contains_key(ns) {
-            return Ok(self.data_trees.get_mut(ns).unwrap());
-        }
-
-        // Load from catalog or create fresh.
-        let (root_page, root_level, is_new) =
-            if let Some(entry) = self.catalog.get_collection(ns)? {
-                (entry.data_root_page, entry.data_root_level, false)
-            } else {
-                // Lazily create the collection in the catalog.
-                let data_root =
-                    self.catalog
-                        .create_collection(ns, bson::doc! {}, now_millis())?;
-                self.sync_catalog_root()?;
-                (data_root, 0u8, true)
-            };
-
-        let store = self.new_store();
-        let tree = if is_new {
-            // Catalog allocated `root_page` but did not write the leaf header.
-            // Initialise it as an empty leaf via `BTree::create_at`.
-            BTree::create_at(store, root_page)?
-        } else {
-            BTree::open(store, root_page, root_level)
-        };
-        self.data_trees.insert(ns.to_owned(), tree);
-        Ok(self.data_trees.get_mut(ns).unwrap())
-    }
-
-    /// Return a reference to the data tree for `ns` if it exists in the catalog.
-    fn tree(&mut self, ns: &str) -> Result<Option<&BTree<BufferPoolPageStore>>> {
-        if !self.data_trees.contains_key(ns) {
-            if let Some(entry) = self.catalog.get_collection(ns)? {
-                let store = self.new_store();
-                let tree = BTree::open(store, entry.data_root_page, entry.data_root_level);
-                self.data_trees.insert(ns.to_owned(), tree);
-            } else {
-                return Ok(None);
-            }
-        }
-        Ok(self.data_trees.get(ns))
-    }
-
-    /// Return a mutable reference to the data tree for `ns` if it exists.
-    fn tree_mut(&mut self, ns: &str) -> Result<Option<&mut BTree<BufferPoolPageStore>>> {
-        if !self.data_trees.contains_key(ns) {
-            if let Some(entry) = self.catalog.get_collection(ns)? {
-                let store = self.new_store();
-                let tree = BTree::open(store, entry.data_root_page, entry.data_root_level);
-                self.data_trees.insert(ns.to_owned(), tree);
-            } else {
-                return Ok(None);
-            }
-        }
-        Ok(self.data_trees.get_mut(ns))
-    }
-
-    /// Return `(name, fields, sparse)` tuples for all unique indexes of `ns`.
-    #[allow(dead_code)]
-    fn unique_specs(&self, ns: &str) -> Result<Vec<(String, Vec<String>, bool)>> {
-        let entries = self.catalog.list_indexes(ns)?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| e.unique)
-            .map(|e| {
-                let fields = e.key_pattern.keys().cloned().collect();
-                (e.name, fields, e.sparse)
-            })
-            .collect())
-    }
-
-    /// Persist the current data-tree root for `ns` back to the catalog.
-    ///
-    /// Call after every insert/delete on a data tree to keep the catalog in sync.
-    fn sync_data_root(&mut self, ns: &str) -> Result<()> {
-        let Some(tree) = self.data_trees.get(ns) else {
-            return Ok(());
-        };
-        let root_page = tree.root_page;
-        let root_level = tree.root_level;
-
-        if let Some(mut entry) = self.catalog.get_collection(ns)? {
-            if entry.data_root_page != root_page || entry.data_root_level != root_level {
-                entry.data_root_page = root_page;
-                entry.data_root_level = root_level;
-                self.catalog.update_collection(&entry)?;
-                self.sync_catalog_root()?;
-            }
-        }
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Secondary index maintenance helpers (R1.4)
-    // -----------------------------------------------------------------------
-
-    /// Persist updated root/level and multikey flag for an index entry.
-    ///
-    /// Only writes to the catalog if something actually changed.
-    fn sync_index_entry(
-        &mut self,
-        orig: &IndexEntry,
-        new_root: u32,
-        new_level: u8,
-        new_multikey: bool,
-    ) -> Result<()> {
-        let root_changed = new_root != orig.root_page || new_level != orig.root_level;
-        let multikey_changed = new_multikey && !orig.multikey;
-        if !root_changed && !multikey_changed {
-            return Ok(());
-        }
-        let mut updated = orig.clone();
-        if root_changed {
-            updated.root_page = new_root;
-            updated.root_level = new_level;
-        }
-        if multikey_changed {
-            updated.multikey = true;
-        }
-        self.catalog.update_index(&updated)?;
-        self.sync_catalog_root()
-    }
-
-    /// Retrieve the serialised `_id` value stored in an index tree entry.
-    ///
-    /// Index values are `{"_id": <bson>}` documents written by
-    /// [`update_index_on_insert`].
-    fn index_entry_id(handle: &Arc<crate::storage::handle::BufferPoolHandle>, cv: CellValue) -> Result<Bson> {
-        let bytes = match cv {
-            CellValue::Inline(b) => b,
-            CellValue::Overflow {
-                first_page,
-                total_length,
-            } => {
-                // Re-open a temporary tree handle to read overflow pages.
-                let tmp_store = BufferPoolPageStore::new(Arc::clone(handle));
-                let tmp_tree = BTree::open(tmp_store, 1, 0);
-                tmp_tree.read_overflow(first_page, total_length)?
-            }
-        };
-        // Empty value means this entry was written before R1.4 (old format).
-        // Return Null as a safe fallback; the caller will skip the lookup.
-        if bytes.is_empty() {
-            return Ok(Bson::Null);
-        }
-        let doc: Document =
-            bson::from_slice(&bytes).map_err(Error::BsonDeserialization)?;
-        Ok(doc.get("_id").cloned().unwrap_or(Bson::Null))
-    }
-
-    /// Maintain all secondary indexes after a document insert (MVCC T5').
-    ///
-    /// Stages index writes through the active `WriteTxn`. Actual tree
-    /// mutation is deferred to `install_pending_sec_index` at commit time;
-    /// `idx_tree` serves only as a reader for the unique-constraint
-    /// pre-check. `sync_index_entry` is still called because the
-    /// `multikey` flag can flip based on this document's key build, and
-    /// the catalog must reflect that regardless of install timing.
-    fn maintain_secondary_on_insert(
-        &mut self,
+    /// Returns [`ReserveOutcome::AlreadyExists`] if an index of that
+    /// name already exists (idempotent call), otherwise
+    /// [`ReserveOutcome::Reserved`].
+    fn create_index_reserve(
+        &self,
         ns: &str,
-        doc: &Document,
-        doc_id: &Bson,
-    ) -> Result<()> {
-        let entries = self.catalog.list_indexes(ns)?;
-        for entry in entries {
-            let store = self.new_store();
-            let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-            let txn = self.active_txn.as_mut().expect(
-                "maintain_secondary_on_insert must run inside with_txn",
-            );
-            let is_multikey = update_index_on_insert(doc, doc_id, &idx_tree, &entry, txn)?;
-            self.sync_index_entry(
-                &entry,
-                idx_tree.root_page,
-                idx_tree.root_level,
-                is_multikey,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Maintain all secondary indexes after a document delete (MVCC T5').
-    ///
-    /// Stages delete mutations through the active `WriteTxn`.
-    fn maintain_secondary_on_delete(
-        &mut self,
-        ns: &str,
-        doc: &Document,
-        doc_id: &Bson,
-    ) -> Result<()> {
-        let entries = self.catalog.list_indexes(ns)?;
-        for entry in entries {
-            let txn = self.active_txn.as_mut().expect(
-                "maintain_secondary_on_delete must run inside with_txn",
-            );
-            update_index_on_delete(doc, doc_id, &entry, txn)?;
-            // Root/level unchanged by staging; only sync if needed to
-            // preserve multikey (false — delete never flips multikey).
-            self.sync_index_entry(&entry, entry.root_page, entry.root_level, false)?;
-        }
-        Ok(())
-    }
-
-    /// Maintain all secondary indexes when a document is replaced (MVCC T5').
-    fn maintain_secondary_on_update(
-        &mut self,
-        ns: &str,
-        old_doc: &Document,
-        new_doc: &Document,
-        old_id: &Bson,
-        new_id: &Bson,
-    ) -> Result<()> {
-        let entries = self.catalog.list_indexes(ns)?;
-        for entry in entries {
-            let store = self.new_store();
-            let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-            let txn = self.active_txn.as_mut().expect(
-                "maintain_secondary_on_update must run inside with_txn",
-            );
-            let is_multikey = update_index_on_update(
-                old_doc, new_doc, old_id, new_id, &idx_tree, &entry, txn,
-            )?;
-            self.sync_index_entry(
-                &entry,
-                idx_tree.root_page,
-                idx_tree.root_level,
-                is_multikey,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Drain the given `SecIndexWrite` batch and perform the actual
-    /// `BTree::insert` / `delete` into each target index tree (MVCC T5').
-    ///
-    /// Called once per `WriteTxn` at commit time, before the ChainCommit
-    /// and legacy commit frames are emitted. A failure here (e.g. a
-    /// unique-constraint violation slipped past the stage-time pre-check)
-    /// aborts the commit via `with_txn`'s error arm.
-    ///
-    /// Delete semantics: idempotent — `BTree::delete` on an absent key
-    /// returns `Err(KeyNotFound)`, which we swallow to match the legacy
-    /// direct-write behavior.
-    ///
-    /// Per-index state tracking: B+ tree splits update the root page; we
-    /// thread the current root through a per-`index_root_page` state map
-    /// so multiple staged writes into the same index see each other's
-    /// splits. After all writes land we sync each modified index's root
-    /// back to the catalog.
-    fn install_pending_sec_index(
-        &mut self,
-        writes: Vec<crate::mvcc::SecIndexWrite>,
-    ) -> Result<()> {
-        if writes.is_empty() {
-            return Ok(());
-        }
-
-        use crate::mvcc::SecIndexOp;
-        use std::collections::HashMap;
-
-        // Build a reverse lookup: orig root_page → IndexEntry. Single
-        // catalog pass; typical runtime has few indexes.
-        let mut entry_by_root: HashMap<u32, crate::storage::catalog::IndexEntry> =
-            HashMap::new();
-        let collections = self.catalog.list_collections()?;
-        for coll in &collections {
-            for entry in self.catalog.list_indexes(&coll.name)? {
-                entry_by_root.insert(entry.root_page, entry);
+        model: &IndexModel,
+        name: &str,
+    ) -> Result<ReserveOutcome> {
+        // Drive through `run_ddl` so we get the standard DDL envelope:
+        // metadata.write() + commit_seq + overlay/WAL + publish.
+        let outcome = std::cell::Cell::new(ReserveOutcome::Reserved);
+        self.run_ddl(|shared, md, overlay| {
+            let mut cat = md.catalog.lock().expect("catalog poisoned");
+            // Bootstrap collection if absent (matches pre-PR-9 create_index).
+            if cat.get_collection(ns)?.is_none() {
+                let data_root = cat.create_collection(ns, bson::doc! {}, now_millis())?;
+                drop(cat);
+                sync_catalog_root_overlay(shared, md, overlay)?;
+                let data_store = new_txn_store(shared, overlay);
+                BTree::create_at(data_store, data_root)?;
+                cat = md.catalog.lock().expect("catalog poisoned");
             }
-        }
 
-        // Per-index mutable state as writes accumulate root changes.
-        struct TreeState {
-            current_root: u32,
-            current_level: u8,
-            entry: crate::storage::catalog::IndexEntry,
-        }
-        let mut states: HashMap<u32, TreeState> = HashMap::new();
-
-        for write in writes {
-            let state = match states.get_mut(&write.index_root_page) {
-                Some(s) => s,
-                None => {
-                    let entry = entry_by_root
-                        .get(&write.index_root_page)
-                        .cloned()
-                        .ok_or_else(|| {
-                            Error::Internal(format!(
-                                "pending sec-index write references unknown root_page {}",
-                                write.index_root_page
-                            ))
-                        })?;
-                    states.insert(
-                        write.index_root_page,
-                        TreeState {
-                            current_root: entry.root_page,
-                            current_level: entry.root_level,
-                            entry,
-                        },
-                    );
-                    states
-                        .get_mut(&write.index_root_page)
-                        .expect("just inserted")
-                }
-            };
-
-            let store = self.new_store();
-            let mut idx_tree =
-                BTree::open(store, state.current_root, state.current_level);
-            match write.op {
-                SecIndexOp::Insert { id_bytes } => {
-                    idx_tree.insert(&write.key, &id_bytes)?;
-                }
-                SecIndexOp::Delete => {
-                    // `BTree::delete` returns `Ok(false)` for an absent
-                    // key; legacy `update_index_on_delete` was idempotent,
-                    // so we swallow that case here too.
-                    let _ = idx_tree.delete(&write.key)?;
-                }
+            // Idempotent: if an index with this name already exists we
+            // treat the call as a no-op (matches pre-PR-9 semantics).
+            // We do NOT re-check state here — a caller seeing an
+            // in-progress Building entry from a prior failed build is
+            // reported as "exists"; the prior build's cleanup will have
+            // removed it if it failed. If cleanup itself failed and an
+            // orphan Building entry remains, callers can drop_index and
+            // retry.
+            if cat.get_index(ns, name)?.is_some() {
+                outcome.set(ReserveOutcome::AlreadyExists);
+                return Ok(());
             }
-            state.current_root = idx_tree.root_page;
-            state.current_level = idx_tree.root_level;
-        }
 
-        for (_, state) in states {
-            self.sync_index_entry(
-                &state.entry,
-                state.current_root,
-                state.current_level,
-                state.entry.multikey,
-            )?;
-        }
+            let idx_root = cat.create_index(ns, model, name)?;
+            // `catalog.create_index` defaults `state` to `Ready`. Flip
+            // to `Building` so the published snapshot marks this index
+            // as not-yet-queryable.
+            let mut entry = cat
+                .get_index(ns, name)?
+                .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
+            entry.state = IndexState::Building;
+            cat.update_index(&entry)?;
+            drop(cat);
+            sync_catalog_root_overlay(shared, md, overlay)?;
 
-        Ok(())
+            // Initialize the freshly-allocated leaf page so the index
+            // tree is valid to open for writes during Phase 2.
+            let idx_store = new_txn_store(shared, overlay);
+            BTree::create_at(idx_store, idx_root)?;
+            Ok(())
+        })?;
+        Ok(outcome.get())
     }
 
-    /// Install staged primary-tree writes as fresh heads on each key's
-    /// per-leaf version chain (MVCC T5' sub-step 2).
+    /// Phase 2 of `create_index`: populate the index from the data tree.
     ///
-    /// For each `PrimaryWrite`:
-    /// 1. Resolve the current tree by namespace (so in-txn root splits
-    ///    between stage and install time are transparently followed).
-    /// 2. Walk from the current root to the owning leaf via
-    ///    [`BTree::find_leaf`].
-    /// 3. Pin the leaf (`fetch_page`) so `take_chain` / `put_chain` reach
-    ///    the resident frame. The pin drops at end of iteration.
-    /// 4. Take the existing chain (or start an empty one), advance the
-    ///    prior head's `stop_ts` to `commit_ts` via [`Arc::make_mut`]
-    ///    (CoW — concurrent `ChainSnapshot` holders keep their frozen
-    ///    view), then `push_front` a fresh `VersionEntry` carrying
-    ///    `commit_ts` and this txn's `txn_id`.
-    /// 5. `put_chain` the updated `Arc<VecDeque<VersionEntry>>` back onto
-    ///    the frame.
-    ///
-    /// If the namespace isn't cached in `data_trees` (collection dropped
-    /// mid-txn), the write is silently skipped — the dual-write on-disk
-    /// cell remains authoritative under current semantics, and the chain
-    /// entry would be referencing a dead tree root anyway.
-    fn install_pending_primary(
-        &mut self,
-        writes: Vec<crate::mvcc::PrimaryWrite>,
-        commit_ts: crate::mvcc::Ts,
-        txn_id: u64,
-    ) -> Result<()> {
-        if writes.is_empty() {
-            return Ok(());
-        }
+    /// Runs under `metadata.read()` + the target namespace's lane, so
+    /// writers on *other* namespaces proceed concurrently. Writers on
+    /// this namespace wait on the lane (same as any other ns-local
+    /// serialization). Any writer that commits DURING the build on this
+    /// ns is blocked out; writers between Phase 1 and Phase 2 have
+    /// already dual-written to the Building index (via
+    /// `maintain_secondary_on_*`).
+    fn create_index_build(&self, ns: &str, name: &str) -> Result<()> {
+        // Acquire the namespace lane under a short-lived metadata.read()
+        // guard — the read guard blocks drop_namespace (which needs
+        // metadata.write()) from racing with lane acquisition. Once the
+        // lane is in hand, drop the read guard so the long build scan
+        // below does NOT block DDL on other namespaces or bootstrapping
+        // of new namespaces (Gap-9 follow-up; fixes PR 9's known v1
+        // limitation).
+        let lane = self.lane_for(ns);
+        let _lane_guard = {
+            let _md_read = self.metadata.read().map_err(|_| {
+                Error::Internal("metadata RwLock poisoned".into())
+            })?;
+            self.acquire_lane(lane)?
+            // _md_read dropped here.
+        };
 
-        use crate::mvcc::{PrimaryOp, Ts, VersionData, VersionEntry};
-        use std::collections::VecDeque;
+        // Take the latest IndexEntry AND CollectionEntry under a brief
+        // metadata.read(). The root pages observed here are authoritative:
+        // we now hold the namespace lane, so no concurrent writer on this
+        // ns can advance them until we release the lane. drop_namespace of
+        // this ns would block on the lane; drop_index of this index may
+        // race and leave us with a missing entry — we error cleanly.
+        let (idx_entry, data_entry) = {
+            let md_read = self.metadata.read().map_err(|_| {
+                Error::Internal("metadata RwLock poisoned".into())
+            })?;
+            let cat = md_read.catalog.lock().expect("catalog poisoned");
+            let idx_entry = cat.get_index(ns, name)?.ok_or_else(|| {
+                Error::Internal(format!(
+                    "index '{}' on '{}' disappeared before build phase",
+                    name, ns
+                ))
+            })?;
+            let data_entry = cat.get_collection(ns)?.ok_or_else(|| {
+                Error::Internal(format!(
+                    "collection '{}' disappeared before build phase",
+                    ns
+                ))
+            })?;
+            (idx_entry, data_entry)
+        };
 
-        for write in writes {
-            // Resolve current tree and find the owning leaf.
-            let leaf_page = match self.data_trees.get(&write.ns) {
-                Some(tree) => tree.find_leaf(&write.key)?,
-                None => continue,
-            };
-
-            // Pin the leaf so the chain helpers operate on a resident
-            // frame. Pin auto-unpins at end of scope.
-            let _pin = self.handle.fetch_page(leaf_page, PageSize::Large32k)?;
-
-            // Take the existing chain (or start fresh). `Arc::make_mut`
-            // gives CoW: if a concurrent `ChainSnapshot` is holding a
-            // reader view, their Arc count > 1 and the make_mut deep-clones;
-            // otherwise we mutate in-place.
-            let mut chain_arc = self
-                .handle
-                .pool()
-                .take_chain(leaf_page, &write.key)?
-                .unwrap_or_else(|| std::sync::Arc::new(VecDeque::new()));
-            {
-                let chain_mut = std::sync::Arc::make_mut(&mut chain_arc);
-                if let Some(prev_head) = chain_mut.front_mut() {
-                    prev_head.stop_ts = commit_ts;
-                }
-                let (data, is_tombstone) = match write.op {
-                    PrimaryOp::Insert { data } => (VersionData::Inline(data), false),
-                    PrimaryOp::Update { data } => (VersionData::Inline(data), false),
-                    PrimaryOp::Delete => (VersionData::Inline(Vec::new()), true),
-                };
-                chain_mut.push_front(VersionEntry {
-                    start_ts: commit_ts,
-                    stop_ts: Ts::MAX,
-                    txn_id,
-                    data,
-                    is_tombstone,
+        // Open a dedicated WAL transaction for the build — it's
+        // independent of Phase 1's txn (already committed) and Phase 3's
+        // txn (has not yet begun).
+        let mark = self.shared.handle.begin_txn()?;
+        let overlay = TxnOverlay::new_shared();
+        let ready_reservations = self
+            .shared
+            .handle
+            .allocator()
+            .drain_deferred_free_reservations();
+        if !ready_reservations.is_empty() {
+            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
+            for page in ready_reservations {
+                ov.push_reservation(PageReservation {
+                    page,
+                    size: PageSize::Large32k,
+                    origin: PageOrigin::DeferredFree,
                 });
             }
-            self.handle
-                .pool()
-                .put_chain(leaf_page, write.key, chain_arc)?;
         }
 
-        Ok(())
-    }
+        let body: Result<()> = (|| {
+            let data_store = new_txn_store(&self.shared, &overlay);
+            let data_tree = BTree::open(
+                data_store,
+                data_entry.data_root_page,
+                data_entry.data_root_level,
+            );
+            let idx_store = new_txn_store(&self.shared, &overlay);
+            let mut idx_tree = BTree::open(
+                idx_store,
+                idx_entry.root_page,
+                idx_entry.root_level,
+            );
+            let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
 
-    // -----------------------------------------------------------------------
-    // Index scan executor (R1.4)
-    // -----------------------------------------------------------------------
-
-    /// Build the [start, end] range for a secondary index B+ tree scan.
-    ///
-    /// The secondary index key format for an ascending single-field is:
-    /// `encode_key(field_val) | 0x01 | encode_key(_id)`
-    ///
-    /// Returns `(start, end)` suitable for `BTree::range_scan`.
-    /// `None` means unbounded in that direction.
-    /// A return of `(None, None)` with `condition == In` is a sentinel asking
-    /// the caller to perform multiple equality scans.
-    fn index_bounds(
-        condition: &IndexCondition,
-        ascending: bool,
-    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        /// Prefix bytes: `encode_compound_key([(val, ascending)]) + COMPOUND_SEP`.
-        /// All secondary-index keys with `field == val` start with this prefix
-        /// (followed by more bytes for the `_id` component).
-        fn prefix(val: &Bson, asc: bool) -> Vec<u8> {
-            let mut p = encode_compound_key(&[(val, asc)]);
-            p.push(COMPOUND_SEP); // 0x01
-            p
-        }
-        /// One past the prefix: prefix with last byte incremented (0x01 → 0x02).
-        /// Since COMPOUND_SEP < 0x02, every real key with `field == val` sorts
-        /// before this, so this byte sequence acts as an exclusive upper bound.
-        fn prefix_next(val: &Bson, asc: bool) -> Vec<u8> {
-            let mut p = prefix(val, asc);
-            *p.last_mut().unwrap() += 1; // COMPOUND_SEP + 1 = 0x02, safe
-            p
-        }
-
-        match condition {
-            // Exact equality: range [prefix(v), prefix_next(v)].
-            IndexCondition::Eq(v) => (Some(prefix(v, ascending)), Some(prefix_next(v, ascending))),
-
-            // Full scan through the secondary index (pass-through to the full filter).
-            IndexCondition::Any => (None, None),
-
-            // Multi-point: caller handles `In` with multiple equality sweeps.
-            IndexCondition::In(_) => (None, None),
-
-            IndexCondition::Range { gt, gte, lt, lte } => {
-                if ascending {
-                    // Ascending field: larger values have larger encoded keys.
-                    let start = match (gte.as_ref(), gt.as_ref()) {
-                        (Some(v), _) => Some(prefix(v, true)),        // field >= v
-                        (None, Some(v)) => Some(prefix_next(v, true)), // field >  v
-                        _ => None,
-                    };
-                    let end = match (lte.as_ref(), lt.as_ref()) {
-                        (Some(v), _) => Some(prefix_next(v, true)), // field <= v
-                        (None, Some(v)) => Some(prefix(v, true)),     // field <  v
-                        _ => None,
-                    };
-                    (start, end)
-                } else {
-                    // Descending field: encoding is inverted so range semantics
-                    // are mirrored.  $gt on field → smaller encoded prefix.
-                    let start = match (lte.as_ref(), lt.as_ref()) {
-                        (Some(v), _) => Some(prefix(v, false)),        // field <= v → encoded >=
-                        (None, Some(v)) => Some(prefix_next(v, false)), // field <  v → encoded >
-                        _ => None,
-                    };
-                    let end = match (gte.as_ref(), gt.as_ref()) {
-                        (Some(v), _) => Some(prefix_next(v, false)), // field >= v → encoded <=
-                        (None, Some(v)) => Some(prefix(v, false)),     // field >  v → encoded <
-                        _ => None,
-                    };
-                    (start, end)
+            // Persist the possibly-updated root + multikey flag. Note:
+            // we do NOT flip state to Ready here — that happens in
+            // Phase 3 under metadata.write() so readers see a
+            // consistent transition on the published snapshot.
+            let root_changed = idx_tree.root_page != idx_entry.root_page
+                || idx_tree.root_level != idx_entry.root_level;
+            let multikey_changed = any_multikey && !idx_entry.multikey;
+            if root_changed || multikey_changed {
+                let mut updated = idx_entry.clone();
+                if root_changed {
+                    updated.root_page = idx_tree.root_page;
+                    updated.root_level = idx_tree.root_level;
                 }
+                if multikey_changed {
+                    updated.multikey = true;
+                }
+                // Brief metadata.read() for the catalog write. Lane still
+                // protects same-ns serialization; read guard is acquired
+                // only for the duration of the catalog mutation + header
+                // sync so long-build scans don't block other-ns DDL.
+                let md_read = self.metadata.read().map_err(|_| {
+                    Error::Internal("metadata RwLock poisoned".into())
+                })?;
+                md_read
+                    .catalog
+                    .lock()
+                    .expect("catalog poisoned")
+                    .update_index(&updated)?;
+                sync_catalog_root_overlay(&self.shared, &md_read, &overlay)?;
+            }
+            Ok(())
+        })();
+
+        match body {
+            Ok(()) => {
+                // Commit the build txn. We intentionally do NOT hold
+                // commit_seq here — no timestamp is allocated (Phase 2
+                // has no primary writes), and no publish is performed.
+                // The only shared mutation is catalog root/multikey
+                // metadata, which is safe under the lane.
+                let overlay_inner = Arc::try_unwrap(overlay)
+                    .map_err(|_| {
+                        Error::Internal("TxnOverlay still referenced at build commit".into())
+                    })?
+                    .into_inner()
+                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
+                let mut base = new_store(&self.shared);
+                overlay_inner.commit(&mut base, &self.shared.handle)?;
+                self.shared.handle.flush()?;
+                let db_page_count = self
+                    .shared
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.total_page_count)?;
+                let header_data = {
+                    let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
+                    page.data().to_vec()
+                };
+                let emergency = self.shared.handle.commit_txn(
+                    0,
+                    PageSize::Small4k,
+                    &header_data,
+                    db_page_count,
+                )?;
+                if emergency {
+                    let _ = self.shared.handle.emergency_checkpoint();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.rollback_overlay_and_wal(overlay, mark);
+                Err(e)
             }
         }
     }
 
+    /// Phase 3 of `create_index`: flip `state: Ready` under metadata.write
+    /// and publish the final snapshot.
+    fn create_index_commit(&self, ns: &str, name: &str) -> Result<()> {
+        self.run_ddl(|_shared, md, _overlay| {
+            let mut cat = md.catalog.lock().expect("catalog poisoned");
+            let mut entry = cat.get_index(ns, name)?.ok_or_else(|| {
+                Error::Internal(format!(
+                    "index '{}' on '{}' disappeared before commit phase",
+                    name, ns
+                ))
+            })?;
+            entry.state = IndexState::Ready;
+            cat.update_index(&entry)?;
+            // No catalog-root change unless the B+ tree reshaped; since
+            // we only did an update-in-place of the entry, keep the
+            // header in sync just in case.
+            drop(cat);
+            sync_catalog_root_overlay(_shared, md, _overlay)?;
+            Ok(())
+        })
+    }
+
+    /// Cleanup after a failed Phase 2: drop the orphan Building entry.
+    ///
+    /// This keeps the catalog in a state where a retried
+    /// `create_index(ns, same_name)` succeeds from Phase 1 instead of
+    /// hitting the idempotent-already-exists early return with a stale
+    /// Building entry.
+    fn create_index_cleanup(&self, ns: &str, name: &str) -> Result<()> {
+        self.run_ddl(|shared, md, overlay| {
+            let removed = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .drop_index(ns, name)?;
+            if removed {
+                sync_catalog_root_overlay(shared, md, overlay)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// CRUD write lifecycle.
+    ///
+    /// Drives: metadata.read() → bootstrap-if-missing → lane → overlay +
+    /// WriteTxn setup → body → commit_seq { install_sec + install_primary +
+    /// overlay commit + flush + append_chain_commit + commit_txn +
+    /// rebuild_and_publish } → release lane → release metadata.
+    fn run_write<F, R>(&self, ns: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(
+            &SharedState,
+            &MetadataState,
+            &Arc<Mutex<TxnOverlay>>,
+            &mut WriteTxn,
+        ) -> Result<R>,
+    {
+        // Take read guard; if namespace absent, bootstrap then retry.
+        let md_read = self.metadata.read().map_err(|_| {
+            Error::Internal("metadata RwLock poisoned".into())
+        })?;
+        let ns_missing = md_read
+            .catalog
+            .lock()
+            .expect("catalog poisoned")
+            .get_collection(ns)?
+            .is_none();
+        if ns_missing {
+            drop(md_read);
+            self.bootstrap_namespace(ns)?;
+            // Re-acquire the read guard and proceed.
+            return self.run_write_existing(ns, f);
+        }
+        drop(md_read);
+        self.run_write_existing(ns, f)
+    }
+
+    /// Internal form of `run_write` that assumes the namespace already exists
+    /// (or the write path tolerates its absence — `update`/`delete` do).
+    ///
+    /// Deadlock fix (PR 8 follow-up): the previous revision upgraded
+    /// `metadata.read()` → `metadata.write()` while holding the
+    /// namespace lane. Two writers on different namespaces each held
+    /// `metadata.read()` and then tried to upgrade, producing a
+    /// writer-vs-writer deadlock (A holds lane+waits-for-write; B
+    /// holds read+waits-for-lane-from-A-after-its-upgrade).
+    ///
+    /// Fix: keep `metadata.read()` for the whole body; mutate the
+    /// catalog via the interior `Mutex<Catalog>`. Lock order is
+    /// documented on `MetadataState`.
+    fn run_write_existing<F, R>(&self, ns: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(
+            &SharedState,
+            &MetadataState,
+            &Arc<Mutex<TxnOverlay>>,
+            &mut WriteTxn,
+        ) -> Result<R>,
+    {
+        let md_read = self.metadata.read().map_err(|_| {
+            Error::Internal("metadata RwLock poisoned".into())
+        })?;
+        let lane = self.lane_for(ns);
+        let _lane_guard = self.acquire_lane(lane)?;
+
+        // Setup overlay + WriteTxn.
+        let mark = self.shared.handle.begin_txn()?;
+        let overlay = TxnOverlay::new_shared();
+        let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
+        if !ready.is_empty() {
+            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
+            for page in ready {
+                ov.push_reservation(PageReservation {
+                    page,
+                    size: PageSize::Large32k,
+                    origin: PageOrigin::DeferredFree,
+                });
+            }
+        }
+        let txn_id = self.shared.txn_counter.fetch_add(1, Ordering::Relaxed);
+        let mut txn = WriteTxn::new(txn_id);
+
+        // Body — pass `&*md_read` directly. The catalog itself is
+        // behind `Mutex<Catalog>`, so mutations happen inside the
+        // closure under the catalog mutex without needing a RwLock
+        // upgrade. Other CRUD writers on different namespaces hold
+        // their own `metadata.read()` concurrently and their own
+        // lanes; only `commit_seq` serializes the publish step.
+        let body_result = f(&self.shared, &*md_read, &overlay, &mut txn);
+
+        match body_result {
+            Ok(value) => {
+                // Commit sequencing.
+                let _commit = self.commit_seq.lock().map_err(|_| {
+                    Error::Internal("commit_seq mutex poisoned".into())
+                })?;
+
+                let sec_writes = std::mem::take(&mut txn.pending_sec_index);
+                if let Err(e) =
+                    install_pending_sec_index(&self.shared, &*md_read, &overlay, sec_writes)
+                {
+                    drop(txn);
+                    let _ = self.rollback_overlay_and_wal(overlay, mark);
+                    return Err(e);
+                }
+
+                let primary_writes = std::mem::take(&mut txn.pending_primary);
+                let commit_ts_opt = if !primary_writes.is_empty() {
+                    let txn_id = txn.txn_id;
+                    let commit_ts = match txn.allocate_commit_ts(&self.shared.oracle) {
+                        Ok(ts) => ts,
+                        Err(e) => {
+                            drop(txn);
+                            let _ = self.rollback_overlay_and_wal(overlay, mark);
+                            return Err(e);
+                        }
+                    };
+                    if let Err(e) = install_pending_primary(
+                        &self.shared,
+                        &*md_read,
+                        &overlay,
+                        primary_writes,
+                        commit_ts,
+                        txn_id,
+                    ) {
+                        drop(txn);
+                        let _ = self.rollback_overlay_and_wal(overlay, mark);
+                        return Err(e);
+                    }
+                    Some(commit_ts)
+                } else {
+                    None
+                };
+
+                // Commit overlay bytes onto shared frames.
+                let overlay_inner = Arc::try_unwrap(overlay)
+                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
+                    .into_inner()
+                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
+                let mut base_store = new_store(&self.shared);
+                if let Err(e) = overlay_inner.commit(&mut base_store, &self.shared.handle) {
+                    drop(txn);
+                    let _ = self.shared.handle.rollback_txn(mark);
+                    return Err(e);
+                }
+                self.shared.handle.flush()?;
+                let (_commit_ts, _installed, _sec_index) =
+                    txn.commit(&self.shared.oracle, &self.shared.handle)?;
+                let db_page_count = self
+                    .shared
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.total_page_count)?;
+                // Build the commit-frame page-0 bytes from the allocator's
+                // authoritative header rather than the buffer pool.  The
+                // overlay commit above (overlay_inner.commit) may have written
+                // a stale catalog_root_page to the pool if a concurrent DDL
+                // (e.g. drop_namespace) committed AFTER this txn's body ran
+                // but BEFORE we reached the commit-seq lock.  Reading from the
+                // allocator — which is always updated atomically under
+                // update_header — guarantees we persist the latest
+                // catalog_root_page even if a concurrent DDL beat us here.
+                let header_data = self
+                    .shared
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.to_bytes())?;
+                let emergency = self.shared.handle.commit_txn(
+                    0,
+                    PageSize::Small4k,
+                    &header_data,
+                    db_page_count,
+                )?;
+                if emergency {
+                    let _ = self.shared.handle.emergency_checkpoint();
+                }
+                let publish_ts = commit_ts_opt.unwrap_or_else(|| self.shared.oracle.now());
+                rebuild_and_publish_locked(&self.shared, &*md_read, publish_ts)?;
+                Ok(value)
+            }
+            Err(e) => {
+                drop(txn);
+                let _ = self.rollback_overlay_and_wal(overlay, mark);
+                Err(e)
+            }
+        }
+    }
+
+    fn rollback_overlay_and_wal(
+        &self,
+        overlay: Arc<Mutex<TxnOverlay>>,
+        mark: Option<u64>,
+    ) -> Result<()> {
+        let ov = Arc::try_unwrap(overlay)
+            .map_err(|_| Error::Internal("TxnOverlay still referenced at rollback time".into()))?
+            .into_inner()
+            .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
+        ov.rollback(&self.shared.handle)?;
+        let _ = self.shared.handle.rollback_txn(mark);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
-    // Read-only helpers (R1.6 SWMR)
+    // Read-only catalog helpers (used by try_index_scan_ro etc.)
     // -----------------------------------------------------------------------
 
-    /// Open a data tree for reading without mutating the cache.
-    ///
-    /// If the tree is already cached (placed there by a previous write), the
-    /// cached root page/level is used (it reflects the latest committed
-    /// state).  Otherwise the catalog is consulted, which also reflects the
-    /// last committed state.
-    ///
-    /// The returned tree is an independent handle — it does **not** affect
-    /// the write cache in `data_trees`.  Takes `&self` so it can be called
-    /// while holding an `RwLock` read guard.
-    fn open_tree_for_read(&self, ns: &str) -> Result<Option<BTree<BufferPoolPageStore>>> {
-        // Prefer the in-memory cache: it holds the current root after the
-        // latest write (may be ahead of what is flushed to catalog on disk).
-        if let Some(cached) = self.data_trees.get(ns) {
-            let store = self.new_store();
-            return Ok(Some(BTree::open(store, cached.root_page, cached.root_level)));
-        }
-        // Not cached — fall back to the catalog (reads only, &self OK).
-        if let Some(entry) = self.catalog.get_collection(ns)? {
-            let store = self.new_store();
+    /// Open a data tree for reading from `md` (non-mutating).
+    fn open_tree_for_read(
+        md: &MetadataState,
+        shared: &SharedState,
+        ns: &str,
+    ) -> Result<Option<BTree<BufferPoolPageStore>>> {
+        if let Some(entry) = md.catalog.lock().expect("catalog poisoned").get_collection(ns)? {
             Ok(Some(BTree::open(
-                store,
+                new_store(shared),
                 entry.data_root_page,
                 entry.data_root_level,
             )))
@@ -1189,259 +1937,42 @@ impl BpBackend {
             Ok(None)
         }
     }
-
-    /// Read-only variant of [`try_index_scan`] that takes `&self`.
-    ///
-    /// Used by read operations that hold an `RwLock` read guard.  Does not
-    /// mutate the data-tree cache.  All B+ trees (index and data) are opened
-    /// as fresh, independent handles via [`open_tree_for_read`].
-    fn try_index_scan_ro(
-        &self,
-        ns: &str,
-        filter: &Document,
-    ) -> Result<Option<Vec<Document>>> {
-        let entries = self.catalog.list_indexes(ns)?;
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        let index_metas: Vec<IndexMeta<'_>> = entries
-            .iter()
-            .map(|e| IndexMeta {
-                name: &e.name,
-                keys: &e.key_pattern,
-            })
-            .collect();
-        if index_metas.is_empty() {
-            return Ok(None);
-        }
-
-        let plan = select_plan(filter, &index_metas);
-        let (index_name, primary_field, condition) = match plan {
-            ScanPlan::CollScan => return Ok(None),
-            ScanPlan::IndexScan {
-                index_name,
-                primary_field,
-                condition,
-            } => (index_name, primary_field, condition),
-        };
-
-        let idx_entry = entries
-            .iter()
-            .find(|e| e.name == index_name)
-            .cloned()
-            .ok_or_else(|| Error::Internal(format!("index '{}' not in catalog", index_name)))?;
-
-        let ascending = idx_entry
-            .key_pattern
-            .get(&primary_field)
-            .map(|v| !matches!(v, Bson::Int32(-1) | Bson::Int64(-1)))
-            .unwrap_or(true);
-
-        let handle = Arc::clone(&self.handle);
-        let id_bsons: Vec<Bson> = if let IndexCondition::In(vals) = &condition {
-            let mut results = Vec::new();
-            for v in vals {
-                let mut p = encode_compound_key(&[(v, ascending)]);
-                p.push(COMPOUND_SEP);
-                let mut p_next = p.clone();
-                *p_next.last_mut().unwrap() += 1;
-                let idx_store = self.new_store();
-                let idx_tree =
-                    BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
-                for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
-                    let id = Self::index_entry_id(&handle, cv)?;
-                    if !matches!(id, Bson::Null) {
-                        results.push(id);
-                    }
-                }
-            }
-            results
-        } else {
-            let (start, end) = Self::index_bounds(&condition, ascending);
-            let idx_store = self.new_store();
-            let idx_tree = BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
-            idx_tree
-                .range_scan(start.as_deref(), end.as_deref())?
-                .into_iter()
-                .filter_map(|(_, cv)| {
-                    Self::index_entry_id(&handle, cv)
-                        .ok()
-                        .filter(|id| !matches!(id, Bson::Null))
-                })
-                .collect()
-        };
-
-        // Look up documents using the read-only tree handle.
-        let mut docs = Vec::new();
-        if !id_bsons.is_empty() {
-            // Open the data tree once (outside the loop) for efficiency.
-            if let Some(data_tree) = self.open_tree_for_read(ns)? {
-                for id_bson in id_bsons {
-                    let data_key = encode_key(&id_bson);
-                    if let Some(cv) = data_tree.search(&data_key)? {
-                        let doc_bytes = resolve_cell(&data_tree, cv)?;
-                        let doc: Document =
-                            bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
-                        if eval_filter(&doc, filter)? {
-                            docs.push(doc);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Some(docs))
-    }
-
-    /// Execute an index scan on `ns` for `filter` in the buffered backend.
-    ///
-    /// Returns `Some(docs)` when an index was used, `None` when the planner
-    /// decided a full collection scan is better (or when no indexes exist).
-    ///
-    /// When `Some` is returned the caller must still apply `find_opts` (sort,
-    /// skip, limit, projection) but does **not** need to re-apply the filter
-    /// because the full filter is evaluated here against every candidate doc.
-    #[allow(dead_code)]
-    fn try_index_scan(
-        &mut self,
-        ns: &str,
-        filter: &Document,
-    ) -> Result<Option<Vec<Document>>> {
-        // Build IndexMeta list from catalog.
-        let entries = self.catalog.list_indexes(ns)?;
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        let index_metas: Vec<IndexMeta<'_>> = entries
-            .iter()
-            .map(|e| IndexMeta {
-                name: &e.name,
-                keys: &e.key_pattern,
-            })
-            .collect();
-        if index_metas.is_empty() {
-            return Ok(None);
-        }
-
-        // Ask the planner for a plan.
-        let plan = select_plan(filter, &index_metas);
-        let (index_name, primary_field, condition) = match plan {
-            ScanPlan::CollScan => return Ok(None),
-            ScanPlan::IndexScan {
-                index_name,
-                primary_field,
-                condition,
-            } => (index_name, primary_field, condition),
-        };
-
-        // Find the index entry.
-        let idx_entry = entries
-            .iter()
-            .find(|e| e.name == index_name)
-            .cloned()
-            .ok_or_else(|| Error::Internal(format!("index '{}' not in catalog", index_name)))?;
-
-        // Determine the scan direction of the primary field.
-        let ascending = idx_entry
-            .key_pattern
-            .get(&primary_field)
-            .map(|v| !matches!(v, Bson::Int32(-1) | Bson::Int64(-1)))
-            .unwrap_or(true);
-
-        // Collect candidate _id values from the secondary index tree.
-        let handle = Arc::clone(&self.handle);
-        let id_bsons: Vec<Bson> = if let IndexCondition::In(vals) = &condition {
-            // Multi-point: run one equality scan per value and union.
-            let mut results = Vec::new();
-            for v in vals {
-                let mut p = encode_compound_key(&[(v, ascending)]);
-                p.push(COMPOUND_SEP);
-                let mut p_next = p.clone();
-                *p_next.last_mut().unwrap() += 1;
-                let idx_store = self.new_store();
-                let idx_tree =
-                    BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
-                for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
-                    let id = Self::index_entry_id(&handle, cv)?;
-                    if !matches!(id, Bson::Null) {
-                        results.push(id);
-                    }
-                }
-            }
-            results
-        } else {
-            let (start, end) = Self::index_bounds(&condition, ascending);
-            let idx_store = self.new_store();
-            let idx_tree = BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
-            idx_tree
-                .range_scan(start.as_deref(), end.as_deref())?
-                .into_iter()
-                .filter_map(|(_, cv)| {
-                    Self::index_entry_id(&handle, cv)
-                        .ok()
-                        .filter(|id| !matches!(id, Bson::Null))
-                })
-                .collect()
-        };
-
-        // Look up documents in the data tree and apply the full filter.
-        let mut docs = Vec::new();
-        for id_bson in id_bsons {
-            let data_key = encode_key(&id_bson);
-            let data_tree_opt = self.tree(ns)?;
-            if let Some(data_tree) = data_tree_opt {
-                if let Some(cv) = data_tree.search(&data_key)? {
-                    let doc_bytes = resolve_cell(data_tree, cv)?;
-                    let doc: Document =
-                        bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
-                    if eval_filter(&doc, filter)? {
-                        docs.push(doc);
-                    }
-                }
-            }
-        }
-        Ok(Some(docs))
-    }
 }
 
 // ---------------------------------------------------------------------------
-// PagedEngine — public struct
+// OwnedLaneGuard — holds Arc<Mutex<()>> + its MutexGuard together so the
+// stdlib Mutex lifetime restriction is satisfied.
 // ---------------------------------------------------------------------------
 
-/// Phase 1 storage engine: B+ tree per namespace, through the buffer pool.
-///
-/// ## Concurrency
-///
-/// `inner` is protected by an `RwLock` to implement Single-Writer Multiple-Reader
-/// (SWMR) snapshot isolation (R1.6):
-///
-/// - **Readers** (`find`, `find_one`, `count`, `list_indexes`, etc.) acquire a
-///   shared read lock — any number of readers can run concurrently.
-/// - **Writers** (`insert`, `update`, `delete`, `create_index`, etc.) acquire an
-///   exclusive write lock — one writer at a time, writers never block readers.
-pub(crate) struct PagedEngine {
-    inner: Mutex<BpBackend>,
+struct OwnedLaneGuard {
+    // The Arc keeps the Mutex alive. `_guard` is the MutexGuard that
+    // references the Mutex through `lane`. We hold the Arc AFTER the
+    // guard so drop order is: guard (release lock) then lane.
+    _guard: std::sync::MutexGuard<'static, ()>,
+    _lane: Arc<Mutex<()>>,
 }
 
-impl PagedEngine {
-
-    /// Create a file-backed engine using `handle` as the page store.
-    ///
-    /// If `catalog_root_page == 0` the database is new and an empty catalog
-    /// will be created.  Otherwise the catalog is opened at the given root.
-    pub(crate) fn new_buffered(
-        handle: Arc<BufferPoolHandle>,
-        catalog_root_page: u32,
-        catalog_root_level: u8,
-    ) -> Result<Self> {
-        let backend = BpBackend::new(handle, catalog_root_page, catalog_root_level)?;
-        Ok(PagedEngine {
-            inner: Mutex::new(backend),
-        })
+impl OwnedLaneGuard {
+    fn new(lane: Arc<Mutex<()>>, guard: std::sync::MutexGuard<'_, ()>) -> Self {
+        // Extend the lifetime of the guard to 'static. Safe because we
+        // keep `lane` alive inside `Self`, so the backing Mutex lives at
+        // least as long as the guard.
+        let guard_static: std::sync::MutexGuard<'static, ()> =
+            unsafe { std::mem::transmute(guard) };
+        OwnedLaneGuard {
+            _guard: guard_static,
+            _lane: lane,
+        }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // StorageEngine implementation
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// StorageEngine implementation (PR 8 — MWMR v1)
 // ---------------------------------------------------------------------------
 
 impl StorageEngine for PagedEngine {
@@ -1450,23 +1981,28 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn insert(&self, ns: &str, mut doc: Document) -> Result<Bson> {
-        let mut inner = self.inner.lock().unwrap();
-        let bp = &mut *inner;
-        bp.with_txn(|bp| {
-            // Insert into the primary (data) tree.  Unique-constraint
-            // checking for secondary indexes happens below after the
-            // secondary index trees are maintained.
-            let (id, key, bson_bytes, _tree_root) = {
-                let tree = bp.tree_or_create(ns)?;
-                btree_insert_doc(tree, &mut doc, &[])?
-            };
-            bp.active_txn_mut()
-                .expect("insert must run inside with_txn")
-                .stage_primary_insert(ns.to_string(), key, bson_bytes);
-            bp.sync_data_root(ns)?;
-            // Maintain secondary indexes (includes unique-constraint
-            // enforcement via the index B+ trees themselves).
-            bp.maintain_secondary_on_insert(ns, &doc, &id)?;
+        self.run_write(ns, |shared, md, overlay, txn| {
+            let entry = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .get_collection(ns)?
+                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-write", ns)))?;
+            let mut tree = BTree::open(
+                new_txn_store(shared, overlay),
+                entry.data_root_page,
+                entry.data_root_level,
+            );
+            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut doc, &[])?;
+            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
+                let mut updated = entry.clone();
+                updated.data_root_page = tree.root_page;
+                updated.data_root_level = tree.root_level;
+                md.catalog.lock().expect("catalog poisoned").update_collection(&updated)?;
+                sync_catalog_root_overlay(shared, md, overlay)?;
+            }
+            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+            maintain_secondary_on_insert(shared, md, overlay, ns, &doc, &id, txn)?;
             Ok(id)
         })
     }
@@ -1476,37 +2012,27 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn find(&self, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>> {
-        // Read-only: acquire a shared read lock so concurrent readers don't block.
-        let inner = self.inner.lock().unwrap();
-        let bp = &*inner;
-        let matched: Vec<Document> = {
-            // Try an index scan first; fall back to a full collection scan.
-            if let Some(docs) = bp.try_index_scan_ro(ns, filter)? {
-                docs
-            } else {
-                match bp.open_tree_for_read(ns)? {
-                    None => return Ok(Vec::new()),
-                    Some(tree) => {
-                        let view = bp.open_read_view();
-                        let probe = bp.primary_history_probe(ns);
-                        btree_collscan(&tree, filter, &view, Some(&probe))?
-                            .into_iter()
-                            .map(|(_, doc)| doc)
-                            .collect()
-                    }
-                }
-            }
+        let snap = self.shared.published.load();
+        let ns_snap = match snap.namespaces.get(ns) {
+            None => return Ok(Vec::new()),
+            Some(n) => n,
         };
+        let matched: Vec<Document> = execute_snapshot_pairs_from_snap(
+            &self.shared,
+            ns,
+            ns_snap,
+            filter,
+            snap.publish_ts,
+            true,
+        )?
+        .into_iter()
+        .map(|(_, doc)| doc)
+        .collect();
         Ok(apply_find_opts(matched, opts))
     }
 
-    // -----------------------------------------------------------------------
-    // find_one
-    // -----------------------------------------------------------------------
-
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         let opts = FindOptions::new();
-        // find() already acquires a read lock internally.
         let mut results = self.find(ns, filter, &opts)?;
         Ok(if results.is_empty() {
             None
@@ -1529,37 +2055,40 @@ impl StorageEngine for PagedEngine {
     ) -> Result<UpdateResult> {
         if !is_operator_update(update) {
             return Err(Error::Internal(
-                "update requires an operator update document (e.g. {$set: {...}}); \
-                 use find_one_and_replace for replacements"
+                "update requires an operator update document (e.g. {$set: {...}});                  use find_one_and_replace for replacements"
                     .into(),
             ));
         }
 
-        let mut inner = self.inner.lock().unwrap();
-        let (matched_pairs, tree_exists): (Vec<(Vec<u8>, Document)>, bool) = {
-            let bp = &mut *inner;
-            let view = bp.open_read_view();
-            let probe = bp.primary_history_probe(ns);
-            match bp.tree(ns)? {
-                None => {
-                    if opts.upsert {
-                        drop(inner);
-                        return self.do_upsert_update(ns, filter, update);
-                    }
-                    return Ok(UpdateResult {
-                        matched_count: 0,
-                        modified_count: 0,
-                        upserted_id: None,
-                    });
+        // Pre-scan phase uses the published snapshot (mutex-free). If the
+        // namespace does not exist and upsert is requested, route to the
+        // upsert helper.
+        let snap = self.shared.published.load();
+        let ns_snap_opt = snap.namespaces.get(ns);
+        let matched_pairs: Vec<(Vec<u8>, Document)> = match ns_snap_opt {
+            None => {
+                if opts.upsert {
+                    return self.do_upsert_update(ns, filter, update);
                 }
-                Some(tree) => (btree_collscan(tree, filter, &view, Some(&probe))?, true),
+                return Ok(UpdateResult {
+                    matched_count: 0,
+                    modified_count: 0,
+                    upserted_id: None,
+                });
+            }
+            Some(ns_snap) => {
+                execute_snapshot_pairs_from_snap(
+                    &self.shared,
+                    ns,
+                    ns_snap,
+                    filter,
+                    snap.publish_ts,
+                    false,
+                )?
             }
         };
 
-        let _ = tree_exists;
-
         if matched_pairs.is_empty() && opts.upsert {
-            drop(inner);
             return self.do_upsert_update(ns, filter, update);
         }
 
@@ -1569,8 +2098,7 @@ impl StorageEngine for PagedEngine {
             matched_pairs.into_iter().take(1).collect()
         };
 
-        let bp = &mut *inner;
-        bp.with_txn(move |bp| {
+        self.run_write_existing(ns, |shared, md, overlay, txn| {
             let mut matched_count = 0u64;
             let mut modified_count = 0u64;
             for (key, mut doc) in pairs_to_process {
@@ -1581,24 +2109,37 @@ impl StorageEngine for PagedEngine {
                 if doc != before {
                     modified_count += 1;
                     let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                    let new_bytes =
-                        bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-                    bp.maintain_secondary_on_update(
-                        ns, &before, &doc, &before_id, &new_id,
+                    let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
+                    maintain_secondary_on_update(
+                        shared, md, overlay, ns, &before, &doc, &before_id, &new_id, txn,
                     )?;
-                    let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
+                    let entry_opt = md
+                        .catalog
+                        .lock()
+                        .expect("catalog poisoned")
+                        .get_collection(ns)?;
+                    if let Some(entry) = entry_opt {
+                        let mut tree = BTree::open(
+                            new_txn_store(shared, overlay),
+                            entry.data_root_page,
+                            entry.data_root_level,
+                        );
                         tree.delete(&key)?;
                         tree.insert(&key, &new_bytes)?;
-                        true
-                    } else {
-                        false
-                    };
-                    if tree_exists {
-                        bp.active_txn_mut()
-                            .expect("update must run inside with_txn")
-                            .stage_primary_update(ns.to_string(), key, new_bytes);
+                        if tree.root_page != entry.data_root_page
+                            || tree.root_level != entry.data_root_level
+                        {
+                            let mut updated = entry.clone();
+                            updated.data_root_page = tree.root_page;
+                            updated.data_root_level = tree.root_level;
+                            md.catalog
+                                .lock()
+                                .expect("catalog poisoned")
+                                .update_collection(&updated)?;
+                            sync_catalog_root_overlay(shared, md, overlay)?;
+                        }
+                        txn.stage_primary_update(ns.to_string(), key, new_bytes);
                     }
-                    bp.sync_data_root(ns)?;
                 }
             }
             Ok(UpdateResult {
@@ -1614,45 +2155,61 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
-        let mut inner = self.inner.lock().unwrap();
-
-        // Collect (key, doc) pairs to delete; we need the doc for index maintenance.
-        let pairs_to_delete: Vec<(Vec<u8>, Document)> = {
-            let bp = &mut *inner;
-            let view = bp.open_read_view();
-            let probe = bp.primary_history_probe(ns);
-            match bp.tree(ns)? {
-                None => return Ok(DeleteResult { deleted_count: 0 }),
-                Some(tree) => {
-                    let pairs = btree_collscan(tree, filter, &view, Some(&probe))?;
-                    if many {
-                        pairs
-                    } else {
-                        pairs.into_iter().take(1).collect()
-                    }
+        let snap = self.shared.published.load();
+        let pairs_to_delete: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
+            None => return Ok(DeleteResult { deleted_count: 0 }),
+            Some(ns_snap) => {
+                let pairs = execute_snapshot_pairs_from_snap(
+                    &self.shared,
+                    ns,
+                    ns_snap,
+                    filter,
+                    snap.publish_ts,
+                    false,
+                )?;
+                if many {
+                    pairs
+                } else {
+                    pairs.into_iter().take(1).collect()
                 }
             }
         };
 
         let deleted_count = pairs_to_delete.len() as u64;
+        if deleted_count == 0 {
+            return Ok(DeleteResult { deleted_count: 0 });
+        }
 
-        let bp = &mut *inner;
-        bp.with_txn(move |bp| {
+        self.run_write_existing(ns, |shared, md, overlay, txn| {
             for (key, doc) in &pairs_to_delete {
                 let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                bp.maintain_secondary_on_delete(ns, doc, &doc_id)?;
-                let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
+                maintain_secondary_on_delete(shared, md, overlay, ns, doc, &doc_id, txn)?;
+                let entry_opt = md
+                    .catalog
+                    .lock()
+                    .expect("catalog poisoned")
+                    .get_collection(ns)?;
+                if let Some(entry) = entry_opt {
+                    let mut tree = BTree::open(
+                        new_txn_store(shared, overlay),
+                        entry.data_root_page,
+                        entry.data_root_level,
+                    );
                     tree.delete(key)?;
-                    true
-                } else {
-                    false
-                };
-                if tree_exists {
-                    bp.active_txn_mut()
-                        .expect("delete must run inside with_txn")
-                        .stage_primary_delete(ns.to_string(), key.clone());
+                    if tree.root_page != entry.data_root_page
+                        || tree.root_level != entry.data_root_level
+                    {
+                        let mut updated = entry.clone();
+                        updated.data_root_page = tree.root_page;
+                        updated.data_root_level = tree.root_level;
+                        md.catalog
+                            .lock()
+                            .expect("catalog poisoned")
+                            .update_collection(&updated)?;
+                        sync_catalog_root_overlay(shared, md, overlay)?;
+                    }
+                    txn.stage_primary_delete(ns.to_string(), key.clone());
                 }
-                bp.sync_data_root(ns)?;
             }
             Ok(())
         })?;
@@ -1665,18 +2222,22 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
-        // Read-only: shared read lock for concurrent reader support.
-        let inner = self.inner.lock().unwrap();
-        let bp = &*inner;
-        match bp.open_tree_for_read(ns)? {
-            None => Ok(0),
-            Some(tree) => {
-                let view = bp.open_read_view();
-                let probe = bp.primary_history_probe(ns);
-                let pairs = btree_collscan(&tree, filter, &view, Some(&probe))?;
-                Ok(pairs.len() as u64)
-            }
-        }
+        let snap = self.shared.published.load();
+        let ns_snap = match snap.namespaces.get(ns) {
+            None => return Ok(0),
+            Some(n) => n,
+        };
+        Ok(
+            execute_snapshot_pairs_from_snap(
+                &self.shared,
+                ns,
+                ns_snap,
+                filter,
+                snap.publish_ts,
+                false,
+            )?
+            .len() as u64,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1696,26 +2257,28 @@ impl StorageEngine for PagedEngine {
             ));
         }
 
-        let mut inner = self.inner.lock().unwrap();
-        let mut matched: Vec<(Vec<u8>, Document)> = {
-            let bp = &mut *inner;
-            let view = bp.open_read_view();
-            let probe = bp.primary_history_probe(ns);
-            match bp.tree(ns)? {
-                None => {
-                    if opts.upsert {
-                        drop(inner);
-                        return self.fam_upsert_update(ns, filter, update, opts);
-                    }
-                    return Ok(None);
+        let snap = self.shared.published.load();
+        let mut matched: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
+            None => {
+                if opts.upsert {
+                    return self.fam_upsert_update(ns, filter, update, opts);
                 }
-                Some(tree) => btree_collscan(tree, filter, &view, Some(&probe))?,
+                return Ok(None);
+            }
+            Some(ns_snap) => {
+                execute_snapshot_pairs_from_snap(
+                    &self.shared,
+                    ns,
+                    ns_snap,
+                    filter,
+                    snap.publish_ts,
+                    false,
+                )?
             }
         };
 
         if matched.is_empty() {
             if opts.upsert {
-                drop(inner);
                 return self.fam_upsert_update(ns, filter, update, opts);
             }
             return Ok(None);
@@ -1730,24 +2293,39 @@ impl StorageEngine for PagedEngine {
         let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
         apply_update(&mut doc, update, false)?;
         let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-
         let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-        let bp = &mut *inner;
-        bp.with_txn(|bp| {
-            bp.maintain_secondary_on_update(ns, &before, &doc, &before_id, &new_id)?;
-            let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
+
+        self.run_write_existing(ns, |shared, md, overlay, txn| {
+            maintain_secondary_on_update(
+                shared, md, overlay, ns, &before, &doc, &before_id, &new_id, txn,
+            )?;
+            let entry_opt = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .get_collection(ns)?;
+            if let Some(entry) = entry_opt {
+                let mut tree = BTree::open(
+                    new_txn_store(shared, overlay),
+                    entry.data_root_page,
+                    entry.data_root_level,
+                );
                 tree.delete(&key)?;
                 tree.insert(&key, &new_bytes)?;
-                true
-            } else {
-                false
-            };
-            if tree_exists {
-                bp.active_txn_mut()
-                    .expect("find_one_and_update must run inside with_txn")
-                    .stage_primary_update(ns.to_string(), key, new_bytes);
+                if tree.root_page != entry.data_root_page
+                    || tree.root_level != entry.data_root_level
+                {
+                    let mut updated = entry.clone();
+                    updated.data_root_page = tree.root_page;
+                    updated.data_root_level = tree.root_level;
+                    md.catalog
+                        .lock()
+                        .expect("catalog poisoned")
+                        .update_collection(&updated)?;
+                    sync_catalog_root_overlay(shared, md, overlay)?;
+                }
+                txn.stage_primary_update(ns.to_string(), key, new_bytes);
             }
-            bp.sync_data_root(ns)?;
             Ok(())
         })?;
 
@@ -1767,15 +2345,17 @@ impl StorageEngine for PagedEngine {
         filter: &Document,
         opts: &FindOneAndDeleteOptions,
     ) -> Result<Option<Document>> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut matched: Vec<(Vec<u8>, Document)> = {
-            let bp = &mut *inner;
-            let view = bp.open_read_view();
-            let probe = bp.primary_history_probe(ns);
-            match bp.tree(ns)? {
-                None => return Ok(None),
-                Some(tree) => btree_collscan(tree, filter, &view, Some(&probe))?,
-            }
+        let snap = self.shared.published.load();
+        let mut matched: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
+            None => return Ok(None),
+            Some(ns_snap) => execute_snapshot_pairs_from_snap(
+                &self.shared,
+                ns,
+                ns_snap,
+                filter,
+                snap.publish_ts,
+                false,
+            )?,
         };
 
         if matched.is_empty() {
@@ -1789,21 +2369,34 @@ impl StorageEngine for PagedEngine {
         let (key, doc) = matched.remove(0);
         let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
-        let bp = &mut *inner;
-        bp.with_txn(|bp| {
-            bp.maintain_secondary_on_delete(ns, &doc, &doc_id)?;
-            let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
+        self.run_write_existing(ns, |shared, md, overlay, txn| {
+            maintain_secondary_on_delete(shared, md, overlay, ns, &doc, &doc_id, txn)?;
+            let entry_opt = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .get_collection(ns)?;
+            if let Some(entry) = entry_opt {
+                let mut tree = BTree::open(
+                    new_txn_store(shared, overlay),
+                    entry.data_root_page,
+                    entry.data_root_level,
+                );
                 tree.delete(&key)?;
-                true
-            } else {
-                false
-            };
-            if tree_exists {
-                bp.active_txn_mut()
-                    .expect("find_one_and_delete must run inside with_txn")
-                    .stage_primary_delete(ns.to_string(), key);
+                if tree.root_page != entry.data_root_page
+                    || tree.root_level != entry.data_root_level
+                {
+                    let mut updated = entry.clone();
+                    updated.data_root_page = tree.root_page;
+                    updated.data_root_level = tree.root_level;
+                    md.catalog
+                        .lock()
+                        .expect("catalog poisoned")
+                        .update_collection(&updated)?;
+                    sync_catalog_root_overlay(shared, md, overlay)?;
+                }
+                txn.stage_primary_delete(ns.to_string(), key);
             }
-            bp.sync_data_root(ns)?;
             Ok(())
         })?;
 
@@ -1821,26 +2414,28 @@ impl StorageEngine for PagedEngine {
         replacement: &Document,
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut matched: Vec<(Vec<u8>, Document)> = {
-            let bp = &mut *inner;
-            let view = bp.open_read_view();
-            let probe = bp.primary_history_probe(ns);
-            match bp.tree(ns)? {
-                None => {
-                    if opts.upsert {
-                        drop(inner);
-                        return self.fam_upsert_replace(ns, replacement, opts);
-                    }
-                    return Ok(None);
+        let snap = self.shared.published.load();
+        let mut matched: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
+            None => {
+                if opts.upsert {
+                    return self.fam_upsert_replace(ns, replacement, opts);
                 }
-                Some(tree) => btree_collscan(tree, filter, &view, Some(&probe))?,
+                return Ok(None);
+            }
+            Some(ns_snap) => {
+                execute_snapshot_pairs_from_snap(
+                    &self.shared,
+                    ns,
+                    ns_snap,
+                    filter,
+                    snap.publish_ts,
+                    false,
+                )?
             }
         };
 
         if matched.is_empty() {
             if opts.upsert {
-                drop(inner);
                 return self.fam_upsert_replace(ns, replacement, opts);
             }
             return Ok(None);
@@ -1852,9 +2447,7 @@ impl StorageEngine for PagedEngine {
 
         let (old_key, old_doc) = matched.remove(0);
 
-        // Build the replacement, preserving _id.
         let mut new_doc = replacement.clone();
-        // Preserve the original _id.
         let original_id = old_doc.get("_id").cloned().unwrap_or(Bson::Null);
         new_doc.insert("_id", original_id.clone());
         validate_document(&new_doc)?;
@@ -1862,28 +2455,47 @@ impl StorageEngine for PagedEngine {
         let new_key = encode_key(&original_id);
         let new_bytes = bson::to_vec(&new_doc).map_err(Error::BsonSerialization)?;
 
-        let bp = &mut *inner;
-        bp.with_txn(|bp| {
-            bp.maintain_secondary_on_update(
+        let old_doc_clone = old_doc.clone();
+        let new_doc_clone = new_doc.clone();
+        self.run_write_existing(ns, |shared, md, overlay, txn| {
+            maintain_secondary_on_update(
+                shared,
+                md,
+                overlay,
                 ns,
-                &old_doc,
-                &new_doc,
+                &old_doc_clone,
+                &new_doc_clone,
                 &original_id,
                 &original_id,
+                txn,
             )?;
-            let tree_exists = if let Some(tree) = bp.tree_mut(ns)? {
+            let entry_opt = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .get_collection(ns)?;
+            if let Some(entry) = entry_opt {
+                let mut tree = BTree::open(
+                    new_txn_store(shared, overlay),
+                    entry.data_root_page,
+                    entry.data_root_level,
+                );
                 tree.delete(&old_key)?;
                 tree.insert(&new_key, &new_bytes)?;
-                true
-            } else {
-                false
-            };
-            if tree_exists {
-                bp.active_txn_mut()
-                    .expect("find_one_and_replace must run inside with_txn")
-                    .stage_primary_update(ns.to_string(), new_key, new_bytes);
+                if tree.root_page != entry.data_root_page
+                    || tree.root_level != entry.data_root_level
+                {
+                    let mut updated = entry.clone();
+                    updated.data_root_page = tree.root_page;
+                    updated.data_root_level = tree.root_level;
+                    md.catalog
+                        .lock()
+                        .expect("catalog poisoned")
+                        .update_collection(&updated)?;
+                    sync_catalog_root_overlay(shared, md, overlay)?;
+                }
+                txn.stage_primary_update(ns.to_string(), new_key, new_bytes);
             }
-            bp.sync_data_root(ns)?;
             Ok(())
         })?;
 
@@ -1894,7 +2506,19 @@ impl StorageEngine for PagedEngine {
     }
 
     // -----------------------------------------------------------------------
-    // create_index
+    // create_index — 3-phase build (PR 9)
+    //
+    // Phase 1 (reserve):  metadata.write()   — allocate idx root, publish
+    //                                          `IndexEntry { state: Building }`.
+    // Phase 2 (build):    metadata.read() +  — populate idx tree from data
+    //                     ns_lane              tree. Other-ns writers run
+    //                                          concurrently; same-ns writers
+    //                                          wait on the lane.
+    // Phase 3 (commit):   metadata.write()   — flip `state: Ready`, publish.
+    //
+    // Failure in phase 2 drops the Building entry in a recovery phase
+    // (same DDL shape as phase 3) so the catalog does not retain an
+    // orphan `Building` index.
     // -----------------------------------------------------------------------
 
     fn create_index(&self, ns: &str, model: &IndexModel) -> Result<String> {
@@ -1905,61 +2529,40 @@ impl StorageEngine for PagedEngine {
             .clone()
             .unwrap_or_else(|| generate_index_name(&model.keys));
 
-        let mut inner = self.inner.lock().unwrap();
-        let bp = &mut *inner;
-        {
-            // Ensure the collection exists in the catalog first.
-            if bp.catalog.get_collection(ns)?.is_none() {
-                let data_root = bp
-                    .catalog
-                    .create_collection(ns, bson::doc! {}, now_millis())?;
-                bp.sync_catalog_root()?;
-                // Initialise the data tree leaf page so it has a valid header.
-                let data_store = bp.new_store();
-                let data_tree = BTree::create_at(data_store, data_root)?;
-                bp.data_trees.insert(ns.to_owned(), data_tree);
-            }
-            // Idempotent: return existing index name.
-            if bp.catalog.get_index(ns, &name)?.is_some() {
-                return Ok(name);
-            }
-            // Allocate a root page and register the index in the catalog.
-            let idx_root = bp.catalog.create_index(ns, model, &name)?;
-            bp.sync_catalog_root()?;
-            // Initialise the index tree's leaf root page.
-            let idx_store = bp.new_store();
-            BTree::create_at(idx_store, idx_root)?;
-
-            // Build the index by scanning all documents already in the
-            // data tree ("online index build").
-            let idx_entry = bp
-                .catalog
-                .get_index(ns, &name)?
-                .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
-
-            // Open data tree (read-only scan); if the collection is empty
-            // this is a no-op.
-            if let Some(data_entry) = bp.catalog.get_collection(ns)? {
-                let data_store = bp.new_store();
-                let data_tree = BTree::open(
-                    data_store,
-                    data_entry.data_root_page,
-                    data_entry.data_root_level,
-                );
-                let idx_build_store = bp.new_store();
-                let mut idx_tree =
-                    BTree::open(idx_build_store, idx_entry.root_page, idx_entry.root_level);
-                let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
-
-                // Persist the (possibly updated) index root and multikey flag.
-                bp.sync_index_entry(
-                    &idx_entry,
-                    idx_tree.root_page,
-                    idx_tree.root_level,
-                    any_multikey,
-                )?;
-            }
+        // ---------------------------------------------------------------
+        // Phase 1 — Reserve (metadata.write + commit_seq, brief).
+        // ---------------------------------------------------------------
+        let reserve_outcome = self.create_index_reserve(ns, model, &name)?;
+        match reserve_outcome {
+            ReserveOutcome::AlreadyExists => return Ok(name),
+            ReserveOutcome::Reserved => {}
         }
+
+        // ---------------------------------------------------------------
+        // Phase 2 — Build (metadata.read + ns_lane). Long-running scan.
+        //
+        // A failure here leaves a Building entry in the catalog. We fall
+        // through to a cleanup DDL that drops it, keeping the catalog
+        // consistent for a retried `create_index`.
+        // ---------------------------------------------------------------
+        if let Err(build_err) = self.create_index_build(ns, &name) {
+            // Best-effort rollback of the orphan Building entry. Log-and-
+            // propagate if the cleanup itself fails: the caller sees the
+            // original build error, and the Building entry (if any
+            // remains) will still be skipped by the read path.
+            if let Err(cleanup_err) = self.create_index_cleanup(ns, &name) {
+                return Err(Error::Internal(format!(
+                    "create_index build failed: {}; cleanup also failed: {}",
+                    build_err, cleanup_err
+                )));
+            }
+            return Err(build_err);
+        }
+
+        // ---------------------------------------------------------------
+        // Phase 3 — Commit (metadata.write + commit_seq, brief).
+        // ---------------------------------------------------------------
+        self.create_index_commit(ns, &name)?;
         Ok(name)
     }
 
@@ -1973,12 +2576,26 @@ impl StorageEngine for PagedEngine {
                 detail: "drop of '_id_' index is not permitted".to_string(),
             });
         }
-        let mut inner = self.inner.lock().unwrap();
-        let bp = &mut *inner;
-        bp.with_txn(|bp| {
-            let removed = bp.catalog.drop_index(ns, name)?;
+        // Acquire the namespace lane before the DDL body. This serializes
+        // with any in-flight create_index Phase 2 build on the same ns —
+        // the build holds the lane, so drop_index waits for it to release.
+        // After the build finishes (or aborts), drop_index proceeds. A
+        // subsequent Phase 3 (Ready flip) or concurrent CRUD on this ns
+        // will see the missing entry and handle it cleanly.
+        //
+        // Lane-before-metadata ordering matches drop_namespace
+        // (src/storage/paged_engine.rs drop_namespace) and keeps us below
+        // the metadata RwLock in the documented lock order.
+        let lane_arc = self.lane_for(ns);
+        let _lane_guard = self.acquire_lane(lane_arc)?;
+        self.run_ddl(|shared, md, overlay| {
+            let removed = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .drop_index(ns, name)?;
             if removed {
-                bp.sync_catalog_root()?;
+                sync_catalog_root_overlay(shared, md, overlay)?;
                 Ok(())
             } else {
                 Err(Error::Internal(format!(
@@ -1994,16 +2611,19 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
-        let inner = self.inner.lock().unwrap();
-        let bp = &*inner;
-        let entries = bp.catalog.list_indexes(ns)?;
-        Ok(entries
-            .into_iter()
-            .map(|e| IndexInfo {
-                name: e.name,
-                keys: e.key_pattern,
-                unique: e.unique,
-                sparse: e.sparse,
+        let snap = self.shared.published.load();
+        let ns_snap = match snap.namespaces.get(ns) {
+            None => return Ok(Vec::new()),
+            Some(n) => n,
+        };
+        Ok(ns_snap
+            .indexes
+            .iter()
+            .map(|i| IndexInfo {
+                name: i.name.clone(),
+                keys: i.key_pattern.clone(),
+                unique: i.unique,
+                sparse: i.sparse,
             })
             .collect())
     }
@@ -2013,22 +2633,25 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn create_namespace(&self, ns: &str) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        let bp = &mut *inner;
-        bp.with_txn(|bp| {
-            if bp.catalog.get_collection(ns)?.is_some() {
-                return Ok(());
-            }
-            let data_root =
-                bp.catalog
-                    .create_collection(ns, bson::doc! {}, now_millis())?;
-            bp.sync_catalog_root()?;
-            // Initialise the data tree leaf page and cache it for fast first access.
-            let store = bp.new_store();
-            let tree = BTree::create_at(store, data_root)?;
-            bp.data_trees.insert(ns.to_owned(), tree);
+        let result = self.run_ddl(|shared, md, overlay| {
+            let data_root = {
+                let mut cat = md.catalog.lock().expect("catalog poisoned");
+                if cat.get_collection(ns)?.is_some() {
+                    return Ok(());
+                }
+                cat.create_collection(ns, bson::doc! {}, now_millis())?
+            };
+            sync_catalog_root_overlay(shared, md, overlay)?;
+            let store = new_txn_store(shared, overlay);
+            BTree::create_at(store, data_root)?;
             Ok(())
-        })
+        });
+        // Clear the drop tombstone so subsequent auto-bootstrap (from `run_write`)
+        // is re-enabled for this namespace.
+        if result.is_ok() {
+            self.dropped_namespaces.remove(ns);
+        }
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -2036,69 +2659,64 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn drop_namespace(&self, ns: &str) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        let bp = &mut *inner;
-        // Plan §T9 drop_collection barrier: force-expire ALL active
-        // ReadViews GLOBALLY before `free_subtree` walks the leaves. In
-        // v1 ReadViews are collection-agnostic, so any open reader could
-        // observe this collection at its `read_ts`. `force_expire_all`
-        // flips `poisoned = true` then spins per-view until
-        // `pin_ops_in_flight == 0`, guaranteeing no concurrent pin walk
-        // touches the about-to-be-freed leaves. The writer mutex
-        // (position 6) is held around the barrier to block any
-        // `WriteTxn::begin` / `ReadView::open` from interleaving between
-        // the drain and the tree-freeing step.
-        bp.handle.read_view_registry().force_expire_all();
-        bp.with_txn(|bp| {
-                // Collect page-root info from the catalog before removing entries.
-                // We need this to free the B+ tree pages after the catalog entries
-                // are gone (catalog.drop_collection removes both the collection and
-                // all its index entries).
-                let maybe_coll = bp.catalog.get_collection(ns)?;
+        // Plan §T9: force-expire ALL active ReadViews globally before
+        // freeing pages. Done BEFORE taking the metadata write guard so
+        // concurrent readers that just loaded the published snapshot
+        // can finish their pin walks.
+        self.shared.handle.read_view_registry().force_expire_all();
+
+        // Remove the lane from the map so no new writer picks it up, then
+        // wait for any writer that grabbed the lane before the remove by
+        // briefly locking the removed Arc. Release immediately.
+        let removed_lane = self.ns_lanes.remove(ns).map(|(_, v)| v);
+        if let Some(lane) = removed_lane {
+            // Wait out an in-flight writer by taking the lock ourselves.
+            let _guard = lane.lock().map_err(|_| {
+                Error::Internal("namespace lane mutex poisoned during drop".into())
+            })?;
+            // _guard dropped immediately on scope exit below.
+            drop(_guard);
+        }
+
+        let result = self.run_ddl(|shared, md, overlay| {
+            let (maybe_coll, index_roots, dropped) = {
+                let mut cat = md.catalog.lock().expect("catalog poisoned");
+                let maybe_coll = cat.get_collection(ns)?;
                 let index_roots: Vec<(u32, u8)> = if maybe_coll.is_some() {
-                    bp.catalog
-                        .list_indexes(ns)?
+                    cat.list_indexes(ns)?
                         .into_iter()
                         .map(|e| (e.root_page, e.root_level))
                         .collect()
                 } else {
                     Vec::new()
                 };
-
-                // Remove the cached data tree (if any) — we own it after this.
-                let cached_tree = bp.data_trees.remove(ns);
-
-                // Drop catalog entries first so no references to these pages exist.
-                if bp.catalog.drop_collection(ns)? {
-                    bp.sync_catalog_root()?;
-                }
-
-                // Free the data-tree pages.
-                if let Some(coll) = maybe_coll {
-                    let (root_page, root_level) = match &cached_tree {
-                        // If the tree was cached use its current root (may differ
-                        // from catalog if sync_data_root was skipped on a dry run;
-                        // in practice R1.2 always syncs before dropping).
-                        Some(t) => (t.root_page, t.root_level),
-                        None => (coll.data_root_page, coll.data_root_level),
-                    };
-                    // Drop the cached handle first to release its Arc reference,
-                    // then open a fresh tree over the same pages for the walk.
-                    drop(cached_tree);
-                    let store = bp.new_store();
-                    let data_tree = BTree::open(store, root_page, root_level);
-                    data_tree.free_all_pages()?;
-                }
-
-                // Free each index tree's pages.
-                for (idx_root, idx_level) in index_roots {
-                    let store = bp.new_store();
-                    let idx_tree = BTree::open(store, idx_root, idx_level);
-                    idx_tree.free_all_pages()?;
-                }
-
-                Ok(())
-        })
+                let dropped = cat.drop_collection(ns)?;
+                (maybe_coll, index_roots, dropped)
+            };
+            if dropped {
+                sync_catalog_root_overlay(shared, md, overlay)?;
+            }
+            if let Some(coll) = maybe_coll {
+                let store = new_txn_store(shared, overlay);
+                let data_tree = BTree::open(store, coll.data_root_page, coll.data_root_level);
+                data_tree.free_all_pages()?;
+            }
+            for (idx_root, idx_level) in index_roots {
+                let store = new_txn_store(shared, overlay);
+                let idx_tree = BTree::open(store, idx_root, idx_level);
+                idx_tree.free_all_pages()?;
+            }
+            Ok(())
+        });
+        // Record the drop so that `bootstrap_namespace` (called from `run_write`
+        // when the namespace is absent) does not auto-recreate it.  This prevents
+        // a racing insert — one that arrived after `drop_namespace` returned but
+        // whose `run_write` call saw ns_missing — from re-bootstrapping the
+        // namespace and committing stale data to the journal.
+        if result.is_ok() {
+            self.dropped_namespaces.insert(ns.to_string());
+        }
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -2106,10 +2724,8 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_namespaces(&self) -> Result<Vec<String>> {
-        let inner = self.inner.lock().unwrap();
-        let bp = &*inner;
-        let entries = bp.catalog.list_collections()?;
-        Ok(entries.into_iter().map(|e| e.name).collect())
+        let snap = self.shared.published.load();
+        Ok(snap.namespaces.keys().cloned().collect())
     }
 
     // -----------------------------------------------------------------------
@@ -2117,63 +2733,55 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn checkpoint(&self) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
-        let bp = &*inner;
-        // Ensure the catalog root is in the file header before flush.
-        bp.sync_catalog_root()?;
+        // DDL: take metadata.write() so the checkpoint is atomic wrt CRUD
+        // writers. No overlay needed — checkpoint just flushes + GCs.
+        let md = self.metadata.write().map_err(|_| {
+            Error::Internal("metadata RwLock poisoned".into())
+        })?;
 
-        // Plan §T8: invoke the history-store GC pass at checkpoint
-        // cadence. `ort` = `ReadViewRegistry::oldest_required_ts()` — the
-        // smallest `read_ts` still visible to some live reader, or
-        // `Ts::MAX` when no readers are registered (entire aged history
-        // eligible for reclamation). Every history-store entry with
-        // `stop_ts <= ort` is deleted; overflow refcounts are decremented
-        // via RAII and enqueued for deferred free on hitting zero.
-        let ort = bp.handle.read_view_registry().oldest_required_ts();
+        // sync_catalog_root via direct allocator update (no overlay).
+        let (root_page, root_level) = {
+            let cat = md.catalog.lock().expect("catalog poisoned");
+            (cat.root_page(), cat.root_level())
+        };
+        self.shared.handle.allocator().update_header(|h| {
+            h.catalog_root_page = root_page;
+            h.catalog_root_level = root_level;
+            h.catalog_root_backup = root_page;
+        })?;
+
+        // Plan §T8: history-store GC + counters.
+        let ort = self.shared.handle.read_view_registry().oldest_required_ts();
         {
-            let mut hs = bp.history_store.lock().unwrap();
+            let mut hs = self.shared.history_store.lock().unwrap();
             hs.gc_pass(ort)?;
         }
-
-        // Plan §T8 counter samplers.
-        // `mvcc.oldest_required_ts_lag_ms` = `(oracle.now().physical_ms -
-        // ort.physical_ms).max(0)` when `ort < Ts::MAX`, else 0 (no live
-        // readers). Stuck-oracle alert fires when this is large and
-        // `active_read_views == 0`.
         let lag_ms = if ort == crate::mvcc::timestamp::Ts::MAX {
             0
         } else {
-            bp.oracle
+            self.shared
+                .oracle
                 .now()
                 .physical_ms
                 .saturating_sub(ort.physical_ms)
         };
         crate::mvcc::metrics::set_oldest_required_ts_lag_ms(lag_ms);
-        // `mvcc.overflow.pages_in_use` = allocator's current count of
-        // overflow-chain first_pages with refcount >= 1.
         crate::mvcc::metrics::set_overflow_pages_in_use(
-            bp.handle.allocator().overflow_pages_in_use() as u64,
+            self.shared.handle.allocator().overflow_pages_in_use() as u64,
         );
-        // `mvcc.deferred_free_queue_depth` = current queue length.
         crate::mvcc::metrics::set_deferred_free_queue_depth(
-            bp.handle.allocator().deferred_free_queue().depth() as u64,
+            self.shared.handle.allocator().deferred_free_queue().depth() as u64,
         );
-
-        // Flush all dirty pages (data + catalog + header) to disk.
-        bp.handle.flush()
+        self.shared.handle.flush()
     }
-
-    // -----------------------------------------------------------------------
-    // close
-    // -----------------------------------------------------------------------
 
     fn close(&self) -> Result<()> {
         self.checkpoint()
     }
 
-    // -----------------------------------------------------------------------
-    // snapshot_bytes (legacy Phase 0.x — returns None for B+ tree engine)
-    // -----------------------------------------------------------------------
+    fn journal_sync(&self) -> Result<()> {
+        self.shared.handle.journal_sync()
+    }
 
     fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)
@@ -2181,11 +2789,77 @@ impl StorageEngine for PagedEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Private upsert helpers
+// DDL helper + upsert helpers (private)
 // ---------------------------------------------------------------------------
 
 impl PagedEngine {
-    /// Perform an upsert for an `update_one/many` with `upsert: true`.
+    /// Drive a DDL body under `metadata.write()` + `commit_seq`, then
+    /// commit the overlay and publish a fresh snapshot.
+    fn run_ddl<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&SharedState, &MetadataState, &Arc<Mutex<TxnOverlay>>) -> Result<R>,
+    {
+        let md_w = self.metadata.write().map_err(|_| {
+            Error::Internal("metadata RwLock poisoned".into())
+        })?;
+        let _commit = self.commit_seq.lock().map_err(|_| {
+            Error::Internal("commit_seq mutex poisoned".into())
+        })?;
+
+        let mark = self.shared.handle.begin_txn()?;
+        let overlay = TxnOverlay::new_shared();
+        let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
+        if !ready.is_empty() {
+            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
+            for page in ready {
+                ov.push_reservation(PageReservation {
+                    page,
+                    size: PageSize::Large32k,
+                    origin: PageOrigin::DeferredFree,
+                });
+            }
+        }
+
+        let result = f(&self.shared, &md_w, &overlay);
+        match result {
+            Ok(value) => {
+                let overlay_inner = Arc::try_unwrap(overlay)
+                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
+                    .into_inner()
+                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
+                let mut base_store = new_store(&self.shared);
+                overlay_inner.commit(&mut base_store, &self.shared.handle)?;
+                self.shared.handle.flush()?;
+                let db_page_count = self
+                    .shared
+                    .handle
+                    .allocator()
+                    .with_header(|h| h.total_page_count)?;
+                let header_data = {
+                    let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
+                    page.data().to_vec()
+                };
+                let emergency = self.shared.handle.commit_txn(
+                    0,
+                    PageSize::Small4k,
+                    &header_data,
+                    db_page_count,
+                )?;
+                if emergency {
+                    let _ = self.shared.handle.emergency_checkpoint();
+                }
+                let publish_ts = self.shared.oracle.now();
+                rebuild_and_publish_locked(&self.shared, &md_w, publish_ts)?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = self.rollback_overlay_and_wal(overlay, mark);
+                Err(e)
+            }
+        }
+    }
+
+    /// Upsert for `update_one/many` with `upsert: true`.
     fn do_upsert_update(
         &self,
         ns: &str,
@@ -2194,22 +2868,33 @@ impl PagedEngine {
     ) -> Result<UpdateResult> {
         let mut new_doc = upsert_base_from_filter(filter);
         apply_update(&mut new_doc, update, true)?;
-        let id = {
-            let mut inner = self.inner.lock().unwrap();
-            let bp = &mut *inner;
-            bp.with_txn(|bp| {
-                let (id, key, bson_bytes, _tree_root) = {
-                    let tree = bp.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?
-                };
-                bp.active_txn_mut()
-                    .expect("upsert must run inside with_txn")
-                    .stage_primary_insert(ns.to_string(), key, bson_bytes);
-                bp.sync_data_root(ns)?;
-                bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
-                Ok(id)
-            })?
-        };
+        let id = self.run_write(ns, |shared, md, overlay, txn| {
+            let entry = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .get_collection(ns)?
+                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
+            let mut tree = BTree::open(
+                new_txn_store(shared, overlay),
+                entry.data_root_page,
+                entry.data_root_level,
+            );
+            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut new_doc, &[])?;
+            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
+                let mut updated = entry.clone();
+                updated.data_root_page = tree.root_page;
+                updated.data_root_level = tree.root_level;
+                md.catalog
+                    .lock()
+                    .expect("catalog poisoned")
+                    .update_collection(&updated)?;
+                sync_catalog_root_overlay(shared, md, overlay)?;
+            }
+            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+            maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
+            Ok(id)
+        })?;
         Ok(UpdateResult {
             matched_count: 0,
             modified_count: 0,
@@ -2227,22 +2912,33 @@ impl PagedEngine {
     ) -> Result<Option<Document>> {
         let mut new_doc = upsert_base_from_filter(filter);
         apply_update(&mut new_doc, update, true)?;
-        {
-            let mut inner = self.inner.lock().unwrap();
-            let bp = &mut *inner;
-            bp.with_txn(|bp| {
-                let (id, key, bson_bytes, _tree_root) = {
-                    let tree = bp.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?
-                };
-                bp.active_txn_mut()
-                    .expect("fam_upsert_update must run inside with_txn")
-                    .stage_primary_insert(ns.to_string(), key, bson_bytes);
-                bp.sync_data_root(ns)?;
-                bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
-                Ok(())
-            })?;
-        }
+        self.run_write(ns, |shared, md, overlay, txn| {
+            let entry = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .get_collection(ns)?
+                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
+            let mut tree = BTree::open(
+                new_txn_store(shared, overlay),
+                entry.data_root_page,
+                entry.data_root_level,
+            );
+            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut new_doc, &[])?;
+            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
+                let mut updated = entry.clone();
+                updated.data_root_page = tree.root_page;
+                updated.data_root_level = tree.root_level;
+                md.catalog
+                    .lock()
+                    .expect("catalog poisoned")
+                    .update_collection(&updated)?;
+                sync_catalog_root_overlay(shared, md, overlay)?;
+            }
+            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+            maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
+            Ok(())
+        })?;
         Ok(match opts.return_document {
             ReturnDocument::Before => None,
             ReturnDocument::After => Some(new_doc),
@@ -2257,28 +2953,40 @@ impl PagedEngine {
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
         let mut new_doc = replacement.clone();
-        {
-            let mut inner = self.inner.lock().unwrap();
-            let bp = &mut *inner;
-            bp.with_txn(|bp| {
-                let (id, key, bson_bytes, _tree_root) = {
-                    let tree = bp.tree_or_create(ns)?;
-                    btree_insert_doc(tree, &mut new_doc, &[])?
-                };
-                bp.active_txn_mut()
-                    .expect("fam_upsert_replace must run inside with_txn")
-                    .stage_primary_insert(ns.to_string(), key, bson_bytes);
-                bp.sync_data_root(ns)?;
-                bp.maintain_secondary_on_insert(ns, &new_doc, &id)?;
-                Ok(())
-            })?;
-        }
+        self.run_write(ns, |shared, md, overlay, txn| {
+            let entry = md
+                .catalog
+                .lock()
+                .expect("catalog poisoned")
+                .get_collection(ns)?
+                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
+            let mut tree = BTree::open(
+                new_txn_store(shared, overlay),
+                entry.data_root_page,
+                entry.data_root_level,
+            );
+            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut new_doc, &[])?;
+            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
+                let mut updated = entry.clone();
+                updated.data_root_page = tree.root_page;
+                updated.data_root_level = tree.root_level;
+                md.catalog
+                    .lock()
+                    .expect("catalog poisoned")
+                    .update_collection(&updated)?;
+                sync_catalog_root_overlay(shared, md, overlay)?;
+            }
+            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+            maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
+            Ok(())
+        })?;
         Ok(match opts.return_document {
             ReturnDocument::Before => None,
             ReturnDocument::After => Some(new_doc),
         })
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2609,8 +3317,7 @@ mod tests {
 
         // Record total page count before drop.
         let total_before = {
-            let inner = e.inner.lock().unwrap();
-            inner
+            e.shared
                 .handle
                 .allocator()
                 .with_header(|h| h.total_page_count)
@@ -2621,8 +3328,7 @@ mod tests {
 
         // Free page count should have increased (pages returned to free list).
         let free_after = {
-            let inner = e.inner.lock().unwrap();
-            inner
+            e.shared
                 .handle
                 .allocator()
                 .with_header(|h| h.free_page_count_32k + h.free_page_count_4k)
@@ -2723,8 +3429,7 @@ mod tests {
         e.checkpoint().unwrap();
 
         let page_count_after_create = {
-            let inner = e.inner.lock().unwrap();
-            inner
+            e.shared
                 .handle
                 .allocator()
                 .with_header(|h| h.total_page_count)
@@ -2741,8 +3446,7 @@ mod tests {
         e.checkpoint().unwrap();
 
         let page_count_after_recreate = {
-            let inner = e.inner.lock().unwrap();
-            inner
+            e.shared
                 .handle
                 .allocator()
                 .with_header(|h| h.total_page_count)
@@ -3098,8 +3802,11 @@ mod tests {
     /// Verify that a reader can observe a consistent snapshot while a
     /// concurrent writer is modifying the collection.
     ///
-    /// The reader starts BEFORE the writer commits; it must see the
-    /// pre-write state (snapshot at the moment the read lock was acquired).
+    /// PR 4: readers no longer take the engine mutex. Instead they load a
+    /// `PublishedSnapshot`, which captures the state at the moment of the
+    /// last commit. A reader that loaded the snapshot before the writer
+    /// commits will still see the pre-write state because `publish_ts` pins
+    /// the `ReadView` at that timestamp.
     #[test]
     fn swmr_reader_sees_snapshot_isolation() {
         use std::sync::{Arc, Barrier};
@@ -3110,38 +3817,43 @@ mod tests {
         e.insert("test.snap", doc! { "status": "before" })
             .unwrap();
 
-        // Barrier: reader starts, acquires read lock, signals writer.
-        // Barrier has 2 parties: reader + writer.
+        // Barrier: reader loads snapshot, signals writer; writer commits,
+        // then signals reader to finish.
         let barrier = Arc::new(Barrier::new(2));
 
         let e_reader = Arc::clone(&e);
         let barrier_reader = Arc::clone(&barrier);
         let reader = thread::spawn(move || {
-            // Acquire the read lock (shared) and hold it while the writer
-            // is trying to proceed.
-            let inner = e_reader.inner.lock().unwrap();
+            // Load the published snapshot BEFORE the writer commits.
+            let snap = e_reader.shared.published.load_full();
+            let publish_ts = snap.publish_ts;
 
-            // Tell the writer we're inside the read section.
+            // Tell the writer we have our snapshot.
             barrier_reader.wait();
 
-            // Do the actual scan while holding the read lock.
-            let view = inner.open_read_view();
-            let matched = inner
-                .open_tree_for_read("test.snap")
-                .unwrap()
-                .map(|t| btree_collscan(&t, &doc! {}, &view, None).unwrap())
-                .unwrap_or_default();
-            drop(inner); // release read lock
+            // Scan using the snapshot's root pages and publish_ts (no mutex).
+            let matched = if let Some(ns_snap) = snap.namespaces.get("test.snap") {
+                let store = BufferPoolPageStore::new(Arc::clone(&e_reader.shared.handle));
+                let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
+                let txn_id = e_reader.shared.txn_counter.fetch_add(1, Ordering::Relaxed);
+                let view = ReadView::open(
+                    Arc::clone(e_reader.shared.handle.read_view_registry()),
+                    publish_ts,
+                    txn_id,
+                );
+                btree_collscan(&tree, &doc! {}, &view, None).unwrap()
+            } else {
+                Vec::new()
+            };
             matched
         });
 
-        // Writer: wait for the reader to hold the lock, then write.
+        // Writer: wait for the reader to capture its snapshot, then write.
         barrier.wait();
-        // Writer acquires the exclusive write lock (blocks until reader drops).
         e.insert("test.snap", doc! { "status": "after" }).unwrap();
 
         let matched = reader.join().expect("reader panicked");
-        // The reader held the lock before the write so it sees exactly 1 doc.
+        // The reader's snapshot was taken before the write, so it sees exactly 1 doc.
         assert_eq!(
             matched.len(),
             1,

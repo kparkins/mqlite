@@ -138,6 +138,33 @@ impl CollectionEntry {
     }
 }
 
+/// Lifecycle state of an index.
+///
+/// An index in the `Building` state has a catalog entry and an allocated
+/// root page, but its contents may not yet reflect all documents in the
+/// parent collection. The read path (query planning) MUST skip
+/// `Building` indexes. The write path MUST dual-write to them so the
+/// build sees every concurrent mutation on the target namespace.
+///
+/// `Ready` is the default for backwards compatibility: catalog records
+/// persisted before PR 9 do not carry this field and deserialize as
+/// `Ready`, matching their pre-PR-9 behaviour (fully populated and
+/// usable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexState {
+    /// Index has a catalog entry but its contents may be incomplete.
+    /// Not usable for query planning; writers must still dual-write.
+    Building,
+    /// Index is fully populated and ready to serve queries.
+    Ready,
+}
+
+impl Default for IndexState {
+    fn default() -> Self {
+        IndexState::Ready
+    }
+}
+
 /// Metadata stored in the catalog for a single index.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IndexEntry {
@@ -159,11 +186,18 @@ pub(crate) struct IndexEntry {
     pub multikey: bool,
     /// Number of entries in the index.
     pub entry_count: i64,
+    /// Lifecycle state. Defaults to `Ready` for backwards compatibility
+    /// with pre-PR-9 catalog records.
+    pub state: IndexState,
 }
 
 impl IndexEntry {
     /// Serialize to BSON bytes.
     pub(crate) fn to_bson_bytes(&self) -> Result<Vec<u8>> {
+        let state_str = match self.state {
+            IndexState::Building => "building",
+            IndexState::Ready => "ready",
+        };
         let doc = doc! {
             "name": &self.name,
             "collection": &self.collection,
@@ -174,6 +208,7 @@ impl IndexEntry {
             "sparse": self.sparse,
             "multikey": self.multikey,
             "entryCount": self.entry_count,
+            "state": state_str,
         };
         Ok(bson::to_vec(&doc)?)
     }
@@ -213,6 +248,20 @@ impl IndexEntry {
         let entry_count = doc
             .get_i64("entryCount")
             .map_err(|e| Error::Internal(format!("catalog: missing 'entryCount': {e}")))?;
+        // `state` is optional for backwards compatibility: records written
+        // before PR 9 have no field, which we treat as `Ready` (their
+        // contents are fully populated).
+        let state = match doc.get_str("state") {
+            Ok("building") => IndexState::Building,
+            Ok("ready") => IndexState::Ready,
+            Ok(other) => {
+                return Err(Error::Internal(format!(
+                    "catalog: unknown index state '{}'",
+                    other
+                )))
+            }
+            Err(_) => IndexState::Ready,
+        };
         Ok(IndexEntry {
             name,
             collection,
@@ -223,6 +272,7 @@ impl IndexEntry {
             sparse,
             multikey,
             entry_count,
+            state,
         })
     }
 }
@@ -530,6 +580,10 @@ impl<S: BTreePageStore> Catalog<S> {
             sparse: model.options.sparse,
             multikey: false,
             entry_count: 0,
+            // Default is `Ready`. Callers that want a multi-phase build
+            // (see `PagedEngine::create_index`) transition the entry to
+            // `Building` before publishing.
+            state: IndexState::Ready,
         };
         let bytes = entry.to_bson_bytes()?;
         self.tree.insert(&idx_key, &bytes)?;
@@ -772,6 +826,7 @@ mod tests {
             sparse: false,
             multikey: false,
             entry_count: 5000,
+            state: IndexState::Ready,
         };
         let bytes = entry.to_bson_bytes().unwrap();
         let decoded = IndexEntry::from_bson_bytes(&bytes).unwrap();
