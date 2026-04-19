@@ -62,7 +62,6 @@ fn main() -> mqlite::Result<()> {
 |------|-------------|---------|
 | `myapp.mqlite` | Always | Main database file |
 | `myapp.mqlite-wal` | During write activity | Write-ahead log (WAL); safe to leave — replayed on next open |
-| `myapp.mqlite-shm` | While database is open | Shared-memory WAL index; deleted on clean close |
 
 A "single-file database" means a single file **after a clean close** (`Client::close()`).
 Dropping the handle is non-blocking and leaves the WAL on disk; the next open recovers it.

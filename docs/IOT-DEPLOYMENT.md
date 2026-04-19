@@ -232,7 +232,6 @@ fn open_readonly_for_rescue(path: &str) -> mqlite::Result<Client> {
 In read-only mode:
 - WAL replay is skipped (last checkpointed state is visible).
 - No writes are allowed.
-- The `.mqlite-shm` file is not created.
 - No exclusive OS lock is acquired.
 
 This lets you extract readings or audit data even when the filesystem is

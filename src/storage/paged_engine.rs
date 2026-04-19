@@ -625,9 +625,10 @@ impl BpBackend {
                     .handle
                     .commit_txn(0, PageSize::Small4k, &header_data, db_page_count)?;
                 if emergency {
-                    // SHM near-full: move WAL frames into the main file so
-                    // subsequent txns have room. Best-effort — failure here
-                    // does not roll back the txn (it is already committed).
+                    // Journal index reached its hot-threshold: drain the
+                    // journal into the main file so subsequent txns have
+                    // room. Best-effort — failure here does not roll back
+                    // the txn (it is already committed).
                     let _ = self.handle.emergency_checkpoint();
                 }
                 Ok(value)

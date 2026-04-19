@@ -75,8 +75,7 @@
 //! ```text
 //! Client::open("myapp.mqlite")
 //!   ├─ Creates myapp.mqlite            (main database file)
-//!   ├─ Creates myapp.mqlite-journal    (write-ahead journal; accumulates writes)
-//!   └─ Creates myapp.mqlite-shm       (journal shared-memory index; deleted on clean close)
+//!   └─ Creates myapp.mqlite-journal    (write-ahead journal; accumulates writes)
 //!
 //! Client::close(self)             (blocking flush + checkpoint)
 //!   └─ myapp.mqlite-journal is checkpointed into myapp.mqlite and removed
