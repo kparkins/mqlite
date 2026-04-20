@@ -655,9 +655,8 @@ fn incref_overflow_saturates_at_u32_max_without_bumping() {
 
 #[test]
 fn incref_overflow_contended_saturation_exact_500_winners() {
-    // Plan §T3 iter-4 Test 2: refcount = u32::MAX - 500, 8 threads x
-    // 125 calls each (1000 total). Exactly 500 succeed, 500 return
-    // RefcountOverflow; final refcount == u32::MAX.
+    // refcount = u32::MAX - 500, 8 threads x 125 calls each (1000 total).
+    // Exactly 500 succeed, 500 return RefcountOverflow; final refcount == u32::MAX.
     use std::sync::Arc;
     let hdr = fresh_header();
     let handle = Arc::new(AllocatorHandle::new(hdr));

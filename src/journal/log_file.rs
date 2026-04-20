@@ -69,18 +69,17 @@ pub(crate) const JOURNAL_HEADER_SIZE: usize = 32;
 pub(crate) const JOURNAL_FRAME_HEADER_SIZE: usize = 24;
 
 // ---------------------------------------------------------------------------
-// FrameKind (MVCC T2+)
+// FrameKind
 // ---------------------------------------------------------------------------
 //
-// Post-T2 the journal distinguishes legacy page-write commit frames from the
-// MVCC `ChainCommit` frame introduced for version-chain installations. Byte
-// layout for `ChainCommit` is pinned in Format Lock Appendix §A.2 of the
-// MVCC plan:
+// The journal distinguishes legacy page-write commit frames from MVCC
+// `ChainCommit` frames used for version-chain installations. Byte layout
+// for `ChainCommit`:
 //
 //   offset  size  field
 //    0       1    frame_kind: u8 (0x02 = CHAIN_COMMIT; 0x01 = legacy commit)
 //    1       3    reserved: [u8; 3] (MUST be 0)
-//    4       4    total_frame_bytes: u32 LE (length prefix — MAJOR-2 fix)
+//    4       4    total_frame_bytes: u32 LE (length prefix)
 //    8       4    salt1: u32 LE
 //   12       4    salt2: u32 LE
 //   16      12    commit_ts: Ts-LE (physical_ms u64 LE || logical u32 LE)
@@ -89,22 +88,18 @@ pub(crate) const JOURNAL_FRAME_HEADER_SIZE: usize = 24;
 //   32+N     4    page_write_count: u32 LE
 //   36+N     M    page_writes[]
 //   36+N+M   4    checksum_crc32: u32 LE (covers bytes 0..36+N+M)
-//
-// T2 pins the discriminants and the fixed-size header offsets so later tasks
-// (T3/T5'/T6) can plumb the frame through the writer/recovery paths without
-// re-opening the format lock.
 
-/// Discriminant byte at offset 0 of any frame introduced post-T2.
+/// Discriminant byte at offset 0 of a legacy page-write commit frame.
 ///
-/// Legacy page-write frames emitted before T2 do not carry this byte — they
+/// Legacy page-write frames do not carry this byte at a known position — they
 /// are identified by position within the journal and by the length/salt
-/// fields of `JournalFrameHeader`. The `ChainCommit` byte is chosen to be
-/// distinct from any plausible high-order byte of a `page_number` field
+/// fields of `JournalFrameHeader`. The `ChainCommit` discriminant is chosen
+/// to be distinct from any plausible high-order byte of a `page_number` field
 /// in the legacy frame format so a mixed journal can be recovered.
 #[allow(dead_code)]
 pub(crate) const FRAME_KIND_LEGACY_COMMIT: u8 = 0x01;
 
-/// Frame-kind discriminant for MVCC chain-commit frames (Format Lock §A.2).
+/// Frame-kind discriminant for MVCC chain-commit frames.
 #[allow(dead_code)]
 pub(crate) const FRAME_KIND_CHAIN_COMMIT: u8 = 0x02;
 
@@ -395,12 +390,12 @@ pub(crate) fn seek_to_first_frame<F: Seek>(f: &mut F) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// ChainCommit frame (MVCC T3 — Format Lock §A.2)
+// ChainCommit frame
 // ---------------------------------------------------------------------------
 
 /// Page-write entry carried inside a `ChainCommit` frame.
 ///
-/// Byte layout (§A.2): `(page: u32 LE, page_size: u8, reserved: [u8; 3],
+/// Byte layout: `(page: u32 LE, page_size: u8, reserved: [u8; 3],
 /// data: [u8; page_size_bytes])`. `page_size == 0` selects
 /// [`PAGE_SIZE_INTERNAL`]; `page_size == 1` selects [`PAGE_SIZE_LEAF`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,9 +413,9 @@ impl ChainPageWrite {
     }
 }
 
-/// MVCC chain-commit frame — one emitted per `WriteTxn::commit()`.
+/// Chain-commit frame — one emitted per `WriteTxn::commit()`.
 ///
-/// Byte layout per Format Lock Appendix §A.2:
+/// Byte layout:
 ///
 /// ```text
 ///  0       1    frame_kind: u8 (0x02 = CHAIN_COMMIT)
@@ -512,8 +507,8 @@ impl ChainCommitFrame {
 
     /// Decode from bytes. Returns `Ok(None)` when the buffer is
     /// truncated, salt-mismatched, kind-wrong, or checksum-invalid —
-    /// the recovery caller treats every such outcome as frame-not-present
-    /// per §A.2. Returns `Err` only on programmer error (callers pass an
+    /// the recovery caller treats every such outcome as frame-not-present.
+    /// Returns `Err` only on programmer error (callers pass an
     /// absurdly tiny slice) — which is never emitted in recovery.
     #[allow(dead_code)]
     pub(crate) fn decode(
@@ -636,26 +631,25 @@ impl ChainCommitFrame {
 }
 
 // ---------------------------------------------------------------------------
-// try_skip_chain_commit — scan retrofit helper (MVCC T5'/T6)
+// try_skip_chain_commit
 // ---------------------------------------------------------------------------
 
 /// Peek at the current position and skip over a `ChainCommitFrame` if one is
 /// present, returning the number of bytes consumed.
 ///
-/// Legacy `JournalFrameHeader` and `ChainCommitFrame` cohabit the same
-/// append-only log. Every scanner that iterates frames linearly must call
-/// this helper before falling through to `JournalFrameHeader::read`; a
-/// ChainCommit frame interpreted as a legacy header errors out on the
-/// `page_size` field (invalid) and corrupts any `truncate_to` / recovery
-/// scan.
+/// `JournalFrameHeader` and `ChainCommitFrame` cohabit the same append-only
+/// log. Every scanner that iterates frames linearly must call this helper
+/// before falling through to `JournalFrameHeader::read`; a `ChainCommit`
+/// frame interpreted as a legacy header errors out on the `page_size` field
+/// (invalid) and corrupts any `truncate_to` / recovery scan.
 ///
 /// ## Disambiguation
 ///
 /// A legacy frame with `page_number == 2` has an identical first 4 bytes
-/// (`[2, 0, 0, 0]`) to a `ChainCommit` header prefix. To tell them apart
-/// without re-opening the format lock, this helper performs the full
-/// `ChainCommitFrame::decode` CRC check. Matching CRCs for a 32+ byte
-/// header on random legacy data is astronomically unlikely (~1 in 2^32).
+/// (`[2, 0, 0, 0]`) to a `ChainCommit` header prefix. This helper performs
+/// the full `ChainCommitFrame::decode` CRC check to tell them apart. Matching
+/// CRCs for a 32+ byte header on random legacy data is astronomically
+/// unlikely (~1 in 2^32).
 ///
 /// ## Cursor semantics
 ///
@@ -664,7 +658,7 @@ impl ChainCommitFrame {
 ///   `commit_ts` is the decoded commit timestamp (carried out so recovery
 ///   can fold it into `TimestampOracle::set_min`).
 /// - On `Ok(None)`: the reader is restored to its original position. The
-///   caller proceeds to `JournalFrameHeader::read` as before.
+///   caller proceeds to `JournalFrameHeader::read` as normal.
 /// - On `Err`: the reader position is undefined; the caller should treat
 ///   the scan as aborted.
 pub(crate) fn try_skip_chain_commit<R: Read + Seek>(

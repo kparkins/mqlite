@@ -1,7 +1,7 @@
 //! BSON document validation.
 //!
 //! Enforces structural limits on documents at the insert boundary (before any write to storage).
-//! These limits are mandatory security mitigations (mqlite security.md Phase 1, mitigation #3):
+//! These limits are mandatory security mitigations:
 //!
 //! | Limit | Value | Rationale |
 //! |-------|-------|-----------|

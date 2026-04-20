@@ -32,7 +32,7 @@ use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 
-/// Reader-path history fallthrough (plan §T7).
+/// Reader-path history fallthrough.
 ///
 /// Bound to a specific `(ns_id, kind_tag)` at the call site — the BTree
 /// layer only sees an opaque probe object and walks `(key, read_ts)`.
@@ -333,7 +333,7 @@ impl BTreePageStore for MemPageStore {
 }
 
 // ---------------------------------------------------------------------------
-// Empty-page seed helpers (Bug A fix — §M4a/M4b)
+// Empty-page seed helpers
 // ---------------------------------------------------------------------------
 //
 // Used by `TxnPageStore::alloc_leaf` / `alloc_internal` to seed the

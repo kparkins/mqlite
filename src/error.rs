@@ -61,7 +61,7 @@ pub enum Error {
     /// An MQL operator is not supported by mqlite.
     #[error(
         "UnsupportedOperator(\"{operator}\") — this operator is not supported in mqlite.\n\
-         Phase 1 supports: $eq, $gt, $gte, $lt, $lte, $ne, $in, $nin,\n\
+         Supported operators: $eq, $gt, $gte, $lt, $lte, $ne, $in, $nin,\n\
          \t\t\t$and, $or, $not, $nor, $exists, $type,\n\
          \t\t\t$all, $elemMatch, $regex\n\
          See: https://docs.rs/mqlite/latest/mqlite/compatibility"
@@ -82,8 +82,8 @@ pub enum Error {
     #[error(
         "CorruptDatabase at {path:?}: {detail}\n\
          Recoverable: {recoverable}\n\
-         Note: Database::repair() is planned for Phase 2. In Phase 1, restore from a backup \
-         or open in read_only mode to access the last successfully checkpointed state."
+         Note: Restore from a backup or open in read_only mode to access the last \
+         successfully checkpointed state."
     )]
     #[non_exhaustive]
     CorruptDatabase {
@@ -180,8 +180,7 @@ pub enum Error {
     /// MongoDB error code 67 (CannotCreateIndex).
     ///
     /// Returned by `create_index` when the caller requests a TTL, text,
-    /// geospatial, partial, or hashed index — none of which are supported in
-    /// Phase 1.
+    /// geospatial, partial, or hashed index.
     #[error(
         "UnsupportedIndexOption(\"{option}\"): {suggestion}\n\
          Supported index types: single-field, compound, unique, sparse, multikey."
@@ -195,8 +194,7 @@ pub enum Error {
     },
 
     /// The journal file's magic bytes or format version does not match what this build supports.
-    /// Typically produced when opening a pre-T1 database whose stale `-wal` sidecar is still on
-    /// disk, or a T1+ journal from a future format version.
+    /// Produced when the journal sidecar on disk was created by an incompatible mqlite version.
     #[error(
         "UnsupportedJournalFormat: found magic {found:?}, expected {expected:?}.\n\
          The journal sidecar on disk does not match what this build of mqlite supports. \
@@ -239,7 +237,7 @@ pub enum Error {
     ///
     /// Returned when a reader tries to use a `ReadView` whose `poisoned`
     /// flag was set by `ReadViewRegistry::force_expire_all` — e.g. during
-    /// a `drop_collection` barrier (plan §T9). The caller must open a new
+    /// a `drop_collection` barrier. The caller must open a new
     /// `ReadView` to continue reading.
     #[error(
         "ReadViewExpired — this ReadView was force-expired by the engine \

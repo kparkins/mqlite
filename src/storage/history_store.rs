@@ -1,10 +1,9 @@
 //! History store — kind-tagged B-tree of aged MVCC version entries.
 //!
-//! Lives on a **dedicated buffer-pool partition** (plan §T7: "Dedicated
-//! buffer pool partition is NON-NEGOTIABLE — prevents recursive eviction").
-//! Reconciliation evicting a main-data leaf page can install an aged
-//! `VersionEntry` here without re-entering the main-data partition mutex,
-//! because the history store's B-tree pins pages in its own
+//! Lives on a **dedicated buffer-pool partition** to prevent recursive
+//! eviction: reconciliation evicting a main-data leaf page can install an
+//! aged `VersionEntry` here without re-entering the main-data partition
+//! mutex, because the history store's B-tree pins pages in its own
 //! [`BufferPool`](super::buffer_pool::BufferPool). The lock-order document
 //! at the top of `src/mvcc/read_view.rs` pins this at position **1**
 //! (outermost).
@@ -32,7 +31,7 @@
 //!   main-data leaf's in-memory chain has no entry visible at `read_ts`.
 //! * [`HistoryStore::probe_sec_index`] — cold-read fallthrough for a
 //!   secondary-index reader; tombstone hits short-circuit to `None`
-//!   and tick `secondary_index_tombstone_hits_total` (plan §T6 / §T7).
+//!   and tick `secondary_index_tombstone_hits_total`.
 //!
 //! ## Value layout
 //!
@@ -51,7 +50,7 @@
 //! Inline payload: `len: u32 LE` || bytes.
 //! Overflow payload: `first_page: u32 LE` || `total_length: u64 LE`.
 //! Overflow rehydration needs an allocator handle and is deferred to the
-//! caller (plan §T9 wires the real refcounting on probe).
+//! caller.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -63,17 +62,15 @@ use crate::storage::allocator::AllocatorHandle;
 use crate::storage::btree::{BTree, BTreePageStore};
 
 // ---------------------------------------------------------------------------
-// Thread-local non-recursion sentinel (plan §T7)
+// Thread-local non-recursion sentinel
 // ---------------------------------------------------------------------------
 //
-// Architect non-blocking request: catch "history-store reconcile pins
-// main-data page" at runtime. The invariant is enforced structurally by
-// giving `HistoryStore` its own dedicated [`BufferPool`] partition, but a
-// runtime sentinel guards against future wiring mistakes (e.g. someone
-// accidentally routing a history-store probe through the main pool's
-// `BufferPoolPageSource`). Every public `HistoryStore` entry point
-// increments the depth; the main pool's `fetch_page` `debug_assert!`s the
-// depth is zero.
+// Guards against wiring mistakes where a history-store probe is accidentally
+// routed through the main pool's `BufferPoolPageSource`. The invariant is
+// enforced structurally by giving `HistoryStore` its own dedicated
+// [`BufferPool`] partition, but a runtime sentinel catches future mistakes
+// at runtime. Every public `HistoryStore` entry point increments the depth;
+// the main pool's `fetch_page` `debug_assert!`s the depth is zero.
 thread_local! {
     static HISTORY_STORE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -432,8 +429,7 @@ pub(crate) struct GcResult {
 
 impl<S: BTreePageStore> HistoryStore<S> {
     /// Sweep history-store entries whose `stop_ts <= ort` (oldest required
-    /// timestamp). Plan §T8: "`gc_pass(ort: Ts) -> GcResult { entries_deleted,
-    /// pages_freed }`. Called from checkpoint hook in paged_engine."
+    /// timestamp). Called from the checkpoint hook in `paged_engine`.
     ///
     /// Each expired entry is deleted from the B-tree. For entries with
     /// `VersionData::Overflow`, the history entry's logical +1 refcount on
@@ -453,9 +449,9 @@ impl<S: BTreePageStore> HistoryStore<S> {
     pub(crate) fn gc_pass(&mut self, ort: Ts) -> Result<GcResult> {
         let _guard = HistoryStoreGuard::enter();
 
-        // Phase 1: scan, identifying victims. Full-tree range_scan is
-        // acceptable in v1 — the history store is expected to be sparse
-        // relative to main data, and GC runs at checkpoint cadence.
+        // Scan, identifying victims. Full-tree range_scan is acceptable
+        // because the history store is sparse relative to main data, and
+        // GC runs at checkpoint cadence.
         let rows = self.tree.range_scan(None, None)?;
         type Victim = (Vec<u8>, Option<(u32, u64)>);
         let mut victims: Vec<Victim> = Vec::with_capacity(rows.len());
@@ -485,8 +481,8 @@ impl<S: BTreePageStore> HistoryStore<S> {
             victims.push((key, overflow));
         }
 
-        // Phase 2: delete each victim and, for overflow entries, transfer
-        // the logical +1 refcount into an ephemeral OverflowRef and drop it.
+        // Delete each victim and, for overflow entries, transfer the
+        // logical +1 refcount into an ephemeral OverflowRef and drop it.
         let mut result = GcResult::default();
         for (key, overflow) in victims {
             if !self.tree.delete(&key)? {

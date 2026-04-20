@@ -1,6 +1,4 @@
 //! Per-connection cursor state and the idle-eviction sweep task.
-//!
-//! Extracted from [`super`] to keep the file under length budget.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +7,6 @@ use std::sync::Arc;
 pub(crate) const CURSOR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A buffered cursor stored in the per-connection cursor map.
-#[allow(dead_code)] // cursor field used when data commands (getMore, killCursors) are added
 struct StoredCursor {
     /// The buffered cursor data.
     cursor: crate::Cursor<bson::Document>,
@@ -31,7 +28,6 @@ pub(crate) struct ConnectionCursors {
     next_cursor_id: i64,
 }
 
-#[allow(dead_code)] // methods used when data commands (getMore, killCursors) are added
 impl ConnectionCursors {
     pub(crate) fn new() -> Self {
         ConnectionCursors {

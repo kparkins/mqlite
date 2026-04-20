@@ -3,7 +3,7 @@
 > Migrating from the **MongoDB Rust driver** (`mongodb` crate) to mqlite.
 
 This guide provides side-by-side code comparisons and explains what transfers
-directly, what needs adaptation, and what is not available in Phase 1.
+directly, what needs adaptation, and what is not available in mqlite.
 
 ---
 
@@ -20,8 +20,8 @@ directly, what needs adaptation, and what is not available in Phase 1.
 | **Write concern** | Configurable (`w`, `j`, `wtimeout`) | Ignored (all writes committed) |
 | **Read concern** | Configurable (`local`, `majority`) | Ignored (MVCC snapshot per read) |
 | **Connection pool** | Yes (configurable pool size) | N/A (embedded, no network) |
-| **Aggregation** | Full pipeline support | Not supported (Phase 2) |
-| **Transactions** | Multi-document ACID | Not supported (Phase 2) |
+| **Aggregation** | Full pipeline support | Not supported |
+| **Transactions** | Multi-document ACID | Not supported |
 | **Change streams** | `collection.watch()` | Not supported |
 | **Authentication** | SCRAM-SHA-256, x.509 | None (file-level OS permissions) |
 
@@ -532,7 +532,7 @@ These patterns work identically in both the MongoDB driver and mqlite:
 
 ---
 
-## What's Missing (Phase 1 limitations)
+## What's Missing
 
 | Feature | Status | Workaround |
 |---------|--------|-----------|

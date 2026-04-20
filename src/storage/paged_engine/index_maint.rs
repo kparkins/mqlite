@@ -356,11 +356,11 @@ pub(super) fn install_pending_primary(
     Ok(())
 }
 
-/// Outcome of `create_index_reserve` (Phase 1 of the 3-phase build).
+/// Outcome of `create_index_reserve` (reserve step of the 3-step build).
 #[derive(Clone, Copy)]
 pub(super) enum ReserveOutcome {
     /// A fresh Building entry was reserved; caller should proceed to
-    /// Phase 2 (build) and Phase 3 (commit).
+    /// the build and commit steps.
     Reserved,
     /// An index with the same name already exists; `create_index` is
     /// idempotent and returns Ok immediately.

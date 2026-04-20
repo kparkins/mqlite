@@ -84,7 +84,8 @@ pub(crate) struct JournalManager {
     /// during recovery (`recover_existing`). `None` when the journal was
     /// freshly created or carried no ChainCommit frames. The MVCC backend
     /// reads this via [`recovered_max_commit_ts`](Self::recovered_max_commit_ts)
-    /// to floor [`TimestampOracle`] (plan T7 "journal-tail scan").
+    /// to floor [`TimestampOracle`] so every post-recovery commit is strictly
+    /// greater than any durable commit from the previous lifetime.
     pub(super) recovered_max_commit_ts: Option<Ts>,
 }
 
@@ -172,7 +173,7 @@ impl JournalManager {
         self.append_frame(page_number, 0, page_size, page_data)
     }
 
-    /// Append an MVCC `ChainCommit` frame to the journal (Format Lock §A.2).
+    /// Append an MVCC `ChainCommit` frame to the journal.
     ///
     /// Emits one `ChainCommitFrame` carrying `commit_ts`, `refcount_deltas`,
     /// and zero or more `page_writes`. The frame is written at the current
@@ -312,8 +313,7 @@ impl JournalManager {
 
     /// Fallback: linear journal scan to find `page_number`.
     ///
-    /// O(journal frames) per lookup.  Acceptable for Phase 1 with aggressive
-    /// checkpointing.  See scale.md §journal design fallback.
+    /// O(journal frames) per lookup.  Acceptable with aggressive checkpointing.
     pub(crate) fn read_page_linear(&mut self, page_number: u32) -> Result<Option<Vec<u8>>> {
         self.journal_file
             .seek(SeekFrom::Start(JOURNAL_HEADER_SIZE as u64))
@@ -327,8 +327,8 @@ impl JournalManager {
                 .seek(SeekFrom::Start(cursor))
                 .map_err(Error::Io)?;
 
-            // MVCC T5'/T6: skip ChainCommit frames — they carry no
-            // page_number and are invisible to the per-page linear scan.
+            // Skip ChainCommit frames — they carry no page_number and
+            // are invisible to the per-page linear scan.
             if let Some((n, _commit_ts)) =
                 try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
             {
@@ -489,8 +489,7 @@ impl JournalManager {
     /// when the journal was freshly created or carried no ChainCommit
     /// frames. The MVCC backend uses this to floor the HLC oracle at
     /// `max.successor()` so that every post-recovery `commit()` is
-    /// strictly greater than any durable commit from the previous
-    /// lifetime (plan T7 — "journal-tail scan, HLC-aware").
+    /// strictly greater than any durable commit from the previous lifetime.
     pub(crate) fn recovered_max_commit_ts(&self) -> Option<Ts> {
         self.recovered_max_commit_ts
     }
@@ -546,9 +545,9 @@ impl JournalManager {
                 .seek(SeekFrom::Start(scan))
                 .map_err(Error::Io)?;
 
-            // MVCC T5'/T6: ChainCommit frames are part of the durable log
-            // but carry no `page_number` for the in-memory index. Skip past
-            // them so `JournalFrameHeader::read` below sees only legacy frames.
+            // ChainCommit frames are part of the durable log but carry no
+            // `page_number` for the in-memory index. Skip past them so
+            // `JournalFrameHeader::read` below sees only legacy frames.
             if let Some((n, _commit_ts)) =
                 try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
             {

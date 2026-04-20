@@ -1,4 +1,4 @@
-//! Snapshot-based read helpers (PR 4 — mutex-free read path).
+//! Snapshot-based read helpers — mutex-free read path.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

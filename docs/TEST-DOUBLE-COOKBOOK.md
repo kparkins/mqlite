@@ -2,10 +2,6 @@
 
 Drop-in replacement for MongoDB in your test suite — no containers, no ports.
 
-> **Note:** Previously mqlite exposed `Client::open_in_memory()`. That API is
-> removed; use `tempfile::TempDir` + `Client::open` instead (shown throughout
-> this guide).
-
 ---
 
 ## Why mqlite in Tests?
@@ -17,7 +13,7 @@ Drop-in replacement for MongoDB in your test suite — no containers, no ports.
 | **Cleanup** | `db.drop()` or container teardown | Automatic on `Drop` — no cleanup code |
 | **CI** | Requires Docker daemon | Zero external dependencies |
 | **Parallelism** | Shared state unless isolated carefully | Each `TempDir` is always isolated |
-| **Wire compatibility** | Full MongoDB | Phase 1 operator set (see [Compatibility Matrix](COMPATIBILITY.md)) |
+| **Wire compatibility** | Full MongoDB | Supported operator set (see [Compatibility Matrix](COMPATIBILITY.md)) |
 
 The `tempfile::TempDir` + `Client::open` pattern is designed for exactly this
 use case. Each call creates a fresh, empty database backed by a temporary
@@ -377,8 +373,8 @@ fn deterministic_id_assignment() {
 }
 ```
 
-> **Note:** Seeded ObjectId generation is planned for Phase 2. Until then,
-> explicit `_id` assignment is the recommended approach for deterministic tests.
+> **Note:** Seeded ObjectId generation is not yet supported. Explicit `_id` assignment
+> is the recommended approach for deterministic tests.
 
 ---
 
@@ -389,8 +385,8 @@ These are the cases where mqlite behaves differently from MongoDB in ways that
 
 ### Unsupported operators fail immediately
 
-mqlite returns `Error::UnsupportedOperator` for operators outside the Phase 1
-set. This is **good for tests**: you find out instantly if you use an operator
+mqlite returns `Error::UnsupportedOperator` for unsupported operators.
+This is **good for tests**: you find out instantly if you use an operator
 that won't work in your deployment, rather than silently getting wrong results.
 
 ```rust
@@ -398,7 +394,7 @@ let result = col.find(doc! { "name": { "$where": "this.name == 'alice'" } });
 assert!(matches!(result, Err(mqlite::Error::UnsupportedOperator { .. })));
 ```
 
-Unsupported operators in Phase 1: `$where`, `$expr`, `$jsonSchema`, `$mod`,
+Unsupported operators: `$where`, `$expr`, `$jsonSchema`, `$mod`,
 `$text`, `$near`, `$geoWithin`, and the aggregation pipeline. See the
 [Compatibility Matrix](COMPATIBILITY.md) for the complete list.
 

@@ -65,7 +65,7 @@
 //!
 //! `Client`, `Database`, and `Collection<T>` can be cloned and sent to other threads without
 //! any additional synchronization. mqlite serializes concurrent writes internally
-//! with a `Mutex`. Reads are also serialized through the engine `Mutex` in Phase 1.
+//! through per-namespace lane mutexes in the engine.
 //!
 //! `Cursor<T>` is `Send` but not `Sync` — matching the MongoDB Rust driver contract.
 //! Use `Mutex<Cursor<T>>` if you need to drive a cursor from multiple threads simultaneously.
@@ -93,7 +93,7 @@
 //!
 //! - **File permissions**: new `.mqlite` files are created with mode `0600` (Unix)
 //! - **Symlink prevention**: [`Error::SymlinkRejected`] is returned if the path is a symlink
-//! - **Wire protocol**: no authentication in Phase 1 — bind to `127.0.0.1` only;
+//! - **Wire protocol**: no authentication — bind to `127.0.0.1` only;
 //!   see the [Wire Protocol Security Advisory](https://github.com/kyleparkinson/mqlite/blob/master/docs/WIRE-SECURITY.md)
 
 // ---------------------------------------------------------------------------
@@ -122,10 +122,9 @@ pub mod options;
 pub mod results;
 
 // Internal modules (not public API)
-// `mvcc` is `pub` but `#[doc(hidden)]` — integration tests
-// (`tests/registry_stress.rs`, future T4+ concurrency harnesses) need to
+// `mvcc` is `pub` but `#[doc(hidden)]` — integration tests need to
 // reference `ReadView` / `ReadViewRegistry` / `Ts` through the crate root,
-// but the module is not part of the stable surface yet.
+// but the module is not part of the stable surface.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub mod mvcc;

@@ -362,12 +362,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // R1.6: SWMR — concurrent reader tests
+    // SWMR — concurrent reader tests
     // -----------------------------------------------------------------------
 
     /// Verify that concurrent reads via the public `Client` API do not block
-    /// each other: multiple reader threads run simultaneously without the
-    /// writer_lock being a bottleneck (reads don't acquire writer_lock at all).
+    /// each other: multiple reader threads run simultaneously without
+    /// serializing on a single lock.
     #[test]
     fn swmr_concurrent_reads_via_client_do_not_deadlock() {
         use bson::doc;
@@ -408,7 +408,7 @@ mod tests {
     }
 
     /// Verify that concurrent writes via Client all eventually succeed:
-    /// the `acquire_writer_lock` spin-loop serialises them.
+    /// writes serialize internally and none are lost.
     #[test]
     fn swmr_concurrent_writes_via_client_all_succeed() {
         use bson::doc;
@@ -445,7 +445,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // R4.4: Database::backup — consistent hot copy
+    // Database::backup — consistent hot copy
     // -----------------------------------------------------------------------
 
     /// Basic hot backup: insert data, backup, reopen the copy, verify data.

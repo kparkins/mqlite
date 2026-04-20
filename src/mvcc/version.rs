@@ -1,6 +1,6 @@
 //! Version-chain primitives — `OverflowRef` RAII handle and `VersionEntry`.
 //!
-//! See MVCC plan §T3. The central invariant (CRITICAL-3): every live
+//! Central invariant: every live
 //! `OverflowRef` corresponds to one refcount on its `first_page`. This is
 //! enforced structurally — the type is not `Copy`, not `#[derive(Clone)]`.
 //! The explicit `Clone` impl bumps the refcount via the allocator's

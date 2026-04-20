@@ -16,8 +16,6 @@ use super::super::server::ServerState;
 /// - `connectionId` — unique per-connection integer identifier
 /// - No sessions, no auth, no transactions — strips capabilities mqlite lacks
 /// - `mqlite.version` so tooling can detect it is talking to mqlite
-///
-/// See integration.md §Handshake Response Design for the full field rationale.
 pub(super) fn handle_hello(state: &ServerState, connection_id: i32) -> Document {
     doc! {
         // Standalone — no replica set discovery.
@@ -76,7 +74,6 @@ pub(super) fn handle_ping() -> Document {
 /// `buildInfo` — server build metadata.
 ///
 /// Returns mqlite version information in MongoDB buildInfo format.
-/// See integration.md §Server Version Reporting for field rationale.
 pub(super) fn handle_build_info() -> Document {
     doc! {
         "version": env!("CARGO_PKG_VERSION"),
@@ -94,14 +91,13 @@ pub(super) fn handle_build_info() -> Document {
 /// `serverStatus` — runtime diagnostic statistics.
 ///
 /// Returns uptime, journal file size, connection count, and placeholder buffer pool
-/// stats sourced from internal server state (not the public `stats()` API,
-/// which is deferred to Phase 2 per api.md).
+/// stats sourced from internal server state.
 ///
 /// Data sources:
 /// - **uptime**: elapsed seconds since `WireProtocol::bind()`.
 /// - **journal size**: `std::fs::metadata("<db>-journal")?.len()` — best-effort, 0 if absent.
 /// - **connections.current**: approximate (counts connections opened, not live ones).
-/// - **buffer pool**: placeholder zeros (pool instrumentation is Phase 2).
+/// - **buffer pool**: placeholder zeros (pool instrumentation not yet implemented).
 pub(super) fn handle_server_status(state: &ServerState) -> Document {
     let uptime_secs = state.uptime_secs();
     let journal_size = state.journal_file_size() as i64;
@@ -131,7 +127,7 @@ pub(super) fn handle_server_status(state: &ServerState) -> Document {
         "mqlite": {
             "journalFileSizeBytes": journal_size,
         },
-        // Placeholder buffer pool stats (Phase 2: pool instrumentation).
+        // Placeholder buffer pool stats (pool instrumentation not yet implemented).
         "bufferPool": {
             "hits": 0i64,
             "misses": 0i64,

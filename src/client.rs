@@ -134,20 +134,18 @@ fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
 /// Wrapped in `Arc` and shared across [`Client`] clones, [`Database`] handles,
 /// and [`crate::collection::Collection`] handles.
 ///
-/// ## Locking (PR 8 — MWMR v1)
+/// ## Locking
 ///
-/// Cross-process locking is still provided by `file_lock` (OS advisory).
-/// In-process writer serialization was historically handled by
-/// `writer_lock: Mutex<()>` here in `ClientInner`. PR 8 moves that
-/// responsibility into the engine's per-namespace lanes: two writers on
-/// DIFFERENT namespaces now overlap; same-namespace writers serialize on
-/// an engine-owned lane mutex. Busy-timeout + busy-handler configuration
-/// is plumbed into `PagedEngine::new_buffered_with_busy`.
+/// Cross-process locking is provided by `file_lock` (OS advisory).
+/// In-process writer serialization is handled by the engine's per-namespace
+/// lanes: two writers on different namespaces overlap; same-namespace writers
+/// serialize on an engine-owned lane mutex. Busy-timeout + busy-handler
+/// configuration is plumbed into `PagedEngine::new_buffered_with_busy`.
 ///
 /// ## Storage engine
 ///
 /// `engine` is a `Box<dyn StorageEngine>` — the concrete type is always
-/// [`PagedEngine`] in Phase 1, but `ClientInner` never knows this.
+/// [`PagedEngine`], but `ClientInner` never knows this.
 pub(crate) struct ClientInner {
     /// Path to the database file.
     pub path: Option<PathBuf>,
@@ -158,7 +156,7 @@ pub(crate) struct ClientInner {
     /// Stored as `Arc` so the same fd can be shared with the `FilePageSource`
     /// backing the buffer pool.
     file_lock: Arc<AnyFileLock>,
-    /// Buffer pool handle — file I/O infrastructure wired in by R1.1.
+    /// Buffer pool handle.
     #[allow(dead_code)]
     pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
     /// Storage engine.  All CRUD operations are dispatched through this trait.
@@ -285,11 +283,10 @@ impl Client {
         let journal_path = journal_path(&path);
         reject_symlink(&journal_path)?;
 
-        // Detect a legacy pre-T1 sidecar (the file formerly known as
-        // `<db>-wal`) left by an older mqlite build. Return
-        // UnsupportedJournalFormat so the caller knows they need to open with
-        // the old version first and checkpoint before upgrading. The suffix is
-        // hex-encoded to keep the T1 `\bwal\b` grep gate clean.
+        // Detect a legacy `-wal` sidecar left by an older mqlite build.
+        // Return UnsupportedJournalFormat so the caller knows they need to
+        // open with the old version first and checkpoint before upgrading.
+        // The suffix is hex-encoded to keep the `\bwal\b` grep gate clean.
         let legacy_sidecar_path = {
             let mut s = path.as_os_str().to_owned();
             s.push("-\x77\x61\x6c");
@@ -359,7 +356,7 @@ impl Client {
             read_and_validate_header(file_lock.as_ref(), &path)?;
         }
 
-        // R1.2: Construct the buffer pool handle wired to the database file and
+        // Construct the buffer pool handle wired to the database file and
         // create a B+ tree engine backed by it.
         //
         // The pool is backed by FilePageSource which shares the lock fd (Arc clone)
@@ -428,7 +425,7 @@ impl Client {
                 Arc::clone(&journal),
             ));
         let pool = Arc::new(BufferPool::new(opts.buffer_pool_size, layered_source));
-        // Dedicated history-store buffer pool (plan §T7 NON-NEGOTIABLE).
+        // Dedicated history-store buffer pool.
         // Sized conservatively; routes through the same journal-layered source so
         // recovered history pages are visible after checkpoint.
         let history_source: Box<dyn crate::storage::buffer_pool::PageSource> =
@@ -517,11 +514,9 @@ impl Client {
 
     /// Test-only accessor for the MVCC `ReadViewRegistry` backing this client.
     ///
-    /// Exposed for integration tests (plan §T9 `drop_collection` barrier
-    /// verification) that need to register external `ReadView`s and watch
-    /// them get force-expired on the engine's drop path. Returns `None`
-    /// when the client has no attached buffer pool (legacy in-memory
-    /// engines that predate the MVCC rollout).
+    /// Exposed for integration tests that need to register external `ReadView`s
+    /// and watch them get force-expired on the engine's drop path. Returns `None`
+    /// when the client has no attached buffer pool.
     #[doc(hidden)]
     pub fn __read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
         self.inner

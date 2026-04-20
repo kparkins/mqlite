@@ -38,7 +38,7 @@
 //! |-----------|---------------------|----------------------|
 //! | Linux     | [`PosixFileLock`]   | `fcntl(F_SETLK)`     |
 //! | macOS     | [`PosixFileLock`]   | `fcntl(F_SETLK)`     |
-//! | Windows   | [`WindowsFileLock`] | stub — `TODO` Phase 1 |
+//! | Windows   | [`WindowsFileLock`] | stub — not yet implemented |
 //! | in-memory | [`NoopFileLock`]    | no-op                |
 //!
 //! ## macOS-specific behaviour
@@ -368,19 +368,14 @@ impl FileLock for PosixFileLock {
 
 /// Windows file lock stub.
 ///
-/// Full Windows support is tracked as Phase 1 work (hq-dr9).  The production
-/// implementation will use `LockFileEx()` / `UnlockFileEx()` for byte-range
-/// locking via the `windows-sys` crate.
-///
-/// # Target
-///
-/// `x86_64-pc-windows-msvc` is a P1 target — it must compile and pass CI
-/// before Phase 1 ships.  The stub ensures the project compiles on Windows
-/// today; the `acquire_*` methods return `Error::WriterBusy` to prevent
-/// accidental use in production on Windows.
+/// Not yet implemented. The production implementation will use
+/// `LockFileEx()` / `UnlockFileEx()` for byte-range locking via the
+/// `windows-sys` crate. The stub ensures the project compiles on Windows;
+/// the `acquire_*` methods return `Error::WriterBusy` to prevent accidental
+/// use in production on Windows.
 #[cfg(windows)]
 pub(crate) struct WindowsFileLock {
-    // TODO (hq-dr9): add HANDLE field and implement LockFileEx / UnlockFileEx.
+    // TODO: add HANDLE field and implement LockFileEx / UnlockFileEx.
     _marker: std::marker::PhantomData<()>,
 }
 
@@ -396,37 +391,37 @@ impl WindowsFileLock {
 #[cfg(windows)]
 impl FileLock for WindowsFileLock {
     fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<()> {
-        // TODO (hq-dr9): implement using WriteFile at offset via OVERLAPPED.
+        // TODO: implement using WriteFile at offset via OVERLAPPED.
         Err(Error::Internal(
-            "WindowsFileLock::write_at: not yet implemented (hq-dr9)".into(),
+            "WindowsFileLock::write_at: not yet implemented".into(),
         ))
     }
 
     fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
-        // TODO (hq-dr9): implement using ReadFile at offset via OVERLAPPED.
+        // TODO: implement using ReadFile at offset via OVERLAPPED.
         Err(Error::Internal(
-            "WindowsFileLock::read_exact_at: not yet implemented (hq-dr9)".into(),
+            "WindowsFileLock::read_exact_at: not yet implemented".into(),
         ))
     }
 
     fn acquire_exclusive(&self, _timeout: Duration) -> Result<bool> {
-        // TODO (hq-dr9): implement using LockFileEx() with LOCKFILE_EXCLUSIVE_LOCK.
+        // TODO: implement using LockFileEx() with LOCKFILE_EXCLUSIVE_LOCK.
         // The OVERLAPPED structure's Offset/OffsetHigh fields map to the byte
         // range within the file to lock.
         Err(Error::Internal(
-            "Windows file locking not yet implemented (hq-dr9)".into(),
+            "Windows file locking not yet implemented".into(),
         ))
     }
 
     fn acquire_shared(&self, _timeout: Duration) -> Result<bool> {
-        // TODO (hq-dr9): implement using LockFileEx() without LOCKFILE_EXCLUSIVE_LOCK.
+        // TODO: implement using LockFileEx() without LOCKFILE_EXCLUSIVE_LOCK.
         Err(Error::Internal(
-            "Windows file locking not yet implemented (hq-dr9)".into(),
+            "Windows file locking not yet implemented".into(),
         ))
     }
 
     fn release(&self) -> Result<()> {
-        // TODO (hq-dr9): implement using UnlockFileEx().
+        // TODO: implement using UnlockFileEx().
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 //! MongoDB update operator implementation.
 //!
-//! Supported operators (Phase 1b):
+//! Supported operators:
 //!
 //! | Operator      | Description |
 //! |---------------|-------------|

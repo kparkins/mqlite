@@ -29,13 +29,8 @@
 //!
 //! Both `BufferPool` and `AllocatorHandle` are `Send + Sync`; `BufferPoolHandle`
 //! inherits this and can be wrapped in `Arc` for sharing across threads.
-//! Today all concurrent access (reads and writes) is serialized at the
-//! `PagedEngine` level by `PagedEngine::inner: Mutex<BpBackend>`.
-//!
-//! TODO(mwmr): the `writer_lock: Mutex<()>` at `ClientInner` and the engine-level
-//! mutex will both be retired in PR 8 in favour of per-namespace write lanes
-//! (`ns_lanes: DashMap<String, Arc<Mutex<()>>>`) and a metadata `RwLock`.
-//! See docs/adr/0002-mwmr.md.
+//! Concurrent access is managed at the `PagedEngine` level via per-namespace
+//! write lanes (`ns_lanes`) and a metadata `RwLock`.
 
 use std::fs::File;
 use std::sync::{Arc, Mutex};
@@ -104,7 +99,7 @@ impl PageSource for BufferPoolPageSource {
 /// See the module-level documentation for the full API overview.
 pub(crate) struct BufferPoolHandle {
     pool: Arc<BufferPool>,
-    /// Dedicated MVCC history-store buffer pool (plan §T7 "NON-NEGOTIABLE").
+    /// Dedicated MVCC history-store buffer pool.
     ///
     /// Holds the history-store B-tree's cached pages. Lock-order position **1**
     /// (outermost) — partition mutexes on this pool are acquired BEFORE any
@@ -118,9 +113,9 @@ pub(crate) struct BufferPoolHandle {
     /// `PageSource` adapter that routes allocator I/O through the pool.
     pool_io: BufferPoolPageSource,
     /// Registry of live reader `ReadView`s; [`ReadViewRegistry::oldest_required_ts`]
-    /// feeds every chain-reconciliation path. Eager construction here (vs. on
-    /// `BpBackend`) lets [`fetch_page`](Self::fetch_page) reconcile evictions
-    /// on the buffer-pool miss path (plan T7 defect #2).
+    /// feeds every chain-reconciliation path. Eager construction lets
+    /// [`fetch_page`](Self::fetch_page) reconcile evictions on the
+    /// buffer-pool miss path.
     read_view_registry: Arc<ReadViewRegistry>,
     /// Optional journal manager; `None` for in-memory / test handles.
     journal: Option<Arc<Mutex<JournalManager>>>,
@@ -195,15 +190,15 @@ impl BufferPoolHandle {
         page_number: u32,
         size: PageSize,
     ) -> Result<PinnedPage<'a>> {
-        // Non-recursion invariant (plan §T7): reconciliation while evicting a
-        // main-data leaf installs aged entries into `history_pool`. If the
-        // history store could somehow re-enter fetch_page on the main pool we
-        // would risk partition-lock recursion. The depth sentinel catches that
-        // in debug builds.
+        // Non-recursion invariant: reconciliation while evicting a main-data
+        // leaf installs aged entries into `history_pool`. If the history store
+        // could somehow re-enter fetch_page on the main pool we would risk
+        // partition-lock recursion. The depth sentinel catches that in debug
+        // builds.
         debug_assert!(
             crate::storage::history_store::history_store_depth() == 0,
             "BufferPoolHandle::fetch_page entered from within HistoryStore body \
-             — non-recursion invariant violated (plan §T7)"
+             — non-recursion invariant violated"
         );
         self.pool
             .pin_with_reconcile(page_number, size, &self.read_view_registry, &self.allocator)
@@ -256,9 +251,9 @@ impl BufferPoolHandle {
     }
 
     /// Allocate a new page and pin it zeroed on the dedicated history-store
-    /// pool (plan §T7). File-level allocation still goes through the single
-    /// per-file `AllocatorHandle`, so history pages and main-data pages share
-    /// one disjoint page-number namespace.
+    /// pool. File-level allocation still goes through the single per-file
+    /// `AllocatorHandle`, so history pages and main-data pages share one
+    /// disjoint page-number namespace.
     pub(crate) fn alloc_page_history(&self, size: PageSize) -> Result<u32> {
         let page_no = match size {
             PageSize::Small4k => self.allocator.alloc_4k(&self.pool_io)?,
@@ -439,7 +434,7 @@ impl BufferPoolHandle {
         &self.pool
     }
 
-    /// Borrow the dedicated MVCC history-store [`BufferPool`] (plan §T7).
+    /// Borrow the dedicated MVCC history-store [`BufferPool`].
     ///
     /// A separate pool guarantees that `history_store` I/O never invalidates
     /// main-data frames and — combined with the outermost lock-order position —

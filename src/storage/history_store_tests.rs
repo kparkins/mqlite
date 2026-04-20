@@ -243,13 +243,12 @@ fn history_store_isolated_from_main_data_store() {
 }
 
 // -----------------------------------------------------------------------
-// GC pass — plan §T8 acceptance bullets
+// GC pass
 // -----------------------------------------------------------------------
 
 /// Given 10k entries with `stop_ts` spread across [1, 10_000], and
-/// `ort = Ts{3000, 0}`: exactly 3000 entries are deleted. Plan T8
-/// acceptance bullet 1 (inline variant; no overflow required to prove
-/// the delete-count invariant).
+/// `ort = Ts{3000, 0}`: exactly 3000 entries are deleted (inline variant;
+/// no overflow required to prove the delete-count invariant).
 #[test]
 fn gc_pass_deletes_exactly_the_expired_entries() {
     let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
@@ -360,9 +359,8 @@ fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_deferred_free() {
 
     let alloc = Arc::new(AllocatorHandle::new(FileHeader::new(0, 0, 0)));
     // Seed a logical +1 refcount on first_page=777 — simulates the
-    // refcount "owned by the history entry" convention (plan §T7 bullet
-    // 909). This matches what a real reconciliation-path insert would
-    // have done.
+    // refcount owned by the history entry. This matches what a real
+    // reconciliation-path insert would have done.
     alloc.set_overflow_refcount_for_test(777, 1);
 
     let mut hs = HistoryStore::create(MemPageStore::new())

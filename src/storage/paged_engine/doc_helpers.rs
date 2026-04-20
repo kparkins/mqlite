@@ -32,10 +32,10 @@ pub(in crate::storage::paged_engine) fn ensure_id(doc: &mut Document) -> Bson {
 
 /// Validate that an index key pattern does not request an unsupported index type.
 ///
-/// Rejects `text`, `2d`, `2dsphere`, and `hashed` indexes (Phase 2 features).
+/// Rejects `text`, `2d`, `2dsphere`, and `hashed` indexes (not yet implemented).
 pub(in crate::storage::paged_engine) fn validate_index_keys(keys: &Document) -> Result<()> {
     const SUGGESTION: &str =
-        "Phase 1 supports single-field, compound, unique, sparse, and multikey \
+        "Supported: single-field, compound, unique, sparse, and multikey \
          indexes. Text, geospatial, hashed, TTL, and partial indexes are \
          planned for a future release.";
 

@@ -166,7 +166,7 @@ fn find_one_and_delete_returns_doc() {
 }
 
 // -----------------------------------------------------------------------
-// R1.3: Buffered-mode (catalog namespace registry) tests
+// Buffered-mode (catalog namespace registry) tests
 //
 // These tests exercise PagedEngine in buffered mode, using
 // an in-memory mock I/O layer so they remain hermetic and fast.
@@ -395,8 +395,8 @@ fn buffered_catalog_survives_reopen() {
     // Reopen using the persisted catalog root from the header.
     let e2 = reopen_engine(&io);
 
-    // list_namespaces must discover the previously-created collections
-    // by reading the catalog from disk.
+    // list_namespaces must discover the collections created in the first
+    // engine lifetime by reading the catalog from disk.
     let mut ns = e2.list_namespaces().unwrap();
     ns.sort();
     assert_eq!(
@@ -471,7 +471,7 @@ fn buffered_drop_and_create_reuses_pages() {
 }
 
 // -----------------------------------------------------------------------
-// R1.4: Secondary index maintenance + index scan tests (buffered mode)
+// Secondary index maintenance + index scan tests (buffered mode)
 // -----------------------------------------------------------------------
 
 /// Verify that `create_index` builds the secondary B+ tree from existing
@@ -762,7 +762,7 @@ fn buffered_index_survives_reopen() {
 }
 
 // -----------------------------------------------------------------------
-// R1.6: SWMR concurrency tests
+// SWMR concurrency tests
 //
 // Verify that multiple concurrent readers do not block each other, and
 // that readers run concurrently with writers (writers take an exclusive
@@ -802,11 +802,10 @@ fn swmr_concurrent_readers_do_not_block() {
 /// Verify that a reader can observe a consistent snapshot while a
 /// concurrent writer is modifying the collection.
 ///
-/// PR 4: readers no longer take the engine mutex. Instead they load a
-/// `PublishedSnapshot`, which captures the state at the moment of the
-/// last commit. A reader that loaded the snapshot before the writer
-/// commits will still see the pre-write state because `publish_ts` pins
-/// the `ReadView` at that timestamp.
+/// Readers load a `PublishedSnapshot` without taking the engine mutex.
+/// A reader that loaded the snapshot before the writer commits will still
+/// see the pre-write state because `publish_ts` pins the `ReadView` at
+/// that timestamp.
 #[test]
 fn swmr_reader_sees_snapshot_isolation() {
     use std::sync::{Arc, Barrier};

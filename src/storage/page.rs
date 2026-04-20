@@ -345,7 +345,7 @@ pub(crate) struct OverflowPageHeader {
     /// Reference count — number of live `OverflowRef` handles pinning this
     /// chain. Serialized as a plain `u32` in the on-disk struct; atomic
     /// operations go through `allocator::AllocatorHandle::incref_overflow`
-    /// etc. See MVCC plan §A.1 / §A.4.
+    /// etc.
     pub refcount: u32,
     /// CRC32C checksum. Covers bytes 0..4 + 12..END; EXCLUDES bytes 4..12.
     pub checksum: u32,

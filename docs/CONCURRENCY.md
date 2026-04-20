@@ -1,15 +1,13 @@
 # mqlite Concurrency Guide
 
 mqlite uses **in-process MWMR for readers** (via MVCC version chains) and
-**SWMR for writers** today. Every read operation opens a `ReadView` that
+**SWMR for writers**. Every read operation opens a `ReadView` that
 pins a point-in-time snapshot; concurrent writes do not disturb an
-in-progress read. Writers serialize on a single engine-level mutex. The
-v1 upgrade (see [ADR 0002](adr/0002-mwmr.md)) expands the write path to
-per-namespace write lanes so that writers on different namespaces overlap.
+in-progress read. Writers serialize on a single engine-level mutex.
 
 ---
 
-## Current behavior (T9 shipped)
+## Current behavior
 
 ### Readers: MVCC snapshot isolation
 
@@ -104,28 +102,6 @@ the collection's B-tree pages.
 Any caller that holds a `ReadView` across a `drop_collection` will receive
 `Error::ReadViewExpired` on its next read and must open a fresh view.
 Subsequent reads on the dropped collection return zero rows.
-
----
-
-## v1-MWMR target
-
-[ADR 0002](adr/0002-mwmr.md) pins the v1 contract:
-
-- **Latest-published-snapshot reads.** Reads call
-  `published.load()` (an `ArcSwap<PublishedSnapshot>`) once per
-  operation and open B-trees from the snapshot's root pages — no engine
-  mutex taken on the read path at all.
-- **Namespace-level write lanes.** A `DashMap<String, Arc<Mutex<()>>>`
-  serializes writers on the same namespace; writers on different
-  namespaces run concurrently.
-- **Global metadata `RwLock` for DDL**, intentionally conservative in
-  v1. `create_index` is the sole exception — it uses a three-phase
-  Reserve/Build/Commit pattern so the build scan holds only the target
-  namespace's lane.
-- **Journal-durable `FullSync`.** A `FullSync` commit fsyncs the journal
-  and returns; main-file checkpointing moves off the hot path.
-
-See [ADR 0002](adr/0002-mwmr.md) for the full decision record.
 
 ---
 
@@ -410,7 +386,7 @@ Multi-document transaction support is out of scope for v1.
 |----------|-----|
 | Share database across threads | `client.clone()` (it's already `Arc`-backed) |
 | Serialize writes | mqlite does this automatically |
-| Read without blocking writes | `read_only(true)` or just `find_one` (today both serialize on the engine mutex; v1 removes the read-path mutex) |
+| Read without blocking writes | `read_only(true)` or just `find_one` |
 | Wait for writer lock | `busy_timeout(Duration::from_secs(N))` |
 | Custom retry logic | `busy_handler(|attempts| ...)` |
 | Use in async code | `tokio::task::spawn_blocking` |

@@ -228,7 +228,7 @@
 
     #[test]
     fn dispatch_op_msg_list_databases() {
-        // Insert a document so the database is visible in listDatabases (R2.1).
+        // Insert a document so the database is visible in listDatabases.
         let state = ServerState::default();
         let cursors = dummy_cursors();
         let ins_req = make_op_msg_request(
@@ -277,7 +277,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // $db field routing (R2.1 multi-database — any $db is accepted)
+    // $db field routing (multi-database — any $db is accepted)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -294,7 +294,7 @@
 
     #[test]
     fn dispatch_op_msg_any_db_is_allowed() {
-        // R2.1: arbitrary $db values must succeed (no Unauthorized for unknown db).
+        // Arbitrary $db values must succeed (no Unauthorized for unknown db).
         let state = ServerState::default();
         for db in &["admin", "local", "mydb", "arbitrarydb", "test"] {
             let req_buf = make_op_msg_request(20, &doc! { "ping": 1, "$db": db });
@@ -384,7 +384,7 @@
 
     #[test]
     fn dispatch_op_query_any_db_is_allowed() {
-        // R2.1: OP_QUERY from any database must succeed (isMaster handshake).
+        // OP_QUERY from any database must succeed (isMaster handshake).
         let state = ServerState::default();
         let req_buf = make_op_query_request(30, "anydb.$cmd", &doc! { "ismaster": 1 });
         let resp_bytes = dispatch_op_query(&req_buf, 50, 30, &state, 1).unwrap();
@@ -560,7 +560,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // listDatabases — spec compliance (R2.1 multi-database)
+    // listDatabases — spec compliance (multi-database)
     // -----------------------------------------------------------------------
 
     #[test]

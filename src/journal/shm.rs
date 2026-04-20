@@ -16,9 +16,7 @@
 //!
 //! When the index reaches [`JOURNAL_INDEX_HOT_THRESHOLD`] live entries,
 //! [`JournalIndex::insert`] returns `true` to signal that an emergency
-//! checkpoint should drain the journal before it grows further. The threshold
-//! value is preserved verbatim from the previous hash-table-based design so
-//! checkpoint cadence is unchanged.
+//! checkpoint should drain the journal before it grows further.
 //!
 //! Recovery, rollback, and checkpoint correctness depend on the index
 //! reflecting only durable, committed frames — see the call sites in
@@ -27,8 +25,8 @@
 use std::collections::HashMap;
 
 /// Journal index hot-threshold: when the index holds at least this many live
-/// entries, [`JournalIndex::insert`] signals that the journal should be
-/// drained by an emergency checkpoint.
+/// entries, [`JournalIndex::insert`] returns `true` to signal that an
+/// emergency checkpoint should drain the journal.
 pub(crate) const JOURNAL_INDEX_HOT_THRESHOLD: usize = 3072;
 
 // ---------------------------------------------------------------------------

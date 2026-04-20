@@ -2,9 +2,6 @@
 //!
 //! Entry point: [`eval_filter`].
 //!
-// Phase 1b: functions are not yet wired to the storage engine; they are
-// called only from tests.  Dead-code lint is suppressed until the query
-// planner and storage engine integrate the filter evaluator.
 #![allow(dead_code)]
 //!
 //! # Supported operators
@@ -285,7 +282,7 @@ fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bo
         // ---- Explicitly unsupported operators (error code 9) ----
         // These are named individually to ensure they are never silently ignored.
         "$expr"           // Aggregation-expression passthrough — explicitly forbidden.
-        | "$jsonSchema"   // JSON Schema validation — Phase 2.
+        | "$jsonSchema"   // JSON Schema validation — not implemented.
         | "$mod"          // Modulo arithmetic — not implemented.
         | "$text"         // Full-text search — not implemented.
         | "$where"        // JavaScript evaluation — intentionally unsupported.

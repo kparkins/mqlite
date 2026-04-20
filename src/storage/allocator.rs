@@ -258,21 +258,16 @@ struct AllocatorState {
 }
 
 /// Inner state of an [`AllocatorHandle`], shared via a single `Arc`.
-///
-/// Grouping all three fields under one `Arc` collapses the previous
-/// per-field `Arc` wrappers (M3, M4, M5) while preserving `Clone` on
-/// `AllocatorHandle` with a single refcount bump.
 struct AllocatorInner {
     state: Mutex<AllocatorState>,
     /// Per-overflow-chain refcount table.
     ///
     /// Maps `first_page` → shared `AtomicU32` pin counter. Populated when
-    /// the first `OverflowRef` for a chain is created (T5'/T6 wires this
-    /// into the writer path). Cloned-out `Arc<AtomicU32>` handles let
-    /// callers do atomic ops without holding the HashMap mutex.
+    /// the first `OverflowRef` for a chain is created. Cloned-out
+    /// `Arc<AtomicU32>` handles let callers do atomic ops without holding
+    /// the HashMap mutex.
     ///
-    /// MVCC plan §T3: atomic ops on the refcount happen OUTSIDE the
-    /// allocator state mutex.
+    /// Atomic ops on the refcount happen OUTSIDE the allocator state mutex.
     overflow_refcounts: Mutex<HashMap<u32, Arc<AtomicU32>>>,
     /// Refcount-to-zero queue drained by the writer path.
     ///
@@ -283,13 +278,8 @@ struct AllocatorInner {
 /// A `Clone`-able, `Arc`-wrapped allocator handle that owns the
 /// [`FileHeader`] rather than borrowing it.
 ///
-/// Resolves **RISK-03** from the Phase 1 reconciliation plan: the original
-/// [`PageAllocator`] holds `header: &'a mut FileHeader`, which makes it
-/// impossible to use concurrently from multiple threads or to store in an
-/// `Arc`-shared struct like `DatabaseInner`.
-///
-/// `AllocatorHandle` wraps all shared state in a single `Arc<AllocatorInner>`.
-/// All allocations and deallocations lock the state mutex, perform the
+/// Wraps all shared state in a single `Arc<AllocatorInner>`. All
+/// allocations and deallocations lock the state mutex, perform the
 /// operation via a short-lived [`PageAllocator`], and release the lock.
 ///
 /// After any allocation or free, the in-memory header is marked dirty.  Call
@@ -326,7 +316,7 @@ impl AllocatorHandle {
     }
 
     // -----------------------------------------------------------------------
-    // Overflow refcount — MVCC T3
+    // Overflow refcount
     // -----------------------------------------------------------------------
     //
     // The refcount for each overflow chain lives in an AtomicU32 that is
@@ -422,7 +412,7 @@ impl AllocatorHandle {
     }
 
     /// Number of overflow-chain `first_page`s whose refcount is currently
-    /// `>= 1`. Backs the `mvcc.overflow.pages_in_use` gauge (plan §T8).
+    /// `>= 1`. Backs the `mvcc.overflow.pages_in_use` gauge.
     ///
     /// Walks the refcount table under the table mutex; acceptable because
     /// this is called at checkpoint cadence, not on the hot path.
@@ -500,8 +490,7 @@ impl AllocatorHandle {
     }
 
     /// Drain the deferred-free queue but hand the 0-refcount pages to the
-    /// caller as a plain `Vec<u32>` rather than freeing them to the
-    /// allocator (plan §M4b).
+    /// caller as a plain `Vec<u32>` rather than freeing them to the allocator.
     ///
     /// Writer-txn `begin` uses this so the drained pages become
     /// `PageOrigin::DeferredFree` reservations on the txn's overlay.

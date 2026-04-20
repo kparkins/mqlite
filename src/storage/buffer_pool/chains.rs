@@ -1,9 +1,9 @@
 //! MVCC per-frame version-chain helpers on [`BufferPool`].
 //!
-//! The per-key version chains (plan §T3.5) live on the 32 KB leaf partition's
-//! frames. This module extends [`BufferPool`] with the take / put / snapshot /
+//! The per-key version chains live on the 32 KB leaf partition's frames.
+//! This module extends [`BufferPool`] with the take / put / snapshot /
 //! clear / drain helpers the MVCC writer and reader lanes use to manipulate
-//! those chains, plus the [`BufferPool::reconcile`] walk used by T6.
+//! those chains, plus the [`BufferPool::reconcile`] walk.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

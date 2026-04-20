@@ -197,10 +197,9 @@ fn report_db_size(path: &str) {
   reader must scan the journal for page versions).
 
 **Main file size behaviour:**
-- The main file **never shrinks automatically** in Phase 1. Deleted documents
+- The main file **never shrinks automatically**. Deleted documents
   free internal B-tree pages, but those pages are reused for future writes
-  rather than returned to the OS. A `compact()` / `vacuum()` operation is
-  planned for Phase 2.
+  rather than returned to the OS.
 
 ---
 

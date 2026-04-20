@@ -123,7 +123,7 @@ let db = client.database("iot");
 
 Embedded devices often have small storage. A disk-full condition returns
 `Error::DiskFull` and **rolls back** the current write. The database remains
-consistent; no data is lost from previously committed records.
+consistent; no data is lost from committed records.
 
 ```rust
 use mqlite::{Error, doc};

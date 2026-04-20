@@ -3,10 +3,9 @@
 //! Commit timestamps are 12 bytes: an 8-byte physical millisecond reading
 //! followed by a 4-byte logical counter. The oracle guarantees strictly
 //! monotonic, unique timestamps across concurrent callers even when the
-//! physical wall clock regresses (node-local single-wall single-oracle path,
-//! aka T12.A from the design doc).
+//! physical wall clock regresses (node-local single-wall single-oracle path).
 //!
-//! Format Lock Appendix §A.3 pins the on-disk / on-wire serialization:
+//! On-disk / on-wire serialization:
 //!
 //! * **Ts-LE** — 12 bytes: `physical_ms` (8 B LE) || `logical` (4 B LE).
 //!   Used in `VersionEntry`, journal `ChainCommit.commit_ts`, and the
@@ -15,7 +14,7 @@
 //!   Used ONLY in history-store B-tree keys so that lexicographic sort
 //!   equals chronological order.
 //!
-//! A `cfg(loom)` shim around `std::sync::Mutex` lets T4+ loom harnesses
+//! A `cfg(loom)` shim around `std::sync::Mutex` lets loom harnesses
 //! permute the oracle's critical section without touching production code.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -244,7 +243,7 @@ impl<C: WallClock> TimestampOracle<C> {
 
     /// Fold an externally-received `Ts` into the oracle.
     ///
-    /// In the single-node default (T12.A) this is a no-op: we have no peers
+    /// In the single-node default this is a no-op: we have no peers
     /// whose timestamps could outrun ours. Callers pass the received Ts
     /// anyway so the signature is stable when multi-node is wired in later.
     /// Ticks `mvcc.hlc.advance_events_total` per call.

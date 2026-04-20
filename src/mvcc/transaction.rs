@@ -1,7 +1,6 @@
 //! `WriteTxn` — MVCC writer transaction (begin / commit / rollback).
 //!
-//! Per `.omc/plans/mvcc-wiredtiger.md` §T5', every writer path runs inside a
-//! `WriteTxn` that:
+//! Every writer path runs inside a `WriteTxn` that:
 //!
 //! 1. On `begin`: drains the deferred-free queue under
 //!    `AllocatorHandle::state` so any refcount-0 pages from earlier reader
@@ -9,17 +8,12 @@
 //! 2. Accumulates pending overflow-chain pins in `self.pending` (RAII
 //!    decref on abort — pages enqueue for deferred-free on Drop).
 //! 3. On `commit`: requests a `commit_ts` from the oracle, emits exactly
-//!    one `ChainCommit` journal frame (Format Lock §A.2) carrying the
-//!    commit timestamp and any refcount deltas / page writes, fsyncs the
-//!    journal, and transfers ownership of the pending `OverflowRef`s into
-//!    the installed version chains (refcounts remain bumped post-commit
-//!    because the chain now holds the pin).
+//!    one `ChainCommit` journal frame carrying the commit timestamp and any
+//!    refcount deltas / page writes, fsyncs the journal, and transfers
+//!    ownership of the pending `OverflowRef`s into the installed version
+//!    chains (refcounts remain bumped post-commit because the chain now
+//!    holds the pin).
 //! 4. On `rollback` / `Drop`: pending `OverflowRef`s decref via RAII.
-//!
-//! Phase 2 scope: primitives only — the structural protocol plus journal
-//! emission. Phase 6 wires chain population at commit time; phase 4 wraps
-//! the writer sites in `paged_engine.rs`. The API on this file is designed
-//! so those follow-on phases plug in without re-opening the Format Lock.
 //!
 //! ## Lock ownership
 //!
@@ -108,16 +102,15 @@ impl std::ops::Deref for Ns {
 
 /// One pending secondary-index mutation staged by a `WriteTxn`.
 ///
-/// Phase 5 introduces this as an accumulating buffer only — entries are
-/// staged via `stage_sec_index_{insert,delete,update}` and consumed by the
-/// Phase 6 commit loop that installs them into the per-key version chains
-/// under a shared `commit_ts`. On abort, the buffer is discarded by
+/// Entries are staged via `stage_sec_index_{insert,delete,update}` and
+/// consumed by the commit loop that installs them into the per-key version
+/// chains under a shared `commit_ts`. On abort, the buffer is discarded by
 /// `WriteTxn::Drop` (no external refcount state to release — `id_bytes` is
 /// plain owned memory).
 #[derive(Debug, Clone)]
 pub(crate) struct SecIndexWrite {
-    /// Root page of the target secondary-index B+ tree. Phase 6 uses this
-    /// to locate the tree at install time.
+    /// Root page of the target secondary-index B+ tree. The install pass
+    /// uses this to locate the tree at commit time.
     pub(crate) index_root_page: u32,
     /// Compound key bytes (from `encode_compound_key` in `key_encoding`).
     pub(crate) key: Vec<u8>,
@@ -140,20 +133,16 @@ pub(crate) enum SecIndexOp {
 
 /// One pending primary (data-tree) mutation staged by a `WriteTxn`.
 ///
-/// Phase 6 sub-step 2: writer paths in `paged_engine` stage through
+/// Writer paths in `paged_engine` stage through
 /// `stage_primary_{insert,update,delete}`. At commit time the staged writes
 /// install a `VersionEntry` at the head of each key's version chain (on the
 /// owning leaf frame) under the txn's `commit_ts`, with prev-head's
 /// `stop_ts` advanced to `commit_ts` via `Arc::make_mut`.
-///
-/// Dual-write: writers also mutate the on-disk cell as today so the durable
-/// image remains a valid snapshot at a single HLC ts (plan principle #3).
-/// T6 reconciliation will later collapse the dual-write.
 #[derive(Debug, Clone)]
 pub(crate) struct PrimaryWrite {
-    /// Target data-tree namespace. The install pass looks up the current
-    /// tree by name so any in-txn root splits between stage and install
-    /// time are transparently followed.
+    /// Target data-tree namespace. The commit install pass looks up the
+    /// current tree by name so any in-txn root splits between stage and
+    /// install time are transparently followed.
     pub(crate) ns: Ns,
     /// B+ tree cell key (e.g. `encode_key(_id)`).
     pub(crate) key: Vec<u8>,
@@ -199,25 +188,25 @@ pub(crate) struct WriteTxn {
     /// deferred-free enqueue).
     pub(crate) pending: SmallVec<[OverflowRef; 2]>,
     /// Page writes to include in the `ChainCommit` journal frame. Each
-    /// entry is a (page, size, bytes) triple. Phase 2 leaves this empty;
-    /// phases 4/6 populate it as chain mutations land.
+    /// entry is a (page, size, bytes) triple. Populated as chain mutations
+    /// land.
     pub(crate) page_writes: SmallVec<[ChainPageWrite; 2]>,
     /// Refcount deltas to record in the `ChainCommit` frame for recovery.
     /// `(first_page, +1)` for newly allocated overflow chains; `(-1)` for
-    /// chains dropped at commit. Phase 2 leaves this empty.
+    /// chains dropped at commit.
     pub(crate) refcount_deltas: SmallVec<[(u32, i32); 2]>,
     /// Pending secondary-index mutations staged by this transaction.
-    /// Phase 5 populates this via `stage_sec_index_{insert,delete,update}`;
-    /// Phase 6 drains it at commit and installs each entry into the
-    /// per-key version chain under the shared `commit_ts`. On abort, the
-    /// buffer is dropped with `self` — `SecIndexWrite` owns no external
-    /// refcount state, so no RAII cleanup is required beyond vec drop.
+    /// Populated via `stage_sec_index_{insert,delete,update}` and drained
+    /// at commit, installing each entry into the per-key version chain
+    /// under the shared `commit_ts`. On abort, the buffer is dropped with
+    /// `self` — `SecIndexWrite` owns no external refcount state, so no
+    /// RAII cleanup is required beyond vec drop.
     pub(crate) pending_sec_index: SmallVec<[SecIndexWrite; 2]>,
     /// Pending primary-tree (data-tree) mutations staged by this transaction.
-    /// Phase 6 sub-step 2 populates this via `stage_primary_{insert,update,delete}`;
-    /// sub-step 2's install pass at commit drains the buffer and installs a
-    /// `VersionEntry` at the head of each key's version chain on the owning
-    /// leaf frame, advancing the prior head's `stop_ts` to `commit_ts`.
+    /// Populated via `stage_primary_{insert,update,delete}`; the install
+    /// pass at commit drains the buffer and installs a `VersionEntry` at
+    /// the head of each key's version chain on the owning leaf frame,
+    /// advancing the prior head's `stop_ts` to `commit_ts`.
     pub(crate) pending_primary: SmallVec<[PrimaryWrite; 2]>,
     /// True after `commit()` has transferred `pending` ownership into the
     /// durable chain. `Drop` checks this to avoid decrementing refcounts
@@ -245,7 +234,7 @@ impl WriteTxn {
 
     /// Begin a new write transaction.
     ///
-    /// Protocol (per plan §T5'):
+    /// Protocol:
     /// 1. Caller must be holding the writer serialization mutex (i.e. the
     ///    `MutexGuard<'_, BpBackend>` from `PagedEngine::inner`). This
     ///    function does not acquire it — ownership is external to keep
@@ -285,10 +274,10 @@ impl WriteTxn {
 
     /// Stage a secondary-index insert for commit-time installation.
     ///
-    /// Phase 5 accumulates the write in `pending_sec_index`; Phase 6's
-    /// commit loop drains the buffer and performs the chain installation
-    /// under the txn's `commit_ts`, sharing the timestamp with primary
-    /// writes in the same txn.
+    /// Accumulates the write in `pending_sec_index`; the commit loop
+    /// drains the buffer and performs the chain installation under the
+    /// txn's `commit_ts`, sharing the timestamp with primary writes in
+    /// the same txn.
     pub(crate) fn stage_sec_index_insert(
         &mut self,
         index_root_page: u32,
@@ -305,8 +294,7 @@ impl WriteTxn {
     /// Stage a secondary-index delete for commit-time installation.
     ///
     /// Idempotent semantics — a delete of an absent key is recorded and
-    /// the Phase 6 install loop silently skips it (matching today's
-    /// `update_index_on_delete` behaviour).
+    /// the install loop silently skips it.
     pub(crate) fn stage_sec_index_delete(&mut self, index_root_page: u32, key: Vec<u8>) {
         self.pending_sec_index.push(SecIndexWrite {
             index_root_page,
@@ -317,10 +305,9 @@ impl WriteTxn {
 
     /// Stage a secondary-index update (delete old-key, insert new-key).
     ///
-    /// Thin wrapper over `stage_sec_index_delete` + `stage_sec_index_insert`
-    /// that mirrors `update_index_on_update`'s delete-then-insert shape.
-    /// If `old_key == new_key`, both entries still stage — the Phase 6
-    /// install loop runs them in order so the net effect is an overwrite.
+    /// Thin wrapper over `stage_sec_index_delete` + `stage_sec_index_insert`.
+    /// If `old_key == new_key`, both entries still stage — the install loop
+    /// runs them in order so the net effect is an overwrite.
     pub(crate) fn stage_sec_index_update(
         &mut self,
         index_root_page: u32,
@@ -371,12 +358,11 @@ impl WriteTxn {
 
     /// Pre-allocate the commit timestamp.
     ///
-    /// Phase 6 sub-step 2 needs the commit ts available BEFORE the primary
-    /// chain-head install runs (each new `VersionEntry` carries `start_ts
-    /// = commit_ts`). Callers that need to install primary chains drive
-    /// the protocol as: `allocate_commit_ts` → `install_pending_primary`
-    /// → `commit` (which detects the preallocation and skips the oracle
-    /// call).
+    /// The commit ts must be available BEFORE the primary chain-head install
+    /// runs (each new `VersionEntry` carries `start_ts = commit_ts`). Callers
+    /// that need to install primary chains drive the protocol as:
+    /// `allocate_commit_ts` → install primary chains → `commit` (which
+    /// detects the preallocation and skips the oracle call).
     ///
     /// Safe to call at most once per txn; asserts `commit_ts == PENDING`.
     pub(crate) fn allocate_commit_ts(&mut self, oracle: &TimestampOracle) -> Result<Ts> {
@@ -388,23 +374,22 @@ impl WriteTxn {
 
     /// Finalize the transaction.
     ///
-    /// Protocol (per plan §T5'):
+    /// Protocol:
     /// 1. Allocate `commit_ts` from the oracle (skipped if
     ///    `allocate_commit_ts` was already called).
     /// 2. Emit a single `ChainCommit` journal frame carrying
     ///    `commit_ts`, `refcount_deltas`, and `page_writes`.
     /// 3. Take ownership of `pending` out of `self` — ownership transfers
     ///    to the caller, who installs each `OverflowRef` into its version
-    ///    chain (phase 6 wires this). The returned `Vec<OverflowRef>`
-    ///    must be consumed by the caller; otherwise the refcounts decref
-    ///    on vec drop and the newly committed chain becomes dangling.
+    ///    chain. The returned `Vec<OverflowRef>` must be consumed by the
+    ///    caller; otherwise the refcounts decref on vec drop and the newly
+    ///    committed chain becomes dangling.
     /// 4. Flip `finalized = true` so `Drop` no longer decrefs `pending`
     ///    (the entries have already been moved out).
     ///
-    /// Returns `(commit_ts, pending)` — phase 6 threads `pending` into
-    /// the chain mutation loop. Phase 2 callers can drop the returned
-    /// vec, which immediately runs `OverflowRef::Drop` on every entry;
-    /// this is correct for no-op commits that stage no overflow data.
+    /// Returns `(commit_ts, pending, pending_sec_index)`. Callers that
+    /// stage no overflow data may drop the returned vecs, which runs
+    /// `OverflowRef::Drop` on every entry — correct for no-op commits.
     pub(crate) fn commit(
         mut self,
         oracle: &TimestampOracle,
@@ -510,7 +495,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Scaffold behaviour (preserved from T3)
+    // WriteTxn basic behaviour
     // -----------------------------------------------------------------------
 
     #[test]
@@ -555,7 +540,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // begin / commit / rollback (phase 2)
+    // begin / commit / rollback
     // -----------------------------------------------------------------------
 
     #[test]
@@ -576,8 +561,8 @@ mod tests {
         // free pages without a corresponding header state; the test here
         // exercises only the fact that `begin` invokes it. In this fresh
         // fixture the page isn't in the allocator's free-list state so
-        // `drain_free_queue` will attempt and fail to free. For the phase 2
-        // test we assert only that `begin` returns without panic.
+        // `drain_free_queue` will attempt and fail to free. We assert only
+        // that `begin` returns without panic.
         let result = WriteTxn::begin(1, &alloc, handle.page_source());
         // Accept either Ok (drain succeeded because fresh pool is empty
         // and free_32k succeeds on unknown page), or an error — both prove
@@ -627,9 +612,9 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(sec.is_empty());
 
-        // Dropping the returned vec runs OverflowRef::drop on each entry
-        // (phase 2 behavior — phase 6 will instead move each ref into a
-        // durable chain and the refcount stays bumped).
+        // Dropping the returned vec runs OverflowRef::drop on each entry.
+        // On commit paths that install into a durable chain, the caller
+        // instead moves each ref into the chain and the refcount stays bumped.
         drop(pending);
         assert_eq!(alloc.overflow_refcount(77), 0);
     }
@@ -723,8 +708,7 @@ mod tests {
 
     #[test]
     fn commit_drains_pending_sec_index_to_caller() {
-        // Staged sec-index writes must transfer to the caller on commit —
-        // Phase 6 will install them into per-key version chains.
+        // Staged sec-index writes must transfer to the caller on commit.
         let handle = fresh_handle();
         let alloc = handle.allocator().clone();
         let oracle = TimestampOracle::new();

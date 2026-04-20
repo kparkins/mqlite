@@ -1,13 +1,8 @@
 //! Command dispatch for the MongoDB wire protocol shim.
 //!
 //! This module maps incoming OP_MSG command documents to mqlite operations.
-//!
-//! Phase 1 target: 18 commands sufficient for mongosh basic CRUD and pymongo acceptance tests.
-//! See api.md for the full list.
-//!
-//! Phase 1 implementation: tracked in hq-6d0.
 
-/// The set of MongoDB commands supported by the Phase 1 wire protocol shim.
+/// The set of MongoDB commands supported by the wire protocol shim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
     // CRUD

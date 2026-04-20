@@ -614,7 +614,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T7 — HLC oracle recovery: ChainCommit frames fold into
+    // HLC oracle recovery: ChainCommit frames fold into
     // `recovered_max_commit_ts` across reopen.
     // -----------------------------------------------------------------------
 

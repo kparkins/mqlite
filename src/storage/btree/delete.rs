@@ -381,7 +381,7 @@ impl<S: BTreePageStore> BTree<S> {
                 return Ok(());
             }
             // Not the root: need to propagate underflow upward.
-            // For Phase 1, we accept an underfull internal node (just write it back).
+            // We accept an underfull internal node (just write it back).
             // A more complete implementation would merge internal nodes too.
             let enc = parent.encode()?;
             self.store.write_internal(parent_page, &enc)?;

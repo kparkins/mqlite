@@ -1,4 +1,4 @@
-//! Transaction-local page-byte overlay (PR 6 / plan §M4a).
+//! Transaction-local page-byte overlay.
 //!
 //! Writers open `BTree<TxnPageStore>` via [`TxnPageStore::new`] where the
 //! underlying pages live in a [`BufferPoolPageStore`]. All page-byte writes
@@ -11,28 +11,24 @@
 //! overlay is dropped and the shared frames are left untouched — the
 //! failing writer no longer pollutes other writers' dirty state.
 //!
-//! Scope (PR 6, §M4a): page-byte isolation only.
-//!
 //! - Page-byte reads and writes are overlay-routed.
-//! - Allocator calls (`alloc_internal` / `alloc_leaf` / `free_*`) go
-//!   straight through to the shared allocator. PR 7 (§M4b) replaces that
-//!   with txn-local allocator reservations.
+//! - Allocator calls (`alloc_internal` / `alloc_leaf` / `free_*`) record
+//!   txn-local reservations so rollback can undo allocations.
 //! - MVCC version-chain helpers (`take_chain` / `put_chain` /
-//!   `chains_empty`) also go straight through to the shared frame. They
-//!   are already CoW-safe via `Arc::make_mut`: concurrent readers holding
-//!   an old `Arc<VecDeque<VersionEntry>>` observe their frozen copy while
-//!   the writer mutates a fresh one. Staging the chain mutation separately
+//!   `chains_empty`) go straight through to the shared frame. They are
+//!   already CoW-safe via `Arc::make_mut`: concurrent readers holding an
+//!   old `Arc<VecDeque<VersionEntry>>` observe their frozen copy while the
+//!   writer mutates a fresh one. Staging the chain mutation separately
 //!   would create a window between `take_chain` and `put_chain` in which
 //!   the shared frame is missing the chain without the overlay being
 //!   consulted; the existing CoW dance already gives us the isolation we
 //!   need.
 //!
 //! Concurrency: a `TxnPageStore` and its backing [`TxnOverlay`] are
-//! single-threaded per write-txn — the engine's outer `Mutex<BpBackend>`
-//! (or per-lane mutex in PR 8+) already serializes every writer. The
-//! overlay is owned exclusively by the write path for the duration of a
-//! transaction and passed to helpers by `&mut` reference. No `Arc`,
-//! `Mutex`, or `RefCell` wrapping is needed.
+//! single-threaded per write-txn — the per-lane mutex already serializes
+//! every writer. The overlay is owned exclusively by the write path for
+//! the duration of a transaction and passed to helpers by `&mut` reference.
+//! No `Arc`, `Mutex`, or `RefCell` wrapping is needed.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -51,7 +47,7 @@ const INTERNAL_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 const LEAF_SIZE: usize = PAGE_SIZE_LEAF as usize;
 
 // ---------------------------------------------------------------------------
-// Reservations (PR 7 — §M4b)
+// Reservations
 // ---------------------------------------------------------------------------
 
 /// Origin of a page reservation held by a writer txn. Determines what
@@ -100,11 +96,9 @@ pub(crate) struct TxnOverlay {
     /// Page numbers in overlay_32k in the order they were first written.
     touched_32k: Vec<u32>,
 
-    // ---- PR 7 (§M4b) additions ------------------------------------------
-
     /// Every page allocated during this txn (via `alloc_internal` /
     /// `alloc_leaf` on a `TxnPageStore`) or drained from the deferred-free
-    /// queue at `WriteTxn::begin`. On rollback each reservation is routed
+    /// queue at txn begin. On rollback each reservation is routed
     /// through its origin-specific undo path.
     ///
     /// Pages that are both allocated AND freed within the same txn have
@@ -131,9 +125,8 @@ impl TxnOverlay {
     /// Apply every staged page to the shared buffer-pool frames via
     /// `base`.
     ///
-    /// Called by `with_txn` at commit time while the writer still holds
-    /// the engine's serialization mutex (today `PagedEngine::inner`,
-    /// under PR 8 the `commit_seq` mutex). Consumes the overlay.
+    /// Called at commit time while the writer still holds the
+    /// `commit_seq` mutex. Consumes the overlay.
     ///
     /// `base` is a fresh `BufferPoolPageStore` pointing at the same
     /// `BufferPoolHandle` the txn used — passing it in rather than
@@ -158,14 +151,13 @@ impl TxnOverlay {
                 base.write_leaf(page, &buf)?;
             }
         }
-        // Plan §M4b: at commit time, DeferredFree reservations transition
-        // from "reserved for this txn" into the allocator free list.
-        // These are pages whose last `OverflowRef` dropped before the
-        // txn began and were drained at `with_txn` entry into the
-        // overlay (rather than directly into the free list) so a
-        // rollback could return them unchanged. NewAlloc reservations
-        // have no commit-time work — successful txns keep their
-        // allocations. `header_pre` is discarded.
+        // At commit time, DeferredFree reservations transition from
+        // "reserved for this txn" into the allocator free list. These
+        // are pages whose last `OverflowRef` dropped before the txn
+        // began and were drained into the overlay (rather than directly
+        // into the free list) so a rollback could return them unchanged.
+        // NewAlloc reservations have no commit-time work — successful
+        // txns keep their allocations. `header_pre` is discarded.
         for res in &self.reservations {
             if matches!(res.origin, PageOrigin::DeferredFree) {
                 handle.free_page(res.page, res.size)?;
@@ -174,8 +166,7 @@ impl TxnOverlay {
         Ok(())
     }
 
-    /// Roll back this txn's side effects on allocator / header / buffer
-    /// pool (plan §M4b).
+    /// Roll back this txn's side effects on allocator / header / buffer pool.
     ///
     /// For each reservation:
     /// - `NewAlloc`: return the page to the allocator free list and
@@ -348,16 +339,16 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
 
     // ---- Allocation / free
     //
-    // PR 7 (§M4b): every allocation made inside a txn is recorded as a
-    // `NewAlloc` reservation on the overlay so rollback can return the
-    // page to the allocator free list AND invalidate the cached frame.
-    // Free stays straight-through, with the overlay eviction (below) to
-    // prevent an alloc-then-free-in-same-txn from replaying page bytes
-    // onto the freed slot at commit time.
+    // Every allocation made inside a txn is recorded as a `NewAlloc`
+    // reservation on the overlay so rollback can return the page to the
+    // allocator free list AND invalidate the cached frame. Free stays
+    // straight-through, with the overlay eviction (below) to prevent an
+    // alloc-then-free-in-same-txn from replaying page bytes onto the
+    // freed slot at commit time.
 
     fn alloc_internal(&mut self) -> Result<u32> {
         let page = self.base.alloc_internal()?;
-        // Seed the overlay with a valid empty-internal image (Bug A fix).
+        // Seed the overlay with a valid empty-internal image.
         // A fresh allocation leaves the shared buffer-pool frame
         // zero-filled (or carrying stale bytes from a previous
         // occupant). Any subsequent in-txn read via `read_internal` must
@@ -378,7 +369,7 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
 
     fn alloc_leaf(&mut self) -> Result<u32> {
         let page = self.base.alloc_leaf()?;
-        // Seed the overlay with a valid empty-leaf image (Bug A fix).
+        // Seed the overlay with a valid empty-leaf image.
         // Same rationale as `alloc_internal` above. Overflow pages also
         // come through `alloc_leaf` because they share the 32 KB slot
         // size; that is safe because `write_overflow_chain` writes a
@@ -402,11 +393,10 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
         // wrote, and then freed the page, we must not replay its bytes
         // onto the freed slot at commit time.
         //
-        // Plan §M4b: if the freed page was recorded as a `NewAlloc`
-        // reservation (same-txn alloc-then-free), drop the reservation
-        // too. Otherwise rollback would double-free the page — the
-        // in-txn `free_*` already returned it to the allocator free
-        // list.
+        // If the freed page was recorded as a `NewAlloc` reservation
+        // (same-txn alloc-then-free), drop the reservation too.
+        // Otherwise rollback would double-free the page — the in-txn
+        // `free_*` already returned it to the allocator free list.
         if self.overlay.overlay_4k.remove(&page).is_some() {
             self.overlay.touched_4k.retain(|p| *p != page);
         }

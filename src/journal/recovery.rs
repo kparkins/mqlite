@@ -1,8 +1,7 @@
 //! Journal recovery — replay an existing journal into the main file.
 //!
 //! This submodule owns the `recover_existing` entry point called from
-//! [`JournalManager::open_or_create`]. Split out of `mod.rs` to keep the
-//! manager file under the 800-line budget.
+//! [`JournalManager::open_or_create`].
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -81,20 +80,20 @@ impl JournalManager {
             Vec::new(); // (page_num, size, data, offset)
         let mut write_cursor = JOURNAL_HEADER_SIZE as u64;
         let mut last_committed_db_page_count: Option<u32> = None;
-        // MVCC T7 — journal-tail HLC oracle recovery. Fold every ChainCommit
-        // frame's `commit_ts` into a running max. The backend reads the max
-        // via `recovered_max_commit_ts` after `open_or_create` returns and
-        // floors `TimestampOracle` at `max.successor()`.
+        // Fold every ChainCommit frame's `commit_ts` into a running max.
+        // The backend reads the max via `recovered_max_commit_ts` after
+        // `open_or_create` returns and floors `TimestampOracle` at
+        // `max.successor()`.
         let mut max_commit_ts: Option<Ts> = None;
 
         loop {
             let frame_offset = write_cursor;
 
-            // MVCC T5'/T6: peek for a `ChainCommit` frame first. These carry
-            // no legacy `JournalFrameHeader` and would crash the scan if
-            // parsed as one. `try_skip_chain_commit` advances the reader
-            // past a valid ChainCommit and returns its length; otherwise
-            // it restores position and returns None for legacy fall-through.
+            // Peek for a `ChainCommit` frame first. These carry no legacy
+            // `JournalFrameHeader` and would crash the scan if parsed as one.
+            // `try_skip_chain_commit` advances the reader past a valid
+            // ChainCommit and returns its length; otherwise it restores
+            // position and returns None for legacy fall-through.
             journal_file
                 .seek(SeekFrom::Start(frame_offset))
                 .map_err(Error::Io)?;

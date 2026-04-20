@@ -3,31 +3,17 @@
 //! This module provides [`WireProtocol`], a background server that handles
 //! MongoDB wire protocol connections using OP_MSG framing.
 //!
-//! # Spike scope (hq-23u)
-//!
-//! Phase 1c requires validating that pymongo can connect before building the
-//! full 18-command surface.  This implementation supports the minimal command
-//! set needed for a pymongo handshake:
-//!
-//! - `hello` / `isMaster` — driver handshake
-//! - `ping` — connectivity check (`admin.command('ping')`)
-//! - `buildInfo` — version metadata
-//! - `serverStatus` — runtime diagnostics
-//! - `listDatabases` — enumerate the single mqlite database
-//!
-//! All other commands return `CommandNotFound` (code 59).
-//!
-//! # Spike finding: two-opcode handshake
+//! # Two-opcode handshake
 //!
 //! pymongo 4.x sends the *initial* `isMaster` using OP_QUERY (opcode 2004),
 //! the legacy opcode, because at connection time the driver does not yet know
 //! the server wire version.  The response must be OP_REPLY (opcode 1).
 //!
 //! After receiving `helloOk: true` in the OP_REPLY, pymongo switches all
-//! subsequent commands — including `hello` topology checks and `ping` — to
+//! subsequent commands — including `hello` topology checks and CRUD — to
 //! OP_MSG (opcode 2013).
 //!
-//! Consequently the server must handle both opcodes:
+//! Consequently the server handles both opcodes:
 //! - OP_QUERY → OP_REPLY  (initial handshake only)
 //! - OP_MSG   → OP_MSG    (all subsequent commands)
 
@@ -272,14 +258,14 @@ impl WireProtocol {
 
         let addr = addr.to_owned();
 
-        // Security: warn when binding to all interfaces — mqlite Phase 1 has
-        // no authentication, so 0.0.0.0 exposes the server to the entire
+        // Security: warn when binding to all interfaces — mqlite has no
+        // authentication, so 0.0.0.0 exposes the server to the entire
         // network.  Default recommended bind is 127.0.0.1 (localhost only).
         if addr.starts_with("0.0.0.0") {
             eprintln!(
                 "mqlite WARNING: wire protocol server bound to {addr} — \
                  accessible from all network interfaces. \
-                 Phase 1 has no authentication. \
+                 mqlite has no authentication. \
                  Use 127.0.0.1 for local-only access."
             );
         }
@@ -478,8 +464,7 @@ fn dispatch_op_query(
     // OP_QUERY body starts after the 16-byte header.
     let body_buf = &full_msg[MsgHeader::SIZE..];
 
-    // In the multi-database wire protocol (R2.1) any database is accepted.
-    // No Unauthorized check here — the fullCollectionName db prefix is used only
+    // Any database is accepted; the fullCollectionName db prefix is used only
     // to identify which database the OP_QUERY targets (legacy handshake only).
     let _ = parse_op_query_db_name(body_buf); // keep fn reachable for tests
 
@@ -511,8 +496,7 @@ fn dispatch_op_msg(
         .ok_or_else(|| crate::error::Error::InvalidWireMessage {
             detail: "command message has no Kind-0 body section".into(),
         })?;
-    // In the multi-database wire protocol (R2.1) any $db value is accepted.
-    // No Unauthorized check — $db is used for routing, not access control.
+    // Any $db value is accepted — $db is used for routing, not access control.
     // Merge Kind-1 document sequences (e.g. pymongo bulk inserts) into the
     // body so handlers always see a complete document regardless of framing.
     let merged_body = merge_doc_sequences_into_body(body, &msg.sections);
@@ -538,9 +522,8 @@ fn route_command(
     connection_id: i32,
     cursors: &Arc<std::sync::Mutex<ConnectionCursors>>,
 ) -> Document {
-    // Silently log (and ignore) fields that mqlite does not support.
-    // Per integration.md: lsid, readConcern, writeConcern, $clusterTime, txnNumber
-    // are silently ignored in Phase 1 — log at DEBUG, never return error.
+    // Silently log (and ignore) session/cluster fields that mqlite does not support:
+    // lsid, readConcern, writeConcern, $clusterTime, txnNumber.
     #[cfg(feature = "tracing")]
     {
         for key in [

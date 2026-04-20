@@ -76,10 +76,10 @@ const HEADER_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 /// Checksum algorithm code for CRC32C.
 const CHECKSUM_ALGO_CRC32C: u32 = 1;
 
-/// Number of bytes covered by the header checksum (v1 post-T2: bytes 0–63).
+/// Number of bytes covered by the header checksum (bytes 0–63).
 const HEADER_CHECKSUM_RANGE: usize = 64;
 
-/// Byte offset of the header checksum field (v1 post-T2).
+/// Byte offset of the header checksum field.
 const HEADER_CHECKSUM_OFFSET: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -216,7 +216,7 @@ fn verify_header(file: &mut File) -> Result<(), String> {
         ));
     }
 
-    // WAL salts (post-T2 header layout: salts shifted +4 vs v0)
+    // WAL salts (offsets 68–75).
     let salt1 = u32::from_le_bytes([buf[68], buf[69], buf[70], buf[71]]);
     if salt1 != FIXED_SALT1 {
         return Err(format!(

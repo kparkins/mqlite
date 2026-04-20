@@ -279,8 +279,8 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
         return Ok(false);
     }
 
-    // Unique-constraint check (single-entry path only; multikey semantics
-    // are complex and deferred to Phase 2 for production hardening).
+    // Unique-constraint check (single-entry path only; multikey unique
+    // semantics are not yet enforced).
     if index_entry.unique && !is_multikey {
         let null_bson = Bson::Null;
         let field_values: Vec<(&Bson, bool)> = index_entry
@@ -432,7 +432,7 @@ fn update_index_on_insert_direct<S: BTreePageStore>(
 ///
 /// Every document is scanned and a corresponding entry is inserted into
 /// `index_tree`.  This is a **blocking** build — the caller must hold a writer
-/// lock for the entire duration (background builds are Phase 2).
+/// lock for the entire duration (background builds are not yet implemented).
 ///
 /// Returns `true` if any document triggered multikey behaviour; the caller
 /// should persist this flag to the catalog's [`IndexEntry`].

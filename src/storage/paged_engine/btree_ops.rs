@@ -45,9 +45,9 @@ pub(super) fn btree_insert_doc<S: BTreePageStore>(
 /// MVCC-aware collection scan. For each key visible at `view.read_ts` (or
 /// the on-disk cell when no chain entry is present), decode the value as
 /// BSON and retain rows that satisfy `filter`. The optional `history`
-/// probe (plan §T7) is consulted when neither the chain nor a newer
-/// version is visible, so readers can still see entries evicted from
-/// memory chains into the history store.
+/// probe is consulted when neither the chain nor a newer version is visible,
+/// so readers can still see entries evicted from memory chains into the
+/// history store.
 pub(super) fn btree_collscan<S: BTreePageStore>(
     tree: &BTree<S>,
     filter: &Document,

@@ -4,19 +4,6 @@
 //! [`BTreePageStore`] trait (which owns its backing store generically) and the
 //! [`BufferPoolHandle`] (which provides pin/unpin-based page access).
 //!
-//! ## Design — RISK-01 Resolution
-//!
-//! The Phase 1 reconciliation plan identified **RISK-01**: the B+ tree uses a
-//! `BTreePageStore` trait whose interface (`read_internal`, `write_internal`,
-//! `alloc_internal`, etc.) is shaped differently from `BufferPool`'s
-//! pin/unpin API.  The bridge must:
-//!
-//! 1. **Implement `BTreePageStore`** using `Arc<BufferPoolHandle>`.
-//! 2. **Manage the pin/unpin lifecycle** across B+ tree calls (a single insert
-//!    can pin many pages in a single recursive operation).
-//! 3. **Keep the header in sync** with allocator state after every `alloc_*`
-//!    call.
-//!
 //! ## Implementation
 //!
 //! [`BufferPoolPageStore`] holds `Arc<BufferPoolHandle>`.
@@ -69,8 +56,7 @@ pub(crate) struct BufferPoolPageStore {
     /// When `true`, all page pins / allocations are routed through
     /// [`BufferPoolHandle::history_pool`] instead of the main pool. Pages
     /// allocated by a history-routed store live in a disjoint cache so that
-    /// reconciliation installing aged entries into the history store never
-    /// re-enters main-pool partition mutexes (plan §T7 lock-order).
+    /// writes to the history store never re-enter main-pool partition mutexes.
     is_history: bool,
 }
 
@@ -81,7 +67,7 @@ impl BufferPoolPageStore {
     }
 
     /// Create a `BufferPoolPageStore` backed by `handle`'s dedicated
-    /// history-store pool (plan §T7).
+    /// history-store pool.
     pub(crate) fn new_history(handle: Arc<BufferPoolHandle>) -> Self {
         Self { handle, is_history: true }
     }

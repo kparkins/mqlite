@@ -136,7 +136,7 @@
     }
 
     // -----------------------------------------------------------------
-    // ChainCommit frame tests (MVCC T3 / Format Lock §A.2)
+    // ChainCommit frame tests
     // -----------------------------------------------------------------
 
     fn sample_chain_commit() -> ChainCommitFrame {
@@ -200,7 +200,7 @@
             refcount_deltas: vec![],
             page_writes: vec![],
         };
-        // §A.2 minimum: 32-byte fixed header + 4-byte page_write_count + 4-byte CRC.
+        // Minimum: 32-byte fixed header + 4-byte page_write_count + 4-byte CRC.
         assert_eq!(frame.total_frame_bytes(), 40);
     }
 
@@ -263,7 +263,7 @@
     }
 
     // -----------------------------------------------------------------
-    // try_skip_chain_commit — scan retrofit helper
+    // try_skip_chain_commit
     // -----------------------------------------------------------------
 
     #[test]

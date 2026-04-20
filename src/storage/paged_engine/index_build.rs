@@ -24,7 +24,7 @@ use super::index_maint::ReserveOutcome;
 use super::PagedEngine;
 
 impl PagedEngine {
-    /// Phase 1 of `create_index`: reserve an index slot.
+    /// Reserve step of `create_index`: reserve an index slot.
     ///
     /// Allocates a root page for the index's B+ tree, writes an
     /// `IndexEntry { state: Building }` into the catalog, initializes
@@ -45,7 +45,7 @@ impl PagedEngine {
         let outcome = std::cell::Cell::new(ReserveOutcome::Reserved);
         self.run_ddl(|shared, md, overlay| {
             let mut cat = md.catalog.lock().expect("catalog poisoned");
-            // Bootstrap collection if absent (matches pre-PR-9 create_index).
+            // Bootstrap collection if absent.
             if cat.get_collection(ns)?.is_none() {
                 let data_root = cat.create_collection(ns, bson::doc! {}, now_millis())?;
                 drop(cat);
@@ -56,7 +56,7 @@ impl PagedEngine {
             }
 
             // Idempotent: if an index with this name already exists we
-            // treat the call as a no-op (matches pre-PR-9 semantics).
+            // treat the call as a no-op.
             // We do NOT re-check state here — a caller seeing an
             // in-progress Building entry from a prior failed build is
             // reported as "exists"; the prior build's cleanup will have
@@ -81,7 +81,7 @@ impl PagedEngine {
             sync_catalog_root_overlay(shared, md, overlay)?;
 
             // Initialize the freshly-allocated leaf page so the index
-            // tree is valid to open for writes during Phase 2.
+            // tree is valid to open for writes during the build step.
             let idx_store = new_txn_store(shared, overlay);
             BTree::create_at(idx_store, idx_root)?;
             Ok(())
@@ -89,13 +89,13 @@ impl PagedEngine {
         Ok(outcome.get())
     }
 
-    /// Phase 2 of `create_index`: populate the index from the data tree.
+    /// Build step of `create_index`: populate the index from the data tree.
     ///
     /// Runs under `metadata.read()` + the target namespace's lane, so
     /// writers on *other* namespaces proceed concurrently. Writers on
     /// this namespace wait on the lane (same as any other ns-local
     /// serialization). Any writer that commits DURING the build on this
-    /// ns is blocked out; writers between Phase 1 and Phase 2 have
+    /// ns is blocked out; writers between the reserve and build steps have
     /// already dual-written to the Building index (via
     /// `maintain_secondary_on_*`).
     pub(super) fn create_index_build(&self, ns: &str, name: &str) -> Result<()> {
@@ -104,8 +104,7 @@ impl PagedEngine {
         // metadata.write()) from racing with lane acquisition. Once the
         // lane is in hand, drop the read guard so the long build scan
         // below does NOT block DDL on other namespaces or bootstrapping
-        // of new namespaces (Gap-9 follow-up; fixes PR 9's known v1
-        // limitation).
+        // of new namespaces.
         let lane = self.lane_for(ns);
         let _lane_guard = {
             let _md_read = self.metadata.read().map_err(|_| {
@@ -142,8 +141,8 @@ impl PagedEngine {
         };
 
         // Open a dedicated WAL transaction for the build — it's
-        // independent of Phase 1's txn (already committed) and Phase 3's
-        // txn (has not yet begun).
+        // independent of the reserve txn (already committed) and the
+        // commit txn (has not yet begun).
         let mark = self.shared.handle.begin_txn()?;
         let mut overlay = TxnOverlay::new();
         let ready_reservations = self
@@ -178,8 +177,8 @@ impl PagedEngine {
             let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
 
             // Persist the possibly-updated root + multikey flag. Note:
-            // we do NOT flip state to Ready here — that happens in
-            // Phase 3 under metadata.write() so readers see a
+            // we do NOT flip state to Ready here — that happens in the
+            // commit step under metadata.write() so readers see a
             // consistent transition on the published snapshot.
             let root_changed = idx_tree.root_page != idx_entry.root_page
                 || idx_tree.root_level != idx_entry.root_level;
@@ -213,8 +212,8 @@ impl PagedEngine {
         match body {
             Ok(()) => {
                 // Commit the build txn. We intentionally do NOT hold
-                // commit_seq here — no timestamp is allocated (Phase 2
-                // has no primary writes), and no publish is performed.
+                // commit_seq here — no timestamp is allocated (the build
+                // step has no primary writes), and no publish is performed.
                 // The only shared mutation is catalog root/multikey
                 // metadata, which is safe under the lane.
                 let mut base = new_store(&self.shared);
@@ -269,10 +268,10 @@ impl PagedEngine {
         })
     }
 
-    /// Cleanup after a failed Phase 2: drop the orphan Building entry.
+    /// Cleanup after a failed build step: drop the orphan Building entry.
     ///
     /// This keeps the catalog in a state where a retried
-    /// `create_index(ns, same_name)` succeeds from Phase 1 instead of
+    /// `create_index(ns, same_name)` succeeds from the reserve step instead of
     /// hitting the idempotent-already-exists early return with a stale
     /// Building entry.
     pub(super) fn create_index_cleanup(&self, ns: &str, name: &str) -> Result<()> {

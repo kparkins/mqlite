@@ -7,11 +7,11 @@
 // All expect() calls in this module operate on fixed-size slice conversions
 // (e.g. `buf[0..4].try_into().expect("4 bytes")`). The slices are guaranteed
 // correct by construction — the buffer is always exactly PAGE_SIZE bytes.
-// These are safe in practice; they are allowed here pending a Phase 1 refactor
-// to a custom byte-reader helper that avoids expect_used entirely.
+// These are safe in practice; they are allowed here. The slices are guaranteed
+// correct by construction — see the fixed-size buffer invariant above.
 #![allow(clippy::expect_used)]
 //!
-//! ## On-disk layout (v1 — Format Lock Appendix §A)
+//! ## On-disk layout (format version 1)
 //!
 //! ```text
 //! Offset  Size  Field
@@ -135,7 +135,7 @@ pub(crate) struct FileHeader {
     /// Root-level byte of the catalog B+ tree (0 = leaf-only; >0 = internal at that level).
     ///
     /// Stored at offset 80 in the reserved region.  Together with
-    /// [`catalog_root_page`](Self::catalog_root_page) this lets R1.2+ reopen the
+    /// [`catalog_root_page`](Self::catalog_root_page) this allows reopening the
     /// catalog without a full tree scan.
     pub catalog_root_level: u8,
     // offsets 81–127: reserved, zero-filled

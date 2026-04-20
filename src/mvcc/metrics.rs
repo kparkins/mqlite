@@ -1,11 +1,11 @@
-//! MVCC counters — T8 finalises the 12 mandatory + 5 diagnostic counters.
+//! MVCC counters — 12 mandatory + 5 diagnostic.
 //!
 //! Each counter is a process-global atomic exposed through
 //! `record()` / `snapshot()` / `reset()` primitives (or `set()` for gauges).
 //! Tests that observe counter transitions should `reset()` first to avoid
 //! cross-test interference.
 //!
-//! ## 12 mandatory counters (plan §T8 table, iter-5)
+//! ## 12 mandatory counters
 //!
 //! | # | Counter | Type |
 //! |---|---------|------|
@@ -33,7 +33,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ===========================================================================
-// 8 — mvcc.secondary_index.tombstone_hits_skipped_total  (counter, T5')
+// 8 — mvcc.secondary_index.tombstone_hits_skipped_total  (counter)
 // ===========================================================================
 
 /// Incremented each time a reader observes a tombstone entry in a
@@ -56,7 +56,7 @@ pub fn reset_secondary_index_tombstone_hits() {
 }
 
 // ===========================================================================
-// 5 — mvcc.reconcile.entries_dropped_total  (counter, T6)
+// 5 — mvcc.reconcile.entries_dropped_total  (counter)
 // ===========================================================================
 
 /// Number of `VersionEntry` objects dropped from per-frame version chains
@@ -81,7 +81,7 @@ pub fn reset_reconcile_entries_dropped() {
 }
 
 // ===========================================================================
-// (T6 extra) — mvcc.overflow.pages_freed_total
+// mvcc.overflow.pages_freed_total
 // ===========================================================================
 
 /// Number of overflow pages that `AllocatorHandle::drain_free_queue` has
@@ -104,7 +104,7 @@ pub fn reset_overflow_pages_freed() {
 }
 
 // ===========================================================================
-// 12 — mvcc.deferred_free_queue_depth  (gauge, T6)
+// 12 — mvcc.deferred_free_queue_depth  (gauge)
 // ===========================================================================
 
 /// Current depth of the deferred-free queue. Gauge — set to the queue's
@@ -333,8 +333,8 @@ pub fn reset_history_store_gc_passes() {
 }
 
 /// Test-only serialization lock shared by every test that resets and asserts
-/// on `HISTORY_STORE_GC_PASSES_TOTAL`. Because tests run in parallel within a
-/// single process, concurrent reset-then-assert sequences on the same global
+/// on `HISTORY_STORE_GC_PASSES_TOTAL`. Tests run in parallel within a single
+/// process, so concurrent reset-then-assert sequences on the same global
 /// counter race. All tests that reset this counter must hold this mutex for
 /// the duration of their reset → record → snapshot sequence.
 #[cfg(test)]
@@ -464,7 +464,7 @@ pub fn reset_force_expire_spin_stalls() {
 mod tests {
     use super::*;
 
-    // --- Pre-T8 counters (kept verbatim) ---
+    // --- Counters ---
 
     #[test]
     fn counter_increments_and_resets() {
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(deferred_free_queue_depth_snapshot(), 0);
     }
 
-    // --- T8 mandatory counters (1–4, 6, 7, 9, 10, 11) ---
+    // --- Mandatory counters (1–4, 6, 7, 9, 10, 11) ---
 
     #[test]
     fn oldest_required_ts_lag_ms_gauge() {
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(history_store_gc_passes_snapshot(), 0);
     }
 
-    // --- T8 diagnostic counters (D1–D5) ---
+    // --- Diagnostic counters (D1–D5) ---
 
     #[test]
     fn reconcile_duration_ms_p99_gauge() {

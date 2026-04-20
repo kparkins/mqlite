@@ -123,10 +123,8 @@ pub(crate) fn parse_op_query_db_name(buf: &[u8]) -> Option<String> {
 
 /// Validate the `$db` field in an OP_MSG command body.
 ///
-/// In the multi-database wire protocol (R2.1) any non-empty `$db` value is
-/// accepted — the database is created on first write ("use mydb" semantics).
-/// This function is retained for backward compatibility and always returns
-/// `None` (i.e., no error).
+/// Any non-empty `$db` value is accepted — the database is created on first
+/// write ("use mydb" semantics).  Always returns `None` (no error).
 #[allow(dead_code)]
 pub(crate) fn check_db_field(_body: &Document, _server_db_name: &str) -> Option<Document> {
     None

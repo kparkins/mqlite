@@ -1,10 +1,8 @@
 # mqlite Compatibility Matrix
 
-> Last updated: Phase 1 (wire protocol complete). Updated with every release.
-
 ## MongoDB Version
 
-mqlite targets **MongoDB 8.0** wire protocol semantics for Phase 1. The embedded
+mqlite targets **MongoDB 8.0** wire protocol semantics. The embedded
 native API is driver-agnostic; the wire shim (`wire` feature) speaks the OP_MSG
 framing used by MongoDB 8.0 drivers.
 
@@ -55,11 +53,11 @@ framing used by MongoDB 8.0 drivers.
 |----------|--------|-------|
 | `$regex` | ✅ Supported | **No PCRE lookahead/lookbehind** (uses Rust `regex` crate, not PCRE). Options: `i`, `m`, `s`, `x`. |
 | `$options` | ✅ Supported | Only valid alongside `$regex` |
-| `$mod` | ❌ Not Supported | Planned Phase 2 |
-| `$text` | ❌ Not Supported | Full-text search. Planned Phase 2 |
+| `$mod` | ❌ Not Supported | |
+| `$text` | ❌ Not Supported | Full-text search |
 | `$where` | ❌ Not Supported | JavaScript evaluation. Not planned (security) |
-| `$expr` | ❌ Not Supported | Aggregation expressions. Planned Phase 2 |
-| `$jsonSchema` | ❌ Not Supported | JSON Schema validation. Planned Phase 2 |
+| `$expr` | ❌ Not Supported | Aggregation expressions |
+| `$jsonSchema` | ❌ Not Supported | JSON Schema validation |
 
 ### Geospatial Operators
 
@@ -106,9 +104,9 @@ framing used by MongoDB 8.0 drivers.
 | `$pullAll` | ✅ Supported | Remove all occurrences of specified values |
 | `$addToSet` | ✅ Supported | Add without duplicates; `$each` modifier supported |
 | `$pop` | ✅ Supported | Remove first (`-1`) or last (`1`) array element |
-| `$` (positional) | ❌ Not Supported | Planned Phase 2 |
-| `$[]` (all positional) | ❌ Not Supported | Planned Phase 2 |
-| `$[<identifier>]` (filtered) | ❌ Not Supported | Planned Phase 2 |
+| `$` (positional) | ❌ Not Supported | |
+| `$[]` (all positional) | ❌ Not Supported | |
+| `$[<identifier>]` (filtered) | ❌ Not Supported | |
 
 ---
 
@@ -163,15 +161,15 @@ framing used by MongoDB 8.0 drivers.
 
 | Command | Status | Notes |
 |---------|--------|-------|
-| `aggregate` | ❌ Not Supported | Planned Phase 2 |
-| `distinct` | ❌ Not Supported | Planned Phase 2 |
+| `aggregate` | ❌ Not Supported | |
+| `distinct` | ❌ Not Supported | |
 | `count` | ❌ Not Supported | Use `countDocuments` via native API |
 | `mapReduce` | ❌ Not Supported | Not planned |
-| `explain` | ❌ Not Supported | Planned Phase 2 (available in native API) |
+| `explain` | ❌ Not Supported | Available in native API |
 | `currentOp` | ❌ Not Supported | |
 | Authentication | ❌ Not Supported | See [WIRE-SECURITY.md](WIRE-SECURITY.md) |
 | Replication commands | ❌ Not Supported | mqlite is standalone, not a replica set |
-| `transaction` / `commitTransaction` | ❌ Not Supported | Planned Phase 2 |
+| `transaction` / `commitTransaction` | ❌ Not Supported | |
 
 ---
 
@@ -184,11 +182,11 @@ framing used by MongoDB 8.0 drivers.
 | Unique | ✅ Supported | Enforced on insert and upsert |
 | Sparse | ✅ Supported | Only indexes documents where the key field exists |
 | Multikey (array fields) | ✅ Supported | Automatically applied when indexing array fields |
-| TTL | ❌ Not Supported | Planned Phase 2 |
-| Text | ❌ Not Supported | Planned Phase 2 |
+| TTL | ❌ Not Supported | |
+| Text | ❌ Not Supported | |
 | Geospatial | ❌ Not Supported | Not planned |
 | Hashed | ❌ Not Supported | Not planned |
-| Partial | ❌ Not Supported | Planned Phase 2 |
+| Partial | ❌ Not Supported | |
 | Wildcard | ❌ Not Supported | Not planned |
 
 ---
@@ -214,14 +212,14 @@ handshake.
 
 ## Known Divergences from MongoDB 8.0
 
-| Feature | MongoDB 8.0 | mqlite Phase 1 |
-|---------|-------------|----------------|
+| Feature | MongoDB 8.0 | mqlite |
+|---------|-------------|--------|
 | `$regex` engine | PCRE2 (lookahead, lookbehind, named groups) | Rust `regex` crate (no lookahead/lookbehind, no backreferences) |
 | Write concern | `w`, `j`, `wtimeout` | Ignored (all writes are single-writer committed) |
 | Read concern | `local`, `majority`, `snapshot` | Ignored (MVCC snapshot per read) |
-| Transactions | Multi-document ACID | Not supported (Phase 2) |
+| Transactions | Multi-document ACID | Not supported |
 | Change streams | `$changeStream` aggregation | Not supported |
-| Aggregation pipeline | Full `$match`, `$group`, `$lookup`, … | Not supported (Phase 2) |
+| Aggregation pipeline | Full `$match`, `$group`, `$lookup`, … | Not supported |
 | `ObjectId` generation | Server-generated | Client-generated (compatible format) |
 | `_id` type enforcement | Any BSON type | Any BSON type |
 | Capped collections | Fixed-size, oldest-doc-removal | Not supported |

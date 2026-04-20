@@ -1,9 +1,9 @@
 //! Query planner: index selection for query execution.
 //!
 //! The planner analyses a filter document and the collection's available indexes
-//! to choose the best execution strategy.  In Phase 1b (in-memory storage) the
-//! planner produces a [`ScanPlan`] that tells the engine whether to do a full
-//! collection scan or an index-accelerated scan.
+//! to choose the best execution strategy.  The planner produces a [`ScanPlan`]
+//! that tells the engine whether to do a full collection scan or an
+//! index-accelerated scan.
 //!
 //! ## Index selection rules
 //!

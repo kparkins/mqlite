@@ -1,19 +1,19 @@
 //! `ReadView` — the snapshot primitive every reader holds.
 //!
-//! See MVCC plan §T3 / §S13. Each open reader holds a `ReadView` pinning
-//! its `read_ts`; the version-chain walker uses `read_ts` to pick the
-//! visible entry. T4 adds the `ReadViewRegistry` that tracks live
-//! `ReadView`s so the writer can compute `oldest_required_ts`.
+//! Each open reader holds a `ReadView` pinning its `read_ts`; the
+//! version-chain walker uses `read_ts` to pick the visible entry. The
+//! `ReadViewRegistry` tracks live `ReadView`s so the writer can compute
+//! `oldest_required_ts`.
 //!
 //! The `poisoned` flag and `pin_ops_in_flight` counter together support
-//! T8 force-expiry (MAJOR-1): `force_expire` flips `poisoned`, then spins
-//! until `pin_ops_in_flight` reaches 0, so no concurrent pin walk can be
+//! force-expiry: `force_expire` flips `poisoned`, then spins until
+//! `pin_ops_in_flight` reaches 0, so no concurrent pin walk can be
 //! mid-flight when pages are released.
 //!
-//! Production-path atomics use the cfg(loom) shim pattern so future
-//! concurrency harnesses (T4, T8) can permute them.
+//! Production-path atomics use the cfg(loom) shim pattern so loom
+//! harnesses can permute them.
 //
-// LOCK-ORDER: (CRITICAL-1 fix; iter-4 adds DeferredFreeQueue at 1.5)
+// LOCK-ORDER:
 // The full database-wide total order; any path that acquires two or more of
 // these mutexes MUST acquire them in this order, and release in reverse:
 //
@@ -32,7 +32,7 @@
 // 3.   32 KB main partition mutex (BufferPool::inner_32k)
 // 4.   4 KB main partition mutex  (BufferPool::inner_4k)
 // 5.   ReadViewRegistry mutex (Arc<Mutex<BTreeMap<u64, u64>>>)
-// 6.   writer serialization mutex (replaces inner: RwLock<BpBackend> → inner: Mutex<BpBackend>)
+// 6.   writer serialization mutex
 //
 // Readers DO NOT acquire `AllocatorHandle::state` for pure reads (refcount
 // atomics live on the page header and are lock-free). The reader-path
@@ -45,14 +45,6 @@
 // context (writer mutex held). `ReadViewRegistry::oldest_required_ts()`
 // MUST be snapshotted **before** any partition mutex is acquired in a
 // reconciliation path.
-//
-// Iter-3 correction: iteration 2 falsely asserted "the allocator does NOT
-// appear in the lock order" and "PageAllocator serializes via exclusive
-// borrow obtained under inner.write()". Both are contradicted by HEAD
-// `src/storage/allocator.rs:273-274`
-// (`AllocatorHandle { state: Arc<Mutex<AllocatorState>> }`) and every
-// alloc/free path at `:301-357`. Iter-3 honestly puts the allocator mutex
-// at position 2.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -72,13 +64,13 @@ use crate::mvcc::version::VersionEntry;
 
 /// A snapshot handle for an active reader.
 ///
-/// Constructed by `ReadViewRegistry::open()` (T4) with `read_ts` taken
-/// from the timestamp oracle. The visibility rule:
+/// Constructed by `ReadViewRegistry::open()` with `read_ts` taken from
+/// the timestamp oracle. The visibility rule:
 ///
 /// - Committed entry `E` is visible iff `E.start_ts <= read_ts < E.stop_ts`.
 /// - Pending entry is visible only to its own `txn_id`.
 ///
-/// `poisoned` is set by T8 force-expiry before touching any owned pins;
+/// `poisoned` is set by force-expiry before touching any owned pins;
 /// `pin_ops_in_flight` lets the force-expiry path wait for concurrent
 /// pin walks to complete before releasing pages.
 #[derive(Debug)]
@@ -89,8 +81,8 @@ pub struct ReadView {
     /// visibility of this reader's own pending entries when the reader
     /// doubles as a writer.
     pub txn_id: u64,
-    /// Set by `force_expire` (T8). Any subsequent pin-walk observes this
-    /// via an Acquire load at the pre-check and again post-increment of
+    /// Set by `force_expire`. Any subsequent pin-walk observes this via an
+    /// Acquire load at the pre-check and again post-increment of
     /// `pin_ops_in_flight`; if poisoned, it bails without walking pins.
     pub poisoned: AtomicBool,
     /// Active pin-walk count. Incremented on entry to
@@ -106,9 +98,9 @@ pub struct ReadView {
 }
 
 impl ReadView {
-    /// Construct a fresh, live `ReadView` that is NOT tracked by any
-    /// registry. Prefer `ReadViewRegistry::open` on reader paths — this
-    /// constructor exists for tests and internal snapshot fixtures.
+    /// Construct a fresh, live `ReadView` not tracked by any registry.
+    /// Prefer `ReadViewRegistry::open` on reader paths — this constructor
+    /// exists for tests and internal snapshot fixtures.
     pub fn new(read_ts: Ts, txn_id: u64) -> Self {
         Self {
             read_ts,
@@ -122,12 +114,8 @@ impl ReadView {
     /// Open a `ReadView` that registers itself with `registry` for the
     /// lifetime of the returned `Arc`. The last `Arc::drop` unregisters
     /// the view's `txn_id`, bounding the duration that `read_ts` pins the
-    /// `oldest_required_ts()` horizon.
-    ///
-    /// T4 adds only the primitive; T5' wires real reader paths through
-    /// this entry point. T9 upgrades the registry slot to also track a
-    /// `Weak<ReadView>` so `drop_collection`'s barrier can iterate live
-    /// views and force-expire them.
+    /// `oldest_required_ts()` horizon. The registry slot also tracks a
+    /// `Weak<ReadView>` so `force_expire_all` can iterate live views.
     pub fn open(registry: Arc<ReadViewRegistry>, read_ts: Ts, txn_id: u64) -> Arc<Self> {
         let view = Arc::new(Self {
             read_ts,
@@ -140,8 +128,8 @@ impl ReadView {
         view
     }
 
-    /// True iff this view has been force-expired (plan §T9). Readers MUST
-    /// check this before acting on a cached `ReadView`; the engine returns
+    /// True iff this view has been force-expired. Readers MUST check this
+    /// before acting on a cached `ReadView`; the engine returns
     /// `Error::ReadViewExpired` on any subsequent operation.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
@@ -158,8 +146,8 @@ impl ReadView {
         }
     }
 
-    /// Force-expire. Iter-4 "subtraction" force-expiry: we DO NOT walk any
-    /// owned snapshots. This method has two responsibilities:
+    /// Force-expire this view. Does NOT walk any owned snapshots.
+    /// This method has two responsibilities:
     ///
     /// 1. Flip `poisoned = true` (Release) so any subsequent
     ///    `ChainSnapshot::new` short-circuits at its pre-check without
@@ -251,8 +239,8 @@ pub struct ReadViewRegistry {
 }
 
 /// Registry entry: the view's `read_ts` plus a `Weak` back-pointer used
-/// by `force_expire_all` (plan §T9) to iterate live views. `Weak` avoids
-/// keeping the view alive past the caller's last `Arc` reference.
+/// by `force_expire_all` to iterate live views. `Weak` avoids keeping the
+/// view alive past the caller's last `Arc` reference.
 struct RegistrySlot {
     read_ts: Ts,
     view: Weak<ReadView>,
@@ -299,21 +287,20 @@ impl ReadViewRegistry {
         guard.values().map(|s| s.read_ts).min().unwrap_or(Ts::MAX)
     }
 
-    /// Force-expire EVERY registered `ReadView` (plan §T9
-    /// `drop_collection` barrier). Snapshots all `Weak<ReadView>` handles
-    /// under the registry mutex, releases the mutex, then upgrades each
-    /// `Weak` and calls `force_expire` on any upgradable view — which
-    /// flips `poisoned` and spins until the view's `pin_ops_in_flight`
-    /// drains to zero.
+    /// Force-expire EVERY registered `ReadView`. Snapshots all
+    /// `Weak<ReadView>` handles under the registry mutex, releases the
+    /// mutex, then upgrades each `Weak` and calls `force_expire` on any
+    /// upgradable view — which flips `poisoned` and spins until the
+    /// view's `pin_ops_in_flight` drains to zero.
     ///
-    /// The snapshot-then-release pattern is required to avoid a reentrant
-    /// acquisition: `Arc::drop` of a view calls `registry.unregister`
-    /// which would re-enter this mutex. By dropping the upgraded `Arc`s
-    /// outside the mutex we guarantee no nested lock.
+    /// The snapshot-then-release pattern avoids a reentrant acquisition:
+    /// `Arc::drop` of a view calls `registry.unregister` which would
+    /// re-enter this mutex. By dropping the upgraded `Arc`s outside the
+    /// mutex we guarantee no nested lock.
     ///
     /// Caller must hold the writer serialization mutex (position 6) to
     /// prevent new `ReadView::open` races from observing a half-drained
-    /// state (plan line 1032).
+    /// state.
     pub fn force_expire_all(&self) {
         let views: Vec<Weak<ReadView>> = {
             let guard = self.inner.lock().unwrap();
@@ -353,7 +340,7 @@ impl ReadViewRegistry {
 /// which in turn runs `OverflowRef::Drop` (atomic decref + deferred-free
 /// enqueue on 0).
 ///
-/// **S13 force-expiry contract:**
+/// **Force-expiry contract:**
 ///
 /// 1. `new` checks `view.poisoned` BEFORE taking any refcount bumps. If
 ///    poisoned, it returns an empty snapshot (no `fetch_add`, no clones).
@@ -372,10 +359,9 @@ pub struct ChainSnapshot {
     /// `VecDeque` were cloned from the source (running `OverflowRef::Clone`
     /// for `VersionData::Overflow` entries).
     chains: HashMap<Vec<u8>, VecDeque<VersionEntry>>,
-    /// Back-reference to the owning reader's `ReadView`, used for the S13
-    /// poison check during `new`. `None` on reader paths that predate the
-    /// T4 `ReadViewRegistry` wiring (every construction site in T3.75
-    /// supplies `None`).
+    /// Back-reference to the owning reader's `ReadView`, used for the
+    /// poison check during `new`. `None` for standalone callers (primarily
+    /// tests that exercise snapshot visibility without a registry).
     #[allow(dead_code)]
     view: Option<Arc<ReadView>>,
 }
@@ -393,15 +379,15 @@ impl ChainSnapshot {
     /// Construct a snapshot from a frame's per-key version chains.
     ///
     /// Deep-clones every entry (bumping overflow refcounts via
-    /// `OverflowRef::Clone`) under the S13 atomic-handoff protocol. See
+    /// `OverflowRef::Clone`) under the atomic-handoff protocol. See
     /// type-level docs for the poison contract.
     pub fn new(
         source: &HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
         view: Option<Arc<ReadView>>,
     ) -> Self {
         // Pre-check: if the owning view is already poisoned, refuse to
-        // pin any entries. The empty snapshot is the S13 "force-expired
-        // view sees nothing" contract.
+        // pin any entries. The empty snapshot is the "force-expired view
+        // sees nothing" contract.
         if let Some(v) = &view {
             if v.poisoned.load(Ordering::Acquire) {
                 return ChainSnapshot {
@@ -582,7 +568,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ChainSnapshot — S13 force-expiry contract
+    // ChainSnapshot — force-expiry contract
     // -----------------------------------------------------------------------
 
     #[test]
@@ -651,7 +637,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ReadViewRegistry — plan T4 acceptance bullets 1–3
+    // ReadViewRegistry
     // -----------------------------------------------------------------------
 
     #[test]
@@ -662,7 +648,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T8 — force_expire
+    // force_expire
     // -----------------------------------------------------------------------
 
     #[test]

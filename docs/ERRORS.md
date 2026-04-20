@@ -235,8 +235,6 @@ match Client::open("myapp.mqlite") {
 # Ok::<(), mqlite::Error>(())
 ```
 
-> **Phase 2:** `client.repair()` for automated recovery is planned.
-
 ---
 
 ### `Error::DiskFull`
@@ -331,7 +329,7 @@ or has already expired. This error only occurs via the wire protocol.
 
 ### `Error::UnsupportedOperator`
 
-A query filter or update document used an MQL operator not supported in Phase 1.
+A query filter or update document used an MQL operator not supported by mqlite.
 
 **MongoDB error code:** 9
 
@@ -365,12 +363,12 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for the complete list of supported oper
 
 ### `Error::UnsupportedCommand`
 
-A wire protocol command is not supported by mqlite's Phase 1 implementation.
+A wire protocol command is not supported by mqlite.
 Commands return error code 59 (CommandNotFound) to the driver.
 
 **Common causes:**
 - Using `aggregate`, `distinct`, `count`, or `explain` via the wire protocol
-- Using authentication commands (mqlite has no auth layer in Phase 1)
+- Using authentication commands (mqlite has no auth layer)
 
 **Recovery:** Use the mqlite native Rust API for operations not yet supported
 over the wire protocol.

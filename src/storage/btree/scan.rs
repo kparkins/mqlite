@@ -52,19 +52,16 @@ impl<S: BTreePageStore> BTree<S> {
         read_overflow_chain(&self.store, first_page, total_length)
     }
 
-    /// MVCC-aware point lookup (T5' sub-step 3).
+    /// MVCC-aware point lookup.
     ///
     /// Consults the owning leaf frame's version chain via `ChainSnapshot`
     /// first; if a [`VersionEntry`] visible to `view` exists for `key`,
     /// its payload is returned (respecting `is_tombstone`). Otherwise the
-    /// on-disk cell is used — this is the dual-write intermediate state
-    /// (T5' has both the in-memory chain and the on-disk cell; T6
-    /// reconciliation will collapse them). Pre-MVCC keys that never got a
-    /// staged write flow through the on-disk fallback.
+    /// on-disk cell is used — pre-MVCC keys that never got a staged write
+    /// flow through the on-disk fallback.
     ///
     /// Not yet called from the engine's reader paths — those route through
-    /// `range_scan_mvcc` via `btree_collscan`. Kept as a T5' acceptance
-    /// deliverable and for future point-lookup fast-paths (T6+).
+    /// `range_scan_mvcc` via `btree_collscan`.
     #[allow(dead_code)]
     pub(crate) fn get_mvcc(
         &self,
@@ -89,7 +86,7 @@ impl<S: BTreePageStore> BTree<S> {
                 }));
             }
         }
-        // Plan §T7: history fallthrough. The chain had no entry visible at
+        // History fallthrough: the chain had no entry visible at
         // `view.read_ts` — an evicted entry in the history store might.
         if let Some(probe) = history {
             if let Some(entry) = probe.probe(key, view.read_ts)? {
@@ -246,10 +243,10 @@ impl<S: BTreePageStore> BTree<S> {
                     continue;
                 }
 
-                // Plan §T7: history fallthrough before falling back to the
-                // on-disk cell. A visible evicted entry in the history store
-                // is preferred over the cell (which reflects the latest
-                // committed baseline, not necessarily visible at `read_ts`).
+                // History fallthrough before falling back to the on-disk cell.
+                // A visible evicted entry in the history store is preferred
+                // over the cell (which reflects the latest committed baseline,
+                // not necessarily visible at `read_ts`).
                 if let Some(probe) = history {
                     if let Some(entry) = probe.probe(&cell.key, view.read_ts)? {
                         if entry.is_tombstone {

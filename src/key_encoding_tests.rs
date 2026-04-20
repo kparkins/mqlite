@@ -1,5 +1,4 @@
-//! Tests extracted from `key_encoding.rs` to keep the source file under the
-//! 800-line guideline. See [`super`] for the production code.
+//! Tests for `key_encoding.rs`. See [`super`] for the production code.
 
 use super::*;
 use bson::spec::BinarySubtype;

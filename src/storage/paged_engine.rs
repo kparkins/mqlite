@@ -1,15 +1,12 @@
-//! `PagedEngine` — Phase 1 `StorageEngine` backed by B+ trees.
+//! `PagedEngine` — `StorageEngine` backed by B+ trees.
 //!
 //! ## Design
 //!
 //! Documents are stored in per-namespace B+ trees keyed by [`encode_key`]-encoded
-//! `_id` values.  Two operating modes:
+//! `_id` values, backed by a [`BufferPoolPageStore`] (shared [`BufferPoolHandle`])
+//! with persistence via buffer pool flush.
 //!
-//! | Mode | Backing store | Persistence |
-//! |------|--------------|-------------|
-//! | **Buffered** | [`BufferPoolPageStore`] (shared [`BufferPoolHandle`]) | Via buffer pool flush |
-//!
-//! ## Catalog (Buffered mode)
+//! ## Catalog
 //!
 //! A [`Catalog`] B+ tree stores [`CollectionEntry`] and [`IndexEntry`] records.
 //! Its root page number is persisted to [`FileHeader::catalog_root_page`] after every
@@ -76,12 +73,12 @@ use self::index_maint::{install_pending_primary, install_pending_sec_index};
 use self::state::{MetadataState, OwnedLaneGuard, SharedState};
 
 // ---------------------------------------------------------------------------
-// PagedEngine — public struct (PR 8)
+// PagedEngine — public struct
 // ---------------------------------------------------------------------------
 
-/// Phase 1 storage engine: B+ tree per namespace, through the buffer pool.
+/// Storage engine: B+ tree per namespace, through the buffer pool.
 ///
-/// ## Concurrency (PR 8: MWMR v1)
+/// ## Concurrency
 ///
 /// - **Reads**: mutex-free — load `shared.published` (`ArcSwap`) and open
 ///   B-trees at the snapshot's root pages. No engine-level lock taken.
@@ -125,7 +122,6 @@ impl PagedEngine {
     ///
     /// If `catalog_root_page == 0` the database is new and an empty catalog
     /// will be created. Otherwise the catalog is opened at the given root.
-    /// `busy_timeout` + `busy_handler` migrated from ClientInner (PR 8).
     #[cfg(test)]
     pub(crate) fn new_buffered(
         handle: Arc<BufferPoolHandle>,
@@ -162,7 +158,7 @@ impl PagedEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Lane acquisition (ported from client.rs acquire_writer_lock)
+    // Lane acquisition
     // -----------------------------------------------------------------------
 
     /// Resolve the per-namespace lane mutex, creating one if needed.
@@ -170,8 +166,7 @@ impl PagedEngine {
         state::lane_for(self, ns)
     }
 
-    /// Acquire the namespace lane with busy-timeout / busy-handler semantics
-    /// matching the client's legacy `acquire_writer_lock`.
+    /// Acquire the namespace lane with busy-timeout / busy-handler semantics.
     fn acquire_lane(
         &self,
         lane: Arc<ParkingMutex<()>>,
@@ -310,14 +305,7 @@ impl PagedEngine {
     /// Internal form of `run_write` that assumes the namespace already exists
     /// (or the write path tolerates its absence — `update`/`delete` do).
     ///
-    /// Deadlock fix (PR 8 follow-up): the previous revision upgraded
-    /// `metadata.read()` → `metadata.write()` while holding the
-    /// namespace lane. Two writers on different namespaces each held
-    /// `metadata.read()` and then tried to upgrade, producing a
-    /// writer-vs-writer deadlock (A holds lane+waits-for-write; B
-    /// holds read+waits-for-lane-from-A-after-its-upgrade).
-    ///
-    /// Fix: keep `metadata.read()` for the whole body; mutate the
+    /// Keeps `metadata.read()` for the whole body and mutates the
     /// catalog via the interior `Mutex<Catalog>`. Lock order is
     /// documented on `MetadataState`.
     fn run_write_existing<F, R>(&self, ns: &str, f: F) -> Result<R>
@@ -467,10 +455,6 @@ impl PagedEngine {
 // StorageEngine implementation
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// StorageEngine implementation (PR 8 — MWMR v1)
-// ---------------------------------------------------------------------------
-
 impl StorageEngine for PagedEngine {
     fn insert(&self, ns: &str, doc: Document) -> Result<Bson> {
         doc_ops::insert(self, ns, doc)
@@ -575,10 +559,9 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn drop_namespace(&self, ns: &str) -> Result<()> {
-        // Plan §T9: force-expire ALL active ReadViews globally before
-        // freeing pages. Done BEFORE taking the metadata write guard so
-        // concurrent readers that just loaded the published snapshot
-        // can finish their pin walks.
+        // Force-expire ALL active ReadViews globally before freeing pages.
+        // Done BEFORE taking the metadata write guard so concurrent readers
+        // that just loaded the published snapshot can finish their pin walks.
         self.shared.handle.read_view_registry().force_expire_all();
 
         // Insert the drop guard BEFORE taking the metadata write lock so that

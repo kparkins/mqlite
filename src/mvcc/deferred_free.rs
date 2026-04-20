@@ -1,16 +1,15 @@
 //! Deferred free queue for refcount-to-zero overflow chains.
 //!
-//! See MVCC plan §T3 (CRITICAL-3 fix) — `OverflowRef::drop` never frees
-//! pages directly. When a decref brings the refcount to 0, the page number
-//! is enqueued here. The actual free runs in the writer path
-//! (`AllocatorHandle::drain_free_queue`) under the writer-serialization
-//! mutex AND the allocator state mutex, rechecking the refcount under
-//! Acquire ordering before releasing the page to the free list.
+//! `OverflowRef::drop` never frees pages directly. When a decref brings the
+//! refcount to 0, the page number is enqueued here. The actual free runs in
+//! the writer path (`AllocatorHandle::drain_free_queue`) under the
+//! writer-serialization mutex AND the allocator state mutex, rechecking the
+//! refcount under Acquire ordering before releasing the page to the free list.
 //!
 //! Lock order: position 1.5 (before AllocatorHandle::state at position 2).
 //!
 //! The module uses the cfg(loom) shim pattern so its `Mutex` can be
-//! permuted by loom's scheduler in future concurrency harnesses (T4+).
+//! permuted by loom's scheduler in concurrency harnesses.
 
 #[cfg(loom)]
 use loom::sync::Mutex;

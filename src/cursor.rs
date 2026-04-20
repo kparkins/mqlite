@@ -136,12 +136,6 @@ impl<T> Cursor<T> {
     /// Returns a snapshot of the plan captured when the cursor was created.
     /// The cursor does not need to be fully consumed before calling `explain`.
     ///
-    /// # Phase 1 behavior
-    ///
-    /// All queries in Phase 1 use a full collection scan (`COLLSCAN`).
-    /// `docs_examined` reflects the collection size at cursor-creation time.
-    /// Index-accelerated query plans are introduced in Phase 1c.
-    ///
     /// # Example
     /// ```no_run
     /// # use mqlite::{Client, doc};

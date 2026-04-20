@@ -3,9 +3,8 @@
 //! Readers load an `Arc<PublishedSnapshot>` atomically via
 //! `ArcSwap::load()` and use it to locate B-tree root pages and issue
 //! a `ReadView` at `publish_ts`. Writers publish a new snapshot on
-//! commit by `ArcSwap::store()`. Under v1-MWMR (PR 8) this is the
-//! only read-path coordination point; readers never take the engine
-//! write mutex.
+//! commit by `ArcSwap::store()`. This is the only read-path coordination
+//! point; readers never take the engine write mutex.
 
 use std::collections::HashMap;
 

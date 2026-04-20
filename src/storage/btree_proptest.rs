@@ -407,11 +407,11 @@ fn collect_leaves_via_traversal(
 // • No leaf must hold more entries than its page can encode (max bound).
 // • No leaf must be completely empty unless it is the root leaf.
 // • No leaf may exceed PAGE_SIZE_LEAF bytes.
-// • Internal nodes: only the maximum bound is enforced (Phase 1 allows
-//   underfull internal nodes after deletions).
+// • Internal nodes: only the maximum bound is enforced (underfull internal
+//   nodes after deletions are currently accepted).
 //
 // Note: minimum occupancy (MIN_LEAF_CELLS) is not strictly checked here
-// because several valid Phase-1 scenarios produce underfull leaves:
+// because several valid scenarios produce underfull leaves:
 //   – A split where the new cell lands at a key-order extreme (only 1 cell
 //     on one side; both halves still fit by bytes).
 //   – A delete where redistribution/merge is blocked by large adjacent cells.
@@ -852,7 +852,7 @@ fn regression_invariants_single_insert() {
     check_all_invariants(&tree);
 }
 
-/// Insert a known sequence that was previously problematic: reverse order.
+/// Insert keys in reverse order — exercises descending-split paths.
 #[test]
 fn regression_invariants_reverse_insert_160() {
     let store = MemPageStore::new();

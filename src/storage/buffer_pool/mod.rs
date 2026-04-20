@@ -29,7 +29,7 @@
 //! read-only pins (using only [`data`](PinnedPage::data)) are safe.  The
 //! database-level single-writer lock enforces this at a higher level.
 //
-// LOCK-ORDER (CRITICAL-1; iter-4): this file owns positions **3** (32 KB
+// LOCK-ORDER (CRITICAL-1): this file owns positions **3** (32 KB
 // partition mutex, `BufferPool::inner_32k`) and **4** (4 KB partition
 // mutex, `BufferPool::inner_4k`) in the database-wide total order. Any
 // path that acquires both partitions MUST acquire 32 KB before 4 KB, and
@@ -38,9 +38,8 @@
 // while holding either partition mutex. The canonical definition of the
 // full order (positions 1 → 1.5 → 2 → 3 → 4 → 5 → 6) lives at the top of
 // `src/mvcc/read_view.rs` — edit both blocks together or neither.
-// T6 wires the reconciliation path that snapshots
-// `ReadViewRegistry::oldest_required_ts()` (position 5) BEFORE acquiring
-// a partition mutex; T4 only adds the primitive.
+// The reconciliation path snapshots `ReadViewRegistry::oldest_required_ts()`
+// (position 5) BEFORE acquiring a partition mutex.
 
 mod chains;
 mod partition;
@@ -56,17 +55,16 @@ use crate::storage::allocator::AllocatorHandle;
 use partition::Partition;
 
 // ---------------------------------------------------------------------------
-// Main buffer-pool sharding (T6 / S12)
+// Main buffer-pool sharding
 // ---------------------------------------------------------------------------
 
 /// Number of independent main buffer pools in the engine.
 ///
-/// The MVCC design (plan §T6, S12 criterion) mandates a single main pool
-/// (two size-class partitions live *inside* that pool). T7 adds a dedicated
-/// history-store pool but does not change this count. A second main pool
-/// would require a second lock-order position at level 3 / 4 — intentionally
-/// ruled out. Changes to this constant must be accompanied by a lock-order
-/// audit; the compile-time assertion in
+/// A single main pool is used (two size-class partitions live *inside* that
+/// pool); a dedicated history-store pool is separate and does not count here.
+/// A second main pool would require a second lock-order position at level 3 / 4
+/// — intentionally ruled out. Changes to this constant must be accompanied by a
+/// lock-order audit; the compile-time assertion in
 /// `tests/partition_pool_sharding_invariant.rs` guards the invariant.
 #[allow(dead_code)]
 pub(crate) const N_MAIN_POOLS: usize = 1;
@@ -263,7 +261,7 @@ impl BufferPool {
         })
     }
 
-    /// Pin `page_number` with chain reconciliation on the miss path (T7).
+    /// Pin `page_number` with chain reconciliation on the miss path.
     ///
     /// Identical to [`BufferPool::pin`] on a cache hit. On a miss, the
     /// chosen victim frame's version chains are pruned against the current
@@ -273,7 +271,7 @@ impl BufferPool {
     /// overflow pages whose refcount reached zero as a side-effect of the
     /// prune.
     ///
-    /// **Lock-order contract (T4 / T6 / T7):**
+    /// **Lock-order contract:**
     /// 1. `ReadViewRegistry::oldest_required_ts()` is snapshotted BEFORE
     ///    the partition mutex. Position 5 is below positions 3/4 in the
     ///    total order.
@@ -367,7 +365,7 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Invalidate the cached frame for `page_number` (plan §M4b).
+    /// Invalidate the cached frame for `page_number`.
     ///
     /// Used by the writer-txn rollback path after returning a page to the
     /// allocator free list: the previous occupant's frame may still be
@@ -441,7 +439,7 @@ pub(crate) mod default_sizes {
     pub const DESKTOP: usize = 64 * 1024 * 1024;
     /// Server deployments: 256 MiB.
     pub const SERVER: usize = 256 * 1024 * 1024;
-    /// Dedicated history-store pool (plan §T7): 8 MiB default.
+    /// Dedicated history-store pool: 8 MiB default.
     pub const HISTORY: usize = 8 * 1024 * 1024;
 }
 

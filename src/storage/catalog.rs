@@ -147,9 +147,8 @@ impl CollectionEntry {
 /// build sees every concurrent mutation on the target namespace.
 ///
 /// `Ready` is the default for backwards compatibility: catalog records
-/// persisted before PR 9 do not carry this field and deserialize as
-/// `Ready`, matching their pre-PR-9 behaviour (fully populated and
-/// usable).
+/// written before this field existed do not carry it and deserialize as
+/// `Ready` (fully populated and usable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexState {
     /// Index has a catalog entry but its contents may be incomplete.
@@ -248,9 +247,9 @@ impl IndexEntry {
         let entry_count = doc
             .get_i64("entryCount")
             .map_err(|e| Error::Internal(format!("catalog: missing 'entryCount': {e}")))?;
-        // `state` is optional for backwards compatibility: records written
-        // before PR 9 have no field, which we treat as `Ready` (their
-        // contents are fully populated).
+        // `state` is optional for backwards compatibility: older records
+        // have no field, which we treat as `Ready` (their contents are
+        // fully populated).
         let state = match doc.get_str("state") {
             Ok("building") => IndexState::Building,
             Ok("ready") => IndexState::Ready,

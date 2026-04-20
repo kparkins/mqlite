@@ -18,11 +18,10 @@
 //! multiple threads.  Implementations handle their own synchronization (interior
 //! mutability — typically a `Mutex<Inner>`).
 //!
-//! # Phase 1 implementation
+//! # Concrete implementation
 //!
-//! The first concrete implementation is [`crate::storage::paged_engine::PagedEngine`],
-//! which is currently a stub backed by an in-memory `Vec<Document>` engine.
-//! Subsequent beads (hq-bhon onwards) wire in the real B+ tree / buffer pool / WAL stack.
+//! The concrete implementation is [`crate::storage::paged_engine::PagedEngine`],
+//! backed by a B+ tree / buffer pool / WAL stack.
 
 use bson::{Bson, Document};
 
@@ -205,20 +204,9 @@ pub trait StorageEngine: Send + Sync {
     #[allow(dead_code)]
     fn close(&self) -> Result<()>;
 
-    // -------------------------------------------------------------------------
-    // Temporary Phase 0.x API — removed in Phase 1.5
-    // -------------------------------------------------------------------------
-
     /// Serialise the current engine state to a BSON snapshot blob.
     ///
-    /// **Temporary API.** This exists only during Phase 0.x while the legacy
-    /// BSON-blob persistence is in use.  It is called by
-    /// [`crate::client::ClientInner::checkpoint`] to write the snapshot to
-    /// disk.  When Phase 1.5 (WAL integration) replaces the snapshot
-    /// mechanism, this method will be removed.
-    ///
-    /// Returns `Ok(None)` when the engine does not use blob-based persistence
-    /// (i.e., once Phase 1.5 is in place).
+    /// Returns `Ok(None)` when the engine does not use blob-based persistence.
     #[allow(dead_code)]
     fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)

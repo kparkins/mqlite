@@ -1,49 +1,12 @@
-# True MVCC Design
+# MVCC Architecture
 
-## Problem: SQLite-style WAL used as a concurrency mechanism
-
-mqlite currently uses a SQLite-style WAL (`src/wal/`) for two unrelated jobs:
-
-1. **Crash recovery** — append page frames, replay on open, checkpoint to main file. This is correct and should be preserved, renamed to *journal* (see below).
-2. **Snapshot isolation** — readers hold `RwLock<BpBackend>` (shared) for the duration of every scan. Writers hold it exclusively. This means a long `find()` blocks all writes until it finishes.
-
-The second job is the problem. The WAL was never designed to provide snapshot isolation — that design belongs to a proper MVCC layer. As a result:
-
-- Readers block writers (and vice versa) for the full duration of every scan.
-- There is exactly one version of every document: the latest committed version.
-- Multi-statement transactions with snapshot isolation are impossible.
-- Long reads under heavy write workloads cause unbounded write latency.
-
-MongoDB's WiredTiger storage engine solves this with per-document in-memory version chains. That is the target.
-
----
-
-## Rename: WAL → Journal
-
-The WAL already does exactly one thing correctly: crash recovery. WiredTiger calls this the **journal**. Before implementing MVCC, rename the module to reflect its true role:
-
-| Old | New |
-|-----|-----|
-| `src/wal/` | `src/journal/` |
-| `src/wal/mod.rs` | `src/journal/mod.rs` |
-| `src/wal/wal_file.rs` | `src/journal/log_file.rs` |
-| `src/wal/shm.rs` | `src/journal/shm.rs` |
-| `WalManager` | `JournalManager` |
-| `WalLayeredSource` | `JournalLayeredSource` |
-| `-wal` file suffix | `-journal` file suffix |
-| `-shm` file suffix | `-shm` file suffix (keep) |
-
-The journal's behavior is unchanged: append page frames on write, replay on open, checkpoint periodically, truncate after checkpoint. MVCC does not interact with the journal at all — the journal handles crash recovery; MVCC handles concurrent read visibility.
-
----
-
-## Solution: WiredTiger-style In-Memory Version Chains
+## WiredTiger-style In-Memory Version Chains
 
 ### Core concept
 
 Every write to a document creates a new **version** in memory, attached to the buffer pool page frame that contains the document's B-tree key. The old version is not discarded — it remains in the chain with a `stop_ts` set. Readers find the version matching their `read_ts` by walking the chain. Old versions are discarded lazily during page eviction (reconciliation).
 
-### Components required
+### Components
 
 #### 1. Timestamp Oracle (`src/mvcc/timestamp.rs`)
 
@@ -170,96 +133,11 @@ Opening a `ReadView` inserts into the registry. Dropping a `ReadView` removes it
 
 ---
 
-## Required Changes Summary
-
-> **Status as of 2026-04-16**: All phases below shipped across commits T0…T9
-> on the MVCC branch. See `docs/adr/0001-mvcc.md` for the accepted ADR, and
-> `.omc/plans/mvcc-wiredtiger.md` for the task-by-task acceptance evidence.
-
-### Phase 1 — Foundation (shipped T0/T1/T2)
-
-1. **WAL → Journal rename** — `src/journal/` is the sole survivor of the
-   old `src/wal/` tree; the `-wal` sidecar is renamed on open for
-   backwards compatibility with pre-T0 database files.
-
-2. **`src/mvcc/` module** ships with:
-   - `timestamp.rs` — HLC oracle `Ts { physical_ms, logical }`,
-     floored on open to the successor of the last durable commit.
-   - `version.rs` — `VersionEntry`, `OverflowRef` (RAII decref),
-     `VersionData::{Inline, Overflow}`.
-   - `read_view.rs` — `ReadView` with `poisoned` / `pin_ops_in_flight`
-     atomics, `ReadViewRegistry` keyed by `txn_id` holding `Weak<ReadView>`
-     slots, `ChainSnapshot` (S13 atomic-handoff pin protocol).
-   - `transaction.rs` — `WriteTxn::begin` drains the deferred-free queue
-     before allocating; staged primary + sec-index writes commit under a
-     single `commit_ts`.
-   - `deferred_free.rs` — writer-drained queue of overflow first-pages
-     whose refcount hit zero on the reader path.
-
-3. **`version_chains` on buffer-pool frames** — each `PageFrame` owns its
-   per-user-key version chains; reconciliation on eviction walks them
-   against `ReadViewRegistry::oldest_required_ts()`.
-
-### Phase 2 — Read Path (shipped T3/T3.5/T3.75/T5')
-
-4. **`ReadView` threaded through BTree reads** — `get` / `range_scan` walk
-   the chain for visibility before falling back to the history store.
-   The split-migration and merge-path guards landed at
-   `src/storage/btree.rs:1281,1308` (T3.5).
-
-5. **RwLock read path removed from `PagedEngine`** (T5'). `find`,
-   `find_one`, `count`, `list_indexes`, `aggregate` open a `ReadView`,
-   read lock-free, and drop the view. Writers acquire only the writer
-   serialization mutex (position 6).
-
-### Phase 3 — Write Path (shipped T5'/T6)
-
-6. **`WriteTxn` on `BpBackend::with_txn`** — staged primary + sec-index
-   writes plus refcount deltas for overflow pins are atomically stamped
-   with the same `commit_ts` (no half-committed witness).
-
-7. **Reconciliation on eviction** — `BufferPool::reconcile_frame_at`
-   drops versions older than `oldest_required_ts` and pushes cold
-   entries into the history store before the page flushes to the
-   journal.
-
-### Phase 4 — History Store & GC (shipped T7/T8)
-
-8. **`src/storage/history_store.rs`** — a dedicated B-tree keyed by
-   `(ns_id, kind, user_key, start_ts_BE)`. Readers probe it on chain
-   miss; kind-tagging keeps primary and sec-index entries disjoint.
-
-9. **GC pass** — runs from `checkpoint()` against
-   `ReadViewRegistry::oldest_required_ts()`; deletes entries whose
-   `stop_ts <= oldest_required_ts`.
-
-### Phase 5 — Barriers, counters, ADR (shipped T8/T9)
-
-10. **12 mandatory + 5 diagnostic MVCC counters** wired through the
-    metrics surface (`mvcc.reconcile.*`, `mvcc.history_store.*`,
-    `mvcc.read_view.*`, `overflow.pages_in_use`, …). Four deferred
-    sampling sites are listed in ADR 0001 §6.
-
-11. **`drop_collection` force-expire barrier** (T9) — acquires writer
-    serialization (6), force-expires every live `ReadView` via the
-    registry (5), waits for `pin_ops_in_flight == 0`, then invokes
-    `free_subtree` under the same writer serialization. Post-barrier,
-    pre-opened views surface `Error::ReadViewExpired` on next use.
-
-12. **Feature flag removed.** `feature = "mvcc"` no longer exists —
-    MVCC is unconditional. Verified by `rg 'feature = "mvcc"'` → 0
-    matches in `Cargo.toml`, `src/`, and `tests/`.
-
-13. **ADR 0001 accepted** — see `docs/adr/0001-mvcc.md` for decision
-    record, lock order, alternatives, and post-v1 deferred items.
-
----
-
 ## Key Invariants
 
 - `start_ts` of the head of any chain is always the `commit_ts` of the most recent committed write to that document.
 - `stop_ts` of the previous head is always equal to `start_ts` of the new head.
 - `oldest_required_ts` is always ≤ the `read_ts` of any open `ReadView`.
 - The on-disk page image always reflects the oldest version that any current or future reader might need (i.e., `stop_ts > oldest_required_ts_at_last_reconciliation`).
-- The journal (formerly WAL) records the reconciled on-disk state for crash recovery only. MVCC version chains are in-memory only and rebuilt from the journal on crash recovery (the on-disk state is always a valid single-version snapshot of the database).
+- The journal records the reconciled on-disk state for crash recovery only. MVCC version chains are in-memory only and rebuilt from the journal on crash recovery (the on-disk state is always a valid single-version snapshot of the database).
 - On crash recovery, the journal replays to produce the latest committed on-disk state. All in-memory version chains start empty. This is correct because crash recovery produces a consistent point-in-time snapshot.

@@ -76,7 +76,7 @@ pub(super) fn handle_drop(body: &Document, state: &ServerState) -> Document {
 /// ```
 pub(super) fn handle_list_collections(body: &Document, state: &ServerState) -> Document {
     // Optional `filter: {name: "<name>"}` — only a simple equality filter on `name`
-    // is supported in Phase 1.
+    // is supported.
     let name_filter: Option<String> = body
         .get_document("filter")
         .ok()

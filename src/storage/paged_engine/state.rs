@@ -21,8 +21,7 @@ use super::catalog_ops::build_snapshot_from_catalog;
 // ---------------------------------------------------------------------------
 
 /// State shared by the read path (no mutex) and the writer inside
-/// `Mutex<BpBackend>`. Under PR 8 this becomes the full MWMR shared
-/// state; in PR 4 it's only what reads need.
+/// `Mutex<BpBackend>`.
 pub(crate) struct SharedState {
     pub handle: Arc<BufferPoolHandle>,
     pub history_store: std::sync::Mutex<HistoryStore<BufferPoolPageStore>>,
@@ -34,7 +33,7 @@ pub(crate) struct SharedState {
 }
 
 // ---------------------------------------------------------------------------
-// MetadataState — catalog wrapped in metadata RwLock (PR 8)
+// MetadataState — catalog wrapped in metadata RwLock
 // ---------------------------------------------------------------------------
 
 /// Per-engine catalog state protected by an `RwLock`. DDL ops take the
@@ -89,10 +88,10 @@ impl MetadataState {
                 None => return Err(Error::TimestampExhausted),
             }
         }
-        // Plan §T7: construct the history store on the dedicated
-        // history-routed page store. A fresh tree is built every open — the
-        // previous lifetime's entries are not persisted across restart
-        // because reconciliation repopulates it lazily (plan deferral 905).
+        // Construct the history store on the dedicated history-routed page
+        // store. A fresh tree is built every open — the previous lifetime's
+        // entries are not persisted across restart because reconciliation
+        // repopulates it lazily.
         let history_store_inner = HistoryStore::create(
             BufferPoolPageStore::new_history(Arc::clone(&handle)),
         )?;

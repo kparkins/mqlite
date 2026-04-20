@@ -14,8 +14,8 @@
 //!
 //! flagBits : uint32
 //!   bit 0  – checksumPresent  (CRC-32C appended after sections)
-//!   bit 1  – moreToCome       (sender will send more replies; ignored in Phase 1)
-//!   bit 16 – exhaustAllowed   (client allows exhaust cursors; ignored in Phase 1)
+//!   bit 1  – moreToCome       (sender will send more replies; not supported)
+//!   bit 16 – exhaustAllowed   (client allows exhaust cursors; not supported)
 //!
 //! Sections (one or more):
 //!   Kind 0 – body (exactly one per message, carries the command document)
@@ -30,8 +30,6 @@
 //! Optional checksum (if flagChecksumPresent):
 //!   checksum : uint32  – CRC-32C over all preceding bytes in the message
 //! ```
-//!
-//! Phase 1 implementation: tracked in hq-6d0 (Phase 1c: OP_MSG framing parser and generator).
 
 use bson::{Document, RawDocumentBuf};
 use smallvec::SmallVec;
@@ -85,9 +83,9 @@ const SECTION_KIND_DOC_SEQ: u8 = 1;
 
 /// flagBits bit 0 – CRC-32C checksum is appended after sections.
 pub const FLAG_CHECKSUM_PRESENT: u32 = 1 << 0;
-/// flagBits bit 1 – sender will send more replies (streaming; ignored Phase 1).
+/// flagBits bit 1 – sender will send more replies (streaming; not supported).
 pub const FLAG_MORE_TO_COME: u32 = 1 << 1;
-/// flagBits bit 16 – client allows exhaust cursors (ignored Phase 1).
+/// flagBits bit 16 – client allows exhaust cursors (not supported).
 pub const FLAG_EXHAUST_ALLOWED: u32 = 1 << 16;
 
 // ---------------------------------------------------------------------------
@@ -103,7 +101,7 @@ pub struct MsgHeader {
     pub request_id: i32,
     /// `request_id` from the message being responded to; 0 for client requests.
     pub response_to: i32,
-    /// Operation code.  Phase 1 uses `OP_MSG` (2013) exclusively.
+    /// Operation code.
     pub op_code: i32,
 }
 
@@ -316,8 +314,7 @@ impl OpMsg {
 
     /// Serialise an OP_MSG response.
     ///
-    /// Outgoing responses always use `flagBits = 0` (no checksum, no moreToCome)
-    /// as mandated by Phase 1 rules.
+    /// Outgoing responses always use `flagBits = 0` (no checksum, no moreToCome).
     ///
     /// `request_id` should be a fresh ID for this response.
     /// `response_to` should be the `request_id` of the incoming request.
