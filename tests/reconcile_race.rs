@@ -76,23 +76,28 @@ fn seeded_chain_map(head_ts: Ts) -> ChainMap {
 /// every key has at least one visible entry (the head is always visible),
 /// and release. Running this under concurrent reconciler retain is the
 /// S1 race criterion.
+///
+/// `oracle.load` happens INSIDE the chain-map mutex and right next to
+/// `ReadView::open` so no writer can advance the oracle or push a new head
+/// between the timestamp snapshot and the registry insert. That closes the
+/// "reader preempted between load and register" window that production
+/// tolerates via the HLC + history-store fallback (neither of which this
+/// shim simulates). The Arc::make_mut / retain vs ChainSnapshot::new race
+/// the test is actually validating is unchanged.
 fn reader_step(
     chains: &Mutex<ChainMap>,
     registry: &Arc<ReadViewRegistry>,
-    read_ts: Ts,
+    oracle: &AtomicU64,
     txn_id: u64,
     mismatches: &AtomicU64,
 ) {
-    let view = ReadView::open(Arc::clone(registry), read_ts, txn_id);
-    // Build the snapshot under the chain-map mutex (this stands in for
-    // the partition mutex in the real pool). Clone out the map shape the
-    // ChainSnapshot expects.
-    let snap = {
+    let (view, snap) = {
         let guard = chains.lock().unwrap();
-        ChainSnapshot::new(&guard, Some(Arc::clone(&view)))
+        let read_ts = ts(oracle.load(Ordering::Acquire));
+        let view = ReadView::open(Arc::clone(registry), read_ts, txn_id);
+        let snap = ChainSnapshot::new(&guard, Some(Arc::clone(&view)));
+        (view, snap)
     };
-    // Every key must have a visible entry (the head is always visible
-    // and the retain rule keeps entries needed by live readers).
     for k in KEYS {
         if snap.visible_at(k, &view).is_none() {
             mismatches.fetch_add(1, Ordering::Relaxed);
@@ -149,6 +154,16 @@ fn readers_never_observe_missing_version_under_reconcile() {
     let stop = Arc::new(AtomicBool::new(false));
     let mismatches = Arc::new(AtomicU64::new(0));
 
+    // Shared monotone "oracle" — both readers and writer pull timestamps
+    // from this counter, mirroring production's HLC. The writer advances
+    // the oracle BEFORE pushing each new head, so a reader's
+    // `read_ts = oracle.load()` is always >= the `start_ts` of the chain
+    // head that exists at the time the reader registers. Without this,
+    // the reader's `read_ts` could drift below every retained chain
+    // entry's `start_ts` and report a spurious "missing version" that
+    // production's HLC invariant rules out.
+    let oracle = Arc::new(AtomicU64::new(1));
+
     let mut handles = Vec::new();
 
     // Four reader threads.
@@ -157,35 +172,39 @@ fn readers_never_observe_missing_version_under_reconcile() {
         let registry = Arc::clone(&registry);
         let stop = Arc::clone(&stop);
         let mismatches = Arc::clone(&mismatches);
+        let oracle = Arc::clone(&oracle);
         handles.push(thread::spawn(move || {
-            let mut k: u64 = 1;
+            let mut k: u64 = 0;
             let txn_id_base = 1_000 + i * 10_000;
             while !stop.load(Ordering::Relaxed) {
-                // Reader pinned at a moving but bounded timestamp.
                 reader_step(
                     &chains,
                     &registry,
-                    ts(k),
+                    &oracle,
                     txn_id_base + k,
                     &mismatches,
                 );
-                k = k.wrapping_add(1).max(1);
+                k = k.wrapping_add(1);
             }
         }));
     }
 
     // One reconciler thread; also drives a writer step so chain depth
-    // stays interesting over time.
+    // stays interesting over time. Order: reconcile → advance oracle →
+    // push new head. Advancing the oracle BEFORE pushing means a reader
+    // that loaded the new oracle value either sees the previous head
+    // (still visible at `read_ts >= prev_start_ts`) or, after the push,
+    // sees the new head with `start_ts == read_ts`.
     {
         let chains = Arc::clone(&chains);
         let registry = Arc::clone(&registry);
         let stop = Arc::clone(&stop);
+        let oracle = Arc::clone(&oracle);
         handles.push(thread::spawn(move || {
-            let mut now_ms: u64 = 100;
             while !stop.load(Ordering::Relaxed) {
                 reconcile_step(&chains, &registry);
+                let now_ms = oracle.fetch_add(1, Ordering::AcqRel) + 1;
                 writer_step(&chains, ts(now_ms));
-                now_ms += 1;
                 // Yield so readers actually get to run.
                 thread::yield_now();
             }
