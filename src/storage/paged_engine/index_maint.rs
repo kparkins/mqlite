@@ -366,3 +366,84 @@ pub(super) enum ReserveOutcome {
     /// idempotent and returns Ok immediately.
     AlreadyExists,
 }
+
+// ---------------------------------------------------------------------------
+// Engine-level index operation free functions
+// ---------------------------------------------------------------------------
+
+use crate::index::{IndexInfo, IndexModel};
+use crate::storage::secondary_index::generate_index_name;
+
+use super::doc_ops::validate_index_keys;
+
+pub(super) fn create_index(engine: &super::PagedEngine, ns: &str, model: &IndexModel) -> crate::error::Result<String> {
+    validate_index_keys(&model.keys)?;
+    let name = model
+        .options
+        .name
+        .clone()
+        .unwrap_or_else(|| generate_index_name(&model.keys));
+
+    let reserve_outcome = engine.create_index_reserve(ns, model, &name)?;
+    match reserve_outcome {
+        ReserveOutcome::AlreadyExists => return Ok(name),
+        ReserveOutcome::Reserved => {}
+    }
+
+    if let Err(build_err) = engine.create_index_build(ns, &name) {
+        if let Err(cleanup_err) = engine.create_index_cleanup(ns, &name) {
+            return Err(crate::error::Error::Internal(format!(
+                "create_index build failed: {}; cleanup also failed: {}",
+                build_err, cleanup_err
+            )));
+        }
+        return Err(build_err);
+    }
+
+    engine.create_index_commit(ns, &name)?;
+    Ok(name)
+}
+
+pub(super) fn drop_index(engine: &super::PagedEngine, ns: &str, name: &str) -> crate::error::Result<()> {
+    if name == "_id_" {
+        return Err(crate::error::Error::InvalidWireMessage {
+            detail: "drop of '_id_' index is not permitted".to_string(),
+        });
+    }
+    let lane_arc = engine.lane_for(ns);
+    let _lane_guard = engine.acquire_lane(lane_arc)?;
+    engine.run_ddl(|shared, md, overlay| {
+        let removed = md
+            .catalog
+            .lock()
+            .expect("catalog poisoned")
+            .drop_index(ns, name)?;
+        if removed {
+            sync_catalog_root_overlay(shared, md, overlay)?;
+            Ok(())
+        } else {
+            Err(crate::error::Error::Internal(format!(
+                "index '{}' not found on '{}'",
+                name, ns
+            )))
+        }
+    })
+}
+
+pub(super) fn list_indexes(engine: &super::PagedEngine, ns: &str) -> crate::error::Result<Vec<IndexInfo>> {
+    let snap = engine.shared.published.load();
+    let ns_snap = match snap.namespaces.get(ns) {
+        None => return Ok(Vec::new()),
+        Some(n) => n,
+    };
+    Ok(ns_snap
+        .indexes
+        .iter()
+        .map(|i| IndexInfo {
+            name: i.name.clone(),
+            keys: i.key_pattern.clone(),
+            unique: i.unique,
+            sparse: i.sparse,
+        })
+        .collect())
+}

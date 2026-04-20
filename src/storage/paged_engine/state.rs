@@ -1,7 +1,8 @@
 //! Shared + metadata state for the PagedEngine.
 
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
@@ -127,4 +128,97 @@ impl MetadataState {
         Ok((md, shared))
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// OwnedLaneGuard — holds Arc<Mutex<()>> + its MutexGuard together so the
+// stdlib Mutex lifetime restriction is satisfied.
+// ---------------------------------------------------------------------------
+
+pub(super) struct OwnedLaneGuard {
+    // The Arc keeps the Mutex alive. `_guard` is the MutexGuard that
+    // references the Mutex through `lane`. We hold the Arc AFTER the
+    // guard so drop order is: guard (release lock) then lane.
+    pub(super) _guard: std::sync::MutexGuard<'static, ()>,
+    pub(super) _lane: Arc<Mutex<()>>,
+}
+
+impl OwnedLaneGuard {
+    pub(super) fn new(lane: Arc<Mutex<()>>, guard: std::sync::MutexGuard<'_, ()>) -> Self {
+        // Extend the lifetime of the guard to 'static. Safe because we
+        // keep `lane` alive inside `Self`, so the backing Mutex lives at
+        // least as long as the guard.
+        let guard_static: std::sync::MutexGuard<'static, ()> =
+            unsafe { std::mem::transmute(guard) };
+        OwnedLaneGuard {
+            _guard: guard_static,
+            _lane: lane,
+        }
+    }
+}
+
+/// Resolve the per-namespace lane mutex, creating one if needed.
+pub(super) fn lane_for(engine: &super::PagedEngine, ns: &str) -> Arc<Mutex<()>> {
+    if let Some(entry) = engine.ns_lanes.get(ns) {
+        return Arc::clone(entry.value());
+    }
+    engine
+        .ns_lanes
+        .entry(ns.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Acquire the namespace lane with busy-timeout / busy-handler semantics.
+pub(super) fn acquire_lane(
+    engine: &super::PagedEngine,
+    lane: Arc<Mutex<()>>,
+) -> Result<OwnedLaneGuard> {
+    let lane_ptr: *const Mutex<()> = Arc::as_ptr(&lane);
+
+    // Fast path: try without any spin first.
+    match unsafe { &*lane_ptr }.try_lock() {
+        Ok(g) => return Ok(OwnedLaneGuard::new(lane, g)),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(Error::Internal("namespace lane mutex poisoned".into()));
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+
+    let timeout = engine.busy_timeout;
+    if let Some(handler) = &engine.busy_handler {
+        let mut attempts: u32 = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(1));
+            match unsafe { &*lane_ptr }.try_lock() {
+                Ok(g) => return Ok(OwnedLaneGuard::new(lane, g)),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(Error::Internal(
+                        "namespace lane mutex poisoned".into(),
+                    ));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if !handler.0(attempts) {
+                return Err(Error::WriterBusy);
+            }
+            attempts = attempts.saturating_add(1);
+        }
+    }
+
+    if timeout.is_zero() {
+        return Err(Error::WriterBusy);
+    }
+
+    let deadline = Instant::now() + timeout;
+    let guard = match unsafe { &*lane_ptr }.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return Err(Error::Internal("namespace lane mutex poisoned".into()));
+        }
+    };
+    if Instant::now() >= deadline && timeout > Duration::ZERO {
+        let _ = deadline;
+    }
+    Ok(OwnedLaneGuard::new(lane, guard))
 }

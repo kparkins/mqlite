@@ -42,7 +42,7 @@ mod tests;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::{DashMap, DashSet};
 
@@ -52,34 +52,28 @@ use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
 use crate::index::{IndexInfo, IndexModel};
-use crate::key_encoding::encode_key;
 use crate::mvcc::transaction::WriteTxn;
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
-    ReturnDocument, UpdateOptions,
+    UpdateOptions,
 };
 use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::BTree;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::IndexState;
 use crate::storage::handle::BufferPoolHandle;
-use crate::storage::secondary_index::{build_index, generate_index_name};
+use crate::storage::secondary_index::build_index;
 use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
 use crate::storage_engine::StorageEngine;
-use crate::update_operators::{apply_update, is_operator_update, upsert_base_from_filter};
-use crate::validation::validate_document;
 
-use self::btree_ops::btree_insert_doc;
 use self::catalog_ops::{
     new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,
 };
-use self::doc_ops::{compare_docs, now_millis, validate_index_keys};
+use self::doc_ops::now_millis;
 use self::index_maint::{
-    install_pending_primary, install_pending_sec_index, maintain_secondary_on_delete,
-    maintain_secondary_on_insert, maintain_secondary_on_update, ReserveOutcome,
+    install_pending_primary, install_pending_sec_index, ReserveOutcome,
 };
-use self::snapshot_ops::{apply_find_opts, execute_snapshot_pairs_from_snap};
-use self::state::{MetadataState, SharedState};
+use self::state::{MetadataState, OwnedLaneGuard, SharedState};
 
 // ---------------------------------------------------------------------------
 // PagedEngine — public struct (PR 8)
@@ -173,84 +167,16 @@ impl PagedEngine {
 
     /// Resolve the per-namespace lane mutex, creating one if needed.
     fn lane_for(&self, ns: &str) -> Arc<Mutex<()>> {
-        if let Some(entry) = self.ns_lanes.get(ns) {
-            return Arc::clone(entry.value());
-        }
-        self.ns_lanes
-            .entry(ns.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        state::lane_for(self, ns)
     }
 
     /// Acquire the namespace lane with busy-timeout / busy-handler semantics
     /// matching the client's legacy `acquire_writer_lock`.
-    ///
-    /// Returns `(lane, guard)` — the caller holds both to keep the guard
-    /// alive for the lane's duration. Stdlib `MutexGuard` is tied to the
-    /// `Arc<Mutex<()>>`'s lifetime so we return the Arc alongside.
     fn acquire_lane(
         &self,
         lane: Arc<Mutex<()>>,
     ) -> Result<OwnedLaneGuard> {
-        let lane_ptr: *const Mutex<()> = Arc::as_ptr(&lane);
-
-        // Fast path: try without any spin first.
-        match unsafe { &*lane_ptr }.try_lock() {
-            Ok(g) => return Ok(OwnedLaneGuard::new(lane, g)),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(Error::Internal("namespace lane mutex poisoned".into()));
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        }
-
-        let timeout = self.busy_timeout;
-        if let Some(handler) = &self.busy_handler {
-            let mut attempts: u32 = 0;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                match unsafe { &*lane_ptr }.try_lock() {
-                    Ok(g) => return Ok(OwnedLaneGuard::new(lane, g)),
-                    Err(std::sync::TryLockError::Poisoned(_)) => {
-                        return Err(Error::Internal(
-                            "namespace lane mutex poisoned".into(),
-                        ));
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) => {}
-                }
-                if !handler.0(attempts) {
-                    return Err(Error::WriterBusy);
-                }
-                attempts = attempts.saturating_add(1);
-            }
-        }
-
-        if timeout.is_zero() {
-            return Err(Error::WriterBusy);
-        }
-
-        // No custom busy handler: block on `lock()` (kernel-managed queue)
-        // rather than spin. This is the common in-process contention path
-        // and avoids WriterBusy timeouts when writers are merely queued.
-        // The busy_timeout still bounds lane wait, enforced via a
-        // scheduled wake: we try first, then fall back to blocking lock()
-        // and check elapsed on return.
-        let deadline = Instant::now() + timeout;
-        let guard = match unsafe { &*lane_ptr }.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                return Err(Error::Internal("namespace lane mutex poisoned".into()));
-            }
-        };
-        if Instant::now() >= deadline && timeout > Duration::ZERO {
-            // We waited longer than busy_timeout, but we DO hold the lock.
-            // The sensible thing is to return the guard — the writer
-            // already won the lane. Strict busy-timeout semantics would
-            // return WriterBusy + release, but that loses forward progress
-            // and is not what the PR 8 test expects ("writers queue up
-            // and eventually all succeed").
-            let _ = deadline;
-        }
-        Ok(OwnedLaneGuard::new(lane, guard))
+        state::acquire_lane(self, lane)
     }
 
     /// Bootstrap a collection if it does not exist yet.
@@ -830,34 +756,6 @@ impl PagedEngine {
 }
 
 // ---------------------------------------------------------------------------
-// OwnedLaneGuard — holds Arc<Mutex<()>> + its MutexGuard together so the
-// stdlib Mutex lifetime restriction is satisfied.
-// ---------------------------------------------------------------------------
-
-struct OwnedLaneGuard {
-    // The Arc keeps the Mutex alive. `_guard` is the MutexGuard that
-    // references the Mutex through `lane`. We hold the Arc AFTER the
-    // guard so drop order is: guard (release lock) then lane.
-    _guard: std::sync::MutexGuard<'static, ()>,
-    _lane: Arc<Mutex<()>>,
-}
-
-impl OwnedLaneGuard {
-    fn new(lane: Arc<Mutex<()>>, guard: std::sync::MutexGuard<'_, ()>) -> Self {
-        // Extend the lifetime of the guard to 'static. Safe because we
-        // keep `lane` alive inside `Self`, so the backing Mutex lives at
-        // least as long as the guard.
-        let guard_static: std::sync::MutexGuard<'static, ()> =
-            unsafe { std::mem::transmute(guard) };
-        OwnedLaneGuard {
-            _guard: guard_static,
-            _lane: lane,
-        }
-    }
-}
-
-
-// ---------------------------------------------------------------------------
 // StorageEngine implementation
 // ---------------------------------------------------------------------------
 
@@ -866,74 +764,17 @@ impl OwnedLaneGuard {
 // ---------------------------------------------------------------------------
 
 impl StorageEngine for PagedEngine {
-    // -----------------------------------------------------------------------
-    // insert
-    // -----------------------------------------------------------------------
-
-    fn insert(&self, ns: &str, mut doc: Document) -> Result<Bson> {
-        self.run_write(ns, |shared, md, overlay, txn| {
-            let entry = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .get_collection(ns)?
-                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-write", ns)))?;
-            let mut tree = BTree::open(
-                new_txn_store(shared, overlay),
-                entry.data_root_page,
-                entry.data_root_level,
-            );
-            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut doc, &[])?;
-            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-                let mut updated = entry.clone();
-                updated.data_root_page = tree.root_page;
-                updated.data_root_level = tree.root_level;
-                md.catalog.lock().expect("catalog poisoned").update_collection(&updated)?;
-                sync_catalog_root_overlay(shared, md, overlay)?;
-            }
-            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
-            maintain_secondary_on_insert(shared, md, overlay, ns, &doc, &id, txn)?;
-            Ok(id)
-        })
+    fn insert(&self, ns: &str, doc: Document) -> Result<Bson> {
+        doc_ops::insert(self, ns, doc)
     }
 
-    // -----------------------------------------------------------------------
-    // find
-    // -----------------------------------------------------------------------
-
     fn find(&self, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>> {
-        let snap = self.shared.published.load();
-        let ns_snap = match snap.namespaces.get(ns) {
-            None => return Ok(Vec::new()),
-            Some(n) => n,
-        };
-        let matched: Vec<Document> = execute_snapshot_pairs_from_snap(
-            &self.shared,
-            ns,
-            ns_snap,
-            filter,
-            snap.publish_ts,
-            true,
-        )?
-        .into_iter()
-        .map(|(_, doc)| doc)
-        .collect();
-        Ok(apply_find_opts(matched, opts))
+        doc_ops::find(self, ns, filter, opts)
     }
 
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
-        let opts = FindOptions::new();
-        let mut results = self.find(ns, filter, &opts)?;
-        Ok(if results.is_empty() {
-            None
-        } else {
-            Some(results.remove(0))
-        })
+        doc_ops::find_one(self, ns, filter)
     }
-
-    // -----------------------------------------------------------------------
-    // update
-    // -----------------------------------------------------------------------
 
     fn update(
         &self,
@@ -943,196 +784,16 @@ impl StorageEngine for PagedEngine {
         opts: &UpdateOptions,
         many: bool,
     ) -> Result<UpdateResult> {
-        if !is_operator_update(update) {
-            return Err(Error::Internal(
-                "update requires an operator update document (e.g. {$set: {...}});                  use find_one_and_replace for replacements"
-                    .into(),
-            ));
-        }
-
-        // Pre-scan phase uses the published snapshot (mutex-free). If the
-        // namespace does not exist and upsert is requested, route to the
-        // upsert helper.
-        let snap = self.shared.published.load();
-        let ns_snap_opt = snap.namespaces.get(ns);
-        let matched_pairs: Vec<(Vec<u8>, Document)> = match ns_snap_opt {
-            None => {
-                if opts.upsert {
-                    return self.do_upsert_update(ns, filter, update);
-                }
-                return Ok(UpdateResult {
-                    matched_count: 0,
-                    modified_count: 0,
-                    upserted_id: None,
-                });
-            }
-            Some(ns_snap) => {
-                execute_snapshot_pairs_from_snap(
-                    &self.shared,
-                    ns,
-                    ns_snap,
-                    filter,
-                    snap.publish_ts,
-                    false,
-                )?
-            }
-        };
-
-        if matched_pairs.is_empty() && opts.upsert {
-            return self.do_upsert_update(ns, filter, update);
-        }
-
-        let pairs_to_process: Vec<(Vec<u8>, Document)> = if many {
-            matched_pairs
-        } else {
-            matched_pairs.into_iter().take(1).collect()
-        };
-
-        self.run_write_existing(ns, |shared, md, overlay, txn| {
-            let mut matched_count = 0u64;
-            let mut modified_count = 0u64;
-            for (key, mut doc) in pairs_to_process {
-                matched_count += 1;
-                let before = doc.clone();
-                let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
-                apply_update(&mut doc, update, false)?;
-                if doc != before {
-                    modified_count += 1;
-                    let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                    let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-                    maintain_secondary_on_update(
-                        shared, md, overlay, ns, &before, &doc, &before_id, &new_id, txn,
-                    )?;
-                    let entry_opt = md
-                        .catalog
-                        .lock()
-                        .expect("catalog poisoned")
-                        .get_collection(ns)?;
-                    if let Some(entry) = entry_opt {
-                        let mut tree = BTree::open(
-                            new_txn_store(shared, overlay),
-                            entry.data_root_page,
-                            entry.data_root_level,
-                        );
-                        tree.delete(&key)?;
-                        tree.insert(&key, &new_bytes)?;
-                        if tree.root_page != entry.data_root_page
-                            || tree.root_level != entry.data_root_level
-                        {
-                            let mut updated = entry.clone();
-                            updated.data_root_page = tree.root_page;
-                            updated.data_root_level = tree.root_level;
-                            md.catalog
-                                .lock()
-                                .expect("catalog poisoned")
-                                .update_collection(&updated)?;
-                            sync_catalog_root_overlay(shared, md, overlay)?;
-                        }
-                        txn.stage_primary_update(ns.to_string(), key, new_bytes);
-                    }
-                }
-            }
-            Ok(UpdateResult {
-                matched_count,
-                modified_count,
-                upserted_id: None,
-            })
-        })
+        doc_ops::update(self, ns, filter, update, opts, many)
     }
-
-    // -----------------------------------------------------------------------
-    // delete
-    // -----------------------------------------------------------------------
 
     fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
-        let snap = self.shared.published.load();
-        let pairs_to_delete: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
-            None => return Ok(DeleteResult { deleted_count: 0 }),
-            Some(ns_snap) => {
-                let pairs = execute_snapshot_pairs_from_snap(
-                    &self.shared,
-                    ns,
-                    ns_snap,
-                    filter,
-                    snap.publish_ts,
-                    false,
-                )?;
-                if many {
-                    pairs
-                } else {
-                    pairs.into_iter().take(1).collect()
-                }
-            }
-        };
-
-        let deleted_count = pairs_to_delete.len() as u64;
-        if deleted_count == 0 {
-            return Ok(DeleteResult { deleted_count: 0 });
-        }
-
-        self.run_write_existing(ns, |shared, md, overlay, txn| {
-            for (key, doc) in &pairs_to_delete {
-                let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-                maintain_secondary_on_delete(shared, md, overlay, ns, doc, &doc_id, txn)?;
-                let entry_opt = md
-                    .catalog
-                    .lock()
-                    .expect("catalog poisoned")
-                    .get_collection(ns)?;
-                if let Some(entry) = entry_opt {
-                    let mut tree = BTree::open(
-                        new_txn_store(shared, overlay),
-                        entry.data_root_page,
-                        entry.data_root_level,
-                    );
-                    tree.delete(key)?;
-                    if tree.root_page != entry.data_root_page
-                        || tree.root_level != entry.data_root_level
-                    {
-                        let mut updated = entry.clone();
-                        updated.data_root_page = tree.root_page;
-                        updated.data_root_level = tree.root_level;
-                        md.catalog
-                            .lock()
-                            .expect("catalog poisoned")
-                            .update_collection(&updated)?;
-                        sync_catalog_root_overlay(shared, md, overlay)?;
-                    }
-                    txn.stage_primary_delete(ns.to_string(), key.clone());
-                }
-            }
-            Ok(())
-        })?;
-
-        Ok(DeleteResult { deleted_count })
+        doc_ops::delete(self, ns, filter, many)
     }
-
-    // -----------------------------------------------------------------------
-    // count
-    // -----------------------------------------------------------------------
 
     fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
-        let snap = self.shared.published.load();
-        let ns_snap = match snap.namespaces.get(ns) {
-            None => return Ok(0),
-            Some(n) => n,
-        };
-        Ok(
-            execute_snapshot_pairs_from_snap(
-                &self.shared,
-                ns,
-                ns_snap,
-                filter,
-                snap.publish_ts,
-                false,
-            )?
-            .len() as u64,
-        )
+        doc_ops::count(self, ns, filter)
     }
-
-    // -----------------------------------------------------------------------
-    // find_one_and_update_doc
-    // -----------------------------------------------------------------------
 
     fn find_one_and_update_doc(
         &self,
@@ -1141,93 +802,8 @@ impl StorageEngine for PagedEngine {
         update: &Document,
         opts: &FindOneAndUpdateOptions,
     ) -> Result<Option<Document>> {
-        if !is_operator_update(update) {
-            return Err(Error::Internal(
-                "find_one_and_update requires an operator update document".into(),
-            ));
-        }
-
-        let snap = self.shared.published.load();
-        let mut matched: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
-            None => {
-                if opts.upsert {
-                    return self.fam_upsert_update(ns, filter, update, opts);
-                }
-                return Ok(None);
-            }
-            Some(ns_snap) => {
-                execute_snapshot_pairs_from_snap(
-                    &self.shared,
-                    ns,
-                    ns_snap,
-                    filter,
-                    snap.publish_ts,
-                    false,
-                )?
-            }
-        };
-
-        if matched.is_empty() {
-            if opts.upsert {
-                return self.fam_upsert_update(ns, filter, update, opts);
-            }
-            return Ok(None);
-        }
-
-        if let Some(s) = &opts.sort {
-            matched.sort_by(|(_, a), (_, b)| compare_docs(a, b, s));
-        }
-
-        let (key, mut doc) = matched.remove(0);
-        let before = doc.clone();
-        let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
-        apply_update(&mut doc, update, false)?;
-        let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-        let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
-
-        self.run_write_existing(ns, |shared, md, overlay, txn| {
-            maintain_secondary_on_update(
-                shared, md, overlay, ns, &before, &doc, &before_id, &new_id, txn,
-            )?;
-            let entry_opt = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .get_collection(ns)?;
-            if let Some(entry) = entry_opt {
-                let mut tree = BTree::open(
-                    new_txn_store(shared, overlay),
-                    entry.data_root_page,
-                    entry.data_root_level,
-                );
-                tree.delete(&key)?;
-                tree.insert(&key, &new_bytes)?;
-                if tree.root_page != entry.data_root_page
-                    || tree.root_level != entry.data_root_level
-                {
-                    let mut updated = entry.clone();
-                    updated.data_root_page = tree.root_page;
-                    updated.data_root_level = tree.root_level;
-                    md.catalog
-                        .lock()
-                        .expect("catalog poisoned")
-                        .update_collection(&updated)?;
-                    sync_catalog_root_overlay(shared, md, overlay)?;
-                }
-                txn.stage_primary_update(ns.to_string(), key, new_bytes);
-            }
-            Ok(())
-        })?;
-
-        Ok(Some(match opts.return_document {
-            ReturnDocument::Before => before,
-            ReturnDocument::After => doc,
-        }))
+        doc_ops::find_one_and_update_doc(self, ns, filter, update, opts)
     }
-
-    // -----------------------------------------------------------------------
-    // find_one_and_delete_doc
-    // -----------------------------------------------------------------------
 
     fn find_one_and_delete_doc(
         &self,
@@ -1235,67 +811,8 @@ impl StorageEngine for PagedEngine {
         filter: &Document,
         opts: &FindOneAndDeleteOptions,
     ) -> Result<Option<Document>> {
-        let snap = self.shared.published.load();
-        let mut matched: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
-            None => return Ok(None),
-            Some(ns_snap) => execute_snapshot_pairs_from_snap(
-                &self.shared,
-                ns,
-                ns_snap,
-                filter,
-                snap.publish_ts,
-                false,
-            )?,
-        };
-
-        if matched.is_empty() {
-            return Ok(None);
-        }
-
-        if let Some(s) = &opts.sort {
-            matched.sort_by(|(_, a), (_, b)| compare_docs(a, b, s));
-        }
-
-        let (key, doc) = matched.remove(0);
-        let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-
-        self.run_write_existing(ns, |shared, md, overlay, txn| {
-            maintain_secondary_on_delete(shared, md, overlay, ns, &doc, &doc_id, txn)?;
-            let entry_opt = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .get_collection(ns)?;
-            if let Some(entry) = entry_opt {
-                let mut tree = BTree::open(
-                    new_txn_store(shared, overlay),
-                    entry.data_root_page,
-                    entry.data_root_level,
-                );
-                tree.delete(&key)?;
-                if tree.root_page != entry.data_root_page
-                    || tree.root_level != entry.data_root_level
-                {
-                    let mut updated = entry.clone();
-                    updated.data_root_page = tree.root_page;
-                    updated.data_root_level = tree.root_level;
-                    md.catalog
-                        .lock()
-                        .expect("catalog poisoned")
-                        .update_collection(&updated)?;
-                    sync_catalog_root_overlay(shared, md, overlay)?;
-                }
-                txn.stage_primary_delete(ns.to_string(), key);
-            }
-            Ok(())
-        })?;
-
-        Ok(Some(doc))
+        doc_ops::find_one_and_delete_doc(self, ns, filter, opts)
     }
-
-    // -----------------------------------------------------------------------
-    // find_one_and_replace_doc
-    // -----------------------------------------------------------------------
 
     fn find_one_and_replace_doc(
         &self,
@@ -1304,218 +821,19 @@ impl StorageEngine for PagedEngine {
         replacement: &Document,
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
-        let snap = self.shared.published.load();
-        let mut matched: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
-            None => {
-                if opts.upsert {
-                    return self.fam_upsert_replace(ns, replacement, opts);
-                }
-                return Ok(None);
-            }
-            Some(ns_snap) => {
-                execute_snapshot_pairs_from_snap(
-                    &self.shared,
-                    ns,
-                    ns_snap,
-                    filter,
-                    snap.publish_ts,
-                    false,
-                )?
-            }
-        };
-
-        if matched.is_empty() {
-            if opts.upsert {
-                return self.fam_upsert_replace(ns, replacement, opts);
-            }
-            return Ok(None);
-        }
-
-        if let Some(s) = &opts.sort {
-            matched.sort_by(|(_, a), (_, b)| compare_docs(a, b, s));
-        }
-
-        let (old_key, old_doc) = matched.remove(0);
-
-        let mut new_doc = replacement.clone();
-        let original_id = old_doc.get("_id").cloned().unwrap_or(Bson::Null);
-        new_doc.insert("_id", original_id.clone());
-        validate_document(&new_doc)?;
-
-        let new_key = encode_key(&original_id);
-        let new_bytes = bson::to_vec(&new_doc).map_err(Error::BsonSerialization)?;
-
-        let old_doc_clone = old_doc.clone();
-        let new_doc_clone = new_doc.clone();
-        self.run_write_existing(ns, |shared, md, overlay, txn| {
-            maintain_secondary_on_update(
-                shared,
-                md,
-                overlay,
-                ns,
-                &old_doc_clone,
-                &new_doc_clone,
-                &original_id,
-                &original_id,
-                txn,
-            )?;
-            let entry_opt = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .get_collection(ns)?;
-            if let Some(entry) = entry_opt {
-                let mut tree = BTree::open(
-                    new_txn_store(shared, overlay),
-                    entry.data_root_page,
-                    entry.data_root_level,
-                );
-                tree.delete(&old_key)?;
-                tree.insert(&new_key, &new_bytes)?;
-                if tree.root_page != entry.data_root_page
-                    || tree.root_level != entry.data_root_level
-                {
-                    let mut updated = entry.clone();
-                    updated.data_root_page = tree.root_page;
-                    updated.data_root_level = tree.root_level;
-                    md.catalog
-                        .lock()
-                        .expect("catalog poisoned")
-                        .update_collection(&updated)?;
-                    sync_catalog_root_overlay(shared, md, overlay)?;
-                }
-                txn.stage_primary_update(ns.to_string(), new_key, new_bytes);
-            }
-            Ok(())
-        })?;
-
-        Ok(Some(match opts.return_document {
-            ReturnDocument::Before => old_doc,
-            ReturnDocument::After => new_doc,
-        }))
+        doc_ops::find_one_and_replace_doc(self, ns, filter, replacement, opts)
     }
-
-    // -----------------------------------------------------------------------
-    // create_index — 3-phase build (PR 9)
-    //
-    // Phase 1 (reserve):  metadata.write()   — allocate idx root, publish
-    //                                          `IndexEntry { state: Building }`.
-    // Phase 2 (build):    metadata.read() +  — populate idx tree from data
-    //                     ns_lane              tree. Other-ns writers run
-    //                                          concurrently; same-ns writers
-    //                                          wait on the lane.
-    // Phase 3 (commit):   metadata.write()   — flip `state: Ready`, publish.
-    //
-    // Failure in phase 2 drops the Building entry in a recovery phase
-    // (same DDL shape as phase 3) so the catalog does not retain an
-    // orphan `Building` index.
-    // -----------------------------------------------------------------------
 
     fn create_index(&self, ns: &str, model: &IndexModel) -> Result<String> {
-        validate_index_keys(&model.keys)?;
-        let name = model
-            .options
-            .name
-            .clone()
-            .unwrap_or_else(|| generate_index_name(&model.keys));
-
-        // ---------------------------------------------------------------
-        // Phase 1 — Reserve (metadata.write + commit_seq, brief).
-        // ---------------------------------------------------------------
-        let reserve_outcome = self.create_index_reserve(ns, model, &name)?;
-        match reserve_outcome {
-            ReserveOutcome::AlreadyExists => return Ok(name),
-            ReserveOutcome::Reserved => {}
-        }
-
-        // ---------------------------------------------------------------
-        // Phase 2 — Build (metadata.read + ns_lane). Long-running scan.
-        //
-        // A failure here leaves a Building entry in the catalog. We fall
-        // through to a cleanup DDL that drops it, keeping the catalog
-        // consistent for a retried `create_index`.
-        // ---------------------------------------------------------------
-        if let Err(build_err) = self.create_index_build(ns, &name) {
-            // Best-effort rollback of the orphan Building entry. Log-and-
-            // propagate if the cleanup itself fails: the caller sees the
-            // original build error, and the Building entry (if any
-            // remains) will still be skipped by the read path.
-            if let Err(cleanup_err) = self.create_index_cleanup(ns, &name) {
-                return Err(Error::Internal(format!(
-                    "create_index build failed: {}; cleanup also failed: {}",
-                    build_err, cleanup_err
-                )));
-            }
-            return Err(build_err);
-        }
-
-        // ---------------------------------------------------------------
-        // Phase 3 — Commit (metadata.write + commit_seq, brief).
-        // ---------------------------------------------------------------
-        self.create_index_commit(ns, &name)?;
-        Ok(name)
+        index_maint::create_index(self, ns, model)
     }
-
-    // -----------------------------------------------------------------------
-    // drop_index
-    // -----------------------------------------------------------------------
 
     fn drop_index(&self, ns: &str, name: &str) -> Result<()> {
-        if name == "_id_" {
-            return Err(Error::InvalidWireMessage {
-                detail: "drop of '_id_' index is not permitted".to_string(),
-            });
-        }
-        // Acquire the namespace lane before the DDL body. This serializes
-        // with any in-flight create_index Phase 2 build on the same ns —
-        // the build holds the lane, so drop_index waits for it to release.
-        // After the build finishes (or aborts), drop_index proceeds. A
-        // subsequent Phase 3 (Ready flip) or concurrent CRUD on this ns
-        // will see the missing entry and handle it cleanly.
-        //
-        // Lane-before-metadata ordering matches drop_namespace
-        // (src/storage/paged_engine.rs drop_namespace) and keeps us below
-        // the metadata RwLock in the documented lock order.
-        let lane_arc = self.lane_for(ns);
-        let _lane_guard = self.acquire_lane(lane_arc)?;
-        self.run_ddl(|shared, md, overlay| {
-            let removed = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .drop_index(ns, name)?;
-            if removed {
-                sync_catalog_root_overlay(shared, md, overlay)?;
-                Ok(())
-            } else {
-                Err(Error::Internal(format!(
-                    "index '{}' not found on '{}'",
-                    name, ns
-                )))
-            }
-        })
+        index_maint::drop_index(self, ns, name)
     }
 
-    // -----------------------------------------------------------------------
-    // list_indexes
-    // -----------------------------------------------------------------------
-
     fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
-        let snap = self.shared.published.load();
-        let ns_snap = match snap.namespaces.get(ns) {
-            None => return Ok(Vec::new()),
-            Some(n) => n,
-        };
-        Ok(ns_snap
-            .indexes
-            .iter()
-            .map(|i| IndexInfo {
-                name: i.name.clone(),
-                keys: i.key_pattern.clone(),
-                unique: i.unique,
-                sparse: i.sparse,
-            })
-            .collect())
+        index_maint::list_indexes(self, ns)
     }
 
     // -----------------------------------------------------------------------
@@ -1618,63 +936,20 @@ impl StorageEngine for PagedEngine {
         Ok(snap.namespaces.keys().cloned().collect())
     }
 
-    // -----------------------------------------------------------------------
-    // checkpoint
-    // -----------------------------------------------------------------------
-
     fn checkpoint(&self) -> Result<()> {
-        // DDL: take metadata.write() so the checkpoint is atomic wrt CRUD
-        // writers. No overlay needed — checkpoint just flushes + GCs.
-        let md = self.metadata.write().map_err(|_| {
-            Error::Internal("metadata RwLock poisoned".into())
-        })?;
-
-        // sync_catalog_root via direct allocator update (no overlay).
-        let (root_page, root_level) = {
-            let cat = md.catalog.lock().expect("catalog poisoned");
-            (cat.root_page(), cat.root_level())
-        };
-        self.shared.handle.allocator().update_header(|h| {
-            h.catalog_root_page = root_page;
-            h.catalog_root_level = root_level;
-            h.catalog_root_backup = root_page;
-        })?;
-
-        // Plan §T8: history-store GC + counters.
-        let ort = self.shared.handle.read_view_registry().oldest_required_ts();
-        {
-            let mut hs = self.shared.history_store.lock().unwrap();
-            hs.gc_pass(ort)?;
-        }
-        let lag_ms = if ort == crate::mvcc::timestamp::Ts::MAX {
-            0
-        } else {
-            self.shared
-                .oracle
-                .now()
-                .physical_ms
-                .saturating_sub(ort.physical_ms)
-        };
-        crate::mvcc::metrics::set_oldest_required_ts_lag_ms(lag_ms);
-        crate::mvcc::metrics::set_overflow_pages_in_use(
-            self.shared.handle.allocator().overflow_pages_in_use() as u64,
-        );
-        crate::mvcc::metrics::set_deferred_free_queue_depth(
-            self.shared.handle.allocator().deferred_free_queue().depth() as u64,
-        );
-        self.shared.handle.flush()
+        snapshot_ops::checkpoint(self)
     }
 
     fn close(&self) -> Result<()> {
-        self.checkpoint()
+        snapshot_ops::close(self)
     }
 
     fn journal_sync(&self) -> Result<()> {
-        self.shared.handle.journal_sync()
+        snapshot_ops::journal_sync(self)
     }
 
     fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        snapshot_ops::snapshot_bytes(self)
     }
 }
 
@@ -1749,130 +1024,4 @@ impl PagedEngine {
         }
     }
 
-    /// Upsert for `update_one/many` with `upsert: true`.
-    fn do_upsert_update(
-        &self,
-        ns: &str,
-        filter: &Document,
-        update: &Document,
-    ) -> Result<UpdateResult> {
-        let mut new_doc = upsert_base_from_filter(filter);
-        apply_update(&mut new_doc, update, true)?;
-        let id = self.run_write(ns, |shared, md, overlay, txn| {
-            let entry = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .get_collection(ns)?
-                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
-            let mut tree = BTree::open(
-                new_txn_store(shared, overlay),
-                entry.data_root_page,
-                entry.data_root_level,
-            );
-            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut new_doc, &[])?;
-            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-                let mut updated = entry.clone();
-                updated.data_root_page = tree.root_page;
-                updated.data_root_level = tree.root_level;
-                md.catalog
-                    .lock()
-                    .expect("catalog poisoned")
-                    .update_collection(&updated)?;
-                sync_catalog_root_overlay(shared, md, overlay)?;
-            }
-            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
-            maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
-            Ok(id)
-        })?;
-        Ok(UpdateResult {
-            matched_count: 0,
-            modified_count: 0,
-            upserted_id: Some(id),
-        })
-    }
-
-    /// Upsert for `find_one_and_update` with `upsert: true`.
-    fn fam_upsert_update(
-        &self,
-        ns: &str,
-        filter: &Document,
-        update: &Document,
-        opts: &FindOneAndUpdateOptions,
-    ) -> Result<Option<Document>> {
-        let mut new_doc = upsert_base_from_filter(filter);
-        apply_update(&mut new_doc, update, true)?;
-        self.run_write(ns, |shared, md, overlay, txn| {
-            let entry = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .get_collection(ns)?
-                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
-            let mut tree = BTree::open(
-                new_txn_store(shared, overlay),
-                entry.data_root_page,
-                entry.data_root_level,
-            );
-            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut new_doc, &[])?;
-            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-                let mut updated = entry.clone();
-                updated.data_root_page = tree.root_page;
-                updated.data_root_level = tree.root_level;
-                md.catalog
-                    .lock()
-                    .expect("catalog poisoned")
-                    .update_collection(&updated)?;
-                sync_catalog_root_overlay(shared, md, overlay)?;
-            }
-            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
-            maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
-            Ok(())
-        })?;
-        Ok(match opts.return_document {
-            ReturnDocument::Before => None,
-            ReturnDocument::After => Some(new_doc),
-        })
-    }
-
-    /// Upsert for `find_one_and_replace` with `upsert: true`.
-    fn fam_upsert_replace(
-        &self,
-        ns: &str,
-        replacement: &Document,
-        opts: &FindOneAndReplaceOptions,
-    ) -> Result<Option<Document>> {
-        let mut new_doc = replacement.clone();
-        self.run_write(ns, |shared, md, overlay, txn| {
-            let entry = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .get_collection(ns)?
-                .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
-            let mut tree = BTree::open(
-                new_txn_store(shared, overlay),
-                entry.data_root_page,
-                entry.data_root_level,
-            );
-            let (id, key, bson_bytes, _tree_root) = btree_insert_doc(&mut tree, &mut new_doc, &[])?;
-            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-                let mut updated = entry.clone();
-                updated.data_root_page = tree.root_page;
-                updated.data_root_level = tree.root_level;
-                md.catalog
-                    .lock()
-                    .expect("catalog poisoned")
-                    .update_collection(&updated)?;
-                sync_catalog_root_overlay(shared, md, overlay)?;
-            }
-            txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
-            maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
-            Ok(())
-        })?;
-        Ok(match opts.return_document {
-            ReturnDocument::Before => None,
-            ReturnDocument::After => Some(new_doc),
-        })
-    }
 }

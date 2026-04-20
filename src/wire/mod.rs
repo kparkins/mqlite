@@ -23,5 +23,9 @@
 pub mod commands;
 pub mod protocol;
 pub mod server;
+pub(super) mod errors;
+pub(super) mod framing;
+pub(super) mod handlers;
 
 pub use server::WireProtocol;
+pub use framing::{read_message, write_message};

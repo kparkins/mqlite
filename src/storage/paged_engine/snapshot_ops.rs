@@ -302,3 +302,58 @@ pub(super) fn execute_snapshot_pairs_from_snap(
         ScanPlan::CollScan => execute_collscan_from_snap(shared, ns, ns_snap, filter, publish_ts),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Engine-level snapshot/lifecycle free functions
+// ---------------------------------------------------------------------------
+
+pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()> {
+    let md = engine.metadata.write().map_err(|_| {
+        crate::error::Error::Internal("metadata RwLock poisoned".into())
+    })?;
+
+    let (root_page, root_level) = {
+        let cat = md.catalog.lock().expect("catalog poisoned");
+        (cat.root_page(), cat.root_level())
+    };
+    engine.shared.handle.allocator().update_header(|h| {
+        h.catalog_root_page = root_page;
+        h.catalog_root_level = root_level;
+        h.catalog_root_backup = root_page;
+    })?;
+
+    let ort = engine.shared.handle.read_view_registry().oldest_required_ts();
+    {
+        let mut hs = engine.shared.history_store.lock().unwrap();
+        hs.gc_pass(ort)?;
+    }
+    let lag_ms = if ort == crate::mvcc::timestamp::Ts::MAX {
+        0
+    } else {
+        engine.shared
+            .oracle
+            .now()
+            .physical_ms
+            .saturating_sub(ort.physical_ms)
+    };
+    crate::mvcc::metrics::set_oldest_required_ts_lag_ms(lag_ms);
+    crate::mvcc::metrics::set_overflow_pages_in_use(
+        engine.shared.handle.allocator().overflow_pages_in_use() as u64,
+    );
+    crate::mvcc::metrics::set_deferred_free_queue_depth(
+        engine.shared.handle.allocator().deferred_free_queue().depth() as u64,
+    );
+    engine.shared.handle.flush()
+}
+
+pub(super) fn close(engine: &super::PagedEngine) -> crate::error::Result<()> {
+    checkpoint(engine)
+}
+
+pub(super) fn journal_sync(engine: &super::PagedEngine) -> crate::error::Result<()> {
+    engine.shared.handle.journal_sync()
+}
+
+pub(super) fn snapshot_bytes(_engine: &super::PagedEngine) -> crate::error::Result<Option<Vec<u8>>> {
+    Ok(None)
+}
