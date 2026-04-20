@@ -78,10 +78,12 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints<S: BTreePageSto
 
     for (idx_name, fields, sparse) in unique_specs {
         // Encode the candidate document's indexed fields.
-        let new_encoded: Vec<Vec<u8>> = fields
-            .iter()
-            .map(|f| encode_key(new_doc.get(f.as_str()).unwrap_or(&Bson::Null)))
-            .collect();
+        let mut new_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+        new_encoded.extend(
+            fields
+                .iter()
+                .map(|f| encode_key(new_doc.get(f.as_str()).unwrap_or(&Bson::Null))),
+        );
 
         // Sparse: skip if all indexed fields are null/absent.
         if *sparse && new_encoded.iter().all(|v| v == &null_encoded) {
@@ -90,15 +92,18 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints<S: BTreePageSto
 
         // Scan all documents in the tree.
         let pairs = tree.range_scan(None, None)?;
+        let mut existing_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
         for (_, cv) in pairs {
             let bson_bytes = resolve_cell(tree, cv)?;
             let existing: Document =
                 bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
 
-            let existing_encoded: Vec<Vec<u8>> = fields
-                .iter()
-                .map(|f| encode_key(existing.get(f.as_str()).unwrap_or(&Bson::Null)))
-                .collect();
+            existing_encoded.clear();
+            existing_encoded.extend(
+                fields
+                    .iter()
+                    .map(|f| encode_key(existing.get(f.as_str()).unwrap_or(&Bson::Null))),
+            );
 
             if new_encoded == existing_encoded {
                 return Err(Error::DuplicateKey {

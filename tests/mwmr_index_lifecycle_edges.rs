@@ -37,8 +37,7 @@ fn tc01_create_index_same_name_idempotent() {
             IndexModel::builder()
                 .keys(doc! { "x": 1 })
                 .options(IndexOptions::new().name("x_idx"))
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -47,8 +46,7 @@ fn tc01_create_index_same_name_idempotent() {
             IndexModel::builder()
                 .keys(doc! { "x": 1 })
                 .options(IndexOptions::new().name("x_idx"))
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -86,8 +84,7 @@ fn tc02_same_keys_different_names_two_indexes() {
             IndexModel::builder()
                 .keys(doc! { "y": 1 })
                 .options(IndexOptions::new().name("y_alpha"))
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -96,8 +93,7 @@ fn tc02_same_keys_different_names_two_indexes() {
             IndexModel::builder()
                 .keys(doc! { "y": 1 })
                 .options(IndexOptions::new().name("y_beta"))
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -146,8 +142,7 @@ fn tc03_concurrent_create_index_different_fields() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "field_a": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
             .unwrap()
     });
@@ -161,8 +156,7 @@ fn tc03_concurrent_create_index_different_fields() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "field_b": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
             .unwrap()
     });
@@ -205,8 +199,7 @@ fn tc04_drop_ready_index() {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "val": 1 })
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -260,8 +253,7 @@ fn tc05_drop_wins_race_during_build() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "tag": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
         // Either Ok (build finished before drop) or Err (drop won). Both allowed.
     });
@@ -312,8 +304,7 @@ fn tc06_create_index_empty_collection() {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "email": 1 })
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -355,8 +346,7 @@ fn tc07_create_index_bootstraps_collection() {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "score": 1 })
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -401,8 +391,7 @@ fn tc08_multikey_index_query() {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "arr": 1 })
-                .build()
-                .unwrap(),
+                .build(),
         )
         .unwrap();
 
@@ -445,8 +434,7 @@ fn tc09_unique_index_build_time_violation() {
         IndexModel::builder()
             .keys(doc! { "email": 1 })
             .options(IndexOptions::new().unique(true).name("email_idx"))
-            .build()
-            .unwrap(),
+            .build(),
     );
 
     // create_index must fail with a DuplicateKey error (or similar) since the
@@ -501,8 +489,7 @@ fn tc10_dual_write_during_build_all_docs_indexed() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "tag": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
             .unwrap()
     });
@@ -571,8 +558,7 @@ fn tc11_building_index_invisible_to_queries() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "status": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
             .unwrap();
     });
@@ -638,8 +624,7 @@ fn tc12_create_index_vs_drop_collection_no_panic() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "score": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             );
     });
 

@@ -161,7 +161,7 @@ pub(crate) enum IndexState {
 
 impl Default for IndexState {
     fn default() -> Self {
-        IndexState::Ready
+        Self::Ready
     }
 }
 
@@ -256,8 +256,7 @@ impl IndexEntry {
             Ok("ready") => IndexState::Ready,
             Ok(other) => {
                 return Err(Error::Internal(format!(
-                    "catalog: unknown index state '{}'",
-                    other
+                    "catalog: unknown index state '{other}'"
                 )))
             }
             Err(_) => IndexState::Ready,
@@ -423,7 +422,7 @@ impl<S: BTreePageStore> Catalog<S> {
         let coll_key = collection_key(name);
         if self.tree.search(&coll_key)?.is_some() {
             return Err(Error::DuplicateKey {
-                detail: format!("collection '{}' already exists", name),
+                detail: format!("collection '{name}' already exists"),
             });
         }
 
@@ -561,8 +560,7 @@ impl<S: BTreePageStore> Catalog<S> {
         if self.tree.search(&idx_key)?.is_some() {
             return Err(Error::DuplicateKey {
                 detail: format!(
-                    "index '{}' already exists on collection '{}'",
-                    index_name, collection
+                    "index '{index_name}' already exists on collection '{collection}'"
                 ),
             });
         }

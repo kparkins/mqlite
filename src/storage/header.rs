@@ -227,8 +227,7 @@ impl FileHeader {
             return Err(Error::CorruptDatabase {
                 path: std::path::PathBuf::new(),
                 detail: format!(
-                    "invalid magic: expected {:?} ('MQLT'), found {:?}",
-                    FILE_MAGIC, magic
+                    "invalid magic: expected {FILE_MAGIC:?} ('MQLT'), found {magic:?}"
                 ),
                 recoverable: false,
             });

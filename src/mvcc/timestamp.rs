@@ -167,6 +167,12 @@ impl WallClock for SystemWallClock {
     }
 }
 
+impl<T: WallClock + ?Sized> WallClock for Box<T> {
+    fn now_ms(&self) -> u64 {
+        (**self).now_ms()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TimestampOracle
 // ---------------------------------------------------------------------------
@@ -180,12 +186,12 @@ impl WallClock for SystemWallClock {
 /// 2. **Strict monotonicity** — subsequent `commit()` returns `> previous`.
 /// 3. **Wall-clock tolerance** — regressions in the wall clock bump only
 ///    the logical counter; `Ts::physical_ms` never regresses.
-pub struct TimestampOracle {
+pub struct TimestampOracle<C: WallClock = SystemWallClock> {
     hlc: Mutex<HlcState>,
-    clock: Box<dyn WallClock>,
+    clock: C,
 }
 
-impl std::fmt::Debug for TimestampOracle {
+impl<C: WallClock> std::fmt::Debug for TimestampOracle<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TimestampOracle").finish_non_exhaustive()
     }
@@ -194,11 +200,13 @@ impl std::fmt::Debug for TimestampOracle {
 impl TimestampOracle {
     /// Construct an oracle backed by the system wall clock.
     pub fn new() -> Self {
-        Self::with_clock(Box::new(SystemWallClock))
+        Self::with_clock(SystemWallClock)
     }
+}
 
+impl<C: WallClock> TimestampOracle<C> {
     /// Construct an oracle backed by a caller-supplied clock (tests / replay).
-    pub fn with_clock(clock: Box<dyn WallClock>) -> Self {
+    pub fn with_clock(clock: C) -> Self {
         Self {
             hlc: Mutex::new(HlcState {
                 physical_ms: 0,
@@ -274,7 +282,7 @@ impl TimestampOracle {
     }
 }
 
-impl Default for TimestampOracle {
+impl Default for TimestampOracle<SystemWallClock> {
     fn default() -> Self {
         Self::new()
     }

@@ -61,16 +61,19 @@ impl<T> Clone for Collection<T> {
 
 impl<T> Collection<T> {
     /// The fully-qualified namespace: `<db_name>.<collection_name>`.
+    #[must_use]
     pub fn namespace(&self) -> String {
         format!("{}.{}", self.db_name, self.name)
     }
 
     /// The unqualified collection name (without the database prefix).
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// The database name this collection belongs to.
+    #[must_use]
     pub fn db_name(&self) -> &str {
         &self.db_name
     }
@@ -306,30 +309,35 @@ pub struct Find<'a, T> {
 
 impl<'a, T: DeserializeOwned> Find<'a, T> {
     /// Sort order for results.
+    #[must_use]
     pub fn sort(mut self, sort: Document) -> Self {
         self.options.sort = Some(sort);
         self
     }
 
     /// Maximum number of documents to return.
+    #[must_use]
     pub fn limit(mut self, limit: i64) -> Self {
         self.options.limit = Some(limit);
         self
     }
 
     /// Number of documents to skip before returning results.
+    #[must_use]
     pub fn skip(mut self, skip: u64) -> Self {
         self.options.skip = Some(skip);
         self
     }
 
     /// Projection document specifying fields to include or exclude.
+    #[must_use]
     pub fn projection(mut self, projection: Document) -> Self {
         self.options.projection = Some(projection);
         self
     }
 
     /// Number of documents per internal batch.
+    #[must_use]
     pub fn batch_size(mut self, batch_size: u32) -> Self {
         self.options.batch_size = Some(batch_size);
         self
@@ -353,6 +361,7 @@ pub struct InsertMany<'a, T> {
 impl<'a, T: Serialize + DeserializeOwned> InsertMany<'a, T> {
     /// If `true` (default), stop at the first error.
     /// If `false`, attempt all documents and collect errors.
+    #[must_use]
     pub fn ordered(mut self, ordered: bool) -> Self {
         self.options.ordered = ordered;
         self
@@ -378,6 +387,7 @@ pub struct Update<'a, T> {
 
 impl<'a, T> Update<'a, T> {
     /// Insert a new document when no document matches the filter.
+    #[must_use]
     pub fn upsert(mut self, upsert: bool) -> Self {
         self.options.upsert = upsert;
         self
@@ -413,18 +423,21 @@ pub struct FindOneAndUpdate<'a, T> {
 
 impl<'a, T: Serialize + DeserializeOwned> FindOneAndUpdate<'a, T> {
     /// Which version of the document to return. Default: [`ReturnDocument::Before`].
+    #[must_use]
     pub fn return_document(mut self, rd: ReturnDocument) -> Self {
         self.options.return_document = rd;
         self
     }
 
     /// Insert a new document when no document matches the filter.
+    #[must_use]
     pub fn upsert(mut self, upsert: bool) -> Self {
         self.options.upsert = upsert;
         self
     }
 
     /// Sort order used to pick a document when multiple match.
+    #[must_use]
     pub fn sort(mut self, sort: Document) -> Self {
         self.options.sort = Some(sort);
         self
@@ -450,6 +463,7 @@ pub struct FindOneAndDelete<'a, T> {
 
 impl<'a, T: DeserializeOwned> FindOneAndDelete<'a, T> {
     /// Sort order used to pick a document when multiple match.
+    #[must_use]
     pub fn sort(mut self, sort: Document) -> Self {
         self.options.sort = Some(sort);
         self
@@ -475,18 +489,21 @@ pub struct FindOneAndReplace<'a, T> {
 
 impl<'a, T: Serialize + DeserializeOwned> FindOneAndReplace<'a, T> {
     /// Which version of the document to return. Default: [`ReturnDocument::Before`].
+    #[must_use]
     pub fn return_document(mut self, rd: ReturnDocument) -> Self {
         self.options.return_document = rd;
         self
     }
 
     /// Insert a new document when no document matches the filter.
+    #[must_use]
     pub fn upsert(mut self, upsert: bool) -> Self {
         self.options.upsert = upsert;
         self
     }
 
     /// Sort order used to pick a document when multiple match.
+    #[must_use]
     pub fn sort(mut self, sort: Document) -> Self {
         self.options.sort = Some(sort);
         self

@@ -160,16 +160,14 @@ pub(super) fn handle_list_databases(state: &ServerState) -> Document {
 
     let size_on_disk = state.journal_file_size() as i64;
 
-    let databases: bson::Array = db_set
-        .into_iter()
-        .map(|name| {
-            bson::Bson::Document(doc! {
-                "name": &name,
-                "sizeOnDisk": size_on_disk,
-                "empty": false,
-            })
-        })
-        .collect();
+    let mut databases: bson::Array = Vec::with_capacity(db_set.len());
+    for name in &db_set {
+        databases.push(bson::Bson::Document(doc! {
+            "name": name,
+            "sizeOnDisk": size_on_disk,
+            "empty": false,
+        }));
+    }
 
     doc! {
         "databases": databases,

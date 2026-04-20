@@ -96,7 +96,7 @@ pub(crate) fn apply_update(doc: &mut Document, update: &Document, is_insert: boo
                     apply_set(doc, args_doc)?;
                 }
             }
-            _ => unreachable!("already validated operator above"),
+            _ => return Err(Error::UnsupportedOperator { operator: op.to_string() }),
         }
     }
     Ok(())
@@ -122,7 +122,7 @@ pub(crate) fn set_nested(doc: &mut Document, path: &str, value: Bson) {
     }
 
     let mut parts = path.splitn(2, '.');
-    let head = parts.next().expect("non-empty path");
+    let head = parts.next().expect("field paths are non-empty: callers must validate before passing to set_nested/remove_nested");
 
     match parts.next() {
         None => {
@@ -148,7 +148,7 @@ pub(crate) fn set_nested(doc: &mut Document, path: &str, value: Bson) {
 /// Remove a (possibly dotted) field path.
 fn remove_nested(doc: &mut Document, path: &str) {
     let mut parts = path.splitn(2, '.');
-    let head = parts.next().expect("non-empty path");
+    let head = parts.next().expect("field paths are non-empty: callers must validate before passing to set_nested/remove_nested");
 
     match parts.next() {
         None => {
@@ -290,10 +290,9 @@ fn bson_cmp(a: &Bson, b: &Bson) -> std::cmp::Ordering {
 
 fn apply_min(doc: &mut Document, args: &Document) -> Result<()> {
     for (path, new_val) in args {
-        let current = get_nested_field(doc, path).cloned();
-        let should_set = match current {
+        let should_set = match get_nested_field(doc, path) {
             None => true,
-            Some(ref cur) => bson_cmp(new_val, cur) == std::cmp::Ordering::Less,
+            Some(cur) => bson_cmp(new_val, cur) == std::cmp::Ordering::Less,
         };
         if should_set {
             set_nested(doc, path, new_val.clone());
@@ -304,10 +303,9 @@ fn apply_min(doc: &mut Document, args: &Document) -> Result<()> {
 
 fn apply_max(doc: &mut Document, args: &Document) -> Result<()> {
     for (path, new_val) in args {
-        let current = get_nested_field(doc, path).cloned();
-        let should_set = match current {
+        let should_set = match get_nested_field(doc, path) {
             None => true,
-            Some(ref cur) => bson_cmp(new_val, cur) == std::cmp::Ordering::Greater,
+            Some(cur) => bson_cmp(new_val, cur) == std::cmp::Ordering::Greater,
         };
         if should_set {
             set_nested(doc, path, new_val.clone());
@@ -363,7 +361,7 @@ fn apply_push_modifiers(doc: &mut Document, path: &str, modifiers: &Document) ->
         .and_then(|v| as_f64(v))
         .map(|f| f as i64);
 
-    let sort_spec = modifiers.get("$sort").cloned();
+    let sort_spec = modifiers.get("$sort");
 
     let slice: Option<i64> = modifiers
         .get("$slice")
@@ -407,7 +405,7 @@ fn apply_push_modifiers(doc: &mut Document, path: &str, modifiers: &Document) ->
     }
 
     // Step 2: Apply $sort (runs before $slice).
-    if let Some(ref spec) = sort_spec {
+    if let Some(spec) = sort_spec {
         sort_bson_array(&mut arr, spec)?;
     }
 
@@ -512,17 +510,15 @@ fn apply_pull(doc: &mut Document, args: &Document) -> Result<()> {
 /// Returns `true` if `elem` matches the `$pull` condition.
 fn matches_pull_condition(elem: &Bson, condition: &Bson) -> bool {
     match condition {
-        // Plain value: exact equality match.
-        non_doc if !matches!(non_doc, Bson::Document(_)) => elem == non_doc,
         // Document: either a query filter or an embedded-doc match.
-        Bson::Document(filter_doc) => {
-            if let Bson::Document(elem_doc) = elem {
+        Bson::Document(filter_doc) => match elem {
+            Bson::Document(elem_doc) => {
                 crate::query::eval_filter(elem_doc, filter_doc).unwrap_or(false)
-            } else {
-                false
             }
-        }
-        _ => false,
+            _ => false,
+        },
+        // Plain value: exact equality match.
+        non_doc => elem == non_doc,
     }
 }
 

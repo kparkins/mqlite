@@ -127,8 +127,8 @@ pub(super) fn handle_kill_cursors(
         Err(_) => return err_bad_value("killCursors requires a \"cursors\" array"),
     };
 
-    let mut killed: bson::Array = Vec::new();
-    let mut not_found: bson::Array = Vec::new();
+    let mut killed: bson::Array = Vec::with_capacity(cursor_ids.len());
+    let mut not_found: bson::Array = Vec::with_capacity(cursor_ids.len());
 
     let mut guard = cursors.lock().unwrap_or_else(|e| e.into_inner());
     for id in &cursor_ids {

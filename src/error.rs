@@ -72,7 +72,7 @@ pub enum Error {
     },
 
     /// A command is not supported by mqlite's wire protocol shim.
-    #[error("Unsupported command: {command}")]
+    #[error("unsupported command: {command}")]
     UnsupportedCommand {
         /// The name of the unsupported command (e.g. `"aggregate"`).
         command: String,
@@ -85,6 +85,7 @@ pub enum Error {
          Note: Database::repair() is planned for Phase 2. In Phase 1, restore from a backup \
          or open in read_only mode to access the last successfully checkpointed state."
     )]
+    #[non_exhaustive]
     CorruptDatabase {
         /// Path to the corrupt database file.
         path: std::path::PathBuf,
@@ -100,6 +101,7 @@ pub enum Error {
          only {available_bytes} available.\n\
          {suggestion}"
     )]
+    #[non_exhaustive]
     DiskFull {
         /// Path to the database file.
         path: std::path::PathBuf,
@@ -112,34 +114,34 @@ pub enum Error {
     },
 
     /// Duplicate key violation (MongoDB error code 11000).
-    #[error("Duplicate key error: {detail}")]
+    #[error("duplicate key error: {detail}")]
     DuplicateKey {
         /// Description of which key and value caused the violation.
         detail: String,
     },
 
     /// The requested collection does not exist.
-    #[error("Collection not found: {name}")]
+    #[error("collection not found: {name}")]
     CollectionNotFound {
         /// Name of the collection that was not found.
         name: String,
     },
 
     /// The cursor was not found (expired or already closed).
-    #[error("Cursor not found: {id}")]
+    #[error("cursor not found: {id}")]
     CursorNotFound {
         /// The cursor ID that was not found.
         id: i64,
     },
 
     /// An internal error occurred that should never happen in correct usage.
-    #[error("Internal error: {0}")]
+    #[error("internal error: {0}")]
     Internal(String),
 
     /// A wire protocol message is malformed, exceeds size limits, or uses an
     /// unsupported opcode (e.g. OP_COMPRESSED / opcode 2012).
     /// MongoDB error code 48 (IllegalOperation).
-    #[error("Invalid wire message: {detail}")]
+    #[error("invalid wire message: {detail}")]
     InvalidWireMessage {
         /// Human-readable description of the problem.
         detail: String,
@@ -147,7 +149,7 @@ pub enum Error {
 
     /// A document failed structural validation (nesting depth, field count, or field name
     /// constraints). MongoDB error code 121.
-    #[error("Document failed validation: {detail}")]
+    #[error("document failed validation: {detail}")]
     DocumentValidationFailure {
         /// Human-readable description of which constraint was violated.
         detail: String,
@@ -168,7 +170,7 @@ pub enum Error {
 
     /// The database path points to a symlink, which mqlite refuses to follow for
     /// security reasons (symlink attack prevention).
-    #[error("Refusing to open symlink at path: {path:?}")]
+    #[error("refusing to open symlink at path: {path:?}")]
     SymlinkRejected {
         /// The path that was detected as a symlink.
         path: std::path::PathBuf,
@@ -200,6 +202,7 @@ pub enum Error {
          The journal sidecar on disk does not match what this build of mqlite supports. \
          This typically means the database was created by an older or newer mqlite version."
     )]
+    #[non_exhaustive]
     UnsupportedJournalFormat {
         /// Magic bytes found in the on-disk journal (or legacy `-wal`) sidecar.
         found: [u8; 4],
@@ -244,6 +247,35 @@ pub enum Error {
          to continue reading."
     )]
     ReadViewExpired,
+
+    /// A shared-state mutex was poisoned by a panicking thread.
+    #[error("state poisoned: {component}")]
+    StatePoisoned {
+        /// Name of the component whose mutex was poisoned (e.g. `"history_store"`).
+        component: &'static str,
+    },
+
+    /// A catalog field could not be parsed from BSON.
+    #[error("catalog parse error at {field}: {source}")]
+    CatalogParse {
+        /// The BSON field name that failed to parse.
+        field: &'static str,
+        /// The underlying BSON deserialization error.
+        #[source]
+        source: bson::de::Error,
+    },
+
+    /// An update operator caused a type mismatch.
+    #[error("update operator {operator} type mismatch: expected {expected}, got {got}")]
+    UpdateOperatorTypeMismatch {
+        /// The operator name (e.g. `"$inc"`).
+        operator: &'static str,
+        /// The expected BSON type name.
+        expected: &'static str,
+        /// The actual BSON type name encountered.
+        got: &'static str,
+    },
+
 }
 
 impl Error {

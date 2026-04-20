@@ -82,8 +82,7 @@ fn create_index_on_other_ns_does_not_block_writers() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "category": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
             .unwrap();
     });
@@ -144,8 +143,7 @@ fn create_index_includes_concurrent_inserts() {
     coll.create_index(
         IndexModel::builder()
             .keys(doc! { "tag": 1 })
-            .build()
-            .unwrap(),
+            .build(),
     )
     .unwrap();
 
@@ -192,8 +190,7 @@ fn bootstrap_new_namespace_not_blocked_by_create_index_build() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "category": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
             .unwrap();
     });
@@ -282,8 +279,7 @@ fn drop_index_during_build_succeeds() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "tag": 1 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
     });
 

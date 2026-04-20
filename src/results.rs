@@ -4,6 +4,7 @@ use bson::oid::ObjectId;
 use bson::Bson;
 
 /// Result returned by `Collection::insert_one`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InsertOneResult {
     /// The `_id` of the inserted document.
@@ -11,6 +12,7 @@ pub struct InsertOneResult {
 }
 
 /// An error that occurred during a bulk write operation.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct BulkWriteError {
     /// The zero-based index of the document that failed.
@@ -26,6 +28,7 @@ pub struct BulkWriteError {
 /// For ordered inserts (`InsertManyOptions::ordered = true`, the default), execution stops
 /// at the first error. For unordered inserts, all documents are attempted and all errors
 /// are collected in `errors`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InsertManyResult {
     /// Map of insertion index → `_id` for each successfully inserted document.
@@ -35,6 +38,7 @@ pub struct InsertManyResult {
 }
 
 /// Result returned by `Collection::update_one` and `Collection::update_many`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct UpdateResult {
     /// Number of documents that matched the filter.
@@ -47,6 +51,7 @@ pub struct UpdateResult {
 }
 
 /// Result returned by `Collection::delete_one` and `Collection::delete_many`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DeleteResult {
     /// Number of documents deleted.

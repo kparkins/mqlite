@@ -24,7 +24,9 @@ loom-tests = []
 arc-swap = "1"
 bson = { version = "2", features = ["serde_with"] }
 dashmap = "6"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 regex = "1"
+smallvec = "1"
 thiserror = "1"
 crc32c = "0.6.4"
 serde = { version = "1", features = ["derive"] }
@@ -57,5 +59,45 @@ loom = "0.7"
 name = "wire_server"
 required-features = ["wire"]
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+strip = "debuginfo"
+overflow-checks = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unreachable = "warn"
+needless_collect = "warn"
+inefficient_to_string = "warn"
+or_fun_call = "warn"
+redundant_clone = "warn"
+must_use_candidate = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"

@@ -107,18 +107,14 @@ impl JournalManager {
                 // datum is `commit_ts`, which folds into `max_commit_ts`
                 // so the HLC oracle lifts above every durable commit.
                 write_cursor += n;
-                max_commit_ts = Some(match max_commit_ts {
-                    Some(prev) if prev >= commit_ts => prev,
-                    _ => commit_ts,
-                });
+                max_commit_ts = Some(max_commit_ts.map_or(commit_ts, |prev| prev.max(commit_ts)));
                 continue;
             }
 
-            let frame_opt =
-                JournalFrameHeader::read(&mut journal_file, salt1, salt2)?;
-            let frame_hdr = match frame_opt {
-                None => break, // Bad checksum or EOF — stop here
-                Some(h) => h,
+            // Bad checksum or EOF — stop here
+            let Some(frame_hdr) = JournalFrameHeader::read(&mut journal_file, salt1, salt2)?
+            else {
+                break;
             };
 
             // NOTE: JournalFrameHeader::read above already consumed the page data bytes

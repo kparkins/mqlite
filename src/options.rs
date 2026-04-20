@@ -43,29 +43,30 @@ impl std::fmt::Debug for BusyHandler {
 ///     .durability(DurabilityMode::FullSync)
 ///     .busy_timeout(Duration::from_secs(5));
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     /// Buffer pool size in bytes. Default: 64MB.
-    pub buffer_pool_size: usize,
+    pub(crate) buffer_pool_size: usize,
     /// Durability mode. Default: `Interval(100ms)`.
-    pub durability: DurabilityMode,
+    pub(crate) durability: DurabilityMode,
     /// Journal auto-checkpoint threshold in pages. Default: 1000.
-    pub journal_auto_checkpoint: u32,
+    pub(crate) journal_auto_checkpoint: u32,
     /// Journal max size in bytes before forced checkpoint. Default: 100MB.
-    pub journal_max_size: u64,
+    pub(crate) journal_max_size: u64,
     /// Timeout for acquiring the writer lock. Default: 5 seconds.
     /// Set to `Duration::ZERO` for immediate failure (SQLite-style SQLITE_BUSY).
-    pub busy_timeout: Duration,
+    pub(crate) busy_timeout: Duration,
     /// Optional busy handler callback. Called when the writer lock is contended.
     /// Return `true` to retry, `false` to fail with [`crate::Error::WriterBusy`].
-    pub busy_handler: Option<BusyHandler>,
+    pub(crate) busy_handler: Option<BusyHandler>,
     /// Open in read-only mode. WAL replay is skipped.
     /// Default: false.
-    pub read_only: bool,
+    pub(crate) read_only: bool,
     /// Create the file if it doesn't exist. Default: true.
-    pub create_if_missing: bool,
+    pub(crate) create_if_missing: bool,
     /// Maximum concurrent readers. Default: 64.
-    pub max_readers: u32,
+    pub(crate) max_readers: u32,
 }
 
 impl Default for OpenOptions {
@@ -86,29 +87,34 @@ impl Default for OpenOptions {
 
 impl OpenOptions {
     /// Create a new `OpenOptions` with sensible defaults.
+    #[must_use]
     pub fn new() -> Self {
         OpenOptions::default()
     }
 
     /// Set the buffer pool size in bytes.
+    #[must_use]
     pub fn buffer_pool_size(mut self, bytes: usize) -> Self {
         self.buffer_pool_size = bytes;
         self
     }
 
     /// Set the durability mode.
+    #[must_use]
     pub fn durability(mut self, mode: DurabilityMode) -> Self {
         self.durability = mode;
         self
     }
 
     /// Set the journal auto-checkpoint threshold in pages.
+    #[must_use]
     pub fn journal_auto_checkpoint(mut self, pages: u32) -> Self {
         self.journal_auto_checkpoint = pages;
         self
     }
 
     /// Set the maximum journal size in bytes before a forced checkpoint.
+    #[must_use]
     pub fn journal_max_size(mut self, bytes: u64) -> Self {
         self.journal_max_size = bytes;
         self
@@ -116,6 +122,7 @@ impl OpenOptions {
 
     /// Set the timeout for acquiring the writer lock.
     /// Use `Duration::ZERO` for immediate failure on contention.
+    #[must_use]
     pub fn busy_timeout(mut self, duration: Duration) -> Self {
         self.busy_timeout = duration;
         self
@@ -124,24 +131,28 @@ impl OpenOptions {
     /// Set a callback invoked when the writer lock is contended.
     /// `attempts` is the number of retries so far.
     /// Return `true` to retry, `false` to fail with [`crate::Error::WriterBusy`].
+    #[must_use]
     pub fn busy_handler(mut self, handler: impl Fn(u32) -> bool + Send + Sync + 'static) -> Self {
         self.busy_handler = Some(BusyHandler(Arc::new(handler)));
         self
     }
 
     /// Open in read-only mode. WAL replay is skipped.
+    #[must_use]
     pub fn read_only(mut self, val: bool) -> Self {
         self.read_only = val;
         self
     }
 
     /// Create the file if it doesn't exist.
+    #[must_use]
     pub fn create_if_missing(mut self, val: bool) -> Self {
         self.create_if_missing = val;
         self
     }
 
     /// Set the maximum number of concurrent readers.
+    #[must_use]
     pub fn max_readers(mut self, count: u32) -> Self {
         self.max_readers = count;
         self
@@ -165,6 +176,7 @@ pub(crate) struct FindOptions {
 }
 
 impl FindOptions {
+    #[must_use]
     pub fn new() -> Self {
         FindOptions::default()
     }
@@ -192,35 +204,40 @@ impl Default for InsertManyOptions {
 }
 
 /// Options for `create_index` operations.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
     /// If true, the index enforces a unique constraint.
-    pub unique: bool,
+    pub(crate) unique: bool,
     /// Custom name for the index.
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     /// If true, only index documents where the key field exists.
-    pub sparse: bool,
+    pub(crate) sparse: bool,
 }
 
 impl IndexOptions {
     /// Create default `IndexOptions`.
+    #[must_use]
     pub fn new() -> Self {
         IndexOptions::default()
     }
 
     /// Set whether the index enforces a unique constraint.
+    #[must_use]
     pub fn unique(mut self, unique: bool) -> Self {
         self.unique = unique;
         self
     }
 
     /// Set a custom name for the index.
+    #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
     /// Set whether to only index documents where the key field exists.
+    #[must_use]
     pub fn sparse(mut self, sparse: bool) -> Self {
         self.sparse = sparse;
         self

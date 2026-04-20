@@ -1,6 +1,6 @@
 //! Secondary-index maintenance + pending-write installation helpers.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bson::{Bson, Document};
 
@@ -55,7 +55,7 @@ pub(super) fn index_bounds_free(
     }
     fn prefix_next(val: &Bson, asc: bool) -> Vec<u8> {
         let mut p = prefix(val, asc);
-        *p.last_mut().unwrap() += 1;
+        *p.last_mut().expect("prefix always contains at least COMPOUND_SEP") += 1;
         p
     }
     match condition {
@@ -98,7 +98,7 @@ pub(super) fn index_bounds_free(
 pub(super) fn sync_index_entry(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
     orig: &IndexEntry,
     new_root: u32,
     new_level: u8,
@@ -125,7 +125,7 @@ pub(super) fn sync_index_entry(
 pub(super) fn maintain_secondary_on_insert(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
     ns: &str,
     doc: &Document,
     doc_id: &Bson,
@@ -136,13 +136,18 @@ pub(super) fn maintain_secondary_on_insert(
         let store = new_txn_store(shared, overlay);
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
         let is_multikey = update_index_on_insert(doc, doc_id, &idx_tree, &entry, txn)?;
+        // Extract root values before dropping idx_tree so the &mut overlay
+        // borrow from its store is released before sync_index_entry borrows
+        // overlay again.
+        let (new_root, new_level) = (idx_tree.root_page, idx_tree.root_level);
+        drop(idx_tree);
         sync_index_entry(
             shared,
             md,
             overlay,
             &entry,
-            idx_tree.root_page,
-            idx_tree.root_level,
+            new_root,
+            new_level,
             is_multikey,
         )?;
     }
@@ -153,7 +158,7 @@ pub(super) fn maintain_secondary_on_insert(
 pub(super) fn maintain_secondary_on_delete(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
     ns: &str,
     doc: &Document,
     doc_id: &Bson,
@@ -179,7 +184,7 @@ pub(super) fn maintain_secondary_on_delete(
 pub(super) fn maintain_secondary_on_update(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
     ns: &str,
     old_doc: &Document,
     new_doc: &Document,
@@ -194,13 +199,15 @@ pub(super) fn maintain_secondary_on_update(
         let is_multikey = update_index_on_update(
             old_doc, new_doc, old_id, new_id, &idx_tree, &entry, txn,
         )?;
+        let (new_root, new_level) = (idx_tree.root_page, idx_tree.root_level);
+        drop(idx_tree);
         sync_index_entry(
             shared,
             md,
             overlay,
             &entry,
-            idx_tree.root_page,
-            idx_tree.root_level,
+            new_root,
+            new_level,
             is_multikey,
         )?;
     }
@@ -212,7 +219,7 @@ pub(super) fn maintain_secondary_on_update(
 pub(super) fn install_pending_sec_index(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
     writes: Vec<crate::mvcc::SecIndexWrite>,
 ) -> Result<()> {
     if writes.is_empty() {
@@ -240,9 +247,9 @@ pub(super) fn install_pending_sec_index(
     let mut states: StdHashMap<u32, TreeState> = StdHashMap::new();
 
     for write in writes {
-        let state = match states.get_mut(&write.index_root_page) {
-            Some(s) => s,
-            None => {
+        let state = match states.entry(write.index_root_page) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
                 let entry = entry_by_root
                     .get(&write.index_root_page)
                     .cloned()
@@ -252,17 +259,11 @@ pub(super) fn install_pending_sec_index(
                             write.index_root_page
                         ))
                     })?;
-                states.insert(
-                    write.index_root_page,
-                    TreeState {
-                        current_root: entry.root_page,
-                        current_level: entry.root_level,
-                        entry,
-                    },
-                );
-                states
-                    .get_mut(&write.index_root_page)
-                    .expect("just inserted")
+                slot.insert(TreeState {
+                    current_root: entry.root_page,
+                    current_level: entry.root_level,
+                    entry,
+                })
             }
         };
 
@@ -300,7 +301,7 @@ pub(super) fn install_pending_sec_index(
 pub(super) fn install_pending_primary(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
     writes: Vec<crate::mvcc::PrimaryWrite>,
     commit_ts: crate::mvcc::Ts,
     txn_id: u64,
@@ -309,7 +310,6 @@ pub(super) fn install_pending_primary(
         return Ok(());
     }
     use crate::mvcc::{PrimaryOp, Ts, VersionData, VersionEntry};
-    use std::collections::VecDeque;
     use crate::storage::buffer_pool::PageSize;
 
     for write in writes {
@@ -329,7 +329,7 @@ pub(super) fn install_pending_primary(
             .handle
             .pool()
             .take_chain(leaf_page, &write.key)?
-            .unwrap_or_else(|| std::sync::Arc::new(VecDeque::new()));
+            .unwrap_or_default();
         {
             let chain_mut = std::sync::Arc::make_mut(&mut chain_arc);
             if let Some(prev_head) = chain_mut.front_mut() {

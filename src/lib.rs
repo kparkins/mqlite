@@ -96,9 +96,6 @@
 //! - **Wire protocol**: no authentication in Phase 1 — bind to `127.0.0.1` only;
 //!   see the [Wire Protocol Security Advisory](https://github.com/kyleparkinson/mqlite/blob/master/docs/WIRE-SECURITY.md)
 
-#![warn(missing_docs)]
-#![warn(clippy::unwrap_used)]
-
 // ---------------------------------------------------------------------------
 // Public modules
 // ---------------------------------------------------------------------------

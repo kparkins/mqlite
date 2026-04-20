@@ -336,11 +336,10 @@ impl JournalManager {
                 continue;
             }
 
-            let frame_opt =
-                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?;
-            let frame_hdr = match frame_opt {
-                None => break,
-                Some(h) => h,
+            let Some(frame_hdr) =
+                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?
+            else {
+                break;
             };
 
             let page_size_bytes = frame_hdr.page_size.bytes();
@@ -557,11 +556,10 @@ impl JournalManager {
                 continue;
             }
 
-            let frame_opt =
-                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?;
-            let frame_hdr = match frame_opt {
-                None => break,
-                Some(h) => h,
+            let Some(frame_hdr) =
+                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?
+            else {
+                break;
             };
             self.index.insert(frame_hdr.page_number, scan);
             if frame_hdr.db_page_count > 0 {
@@ -586,15 +584,8 @@ impl JournalManager {
 
         // Re-write header with incremented checkpoint sequence.
         self.checkpoint_seq = self.checkpoint_seq.wrapping_add(1);
-        let header = JournalHeader {
-            magic: self::log_file::JOURNAL_MAGIC,
-            format_version: self::log_file::JOURNAL_FORMAT_VERSION,
-            page_size_internal: crate::storage::page::PAGE_SIZE_INTERNAL,
-            page_size_leaf: crate::storage::page::PAGE_SIZE_LEAF,
-            salt1: self.salt1,
-            salt2: self.salt2,
-            checkpoint_seq: self.checkpoint_seq,
-        };
+        let mut header = JournalHeader::new(self.salt1, self.salt2);
+        header.checkpoint_seq = self.checkpoint_seq;
         self.journal_file
             .write_all(&header.to_bytes())
             .map_err(Error::Io)?;

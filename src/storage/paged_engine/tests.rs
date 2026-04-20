@@ -119,8 +119,7 @@ fn create_and_list_indexes() {
     e.create_namespace("test.c").unwrap();
     let model = IndexModel::builder()
         .keys(doc! { "email": 1 })
-        .build()
-        .unwrap();
+        .build();
     let name = e.create_index("test.c", &model).unwrap();
     assert_eq!(name, "email_1");
     let indexes = e.list_indexes("test.c").unwrap();
@@ -501,8 +500,7 @@ fn buffered_create_index_builds_from_existing_docs() {
     // Create an index on "sku".
     let idx = IndexModel::builder()
         .keys(doc! { "sku": 1 })
-        .build()
-        .unwrap();
+        .build();
     let name = e.create_index("test.items", &idx).unwrap();
     assert_eq!(name, "sku_1");
 
@@ -522,8 +520,7 @@ fn buffered_index_maintained_on_insert() {
 
     let idx = IndexModel::builder()
         .keys(doc! { "email": 1 })
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.users", &idx).unwrap();
 
     // Insert after index creation.
@@ -554,8 +551,7 @@ fn buffered_index_maintained_on_delete() {
 
     let idx = IndexModel::builder()
         .keys(doc! { "email": 1 })
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.users", &idx).unwrap();
 
     e.insert("test.users", doc! { "email": "charlie@test.com" })
@@ -582,8 +578,7 @@ fn buffered_index_maintained_on_update() {
 
     let idx = IndexModel::builder()
         .keys(doc! { "email": 1 })
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.users", &idx).unwrap();
 
     e.insert("test.users", doc! { "email": "old@test.com" })
@@ -622,8 +617,7 @@ fn buffered_index_scan_range_gt() {
 
     let idx = IndexModel::builder()
         .keys(doc! { "score": 1 })
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.players", &idx).unwrap();
 
     for i in 0i32..10 {
@@ -652,8 +646,7 @@ fn buffered_index_scan_in_query() {
 
     let idx = IndexModel::builder()
         .keys(doc! { "status": 1 })
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.orders", &idx).unwrap();
 
     e.insert("test.orders", doc! { "status": "pending", "amount": 10i32 })
@@ -686,8 +679,7 @@ fn buffered_unique_secondary_index_rejects_duplicates() {
     let idx = IndexModel::builder()
         .keys(doc! { "email": 1 })
         .options(IndexOptions::new().unique(true))
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.users", &idx).unwrap();
 
     e.insert("test.users", doc! { "email": "dup@test.com" })
@@ -706,8 +698,7 @@ fn buffered_compound_index_lookup() {
 
     let idx = IndexModel::builder()
         .keys(doc! { "category": 1, "price": 1 })
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.products", &idx).unwrap();
 
     e.insert(
@@ -747,8 +738,7 @@ fn buffered_index_survives_reopen() {
 
     let idx = IndexModel::builder()
         .keys(doc! { "username": 1 })
-        .build()
-        .unwrap();
+        .build();
     e.create_index("test.accounts", &idx).unwrap();
 
     e.insert("test.accounts", doc! { "username": "alice" })

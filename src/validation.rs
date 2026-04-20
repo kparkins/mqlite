@@ -138,12 +138,7 @@ fn validate_value_recursive(value: &Bson, depth: u32, field_count: &mut usize) -
 /// - Must not contain null bytes (`\0`), which are forbidden by the BSON spec
 ///   and can corrupt index keys.
 fn validate_field_name(name: &str) -> Result<()> {
-    if name.len() > MAX_FIELD_NAME_LEN {
-        return Err(Error::DocumentValidationFailure {
-            detail: "field name too long or contains null byte".into(),
-        });
-    }
-    if name.contains('\0') {
+    if name.len() > MAX_FIELD_NAME_LEN || name.contains('\0') {
         return Err(Error::DocumentValidationFailure {
             detail: "field name too long or contains null byte".into(),
         });

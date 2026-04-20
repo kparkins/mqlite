@@ -10,8 +10,6 @@
 //! - [`PagedEngine::create_index_cleanup`] — drop an orphan Building entry
 //!   on Phase-2 failure.
 
-use std::sync::Arc;
-
 use crate::error::{Error, Result};
 use crate::index::IndexModel;
 use crate::storage::btree::BTree;
@@ -147,31 +145,31 @@ impl PagedEngine {
         // independent of Phase 1's txn (already committed) and Phase 3's
         // txn (has not yet begun).
         let mark = self.shared.handle.begin_txn()?;
-        let overlay = TxnOverlay::new_shared();
+        let mut overlay = TxnOverlay::new();
         let ready_reservations = self
             .shared
             .handle
             .allocator()
             .drain_deferred_free_reservations();
-        if !ready_reservations.is_empty() {
-            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
-            for page in ready_reservations {
-                ov.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+        for page in ready_reservations {
+            overlay.push_reservation(PageReservation {
+                page,
+                size: PageSize::Large32k,
+                origin: PageOrigin::DeferredFree,
+            });
         }
 
         let body: Result<()> = (|| {
-            let data_store = new_txn_store(&self.shared, &overlay);
+            // The data tree is read-only during index build — we use a
+            // plain BufferPoolPageStore (no overlay) so the idx_store
+            // can hold the sole &mut TxnOverlay borrow simultaneously.
+            let data_store = new_store(&self.shared);
             let data_tree = BTree::open(
                 data_store,
                 data_entry.data_root_page,
                 data_entry.data_root_level,
             );
-            let idx_store = new_txn_store(&self.shared, &overlay);
+            let idx_store = new_txn_store(&self.shared, &mut overlay);
             let mut idx_tree = BTree::open(
                 idx_store,
                 idx_entry.root_page,
@@ -207,7 +205,7 @@ impl PagedEngine {
                     .lock()
                     .expect("catalog poisoned")
                     .update_index(&updated)?;
-                sync_catalog_root_overlay(&self.shared, &md_read, &overlay)?;
+                sync_catalog_root_overlay(&self.shared, &md_read, &mut overlay)?;
             }
             Ok(())
         })();
@@ -219,14 +217,8 @@ impl PagedEngine {
                 // has no primary writes), and no publish is performed.
                 // The only shared mutation is catalog root/multikey
                 // metadata, which is safe under the lane.
-                let overlay_inner = Arc::try_unwrap(overlay)
-                    .map_err(|_| {
-                        Error::Internal("TxnOverlay still referenced at build commit".into())
-                    })?
-                    .into_inner()
-                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
                 let mut base = new_store(&self.shared);
-                overlay_inner.commit(&mut base, &self.shared.handle)?;
+                overlay.commit(&mut base, &self.shared.handle)?;
                 self.shared.handle.flush()?;
                 let db_page_count = self
                     .shared

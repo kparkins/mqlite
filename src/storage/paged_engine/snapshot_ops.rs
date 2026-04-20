@@ -36,12 +36,12 @@ pub(super) fn open_snapshot_read_view(
     )
 }
 
-pub(super) fn primary_history_probe(
-    shared: &SharedState,
+pub(super) fn primary_history_probe<'a>(
+    shared: &'a SharedState,
     ns: &str,
-) -> PrimaryHistoryProbe<BufferPoolPageStore> {
+) -> PrimaryHistoryProbe<'a, BufferPoolPageStore> {
     PrimaryHistoryProbe {
-        store: Arc::clone(&shared.history_store),
+        store: &shared.history_store,
         ns_id: ns_id_for(ns),
     }
 }
@@ -88,7 +88,7 @@ pub(super) fn execute_primary_key_lookup_from_snap(
             let mut keys: Vec<Vec<u8>> = vals.iter().map(encode_key).collect();
             keys.sort();
             keys.dedup();
-            let mut matched = Vec::new();
+            let mut matched = Vec::with_capacity(keys.len());
             for key in keys {
                 if let Some(pair) = fetch_primary_pair(&tree, key, filter, &view, Some(&probe))? {
                     matched.push(pair);
@@ -116,12 +116,12 @@ pub(super) fn ns_id_for(ns: &str) -> u32 {
 
 /// Bind the primary-key probe path of a [`HistoryStore`] to a fixed
 /// `(ns_id, KIND_PRIMARY)` so the BTree layer sees a key-only probe.
-pub(super) struct PrimaryHistoryProbe<S: BTreePageStore> {
-    store: Arc<std::sync::Mutex<HistoryStore<S>>>,
+pub(super) struct PrimaryHistoryProbe<'a, S: BTreePageStore> {
+    store: &'a std::sync::Mutex<HistoryStore<S>>,
     ns_id: u32,
 }
 
-impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryProbe<S> {
+impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryProbe<'_, S> {
     fn probe(
         &self,
         key: &[u8],
@@ -144,7 +144,7 @@ pub(super) fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Ve
         if n >= docs.len() {
             docs.clear();
         } else {
-            docs = docs.into_iter().skip(n).collect();
+            docs.drain(..n);
         }
     }
     if let Some(limit) = opts.limit {
@@ -153,10 +153,9 @@ pub(super) fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Ve
         }
     }
     if let Some(proj) = &opts.projection {
-        docs = docs
-            .into_iter()
-            .map(|d| apply_projection_to_doc(d, proj))
-            .collect();
+        for d in docs.iter_mut() {
+            *d = apply_projection_to_doc(std::mem::take(d), proj);
+        }
     }
     docs
 }
@@ -185,12 +184,12 @@ pub(super) fn execute_index_scan_from_snap(
 
     let handle = Arc::clone(&shared.handle);
     let id_bsons: Vec<Bson> = if let IndexCondition::In(vals) = condition {
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(vals.len());
         for v in vals {
             let mut p = encode_compound_key(&[(v, ascending)]);
             p.push(COMPOUND_SEP);
             let mut p_next = p.clone();
-            *p_next.last_mut().unwrap() += 1;
+            *p_next.last_mut().expect("compound key always contains at least COMPOUND_SEP") += 1;
             let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
             let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
             for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
@@ -324,7 +323,7 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
 
     let ort = engine.shared.handle.read_view_registry().oldest_required_ts();
     {
-        let mut hs = engine.shared.history_store.lock().unwrap();
+        let mut hs = engine.shared.history_store.lock().map_err(|_| crate::error::Error::StatePoisoned { component: "history_store" })?;
         hs.gc_pass(ort)?;
     }
     let lag_ms = if ort == crate::mvcc::timestamp::Ts::MAX {

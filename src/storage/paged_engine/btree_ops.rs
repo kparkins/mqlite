@@ -55,7 +55,7 @@ pub(super) fn btree_collscan<S: BTreePageStore>(
     history: Option<&dyn crate::storage::btree::HistoryProbe>,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
     let pairs = tree.range_scan_mvcc(None, None, view, history)?;
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(pairs.len());
     for (key, bson_bytes) in pairs {
         let doc: Document = bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
         if eval_filter(&doc, filter)? {

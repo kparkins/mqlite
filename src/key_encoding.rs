@@ -111,7 +111,8 @@ pub(crate) const COMPOUND_SEP: u8 = 0x01;
 /// assert!(k1 < k2 && k2 < k3);
 /// ```
 pub fn encode_key(value: &Bson) -> Vec<u8> {
-    let mut buf = Vec::new();
+    // Most scalar encodings fit in <= 32 bytes (numbers use 18, ObjectId uses 13).
+    let mut buf = Vec::with_capacity(32);
     encode_into(&mut buf, value);
     buf
 }
@@ -134,17 +135,21 @@ pub fn encode_key(value: &Bson) -> Vec<u8> {
 /// ]);
 /// ```
 pub fn encode_compound_key(fields: &[(&Bson, bool)]) -> Vec<u8> {
-    let mut buf = Vec::new();
+    // Rough estimate: 32 bytes per field plus separators.
+    let mut buf = Vec::with_capacity(fields.len() * 33);
     for (i, (value, ascending)) in fields.iter().enumerate() {
         if i > 0 {
             buf.push(COMPOUND_SEP);
         }
-        let mut field_bytes = Vec::new();
+        let mut field_bytes = Vec::with_capacity(32);
         encode_into(&mut field_bytes, value);
         if *ascending {
             buf.extend_from_slice(&field_bytes);
         } else {
-            buf.extend(field_bytes.iter().map(|b| !b));
+            for b in &mut field_bytes {
+                *b = !*b;
+            }
+            buf.extend_from_slice(&field_bytes);
         }
     }
     buf
@@ -388,6 +393,7 @@ fn encode_decimal128(buf: &mut Vec<u8>, v: &Decimal128) {
 /// The escaping ensures that no field encoding contains a bare `0x00` before the
 /// terminator, preserving `memcmp` correctness across variable-length fields.
 fn encode_string_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.reserve(bytes.len() + 1);
     for &b in bytes {
         match b {
             0x00 => {

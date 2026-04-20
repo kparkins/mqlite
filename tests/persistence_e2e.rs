@@ -65,8 +65,7 @@ fn end_to_end_persistence_across_three_databases() {
                         .unique(true)
                         .name("email_unique".to_string()),
                 )
-                .build()
-                .unwrap();
+                .build();
             col.create_index(model).expect("create users email index");
 
             // Sanity check before close.
@@ -99,8 +98,7 @@ fn end_to_end_persistence_across_three_databases() {
                         .unique(true)
                         .name("sku_unique".to_string()),
                 )
-                .build()
-                .unwrap();
+                .build();
             col.create_index(model).expect("create products sku index");
 
             // Sanity check before close.
@@ -133,8 +131,7 @@ fn end_to_end_persistence_across_three_databases() {
             let model = IndexModel::builder()
                 .keys(doc! { "kind": 1i32 })
                 .options(IndexOptions::new().name("kind_idx".to_string()))
-                .build()
-                .unwrap();
+                .build();
             col.create_index(model).expect("create events kind index");
         }
 

@@ -257,24 +257,13 @@ struct AllocatorState {
     header_dirty: bool,
 }
 
-/// A `Clone`-able, `Arc`-wrapped allocator handle that owns the
-/// [`FileHeader`] rather than borrowing it.
+/// Inner state of an [`AllocatorHandle`], shared via a single `Arc`.
 ///
-/// Resolves **RISK-03** from the Phase 1 reconciliation plan: the original
-/// [`PageAllocator`] holds `header: &'a mut FileHeader`, which makes it
-/// impossible to use concurrently from multiple threads or to store in an
-/// `Arc`-shared struct like `DatabaseInner`.
-///
-/// `AllocatorHandle` wraps the header in `Arc<Mutex<AllocatorState>>`.  All
-/// allocations and deallocations lock the mutex, perform the operation via a
-/// short-lived [`PageAllocator`], and release the lock.
-///
-/// After any allocation or free, the in-memory header is marked dirty.  Call
-/// [`flush_header`](AllocatorHandle::flush_header) to persist the updated
-/// header to page 0 through a `PageSource`.
-#[derive(Clone)]
-pub(crate) struct AllocatorHandle {
-    state: Arc<Mutex<AllocatorState>>,
+/// Grouping all three fields under one `Arc` collapses the previous
+/// per-field `Arc` wrappers (M3, M4, M5) while preserving `Clone` on
+/// `AllocatorHandle` with a single refcount bump.
+struct AllocatorInner {
+    state: Mutex<AllocatorState>,
     /// Per-overflow-chain refcount table.
     ///
     /// Maps `first_page` → shared `AtomicU32` pin counter. Populated when
@@ -284,11 +273,31 @@ pub(crate) struct AllocatorHandle {
     ///
     /// MVCC plan §T3: atomic ops on the refcount happen OUTSIDE the
     /// allocator state mutex.
-    overflow_refcounts: Arc<Mutex<HashMap<u32, Arc<AtomicU32>>>>,
+    overflow_refcounts: Mutex<HashMap<u32, Arc<AtomicU32>>>,
     /// Refcount-to-zero queue drained by the writer path.
     ///
     /// Lock-order position 1.5 (before `state` at position 2).
-    deferred_free_queue: Arc<DeferredFreeQueue>,
+    deferred_free_queue: DeferredFreeQueue,
+}
+
+/// A `Clone`-able, `Arc`-wrapped allocator handle that owns the
+/// [`FileHeader`] rather than borrowing it.
+///
+/// Resolves **RISK-03** from the Phase 1 reconciliation plan: the original
+/// [`PageAllocator`] holds `header: &'a mut FileHeader`, which makes it
+/// impossible to use concurrently from multiple threads or to store in an
+/// `Arc`-shared struct like `DatabaseInner`.
+///
+/// `AllocatorHandle` wraps all shared state in a single `Arc<AllocatorInner>`.
+/// All allocations and deallocations lock the state mutex, perform the
+/// operation via a short-lived [`PageAllocator`], and release the lock.
+///
+/// After any allocation or free, the in-memory header is marked dirty.  Call
+/// [`flush_header`](AllocatorHandle::flush_header) to persist the updated
+/// header to page 0 through a `PageSource`.
+#[derive(Clone)]
+pub(crate) struct AllocatorHandle {
+    inner: Arc<AllocatorInner>,
 }
 
 impl AllocatorHandle {
@@ -299,19 +308,21 @@ impl AllocatorHandle {
     /// changes.
     pub(crate) fn new(header: FileHeader) -> Self {
         Self {
-            state: Arc::new(Mutex::new(AllocatorState {
-                header,
-                header_dirty: false,
-            })),
-            overflow_refcounts: Arc::new(Mutex::new(HashMap::new())),
-            deferred_free_queue: Arc::new(DeferredFreeQueue::new()),
+            inner: Arc::new(AllocatorInner {
+                state: Mutex::new(AllocatorState {
+                    header,
+                    header_dirty: false,
+                }),
+                overflow_refcounts: Mutex::new(HashMap::new()),
+                deferred_free_queue: DeferredFreeQueue::new(),
+            }),
         }
     }
 
     /// Borrow the deferred-free queue (used by `OverflowRef::drop` and the
     /// writer-path drain).
-    pub(crate) fn deferred_free_queue(&self) -> &Arc<DeferredFreeQueue> {
-        &self.deferred_free_queue
+    pub(crate) fn deferred_free_queue(&self) -> &DeferredFreeQueue {
+        &self.inner.deferred_free_queue
     }
 
     // -----------------------------------------------------------------------
@@ -331,7 +342,7 @@ impl AllocatorHandle {
     /// Look up or create the shared `AtomicU32` refcount for `first_page`.
     fn refcount_handle(&self, first_page: u32) -> Arc<AtomicU32> {
         #[allow(clippy::unwrap_used)]
-        let mut table = self.overflow_refcounts.lock().unwrap();
+        let mut table = self.inner.overflow_refcounts.lock().unwrap();
         table
             .entry(first_page)
             .or_insert_with(|| Arc::new(AtomicU32::new(0)))
@@ -341,7 +352,7 @@ impl AllocatorHandle {
     /// Get the refcount handle if one exists; do not create.
     fn refcount_handle_opt(&self, first_page: u32) -> Option<Arc<AtomicU32>> {
         #[allow(clippy::unwrap_used)]
-        let table = self.overflow_refcounts.lock().unwrap();
+        let table = self.inner.overflow_refcounts.lock().unwrap();
         table.get(&first_page).cloned()
     }
 
@@ -391,15 +402,12 @@ impl AllocatorHandle {
     /// no net effect (defense-in-depth for a class of bugs that RAII is
     /// supposed to prevent).
     pub(crate) fn decref_overflow(&self, first_page: u32) -> u32 {
-        let atomic = match self.refcount_handle_opt(first_page) {
-            Some(a) => a,
-            None => {
-                debug_assert!(
-                    false,
-                    "decref on unknown first_page {first_page} — pin accounting bug"
-                );
-                return 0;
-            }
+        let Some(atomic) = self.refcount_handle_opt(first_page) else {
+            debug_assert!(
+                false,
+                "decref on unknown first_page {first_page} — pin accounting bug"
+            );
+            return 0;
         };
         let prev = atomic.fetch_sub(1, Ordering::Release);
         debug_assert!(prev > 0, "decref on already-zero refcount");
@@ -410,8 +418,7 @@ impl AllocatorHandle {
     /// Release decrefs.
     pub(crate) fn overflow_refcount(&self, first_page: u32) -> u32 {
         self.refcount_handle_opt(first_page)
-            .map(|a| a.load(Ordering::Acquire))
-            .unwrap_or(0)
+            .map_or(0, |a| a.load(Ordering::Acquire))
     }
 
     /// Number of overflow-chain `first_page`s whose refcount is currently
@@ -421,7 +428,7 @@ impl AllocatorHandle {
     /// this is called at checkpoint cadence, not on the hot path.
     pub(crate) fn overflow_pages_in_use(&self) -> usize {
         #[allow(clippy::unwrap_used)]
-        let table = self.overflow_refcounts.lock().unwrap();
+        let table = self.inner.overflow_refcounts.lock().unwrap();
         table
             .values()
             .filter(|a| a.load(Ordering::Acquire) >= 1)
@@ -431,7 +438,7 @@ impl AllocatorHandle {
     /// Enqueue a page for deferred free. Called by `OverflowRef::drop`
     /// when the decrement brings refcount to 0.
     pub(crate) fn enqueue_deferred_free(&self, first_page: u32) {
-        self.deferred_free_queue.push(first_page);
+        self.inner.deferred_free_queue.push(first_page);
     }
 
     /// Writer-serialized drain of the deferred-free queue.
@@ -451,14 +458,14 @@ impl AllocatorHandle {
     ///
     /// Returns the number of pages actually freed.
     pub(crate) fn drain_free_queue(&self, io: &dyn PageSource) -> Result<usize> {
-        let pages = self.deferred_free_queue.take_all();
+        let pages = self.inner.deferred_free_queue.take_all();
         if pages.is_empty() {
             crate::mvcc::metrics::set_deferred_free_queue_depth(0);
             return Ok(0);
         }
 
         let mut state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut freed = 0usize;
@@ -471,7 +478,7 @@ impl AllocatorHandle {
                 alloc.free_32k(page)?;
                 // Drop the refcount entry — the page is no longer live.
                 #[allow(clippy::unwrap_used)]
-                let mut table = self.overflow_refcounts.lock().unwrap();
+                let mut table = self.inner.overflow_refcounts.lock().unwrap();
                 table.remove(&page);
                 freed += 1;
                 crate::mvcc::metrics::record_overflow_page_freed();
@@ -484,10 +491,10 @@ impl AllocatorHandle {
         drop(state);
 
         if !requeue.is_empty() {
-            self.deferred_free_queue.push_many(requeue);
+            self.inner.deferred_free_queue.push_many(requeue);
         }
         crate::mvcc::metrics::set_deferred_free_queue_depth(
-            self.deferred_free_queue.depth() as u64,
+            self.inner.deferred_free_queue.depth() as u64,
         );
         Ok(freed)
     }
@@ -509,7 +516,7 @@ impl AllocatorHandle {
     /// Precondition: caller holds writer serialization (same as
     /// `drain_free_queue`).
     pub(crate) fn drain_deferred_free_reservations(&self) -> Vec<u32> {
-        let pages = self.deferred_free_queue.take_all();
+        let pages = self.inner.deferred_free_queue.take_all();
         if pages.is_empty() {
             crate::mvcc::metrics::set_deferred_free_queue_depth(0);
             return Vec::new();
@@ -521,7 +528,7 @@ impl AllocatorHandle {
             if cnt == 0 {
                 // Drop the refcount entry — the page is no longer live.
                 #[allow(clippy::unwrap_used)]
-                let mut table = self.overflow_refcounts.lock().unwrap();
+                let mut table = self.inner.overflow_refcounts.lock().unwrap();
                 table.remove(&page);
                 ready.push(page);
             } else {
@@ -529,10 +536,10 @@ impl AllocatorHandle {
             }
         }
         if !requeue.is_empty() {
-            self.deferred_free_queue.push_many(requeue);
+            self.inner.deferred_free_queue.push_many(requeue);
         }
         crate::mvcc::metrics::set_deferred_free_queue_depth(
-            self.deferred_free_queue.depth() as u64,
+            self.inner.deferred_free_queue.depth() as u64,
         );
         ready
     }
@@ -556,7 +563,7 @@ impl AllocatorHandle {
     /// buffer pool) to persist the change to disk.
     pub(crate) fn alloc_4k(&self, io: &dyn PageSource) -> Result<u32> {
         let mut state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -570,7 +577,7 @@ impl AllocatorHandle {
     /// Updates the in-memory free list and marks the header dirty.
     pub(crate) fn alloc_32k(&self, io: &dyn PageSource) -> Result<u32> {
         let mut state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -589,7 +596,7 @@ impl AllocatorHandle {
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_4k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
         let mut state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -604,7 +611,7 @@ impl AllocatorHandle {
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_32k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
         let mut state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -627,7 +634,7 @@ impl AllocatorHandle {
         F: FnOnce(&FileHeader) -> R,
     {
         let state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         Ok(f(&state.header))
@@ -642,7 +649,7 @@ impl AllocatorHandle {
         F: FnOnce(&mut FileHeader),
     {
         let mut state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         f(&mut state.header);
@@ -663,7 +670,7 @@ impl AllocatorHandle {
     /// complete, before the WAL commit frame is written.
     pub(crate) fn flush_header(&self, io: &dyn PageSource) -> Result<()> {
         let mut state = self
-            .state
+            .inner.state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         if state.header_dirty {
@@ -678,7 +685,7 @@ impl AllocatorHandle {
     /// last [`flush_header`](Self::flush_header) call.
     #[allow(dead_code)]
     pub(crate) fn is_header_dirty(&self) -> bool {
-        self.state.lock().map(|s| s.header_dirty).unwrap_or(false)
+        self.inner.state.lock().map_or(false, |s| s.header_dirty)
     }
 }
 

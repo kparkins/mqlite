@@ -28,7 +28,7 @@ use crate::{
         file_io::FilePageSource,
         handle::BufferPoolHandle,
         header::{FileHeader, HEADER_PAGE_SIZE},
-        lock::{self, FileLock},
+        lock::{self, AnyFileLock, FileLock},
         paged_engine::PagedEngine,
     },
     storage_engine::StorageEngine,
@@ -157,7 +157,7 @@ pub(crate) struct ClientInner {
     ///
     /// Stored as `Arc` so the same fd can be shared with the `FilePageSource`
     /// backing the buffer pool.
-    file_lock: Arc<dyn FileLock>,
+    file_lock: Arc<AnyFileLock>,
     /// Buffer pool handle — file I/O infrastructure wired in by R1.1.
     #[allow(dead_code)]
     pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
@@ -171,7 +171,7 @@ impl ClientInner {
     fn new_with_buffer_pool(
         path: Option<PathBuf>,
         opts: OpenOptions,
-        file_lock: Arc<dyn FileLock>,
+        file_lock: Arc<AnyFileLock>,
         buffer_pool: Arc<BufferPoolHandle>,
         catalog_root_page: u32,
         catalog_root_level: u8,
@@ -309,7 +309,7 @@ impl Client {
 
         // Acquire OS advisory file lock.
         // Store as Arc so the same fd can be shared with FilePageSource.
-        let file_lock: Arc<dyn FileLock> = Arc::from(lock::open_file_lock(&path)?);
+        let file_lock: Arc<AnyFileLock> = Arc::new(lock::open_file_lock(&path)?);
         let busy_timeout = opts.busy_timeout;
         #[cfg(feature = "tracing")]
         let _lock_t = std::time::Instant::now();
@@ -421,7 +421,7 @@ impl Client {
 
         let journal = Arc::new(Mutex::new(journal_mgr));
 
-        let file_src = Arc::new(FilePageSource::new(Arc::clone(&file_lock)));
+        let file_src = Arc::new(FilePageSource::new(Arc::clone(&file_lock) as Arc<dyn FileLock>));
         let layered_source: Box<dyn crate::storage::buffer_pool::PageSource> =
             Box::new(JournalLayeredSource::new(
                 Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,
@@ -486,6 +486,7 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn database(&self, name: &str) -> Database {
         Database {
             inner: Arc::clone(&self.inner),

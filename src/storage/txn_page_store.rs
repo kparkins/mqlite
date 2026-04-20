@@ -28,17 +28,14 @@
 //!   need.
 //!
 //! Concurrency: a `TxnPageStore` and its backing [`TxnOverlay`] are
-//! single-threaded per write-txn — the engine's outer
-//! `Mutex<BpBackend>` already serializes every writer. The overlay is
-//! nevertheless shared via `Arc<Mutex<_>>` (not `Rc<RefCell<_>>`)
-//! because `BpBackend` itself must be `Send` / `Sync` so it can live
-//! inside that `Mutex`. The inner `Mutex<TxnOverlay>` never actually
-//! contends: writers-inside-a-txn are serial by construction, and it is
-//! there purely as a `Send` shim. PR 8 may revisit this once per-lane
-//! `Mutex<BpBackend>` splits land.
+//! single-threaded per write-txn — the engine's outer `Mutex<BpBackend>`
+//! (or per-lane mutex in PR 8+) already serializes every writer. The
+//! overlay is owned exclusively by the write path for the duration of a
+//! transaction and passed to helpers by `&mut` reference. No `Arc`,
+//! `Mutex`, or `RefCell` wrapping is needed.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
@@ -126,12 +123,9 @@ pub(crate) struct TxnOverlay {
 }
 
 impl TxnOverlay {
-    /// Create a fresh overlay wrapped in the `Arc<Mutex<_>>` used by
-    /// writer helpers. The inner `Mutex` never contends — see the
-    /// module docstring — but it is required so `BpBackend` stays
-    /// `Send + Sync`.
-    pub(crate) fn new_shared() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self::default()))
+    /// Create a fresh, empty overlay for a new writer transaction.
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     /// Apply every staged page to the shared buffer-pool frames via
@@ -290,32 +284,29 @@ impl TxnOverlay {
 // TxnPageStore — BTreePageStore adapter layering overlay over base
 // ---------------------------------------------------------------------------
 
-/// `BTreePageStore` that routes writes into a shared [`TxnOverlay`] and
+/// `BTreePageStore` that routes writes into a [`TxnOverlay`] and
 /// falls back to `base` for any page not present in the overlay.
 ///
-/// Each writer helper that opens a BTree during `with_txn` should
-/// construct a fresh `TxnPageStore` backed by a clone of the same
-/// `Arc<Mutex<TxnOverlay>>` so every helper sees every prior write.
-pub(crate) struct TxnPageStore {
+/// Each writer helper that opens a BTree constructs a `TxnPageStore`
+/// borrowing the same `&mut TxnOverlay` so every helper sees every
+/// prior write within the transaction.
+pub(crate) struct TxnPageStore<'a> {
     base: BufferPoolPageStore,
-    overlay: Arc<Mutex<TxnOverlay>>,
+    overlay: &'a mut TxnOverlay,
 }
 
-impl TxnPageStore {
-    pub(crate) fn new(base: BufferPoolPageStore, overlay: Arc<Mutex<TxnOverlay>>) -> Self {
+impl<'a> TxnPageStore<'a> {
+    pub(crate) fn new(base: BufferPoolPageStore, overlay: &'a mut TxnOverlay) -> Self {
         Self { base, overlay }
     }
 }
 
-impl BTreePageStore for TxnPageStore {
+impl<'a> BTreePageStore for TxnPageStore<'a> {
     // ---- Reads: overlay first, fall back to base.
 
     fn read_internal(&self, page: u32) -> Result<Box<[u8; INTERNAL_SIZE]>> {
-        {
-            let ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-            if let Some(buf) = ov.overlay_4k.get(&page) {
-                return Ok(buf.clone());
-            }
+        if let Some(buf) = self.overlay.overlay_4k.get(&page) {
+            return Ok(buf.clone());
         }
         self.base.read_internal(page)
     }
@@ -324,14 +315,7 @@ impl BTreePageStore for TxnPageStore {
         &self,
         page: u32,
     ) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
-        // Scope the overlay lookup so we either return with a cloned
-        // overlay buffer or release the guard before re-reading the
-        // shared frame.
-        let overlay_hit = {
-            let ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-            ov.overlay_32k.get(&page).cloned()
-        };
-        if let Some(buf) = overlay_hit {
+        if let Some(buf) = self.overlay.overlay_32k.get(&page).cloned() {
             // The chain snapshot lives on the shared frame; a txn-local
             // byte overlay doesn't duplicate chains. Pin-and-snapshot
             // against the real frame so MVCC visibility logic keeps
@@ -345,21 +329,19 @@ impl BTreePageStore for TxnPageStore {
     // ---- Writes: stage into the overlay. NEVER touch the shared frame.
 
     fn write_internal(&mut self, page: u32, data: &[u8; INTERNAL_SIZE]) -> Result<()> {
-        let mut ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-        let existed = ov.overlay_4k.contains_key(&page);
-        ov.overlay_4k.insert(page, Box::new(*data));
+        let existed = self.overlay.overlay_4k.contains_key(&page);
+        self.overlay.overlay_4k.insert(page, Box::new(*data));
         if !existed {
-            ov.touched_4k.push(page);
+            self.overlay.touched_4k.push(page);
         }
         Ok(())
     }
 
     fn write_leaf(&mut self, page: u32, data: &[u8; LEAF_SIZE]) -> Result<()> {
-        let mut ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-        let existed = ov.overlay_32k.contains_key(&page);
-        ov.overlay_32k.insert(page, Box::new(*data));
+        let existed = self.overlay.overlay_32k.contains_key(&page);
+        self.overlay.overlay_32k.insert(page, Box::new(*data));
         if !existed {
-            ov.touched_32k.push(page);
+            self.overlay.touched_32k.push(page);
         }
         Ok(())
     }
@@ -384,10 +366,9 @@ impl BTreePageStore for TxnPageStore {
         // shared frame before the txn becomes visible, so later
         // in-txn writes to the same page simply overwrite the seed.
         let seed = empty_internal_page_bytes()?;
-        let mut ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-        ov.overlay_4k.insert(page, Box::new(seed));
-        ov.touched_4k.push(page);
-        ov.push_reservation(PageReservation {
+        self.overlay.overlay_4k.insert(page, Box::new(seed));
+        self.overlay.touched_4k.push(page);
+        self.overlay.push_reservation(PageReservation {
             page,
             size: PageSize::Small4k,
             origin: PageOrigin::NewAlloc,
@@ -406,10 +387,9 @@ impl BTreePageStore for TxnPageStore {
         // empty-leaf seed is always fully overwritten before it can be
         // misinterpreted.
         let seed = empty_leaf_page_bytes()?;
-        let mut ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-        ov.overlay_32k.insert(page, Box::new(seed));
-        ov.touched_32k.push(page);
-        ov.push_reservation(PageReservation {
+        self.overlay.overlay_32k.insert(page, Box::new(seed));
+        self.overlay.touched_32k.push(page);
+        self.overlay.push_reservation(PageReservation {
             page,
             size: PageSize::Large32k,
             origin: PageOrigin::NewAlloc,
@@ -427,32 +407,26 @@ impl BTreePageStore for TxnPageStore {
         // too. Otherwise rollback would double-free the page — the
         // in-txn `free_*` already returned it to the allocator free
         // list.
-        {
-            let mut ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-            if ov.overlay_4k.remove(&page).is_some() {
-                ov.touched_4k.retain(|p| *p != page);
-            }
-            ov.reservations.retain(|r| {
-                !(r.page == page
-                    && r.size == PageSize::Small4k
-                    && r.origin == PageOrigin::NewAlloc)
-            });
+        if self.overlay.overlay_4k.remove(&page).is_some() {
+            self.overlay.touched_4k.retain(|p| *p != page);
         }
+        self.overlay.reservations.retain(|r| {
+            r.page != page
+                || r.size != PageSize::Small4k
+                || r.origin != PageOrigin::NewAlloc
+        });
         self.base.free_internal(page)
     }
 
     fn free_leaf(&mut self, page: u32) -> Result<()> {
-        {
-            let mut ov = self.overlay.lock().expect("TxnOverlay mutex poisoned");
-            if ov.overlay_32k.remove(&page).is_some() {
-                ov.touched_32k.retain(|p| *p != page);
-            }
-            ov.reservations.retain(|r| {
-                !(r.page == page
-                    && r.size == PageSize::Large32k
-                    && r.origin == PageOrigin::NewAlloc)
-            });
+        if self.overlay.overlay_32k.remove(&page).is_some() {
+            self.overlay.touched_32k.retain(|p| *p != page);
         }
+        self.overlay.reservations.retain(|r| {
+            r.page != page
+                || r.size != PageSize::Large32k
+                || r.origin != PageOrigin::NewAlloc
+        });
         self.base.free_leaf(page)
     }
 

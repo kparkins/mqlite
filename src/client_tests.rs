@@ -680,7 +680,7 @@ mod compat_tests {
         let model = IndexModel::builder()
             .keys(doc! { "x": 1i32 })
             .options(IndexOptions::new().unique(true))
-            .build().unwrap();
+            .build();
         col.create_index(model).unwrap();
         col.insert_one(&doc! { "x": "dup" }).unwrap();
         let docs = vec![
@@ -710,7 +710,7 @@ mod compat_tests {
         let model = IndexModel::builder()
             .keys(doc! { "x": 1i32 })
             .options(IndexOptions::new().unique(true))
-            .build().unwrap();
+            .build();
         col.create_index(model).unwrap();
         col.insert_one(&doc! { "x": "dup" }).unwrap();
         let docs = vec![
@@ -809,7 +809,7 @@ mod compat_tests {
             let model = IndexModel::builder()
                 .keys(doc! { "email": 1i32 })
                 .options(IndexOptions::new().unique(true).name("email_1".to_string()))
-                .build().unwrap();
+                .build();
             col.create_index(model).expect("create email index");
             assert!(col.find_one(doc! { "email": reference_email }).expect("find_one before close").is_some());
             db.close().expect("close database");
@@ -840,7 +840,7 @@ mod compat_tests {
         for i in 0..10i32 {
             col.insert_one(&doc! { "score": i }).unwrap();
         }
-        let model = IndexModel::builder().keys(doc! { "score": 1i32 }).build().unwrap();
+        let model = IndexModel::builder().keys(doc! { "score": 1i32 }).build();
         let idx_name = col.create_index(model).unwrap();
         let filter = doc! { "score": { "$ne": 5i32 } };
         let with_index: Vec<Document> = col.find(filter.clone()).run().unwrap()
@@ -865,7 +865,7 @@ mod compat_tests {
         let model = IndexModel::builder()
             .keys(doc! { "email": 1i32 })
             .options(IndexOptions::new().unique(true))
-            .build().unwrap();
+            .build();
         col.create_index(model).unwrap();
         col.insert_one(&doc! { "email": "alice@example.com" }).unwrap();
         let err = col.insert_one(&doc! { "email": "alice@example.com" }).unwrap_err();
@@ -890,7 +890,7 @@ mod compat_tests {
         let _tempdir = TempDir::new().expect("tempdir");
         let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let col = client.database("test").collection::<Document>("u");
-        let model = IndexModel::builder().keys(doc! { "description": "text" }).build().unwrap();
+        let model = IndexModel::builder().keys(doc! { "description": "text" }).build();
         let err = col.create_index(model).unwrap_err();
         assert!(matches!(err, Error::UnsupportedIndexOption { .. }));
         assert_eq!(err.code(), Some(codes::CANNOT_CREATE_INDEX));
@@ -955,7 +955,7 @@ mod journal_atomicity_tests {
                 IndexModel::builder()
                     .keys(doc! { "email": 1 })
                     .options(IndexOptions::new().unique(true))
-                    .build().unwrap(),
+                    .build(),
             ).expect("create unique index");
             col.insert_one(&doc! { "_id": 1i32, "email": "a@b.com" }).expect("first insert succeeds");
             let err = col.insert_one(&doc! { "_id": 2i32, "email": "a@b.com" }).unwrap_err();
@@ -978,7 +978,7 @@ mod journal_atomicity_tests {
             IndexModel::builder()
                 .keys(doc! { "email": 1 })
                 .options(IndexOptions::new().unique(true))
-                .build().unwrap(),
+                .build(),
         ).expect("create unique index");
         col.update_one(doc! { "_id": 1i32 }, doc! { "$set": { "email": "x@y.com" } })
             .upsert(true)

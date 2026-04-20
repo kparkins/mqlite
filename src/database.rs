@@ -67,6 +67,7 @@ impl Database {
     // -------------------------------------------------------------------------
 
     /// The name of this database.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.db_name
     }
@@ -88,6 +89,7 @@ impl Database {
     /// This call is infallible — the collection is not created until the first write.
     /// The returned [`Collection`] uses the qualified name `<db>.<collection>` as
     /// its engine key.
+    #[must_use]
     pub fn collection<T: Serialize + DeserializeOwned>(&self, name: &str) -> Collection<T> {
         Collection {
             db_name: self.db_name.clone(),
@@ -109,13 +111,7 @@ impl Database {
         let all = self.inner.list_collection_names()?;
         let filtered = all
             .into_iter()
-            .filter_map(|n| {
-                if let Some(local) = n.strip_prefix(&prefix) {
-                    Some(local.to_owned())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|n| n.strip_prefix(&prefix).map(str::to_owned))
             .collect();
         Ok(filtered)
     }

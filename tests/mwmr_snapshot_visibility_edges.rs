@@ -292,8 +292,7 @@ fn list_indexes_returns_ready_only() {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "score": 1i32 })
-                    .build()
-                    .unwrap(),
+                    .build(),
             )
             .unwrap();
     });

@@ -57,8 +57,7 @@ use crate::storage::catalog::IndexEntry;
 /// - `{email: 1}` → `"email_1"`
 /// - `{name: 1, age: -1}` → `"name_1_age_-1"`
 pub(crate) fn generate_index_name(keys: &Document) -> String {
-    let parts: Vec<String> = keys
-        .iter()
+    keys.iter()
         .map(|(field, dir)| {
             let suffix = match dir {
                 Bson::Int32(-1) | Bson::Int64(-1) => "-1",
@@ -66,8 +65,8 @@ pub(crate) fn generate_index_name(keys: &Document) -> String {
             };
             format!("{field}_{suffix}")
         })
-        .collect();
-    parts.join("_")
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 // ---------------------------------------------------------------------------
@@ -147,10 +146,11 @@ pub(crate) fn build_index_keys(
     }
 
     if let Some(arr_idx) = array_field_idx {
-        // Multikey: generate one entry per array element.
-        let arr = match fields[arr_idx].1.unwrap() {
-            Bson::Array(a) => a,
-            _ => unreachable!(),
+        // Multikey: generate one entry per array element. The invariant set
+        // above guarantees that `fields[arr_idx].1` is `Some(Bson::Array(_))`.
+        let arr = match fields[arr_idx].1 {
+            Some(Bson::Array(a)) => a,
+            _ => return Err(Error::Internal("secondary_index: array_field_idx invariant broken".into())),
         };
 
         let mut keys = Vec::with_capacity(arr.len());
@@ -190,7 +190,7 @@ fn unique_range(field_values: &[(&Bson, bool)]) -> (Vec<u8>, Vec<u8>) {
     let mut start = encode_compound_key(field_values);
     start.push(COMPOUND_SEP);
     let mut end = start.clone();
-    *end.last_mut().expect("non-empty prefix") += 1; // 0x01 → 0x02, safe
+    *end.last_mut().expect("encode_compound_key always produces a non-empty byte slice") += 1; // 0x01 → 0x02, safe
     (start, end)
 }
 
@@ -236,8 +236,7 @@ pub(crate) fn check_unique_constraint<S: BTreePageStore>(
         if existing_key != &my_key {
             return Err(Error::DuplicateKey {
                 detail: format!(
-                    "E11000 duplicate key error — unique index violation on key pattern {:?}",
-                    key_pattern
+                    "E11000 duplicate key error — unique index violation on key pattern {key_pattern:?}"
                 ),
             });
         }
@@ -326,7 +325,7 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
     // on the second insert. In the staged model we dedupe up front so the
     // commit-time install doesn't see duplicates from the same doc.
     let staged_keys: Vec<Vec<u8>> = if is_multikey {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::with_capacity(keys.len());
         keys.into_iter().filter(|k| seen.insert(k.clone())).collect()
     } else {
         keys
