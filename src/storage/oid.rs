@@ -89,7 +89,10 @@ impl ObjectIdGenerator {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Return the current Unix time in whole seconds.
+/// Return the current Unix time in whole seconds, truncated to `u32`.
+///
+/// Overflows after Feb 2106 — acceptable for MongoDB's 4-byte ObjectId
+/// timestamp field.
 fn current_timestamp_secs() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,10 +106,9 @@ fn current_timestamp_secs() -> u32 {
 /// a collision within a single second across 2^24 (~16M) inserts is
 /// astronomically unlikely in practice.
 fn next_counter() -> [u8; 3] {
-    let val = COUNTER.fetch_add(1, Ordering::Relaxed);
-    // Extract the low 3 bytes in big-endian order
-    let be = val.to_be_bytes();
-    [be[1], be[2], be[3]]
+    // Extract the low 3 bytes in big-endian order.
+    let [_, b1, b2, b3] = COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+    [b1, b2, b3]
 }
 
 /// Initialize the 5-byte per-process random component.

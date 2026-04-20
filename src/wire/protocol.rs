@@ -34,8 +34,31 @@
 //! Phase 1 implementation: tracked in hq-6d0 (Phase 1c: OP_MSG framing parser and generator).
 
 use bson::{Document, RawDocumentBuf};
+use smallvec::SmallVec;
 
 use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Low-level read helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn read_le_i32(buf: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes(
+        buf[off..off + 4]
+            .try_into()
+            .expect("caller verified buf.len() >= off + 4"),
+    )
+}
+
+#[inline]
+fn read_le_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(
+        buf[off..off + 4]
+            .try_into()
+            .expect("caller verified buf.len() >= off + 4"),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -102,10 +125,10 @@ impl MsgHeader {
             });
         }
         Ok(MsgHeader {
-            message_length: i32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            request_id: i32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            response_to: i32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            op_code: i32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            message_length: read_le_i32(buf, 0),
+            request_id: read_le_i32(buf, 4),
+            response_to: read_le_i32(buf, 8),
+            op_code: read_le_i32(buf, 12),
         })
     }
 
@@ -160,7 +183,7 @@ pub struct OpMsg {
     pub flag_bits: u32,
 
     /// Parsed sections (at least one Kind-0 body section).
-    pub sections: Vec<Section>,
+    pub sections: SmallVec<[Section; 1]>,
 
     /// CRC-32C checksum if `FLAG_CHECKSUM_PRESENT` is set.
     pub checksum: Option<u32>,
@@ -238,7 +261,7 @@ impl OpMsg {
                 detail: "message too short to contain flagBits".into(),
             });
         }
-        let flag_bits = u32::from_le_bytes(msg[FLAGS_OFFSET..SECTIONS_OFFSET].try_into().unwrap());
+        let flag_bits = read_le_u32(msg, FLAGS_OFFSET);
 
         // If checksum is present the last 4 bytes of the message are the CRC.
         let checksum_present = flag_bits & FLAG_CHECKSUM_PRESENT != 0;
@@ -255,7 +278,7 @@ impl OpMsg {
 
         // --- Validate checksum before decoding sections ---
         let checksum = if checksum_present {
-            let stored = u32::from_le_bytes(msg[sections_end..].try_into().unwrap());
+            let stored = read_le_u32(msg, sections_end);
             let computed = crc32c::crc32c(&msg[..sections_end]);
             if stored != computed {
                 return Err(Error::InvalidWireMessage {
@@ -333,13 +356,10 @@ impl OpMsg {
 // ---------------------------------------------------------------------------
 
 /// Parse all sections from `buf` (the slice between flagBits and checksum).
-fn parse_sections(mut buf: &[u8]) -> Result<Vec<Section>> {
-    let mut sections = Vec::new();
+fn parse_sections(mut buf: &[u8]) -> Result<SmallVec<[Section; 1]>> {
+    let mut sections = SmallVec::new();
 
     while !buf.is_empty() {
-        if buf.is_empty() {
-            break;
-        }
         let kind = buf[0];
         buf = &buf[1..];
 
@@ -356,7 +376,7 @@ fn parse_sections(mut buf: &[u8]) -> Result<Vec<Section>> {
                         detail: "Kind-1 section too short for size field".into(),
                     });
                 }
-                let size = i32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+                let size = read_le_i32(buf, 0) as usize;
                 if size < 4 || size > buf.len() {
                     return Err(Error::InvalidWireMessage {
                         detail: format!(
@@ -386,7 +406,7 @@ fn parse_sections(mut buf: &[u8]) -> Result<Vec<Section>> {
 
                 // Remaining bytes are BSON documents.
                 let mut doc_buf = &section_buf[null_pos + 1..];
-                let mut documents = Vec::new();
+                let mut documents: SmallVec<[Document; 1]> = SmallVec::new();
                 while !doc_buf.is_empty() {
                     let doc = read_bson_document(&mut doc_buf)?;
                     documents.push(doc);
@@ -394,7 +414,7 @@ fn parse_sections(mut buf: &[u8]) -> Result<Vec<Section>> {
 
                 sections.push(Section::DocSequence {
                     identifier,
-                    documents,
+                    documents: documents.into_vec(),
                 });
             }
             other => {
@@ -421,7 +441,7 @@ fn read_bson_document(buf: &mut &[u8]) -> Result<Document> {
             ),
         });
     }
-    let size = i32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let size = read_le_i32(buf, 0) as usize;
     if size < 5 {
         // Minimum valid BSON document is 5 bytes ({} = int32 size + 0x00 terminator).
         return Err(Error::InvalidWireMessage {
@@ -687,7 +707,10 @@ mod tests {
             v.push(0); // null terminator
             v
         };
-        let docs_bytes: Vec<u8> = docs.iter().flat_map(|d| bson::to_vec(d).unwrap()).collect();
+        let mut docs_bytes: Vec<u8> = Vec::with_capacity(docs.len() * 128);
+        for d in docs.iter() {
+            bson::to_writer(&mut docs_bytes, d).expect("BSON serialisation should not fail in test");
+        }
         // size field (4) + identifier + docs
         let section_payload_size = 4 + id_bytes.len() + docs_bytes.len();
 

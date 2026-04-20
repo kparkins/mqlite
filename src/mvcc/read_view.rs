@@ -349,9 +349,9 @@ impl ReadViewRegistry {
 /// backing overflow chain cannot be freed while the snapshot is live.
 ///
 /// Drop follows the default Rust drop-glue: the outer `HashMap` drops each
-/// `Arc<VecDeque<VersionEntry>>`, the last `Arc` drops the `VecDeque` which
-/// drops every contained `VersionEntry`, which in turn runs
-/// `OverflowRef::Drop` (atomic decref + deferred-free enqueue on 0).
+/// `VecDeque<VersionEntry>`, which drops every contained `VersionEntry`,
+/// which in turn runs `OverflowRef::Drop` (atomic decref + deferred-free
+/// enqueue on 0).
 ///
 /// **S13 force-expiry contract:**
 ///
@@ -367,11 +367,11 @@ impl ReadViewRegistry {
 ///    `force_expire` does NOT walk snapshot pins. Every refcount bump has
 ///    a matching decref through a single code path.
 pub struct ChainSnapshot {
-    /// Deep-cloned per-key chains. Each inner `Arc<VecDeque<VersionEntry>>`
-    /// is freshly allocated; the `VersionEntry` values inside each
+    /// Deep-cloned per-key chains. Each `VecDeque<VersionEntry>` is owned
+    /// exclusively by this snapshot; the `VersionEntry` values inside each
     /// `VecDeque` were cloned from the source (running `OverflowRef::Clone`
     /// for `VersionData::Overflow` entries).
-    chains: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+    chains: HashMap<Vec<u8>, VecDeque<VersionEntry>>,
     /// Back-reference to the owning reader's `ReadView`, used for the S13
     /// poison check during `new`. `None` on reader paths that predate the
     /// T4 `ReadViewRegistry` wiring (every construction site in T3.75
@@ -417,7 +417,7 @@ impl ChainSnapshot {
         let mut chains = HashMap::with_capacity(source.len());
         for (k, chain) in source {
             let cloned: VecDeque<VersionEntry> = chain.iter().cloned().collect();
-            chains.insert(k.clone(), Arc::new(cloned));
+            chains.insert(k.clone(), cloned);
         }
 
         // Re-check poison AFTER the bumps. If force-expiry fired while we
@@ -466,7 +466,7 @@ impl ChainSnapshot {
 
     /// Length of the chain for `key`, or 0 if absent.
     pub fn chain_len(&self, key: &[u8]) -> usize {
-        self.chains.get(key).map(|c| c.len()).unwrap_or(0)
+        self.chains.get(key).map_or(0, |c| c.len())
     }
 }
 

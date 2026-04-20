@@ -8,6 +8,8 @@ use std::path::Path;
 use bson::{Bson, Document};
 use serde::{de::DeserializeOwned, Serialize};
 
+use crate::storage::lock::FileLock;
+
 use crate::{
     cursor::Cursor,
     error::{Error, Result},
@@ -62,8 +64,8 @@ impl ClientInner {
             doc_count = docs.len() as u64,
             "mqlite::insert"
         );
-        let mut inserted_ids: HashMap<usize, Bson> = HashMap::new();
-        let mut errors: Vec<BulkWriteError> = Vec::new();
+        let mut inserted_ids: HashMap<usize, Bson> = HashMap::with_capacity(docs.len());
+        let mut errors: Vec<BulkWriteError> = Vec::with_capacity(docs.len());
 
         'outer: for (i, doc) in docs.iter().enumerate() {
             let bson_doc = match bson::to_document(doc).map_err(Error::BsonSerialization) {

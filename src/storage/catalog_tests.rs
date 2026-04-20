@@ -18,10 +18,7 @@ fn make_catalog() -> Catalog<MemPageStore> {
 }
 
 fn index_model(keys: Document) -> IndexModel {
-    IndexModel::builder()
-        .keys(keys)
-        .build()
-        .expect("build index model")
+    IndexModel::builder().keys(keys).build()
 }
 
 // -----------------------------------------------------------------------

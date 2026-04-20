@@ -29,6 +29,10 @@
 //! of lifetime parameters and lets callers scope the guard with a
 //! closure or an explicit block.
 
+use std::sync::Arc;
+
+use smallvec::SmallVec;
+
 use crate::error::Result;
 use crate::journal::log_file::ChainPageWrite;
 use crate::mvcc::timestamp::{TimestampOracle, Ts};
@@ -36,6 +40,67 @@ use crate::mvcc::version::OverflowRef;
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::buffer_pool::PageSource;
 use crate::storage::handle::BufferPoolHandle;
+
+// ---------------------------------------------------------------------------
+// Namespace string — cheap clone via Arc refcount
+// ---------------------------------------------------------------------------
+
+/// Namespace string backed by `Arc<str>` so cloning staged writes costs a
+/// refcount bump rather than a heap allocation.
+///
+/// Implements `PartialEq<&str>` and `PartialEq<str>` for ergonomic test
+/// assertions (`assert_eq!(pw.ns, "db.coll")`).
+#[derive(Debug, Clone)]
+pub(crate) struct Ns(Arc<str>);
+
+impl Ns {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for Ns {
+    fn from(s: &str) -> Self {
+        Ns(Arc::from(s))
+    }
+}
+
+impl From<String> for Ns {
+    fn from(s: String) -> Self {
+        Ns(Arc::from(s.as_str()))
+    }
+}
+
+impl From<Arc<str>> for Ns {
+    fn from(a: Arc<str>) -> Self {
+        Ns(a)
+    }
+}
+
+impl PartialEq<str> for Ns {
+    fn eq(&self, other: &str) -> bool {
+        self.0.as_ref() == other
+    }
+}
+
+impl PartialEq<&str> for Ns {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_ref() == *other
+    }
+}
+
+impl PartialEq<Ns> for Ns {
+    fn eq(&self, other: &Ns) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl std::ops::Deref for Ns {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Pending secondary-index write (staging buffer entry)
@@ -89,7 +154,7 @@ pub(crate) struct PrimaryWrite {
     /// Target data-tree namespace. The install pass looks up the current
     /// tree by name so any in-txn root splits between stage and install
     /// time are transparently followed.
-    pub(crate) ns: String,
+    pub(crate) ns: Ns,
     /// B+ tree cell key (e.g. `encode_key(_id)`).
     pub(crate) key: Vec<u8>,
     /// Kind of write, carrying any associated payload bytes.
@@ -132,28 +197,28 @@ pub(crate) struct WriteTxn {
     /// Overflow chains staged by this transaction. Each `OverflowRef`
     /// holds one refcount; drop order is irrelevant (atomic decref +
     /// deferred-free enqueue).
-    pub(crate) pending: Vec<OverflowRef>,
+    pub(crate) pending: SmallVec<[OverflowRef; 2]>,
     /// Page writes to include in the `ChainCommit` journal frame. Each
     /// entry is a (page, size, bytes) triple. Phase 2 leaves this empty;
     /// phases 4/6 populate it as chain mutations land.
-    pub(crate) page_writes: Vec<ChainPageWrite>,
+    pub(crate) page_writes: SmallVec<[ChainPageWrite; 2]>,
     /// Refcount deltas to record in the `ChainCommit` frame for recovery.
     /// `(first_page, +1)` for newly allocated overflow chains; `(-1)` for
     /// chains dropped at commit. Phase 2 leaves this empty.
-    pub(crate) refcount_deltas: Vec<(u32, i32)>,
+    pub(crate) refcount_deltas: SmallVec<[(u32, i32); 2]>,
     /// Pending secondary-index mutations staged by this transaction.
     /// Phase 5 populates this via `stage_sec_index_{insert,delete,update}`;
     /// Phase 6 drains it at commit and installs each entry into the
     /// per-key version chain under the shared `commit_ts`. On abort, the
     /// buffer is dropped with `self` — `SecIndexWrite` owns no external
     /// refcount state, so no RAII cleanup is required beyond vec drop.
-    pub(crate) pending_sec_index: Vec<SecIndexWrite>,
+    pub(crate) pending_sec_index: SmallVec<[SecIndexWrite; 2]>,
     /// Pending primary-tree (data-tree) mutations staged by this transaction.
     /// Phase 6 sub-step 2 populates this via `stage_primary_{insert,update,delete}`;
     /// sub-step 2's install pass at commit drains the buffer and installs a
     /// `VersionEntry` at the head of each key's version chain on the owning
     /// leaf frame, advancing the prior head's `stop_ts` to `commit_ts`.
-    pub(crate) pending_primary: Vec<PrimaryWrite>,
+    pub(crate) pending_primary: SmallVec<[PrimaryWrite; 2]>,
     /// True after `commit()` has transferred `pending` ownership into the
     /// durable chain. `Drop` checks this to avoid decrementing refcounts
     /// that now belong to installed chains.
@@ -169,11 +234,11 @@ impl WriteTxn {
         Self {
             txn_id,
             commit_ts: Ts::PENDING,
-            pending: Vec::new(),
-            page_writes: Vec::new(),
-            refcount_deltas: Vec::new(),
-            pending_sec_index: Vec::new(),
-            pending_primary: Vec::new(),
+            pending: SmallVec::new(),
+            page_writes: SmallVec::new(),
+            refcount_deltas: SmallVec::new(),
+            pending_sec_index: SmallVec::new(),
+            pending_primary: SmallVec::new(),
             finalized: false,
         }
     }
@@ -270,12 +335,12 @@ impl WriteTxn {
     /// Stage a primary-tree insert for commit-time chain installation.
     pub(crate) fn stage_primary_insert(
         &mut self,
-        ns: String,
+        ns: impl Into<Ns>,
         key: Vec<u8>,
         data: Vec<u8>,
     ) {
         self.pending_primary.push(PrimaryWrite {
-            ns,
+            ns: ns.into(),
             key,
             op: PrimaryOp::Insert { data },
         });
@@ -284,21 +349,21 @@ impl WriteTxn {
     /// Stage a primary-tree update for commit-time chain installation.
     pub(crate) fn stage_primary_update(
         &mut self,
-        ns: String,
+        ns: impl Into<Ns>,
         key: Vec<u8>,
         data: Vec<u8>,
     ) {
         self.pending_primary.push(PrimaryWrite {
-            ns,
+            ns: ns.into(),
             key,
             op: PrimaryOp::Update { data },
         });
     }
 
     /// Stage a primary-tree delete (tombstone) for commit-time chain installation.
-    pub(crate) fn stage_primary_delete(&mut self, ns: String, key: Vec<u8>) {
+    pub(crate) fn stage_primary_delete(&mut self, ns: impl Into<Ns>, key: Vec<u8>) {
         self.pending_primary.push(PrimaryWrite {
-            ns,
+            ns: ns.into(),
             key,
             op: PrimaryOp::Delete,
         });
@@ -345,21 +410,18 @@ impl WriteTxn {
         oracle: &TimestampOracle,
         journal: &BufferPoolHandle,
     ) -> Result<(Ts, Vec<OverflowRef>, Vec<SecIndexWrite>)> {
-        let commit_ts = if self.commit_ts == Ts::PENDING {
-            let ts = oracle.commit()?;
-            self.commit_ts = ts;
-            ts
-        } else {
-            self.commit_ts
-        };
+        if self.commit_ts == Ts::PENDING {
+            self.commit_ts = oracle.commit()?;
+        }
+        let commit_ts = self.commit_ts;
 
         // Move pending / page_writes / refcount_deltas / pending_sec_index
         // out of self BEFORE journaling — so that on journal failure we
         // still own `pending` and Drop runs decref.
-        let pending = std::mem::take(&mut self.pending);
-        let page_writes = std::mem::take(&mut self.page_writes);
-        let refcount_deltas = std::mem::take(&mut self.refcount_deltas);
-        let pending_sec_index = std::mem::take(&mut self.pending_sec_index);
+        let pending = std::mem::take(&mut self.pending).into_vec();
+        let page_writes = std::mem::take(&mut self.page_writes).into_vec();
+        let refcount_deltas = std::mem::take(&mut self.refcount_deltas).into_vec();
+        let pending_sec_index = std::mem::take(&mut self.pending_sec_index).into_vec();
 
         journal.append_chain_commit(commit_ts, refcount_deltas, page_writes)?;
 

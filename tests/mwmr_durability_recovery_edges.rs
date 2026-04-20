@@ -289,8 +289,7 @@ fn tc5_page0_correctness_after_journal_recovery() {
                 mqlite::IndexOptions::new()
                     .name(index_name.to_string()),
             )
-            .build()
-            .unwrap();
+            .build();
         col.create_index(model).expect("create seq index");
 
         // Drop → implicit checkpoint.

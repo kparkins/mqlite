@@ -39,6 +39,8 @@ use std::sync::{
     Arc,
 };
 
+use tokio_util::sync::CancellationToken;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -64,6 +66,9 @@ use op_query::{build_op_reply, parse_op_query_body, parse_op_query_db_name};
 /// `isMaster` / `hello` handshake before wire version is established.
 const OP_QUERY: i32 = 2004;
 
+/// How long to wait for any read on an idle connection before closing it.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // Server state
 // ---------------------------------------------------------------------------
@@ -77,7 +82,7 @@ const OP_QUERY: i32 = 2004;
 pub(crate) struct ServerState {
     /// Time when this `WireProtocol` instance was started.
     /// Used to compute uptime in the `serverStatus` response.
-    pub(crate) start_time: Arc<std::time::Instant>,
+    pub(crate) start_time: std::time::Instant,
 
     /// Monotonically increasing counter used to assign unique per-connection IDs.
     /// Starts at 1; each new connection receives the old value before increment.
@@ -94,11 +99,14 @@ pub(crate) struct ServerState {
     /// Shared client inner state — used by CRUD command handlers.
     pub(crate) database: Arc<ClientInner>,
 
+    /// Cancellation token used to signal all connection tasks to stop.
+    pub(crate) cancel: CancellationToken,
+
     /// Keeps the temp directory alive for the lifetime of this state.
     /// Only populated when `ServerState` is constructed without an explicit
     /// database path (i.e., in tests via `default()` or `new()`).
     #[cfg(test)]
-    pub(crate) _tempdir: Option<Arc<tempfile::TempDir>>,
+    pub(crate) _tempdir: Option<tempfile::TempDir>,
 }
 
 #[cfg(test)]
@@ -108,12 +116,13 @@ impl Default for ServerState {
         let db_path = tempdir.path().join("mqlite_test.db");
         let client = Client::open(&db_path).expect("open tempdir-backed client");
         ServerState {
-            start_time: Arc::new(std::time::Instant::now()),
+            start_time: std::time::Instant::now(),
             next_connection_id: Arc::new(AtomicI32::new(1)),
             db_path: Some(db_path.clone()),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
-            _tempdir: Some(Arc::new(tempdir)),
+            cancel: CancellationToken::new(),
+            _tempdir: Some(tempdir),
         }
     }
 }
@@ -128,12 +137,13 @@ impl ServerState {
         let tmp_db_path = tempdir.path().join("mqlite_test.db");
         let client = Client::open(&tmp_db_path).expect("open tempdir-backed client");
         ServerState {
-            start_time: Arc::new(std::time::Instant::now()),
+            start_time: std::time::Instant::now(),
             next_connection_id: Arc::new(AtomicI32::new(1)),
             db_path: Some(db_path.unwrap_or(tmp_db_path)),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
-            _tempdir: Some(Arc::new(tempdir)),
+            cancel: CancellationToken::new(),
+            _tempdir: Some(tempdir),
         }
     }
 
@@ -142,11 +152,12 @@ impl ServerState {
     /// Used by [`WireProtocol::bind`] to wire CRUD handlers to the actual client.
     fn new_with_db(client: &Client) -> Self {
         ServerState {
-            start_time: Arc::new(std::time::Instant::now()),
+            start_time: std::time::Instant::now(),
             next_connection_id: Arc::new(AtomicI32::new(1)),
             db_path: client.inner.path.clone(),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
+            cancel: CancellationToken::new(),
             #[cfg(test)]
             _tempdir: None,
         }
@@ -294,8 +305,12 @@ impl WireProtocol {
 
                 // Run the accept loop until the shutdown signal arrives.
                 tokio::select! {
-                    _ = accept_loop(listener, state) => {}
-                    _ = shutdown_rx => {}
+                    _ = accept_loop(listener, state.clone()) => {}
+                    _ = shutdown_rx => {
+                        // Signal all connection tasks to stop, then wait up
+                        // to 5 seconds for them to drain.
+                        state.cancel.cancel();
+                    }
                 }
             });
         });
@@ -321,17 +336,33 @@ impl WireProtocol {
 // ---------------------------------------------------------------------------
 
 /// Accept incoming connections and spawn a task for each.
+///
+/// Uses a [`tokio::task::JoinSet`] to track all active connection tasks.
+/// Exits when the [`CancellationToken`] in `state` is cancelled or the
+/// listener encounters a hard error; waits up to 5 seconds for connections
+/// to finish before returning.
 async fn accept_loop(listener: tokio::net::TcpListener, state: ServerState) {
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _peer)) => {
-                let conn_state = state.clone();
-                tokio::spawn(handle_connection(stream, conn_state));
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _peer)) => {
+                        let conn_state = state.clone();
+                        join_set.spawn(handle_connection(stream, conn_state));
+                    }
+                    // A hard listener error causes an exit.
+                    Err(_) => break,
+                }
             }
-            // A hard listener error causes an exit.
-            Err(_) => break,
+            _ = state.cancel.cancelled() => break,
         }
     }
+    // Drain remaining connection tasks with a 5-second grace period.
+    let drain = async {
+        while join_set.join_next().await.is_some() {}
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +388,15 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
     loop {
         // Read the 16-byte header to determine the opcode.
         let mut header_buf = [0u8; MsgHeader::SIZE];
-        if stream.read_exact(&mut header_buf).await.is_err() {
-            break;
+        let read_header = tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut header_buf));
+        tokio::select! {
+            result = read_header => {
+                match result {
+                    Ok(Ok(())) => {}
+                    _ => break, // timeout or I/O error
+                }
+            }
+            _ = state.cancel.cancelled() => break,
         }
 
         let declared_len =
@@ -374,8 +412,9 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
         // Read the rest of the message.
         let remainder = declared_len - MsgHeader::SIZE;
         let mut rest = vec![0u8; remainder];
-        if stream.read_exact(&mut rest).await.is_err() {
-            break;
+        match tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut rest)).await {
+            Ok(Ok(())) => {}
+            _ => break, // timeout or I/O error
         }
 
         // Reassemble the full message buffer.
@@ -591,15 +630,11 @@ fn merge_doc_sequences_into_body(body: &Document, sections: &[Section]) -> Docum
         } = section
         {
             if !documents.is_empty() {
-                merged.insert(
-                    identifier.clone(),
-                    bson::Bson::Array(
-                        documents
-                            .iter()
-                            .map(|d| bson::Bson::Document(d.clone()))
-                            .collect(),
-                    ),
-                );
+                let mut arr: bson::Array = Vec::with_capacity(documents.len());
+                for d in documents {
+                    arr.push(bson::Bson::Document(d.clone()));
+                }
+                merged.insert(identifier.clone(), bson::Bson::Array(arr));
             }
         }
     }

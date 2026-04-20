@@ -196,17 +196,12 @@ fn extract_operator_condition(ops: &Document) -> Option<IndexCondition> {
     }
 
     // Range: one or more of $gt/$gte/$lt/$lte.
-    let has_range = ops.contains_key("$gt")
-        || ops.contains_key("$gte")
-        || ops.contains_key("$lt")
-        || ops.contains_key("$lte");
-    if has_range {
-        return Some(IndexCondition::Range {
-            gt: ops.get("$gt").cloned(),
-            gte: ops.get("$gte").cloned(),
-            lt: ops.get("$lt").cloned(),
-            lte: ops.get("$lte").cloned(),
-        });
+    let gt = ops.get("$gt").cloned();
+    let gte = ops.get("$gte").cloned();
+    let lt = ops.get("$lt").cloned();
+    let lte = ops.get("$lte").cloned();
+    if gt.is_some() || gte.is_some() || lt.is_some() || lte.is_some() {
+        return Some(IndexCondition::Range { gt, gte, lt, lte });
     }
 
     // $exists: true — field must be present.

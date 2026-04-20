@@ -46,6 +46,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use parking_lot::Mutex as ParkingMutex;
+
 use dashmap::{DashMap, DashSet};
 
 use crate::options::BusyHandler;
@@ -98,7 +100,7 @@ pub(crate) struct PagedEngine {
     /// Per-namespace write lanes. Two writers on different namespaces run
     /// in parallel; two writers on the same namespace serialize on the
     /// lane mutex.
-    ns_lanes: DashMap<String, Arc<Mutex<()>>>,
+    ns_lanes: DashMap<String, Arc<ParkingMutex<()>>>,
     /// Commit-sequencing mutex. All successful writes acquire it around
     /// the `commit_ts = oracle.commit()` → install_primary → flush →
     /// append_chain_commit → commit_txn → publish sequence, so
@@ -164,7 +166,7 @@ impl PagedEngine {
     // -----------------------------------------------------------------------
 
     /// Resolve the per-namespace lane mutex, creating one if needed.
-    fn lane_for(&self, ns: &str) -> Arc<Mutex<()>> {
+    fn lane_for(&self, ns: &str) -> Arc<ParkingMutex<()>> {
         state::lane_for(self, ns)
     }
 
@@ -172,7 +174,7 @@ impl PagedEngine {
     /// matching the client's legacy `acquire_writer_lock`.
     fn acquire_lane(
         &self,
-        lane: Arc<Mutex<()>>,
+        lane: Arc<ParkingMutex<()>>,
     ) -> Result<OwnedLaneGuard> {
         state::acquire_lane(self, lane)
     }
@@ -208,18 +210,15 @@ impl PagedEngine {
 
         // Open a journal mark + overlay so the bootstrap is atomic.
         let mark = self.shared.handle.begin_txn()?;
-        let overlay = TxnOverlay::new_shared();
+        let mut overlay = TxnOverlay::new();
         // Drain deferred-free into overlay reservations.
         let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
-        if !ready.is_empty() {
-            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
-            for page in ready {
-                ov.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+        for page in ready {
+            overlay.push_reservation(PageReservation {
+                page,
+                size: PageSize::Large32k,
+                origin: PageOrigin::DeferredFree,
+            });
         }
 
         let result: Result<()> = (|| {
@@ -228,19 +227,15 @@ impl PagedEngine {
                 .lock()
                 .expect("catalog poisoned")
                 .create_collection(ns, bson::doc! {}, now_millis())?;
-            sync_catalog_root_overlay(&self.shared, &md_w, &overlay)?;
-            let _ = BTree::create_at(new_txn_store(&self.shared, &overlay), data_root)?;
+            sync_catalog_root_overlay(&self.shared, &md_w, &mut overlay)?;
+            let _ = BTree::create_at(new_txn_store(&self.shared, &mut overlay), data_root)?;
             Ok(())
         })();
 
         match result {
             Ok(()) => {
-                let overlay_inner = Arc::try_unwrap(overlay)
-                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
-                    .into_inner()
-                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
                 let mut base_store = new_store(&self.shared);
-                overlay_inner.commit(&mut base_store, &self.shared.handle)?;
+                overlay.commit(&mut base_store, &self.shared.handle)?;
                 self.shared.handle.flush()?;
                 let db_page_count = self
                     .shared
@@ -269,11 +264,7 @@ impl PagedEngine {
                 Ok(())
             }
             Err(e) => {
-                let overlay_inner = Arc::try_unwrap(overlay)
-                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
-                    .into_inner()
-                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
-                overlay_inner.rollback(&self.shared.handle)?;
+                overlay.rollback(&self.shared.handle)?;
                 let _ = self.shared.handle.rollback_txn(mark);
                 Err(e)
             }
@@ -292,7 +283,7 @@ impl PagedEngine {
         F: FnOnce(
             &SharedState,
             &MetadataState,
-            &Arc<Mutex<TxnOverlay>>,
+            &mut TxnOverlay,
             &mut WriteTxn,
         ) -> Result<R>,
     {
@@ -334,7 +325,7 @@ impl PagedEngine {
         F: FnOnce(
             &SharedState,
             &MetadataState,
-            &Arc<Mutex<TxnOverlay>>,
+            &mut TxnOverlay,
             &mut WriteTxn,
         ) -> Result<R>,
     {
@@ -346,17 +337,14 @@ impl PagedEngine {
 
         // Setup overlay + WriteTxn.
         let mark = self.shared.handle.begin_txn()?;
-        let overlay = TxnOverlay::new_shared();
+        let mut overlay = TxnOverlay::new();
         let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
-        if !ready.is_empty() {
-            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
-            for page in ready {
-                ov.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+        for page in ready {
+            overlay.push_reservation(PageReservation {
+                page,
+                size: PageSize::Large32k,
+                origin: PageOrigin::DeferredFree,
+            });
         }
         let txn_id = self.shared.txn_counter.fetch_add(1, Ordering::Relaxed);
         let mut txn = WriteTxn::new(txn_id);
@@ -367,7 +355,7 @@ impl PagedEngine {
         // upgrade. Other CRUD writers on different namespaces hold
         // their own `metadata.read()` concurrently and their own
         // lanes; only `commit_seq` serializes the publish step.
-        let body_result = f(&self.shared, &md_read, &overlay, &mut txn);
+        let body_result = f(&self.shared, &md_read, &mut overlay, &mut txn);
 
         match body_result {
             Ok(value) => {
@@ -378,7 +366,7 @@ impl PagedEngine {
 
                 let sec_writes = std::mem::take(&mut txn.pending_sec_index);
                 if let Err(e) =
-                    install_pending_sec_index(&self.shared, &md_read, &overlay, sec_writes)
+                    install_pending_sec_index(&self.shared, &md_read, &mut overlay, sec_writes.to_vec())
                 {
                     drop(txn);
                     let _ = self.rollback_overlay_and_wal(overlay, mark);
@@ -399,8 +387,8 @@ impl PagedEngine {
                     if let Err(e) = install_pending_primary(
                         &self.shared,
                         &md_read,
-                        &overlay,
-                        primary_writes,
+                        &mut overlay,
+                        primary_writes.to_vec(),
                         commit_ts,
                         txn_id,
                     ) {
@@ -414,12 +402,8 @@ impl PagedEngine {
                 };
 
                 // Commit overlay bytes onto shared frames.
-                let overlay_inner = Arc::try_unwrap(overlay)
-                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
-                    .into_inner()
-                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
                 let mut base_store = new_store(&self.shared);
-                if let Err(e) = overlay_inner.commit(&mut base_store, &self.shared.handle) {
+                if let Err(e) = overlay.commit(&mut base_store, &self.shared.handle) {
                     drop(txn);
                     let _ = self.shared.handle.rollback_txn(mark);
                     return Err(e);
@@ -469,14 +453,10 @@ impl PagedEngine {
 
     fn rollback_overlay_and_wal(
         &self,
-        overlay: Arc<Mutex<TxnOverlay>>,
+        overlay: TxnOverlay,
         mark: Option<u64>,
     ) -> Result<()> {
-        let ov = Arc::try_unwrap(overlay)
-            .map_err(|_| Error::Internal("TxnOverlay still referenced at rollback time".into()))?
-            .into_inner()
-            .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
-        ov.rollback(&self.shared.handle)?;
+        overlay.rollback(&self.shared.handle)?;
         let _ = self.shared.handle.rollback_txn(mark);
         Ok(())
     }
@@ -607,9 +587,8 @@ impl StorageEngine for PagedEngine {
         let removed_lane = self.ns_lanes.remove(ns).map(|(_, v)| v);
         if let Some(lane) = removed_lane {
             // Wait out an in-flight writer by taking the lock ourselves.
-            let _guard = lane.lock().map_err(|_| {
-                Error::Internal("namespace lane mutex poisoned during drop".into())
-            })?;
+            // parking_lot::Mutex::lock() never panics or poisons.
+            let _guard = lane.lock();
             // _guard dropped immediately on scope exit below.
             drop(_guard);
         }
@@ -661,7 +640,10 @@ impl StorageEngine for PagedEngine {
 
     fn list_namespaces(&self) -> Result<Vec<String>> {
         let snap = self.shared.published.load();
-        Ok(snap.namespaces.keys().cloned().collect())
+        let keys = snap.namespaces.keys();
+        let mut out = Vec::with_capacity(keys.len());
+        out.extend(keys.cloned());
+        Ok(out)
     }
 
     fn checkpoint(&self) -> Result<()> {
@@ -690,7 +672,7 @@ impl PagedEngine {
     /// commit the overlay and publish a fresh snapshot.
     fn run_ddl<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&SharedState, &MetadataState, &Arc<Mutex<TxnOverlay>>) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay) -> Result<R>,
     {
         let md_w = self.metadata.write().map_err(|_| {
             Error::Internal("metadata RwLock poisoned".into())
@@ -700,28 +682,21 @@ impl PagedEngine {
         })?;
 
         let mark = self.shared.handle.begin_txn()?;
-        let overlay = TxnOverlay::new_shared();
+        let mut overlay = TxnOverlay::new();
         let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
-        if !ready.is_empty() {
-            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
-            for page in ready {
-                ov.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+        for page in ready {
+            overlay.push_reservation(PageReservation {
+                page,
+                size: PageSize::Large32k,
+                origin: PageOrigin::DeferredFree,
+            });
         }
 
-        let result = f(&self.shared, &md_w, &overlay);
+        let result = f(&self.shared, &md_w, &mut overlay);
         match result {
             Ok(value) => {
-                let overlay_inner = Arc::try_unwrap(overlay)
-                    .map_err(|_| Error::Internal("TxnOverlay still referenced".into()))?
-                    .into_inner()
-                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
                 let mut base_store = new_store(&self.shared);
-                overlay_inner.commit(&mut base_store, &self.shared.handle)?;
+                overlay.commit(&mut base_store, &self.shared.handle)?;
                 self.shared.handle.flush()?;
                 let db_page_count = self
                     .shared

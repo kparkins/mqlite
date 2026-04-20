@@ -352,14 +352,13 @@ impl FileLock for PosixFileLock {
         let start = READER_LOCK_OFFSET.min(WRITER_LOCK_OFFSET);
         let end = (READER_LOCK_OFFSET + READER_LOCK_LEN).max(WRITER_LOCK_OFFSET + WRITER_LOCK_LEN);
 
-        match self.try_fcntl(
+        self.try_fcntl(
             libc::F_UNLCK as libc::c_short,
             start as libc::off_t,
             (end - start) as libc::off_t,
-        ) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Error::Io(e)),
-        }
+        )
+        .map(|_| ())
+        .map_err(Error::Io)
     }
 }
 
@@ -433,14 +432,89 @@ impl FileLock for WindowsFileLock {
 }
 
 // ---------------------------------------------------------------------------
+// AnyFileLock — closed-set enum that avoids vtable dispatch
+// ---------------------------------------------------------------------------
+
+/// Closed-set enum wrapping all platform [`FileLock`] implementations.
+///
+/// Replaces `Box<dyn FileLock>` / `Arc<dyn FileLock>` with a concrete type
+/// that the compiler can monomorphize, eliminating vtable dispatch on every
+/// I/O and locking call.
+pub(crate) enum AnyFileLock {
+    #[cfg(unix)]
+    Posix(PosixFileLock),
+    #[cfg(windows)]
+    Windows(WindowsFileLock),
+    #[cfg(not(any(unix, windows)))]
+    Noop(NoopFileLock),
+}
+
+impl FileLock for AnyFileLock {
+    fn acquire_exclusive(&self, timeout: Duration) -> Result<bool> {
+        match self {
+            #[cfg(unix)]
+            Self::Posix(l) => l.acquire_exclusive(timeout),
+            #[cfg(windows)]
+            Self::Windows(l) => l.acquire_exclusive(timeout),
+            #[cfg(not(any(unix, windows)))]
+            Self::Noop(l) => l.acquire_exclusive(timeout),
+        }
+    }
+
+    fn acquire_shared(&self, timeout: Duration) -> Result<bool> {
+        match self {
+            #[cfg(unix)]
+            Self::Posix(l) => l.acquire_shared(timeout),
+            #[cfg(windows)]
+            Self::Windows(l) => l.acquire_shared(timeout),
+            #[cfg(not(any(unix, windows)))]
+            Self::Noop(l) => l.acquire_shared(timeout),
+        }
+    }
+
+    fn release(&self) -> Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Posix(l) => l.release(),
+            #[cfg(windows)]
+            Self::Windows(l) => l.release(),
+            #[cfg(not(any(unix, windows)))]
+            Self::Noop(l) => l.release(),
+        }
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Posix(l) => l.write_at(offset, data),
+            #[cfg(windows)]
+            Self::Windows(l) => l.write_at(offset, data),
+            #[cfg(not(any(unix, windows)))]
+            Self::Noop(l) => l.write_at(offset, data),
+        }
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Posix(l) => l.read_exact_at(offset, buf),
+            #[cfg(windows)]
+            Self::Windows(l) => l.read_exact_at(offset, buf),
+            #[cfg(not(any(unix, windows)))]
+            Self::Noop(l) => l.read_exact_at(offset, buf),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
-/// Open a [`FileLock`] for a database file.
+/// Open an [`AnyFileLock`] for a database file.
 ///
-/// On Unix, opens the path with `O_RDWR` and returns a [`PosixFileLock`].
-/// On Windows, returns a [`WindowsFileLock`] stub.
-/// For platforms without native locking, use [`NoopFileLock`] directly.
+/// On Unix, opens the path with `O_RDWR` and returns a [`PosixFileLock`]
+/// variant.  On Windows, returns the [`WindowsFileLock`] stub variant.
+/// For platforms without native locking, returns the [`NoopFileLock`] variant.
 ///
 /// The returned lock **has not yet acquired any lock mode** — call
 /// [`FileLock::acquire_exclusive`] or [`FileLock::acquire_shared`] to
@@ -449,7 +523,7 @@ impl FileLock for WindowsFileLock {
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the file cannot be opened.
-pub(crate) fn open_file_lock(path: &std::path::Path) -> Result<Box<dyn FileLock>> {
+pub(crate) fn open_file_lock(path: &std::path::Path) -> Result<AnyFileLock> {
     #[cfg(unix)]
     {
         // Open with O_RDWR so we can acquire both shared and exclusive locks.
@@ -459,19 +533,19 @@ pub(crate) fn open_file_lock(path: &std::path::Path) -> Result<Box<dyn FileLock>
             .write(true)
             .open(path)
             .map_err(Error::Io)?;
-        Ok(Box::new(PosixFileLock::from_file(file)))
+        Ok(AnyFileLock::Posix(PosixFileLock::from_file(file)))
     }
 
     #[cfg(windows)]
     {
         let _ = path; // suppress unused warning
-        Ok(Box::new(WindowsFileLock::new()))
+        Ok(AnyFileLock::Windows(WindowsFileLock::new()))
     }
 
     #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
-        Ok(Box::new(NoopFileLock))
+        Ok(AnyFileLock::Noop(NoopFileLock))
     }
 }
 
@@ -488,16 +562,13 @@ mod tests {
     #[test]
     fn noop_acquire_exclusive_succeeds() {
         let lock = NoopFileLock;
-        assert_eq!(
-            lock.acquire_exclusive(Duration::from_secs(1)).unwrap(),
-            false
-        );
+        assert!(!lock.acquire_exclusive(Duration::from_secs(1)).unwrap());
     }
 
     #[test]
     fn noop_acquire_shared_succeeds() {
         let lock = NoopFileLock;
-        assert_eq!(lock.acquire_shared(Duration::from_secs(1)).unwrap(), false);
+        assert!(!lock.acquire_shared(Duration::from_secs(1)).unwrap());
     }
 
     #[test]

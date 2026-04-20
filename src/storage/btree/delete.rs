@@ -84,7 +84,11 @@ impl<S: BTreePageStore> BTree<S> {
         path: &[(u32, usize)],
     ) -> Result<()> {
         // Get parent info.
-        let (parent_page, child_idx) = *path.last().unwrap();
+        let Some(&(parent_page, child_idx)) = path.last() else {
+            return Err(Error::Internal(
+                "btree delete: empty path in rebalance".into(),
+            ));
+        };
         let parent_buf = self.store.read_internal(parent_page)?;
         let parent = InternalNode::parse(&parent_buf[..])?;
 

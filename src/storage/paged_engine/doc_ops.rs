@@ -5,6 +5,7 @@
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
+use crate::mvcc::transaction::Ns;
 use crate::key_encoding::encode_key;
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
@@ -24,6 +25,7 @@ use super::index_maint::{
 use super::snapshot_ops::{apply_find_opts, execute_snapshot_pairs_from_snap};
 
 pub(super) fn insert(engine: &super::PagedEngine, ns: &str, mut doc: Document) -> Result<Bson> {
+    let ns_arc = Ns::from(ns);
     engine.run_write(ns, |shared, md, overlay, txn| {
         let entry = md
             .catalog
@@ -44,7 +46,7 @@ pub(super) fn insert(engine: &super::PagedEngine, ns: &str, mut doc: Document) -
             md.catalog.lock().expect("catalog poisoned").update_collection(&updated)?;
             sync_catalog_root_overlay(shared, md, overlay)?;
         }
-        txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+        txn.stage_primary_insert(ns_arc.clone(), key, bson_bytes);
         maintain_secondary_on_insert(shared, md, overlay, ns, &doc, &id, txn)?;
         Ok(id)
     })
@@ -73,11 +75,7 @@ pub(super) fn find(engine: &super::PagedEngine, ns: &str, filter: &Document, opt
 pub(super) fn find_one(engine: &super::PagedEngine, ns: &str, filter: &Document) -> Result<Option<Document>> {
     let opts = FindOptions::new();
     let mut results = find(engine, ns, filter, &opts)?;
-    Ok(if results.is_empty() {
-        None
-    } else {
-        Some(results.remove(0))
-    })
+    Ok((!results.is_empty()).then(|| results.remove(0)))
 }
 
 pub(super) fn update(
@@ -130,6 +128,7 @@ pub(super) fn update(
         matched_pairs.into_iter().take(1).collect()
     };
 
+    let ns_arc = Ns::from(ns);
     engine.run_write_existing(ns, |shared, md, overlay, txn| {
         let mut matched_count = 0u64;
         let mut modified_count = 0u64;
@@ -170,7 +169,7 @@ pub(super) fn update(
                             .update_collection(&updated)?;
                         sync_catalog_root_overlay(shared, md, overlay)?;
                     }
-                    txn.stage_primary_update(ns.to_string(), key, new_bytes);
+                    txn.stage_primary_update(ns_arc.clone(), key, new_bytes);
                 }
             }
         }
@@ -208,6 +207,7 @@ pub(super) fn delete(engine: &super::PagedEngine, ns: &str, filter: &Document, m
         return Ok(DeleteResult { deleted_count: 0 });
     }
 
+    let ns_arc = Ns::from(ns);
     engine.run_write_existing(ns, |shared, md, overlay, txn| {
         for (key, doc) in &pairs_to_delete {
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
@@ -236,7 +236,7 @@ pub(super) fn delete(engine: &super::PagedEngine, ns: &str, filter: &Document, m
                         .update_collection(&updated)?;
                     sync_catalog_root_overlay(shared, md, overlay)?;
                 }
-                txn.stage_primary_delete(ns.to_string(), key.clone());
+                txn.stage_primary_delete(ns_arc.clone(), key.clone());
             }
         }
         Ok(())
@@ -315,6 +315,7 @@ pub(super) fn find_one_and_update_doc(
     let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
     let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
 
+    let ns_arc = Ns::from(ns);
     engine.run_write_existing(ns, |shared, md, overlay, txn| {
         maintain_secondary_on_update(
             shared, md, overlay, ns, &before, &doc, &before_id, &new_id, txn,
@@ -344,7 +345,7 @@ pub(super) fn find_one_and_update_doc(
                     .update_collection(&updated)?;
                 sync_catalog_root_overlay(shared, md, overlay)?;
             }
-            txn.stage_primary_update(ns.to_string(), key, new_bytes);
+            txn.stage_primary_update(ns_arc.clone(), key, new_bytes);
         }
         Ok(())
     })?;
@@ -385,6 +386,7 @@ pub(super) fn find_one_and_delete_doc(
     let (key, doc) = matched.remove(0);
     let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
+    let ns_arc = Ns::from(ns);
     engine.run_write_existing(ns, |shared, md, overlay, txn| {
         maintain_secondary_on_delete(shared, md, overlay, ns, &doc, &doc_id, txn)?;
         let entry_opt = md
@@ -411,7 +413,7 @@ pub(super) fn find_one_and_delete_doc(
                     .update_collection(&updated)?;
                 sync_catalog_root_overlay(shared, md, overlay)?;
             }
-            txn.stage_primary_delete(ns.to_string(), key);
+            txn.stage_primary_delete(ns_arc.clone(), key);
         }
         Ok(())
     })?;
@@ -469,6 +471,7 @@ pub(super) fn find_one_and_replace_doc(
 
     let old_doc_clone = old_doc.clone();
     let new_doc_clone = new_doc.clone();
+    let ns_arc = Ns::from(ns);
     engine.run_write_existing(ns, |shared, md, overlay, txn| {
         maintain_secondary_on_update(
             shared,
@@ -506,7 +509,7 @@ pub(super) fn find_one_and_replace_doc(
                     .update_collection(&updated)?;
                 sync_catalog_root_overlay(shared, md, overlay)?;
             }
-            txn.stage_primary_update(ns.to_string(), new_key, new_bytes);
+            txn.stage_primary_update(ns_arc.clone(), new_key, new_bytes);
         }
         Ok(())
     })?;
@@ -525,6 +528,7 @@ pub(super) fn do_upsert_update(
 ) -> Result<UpdateResult> {
     let mut new_doc = upsert_base_from_filter(filter);
     apply_update(&mut new_doc, update_doc, true)?;
+    let ns_arc = Ns::from(ns);
     let id = engine.run_write(ns, |shared, md, overlay, txn| {
         let entry = md
             .catalog
@@ -548,7 +552,7 @@ pub(super) fn do_upsert_update(
                 .update_collection(&updated)?;
             sync_catalog_root_overlay(shared, md, overlay)?;
         }
-        txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+        txn.stage_primary_insert(ns_arc.clone(), key, bson_bytes);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
         Ok(id)
     })?;
@@ -568,6 +572,7 @@ pub(super) fn fam_upsert_update(
 ) -> Result<Option<Document>> {
     let mut new_doc = upsert_base_from_filter(filter);
     apply_update(&mut new_doc, update_doc, true)?;
+    let ns_arc = Ns::from(ns);
     engine.run_write(ns, |shared, md, overlay, txn| {
         let entry = md
             .catalog
@@ -591,7 +596,7 @@ pub(super) fn fam_upsert_update(
                 .update_collection(&updated)?;
             sync_catalog_root_overlay(shared, md, overlay)?;
         }
-        txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+        txn.stage_primary_insert(ns_arc.clone(), key, bson_bytes);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
         Ok(())
     })?;
@@ -608,6 +613,7 @@ pub(super) fn fam_upsert_replace(
     opts: &FindOneAndReplaceOptions,
 ) -> Result<Option<Document>> {
     let mut new_doc = replacement.clone();
+    let ns_arc = Ns::from(ns);
     engine.run_write(ns, |shared, md, overlay, txn| {
         let entry = md
             .catalog
@@ -631,7 +637,7 @@ pub(super) fn fam_upsert_replace(
                 .update_collection(&updated)?;
             sync_catalog_root_overlay(shared, md, overlay)?;
         }
-        txn.stage_primary_insert(ns.to_string(), key, bson_bytes);
+        txn.stage_primary_insert(ns_arc.clone(), key, bson_bytes);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, txn)?;
         Ok(())
     })?;

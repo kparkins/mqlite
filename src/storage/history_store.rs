@@ -458,7 +458,7 @@ impl<S: BTreePageStore> HistoryStore<S> {
         // relative to main data, and GC runs at checkpoint cadence.
         let rows = self.tree.range_scan(None, None)?;
         type Victim = (Vec<u8>, Option<(u32, u64)>);
-        let mut victims: Vec<Victim> = Vec::new();
+        let mut victims: Vec<Victim> = Vec::with_capacity(rows.len());
         for (key, cell_value) in rows {
             let value_bytes = cell_value_bytes(cell_value)?;
             if value_bytes.len() < 34 {

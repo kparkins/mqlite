@@ -235,7 +235,8 @@ impl BufferPool {
                 .expect("page_map invariant: frame must exist at mapped slot");
 
             let mut dropped_count = 0usize;
-            let keys: Vec<Vec<u8>> = frame.version_chains.keys().cloned().collect();
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.version_chains.len());
+            keys.extend(frame.version_chains.keys().cloned());
 
             for key in keys {
                 let Some(chain_arc) = frame.version_chains.get_mut(&key) else {

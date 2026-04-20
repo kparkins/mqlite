@@ -95,6 +95,7 @@ pub(crate) async fn cursor_sweep_task(
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = interval.tick() => {

@@ -112,7 +112,7 @@ impl Clone for OverflowRef {
         // a bug, and `Clone` is infallible by trait contract, so we panic.
         self.allocator
             .incref_overflow(self.first_page)
-            .expect("refcount overflow in OverflowRef::Clone — this is a bug");
+            .expect("refcount is bounded by CAS saturation at u32::MAX - 1; overflow means > 4B concurrent pins (pin leak)");
         Self {
             first_page: self.first_page,
             total_length: self.total_length,

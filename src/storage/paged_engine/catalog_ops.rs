@@ -1,7 +1,7 @@
 //! Catalog / snapshot build + overlay helpers used by the engine.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -16,10 +16,12 @@ pub(super) fn build_snapshot_from_catalog(
     catalog: &Catalog<BufferPoolPageStore>,
     publish_ts: crate::mvcc::timestamp::Ts,
 ) -> Result<PublishedSnapshot> {
-    let mut namespaces = HashMap::new();
-    for coll in catalog.list_collections()? {
-        let mut idxs = Vec::new();
-        for idx in catalog.list_indexes(&coll.name)? {
+    let collections = catalog.list_collections()?;
+    let mut namespaces = HashMap::with_capacity(collections.len());
+    for coll in collections {
+        let indexes = catalog.list_indexes(&coll.name)?;
+        let mut idxs = Vec::with_capacity(indexes.len());
+        for idx in indexes {
             idxs.push(PublishedIndex {
                 name: idx.name.clone(),
                 root_page: idx.root_page,
@@ -61,9 +63,9 @@ pub(super) fn new_store(shared: &SharedState) -> BufferPoolPageStore {
     BufferPoolPageStore::new(Arc::clone(&shared.handle))
 }
 
-/// Create a new writer-side [`TxnPageStore`] sharing the given overlay.
-pub(super) fn new_txn_store(shared: &SharedState, overlay: &Arc<Mutex<TxnOverlay>>) -> TxnPageStore {
-    TxnPageStore::new(new_store(shared), Arc::clone(overlay))
+/// Create a new writer-side [`TxnPageStore`] borrowing the given overlay.
+pub(super) fn new_txn_store<'a>(shared: &SharedState, overlay: &'a mut TxnOverlay) -> TxnPageStore<'a> {
+    TxnPageStore::new(new_store(shared), overlay)
 }
 
 /// Update `FileHeader::catalog_root_page` and `catalog_root_level` to
@@ -72,7 +74,7 @@ pub(super) fn new_txn_store(shared: &SharedState, overlay: &Arc<Mutex<TxnOverlay
 pub(super) fn sync_catalog_root_overlay(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
 ) -> Result<()> {
     let (root_page, root_level) = {
         let cat = md.catalog.lock().expect("catalog poisoned");
@@ -89,26 +91,24 @@ pub(super) fn sync_catalog_root_overlay(
 /// overlay on first call.
 pub(super) fn txn_update_header<F>(
     shared: &SharedState,
-    overlay: &Arc<Mutex<TxnOverlay>>,
+    overlay: &mut TxnOverlay,
     f: F,
 ) -> Result<()>
 where
     F: FnOnce(&mut crate::storage::header::FileHeader),
 {
-    let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
     if let Some(pre) = shared
         .handle
         .allocator()
         .with_header(|h| {
-            if ov.has_header_pre() {
+            if overlay.has_header_pre() {
                 None
             } else {
                 Some(h.clone())
             }
         })?
     {
-        ov.capture_header_pre_once(&pre);
+        overlay.capture_header_pre_once(&pre);
     }
-    drop(ov);
     shared.handle.allocator().update_header(f)
 }

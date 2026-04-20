@@ -56,10 +56,11 @@ fn main() -> mqlite::Result<()> {
     println!("Total documents: {}\n", total);
 
     // --- Create index on `level` field ---
-    logs.create_index(mqlite::IndexModel {
-        keys: doc! { "level": 1 },
-        options: mqlite::IndexOptions::default(),
-    })?;
+    logs.create_index(
+        mqlite::IndexModel::builder()
+            .keys(doc! { "level": 1 })
+            .build(),
+    )?;
 
     let indexes = logs.list_indexes()?;
     println!("Indexes: {:?}\n", indexes.iter().map(|i| &i.name).collect::<Vec<_>>());

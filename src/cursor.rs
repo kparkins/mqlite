@@ -126,6 +126,7 @@ impl<T> Cursor<T> {
     /// used by the wire protocol `getMore` handler to determine whether to
     /// keep the cursor in the per-connection map or remove it and return
     /// `cursor.id = 0` to the driver.
+    #[must_use]
     pub fn is_exhausted(&self) -> bool {
         self.done || self.buffer.is_empty()
     }
@@ -170,15 +171,10 @@ impl<T: DeserializeOwned> Iterator for Cursor<T> {
             return None;
         }
 
-        match self.buffer.pop_front() {
-            None => {
-                self.done = true;
-                None
-            }
-            Some(doc) => {
-                let result = bson::from_document(doc).map_err(Error::BsonDeserialization);
-                Some(result)
-            }
-        }
+        let Some(doc) = self.buffer.pop_front() else {
+            self.done = true;
+            return None;
+        };
+        Some(bson::from_document(doc).map_err(Error::BsonDeserialization))
     }
 }

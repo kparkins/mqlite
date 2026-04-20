@@ -235,7 +235,8 @@ impl Partition {
             return 0;
         };
         let mut dropped = 0usize;
-        let keys: Vec<Vec<u8>> = frame.version_chains.keys().cloned().collect();
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.version_chains.len());
+        keys.extend(frame.version_chains.keys().cloned());
         for key in keys {
             let Some(chain_arc) = frame.version_chains.get_mut(&key) else {
                 continue;
@@ -284,12 +285,10 @@ impl Partition {
 
     /// Write every dirty frame to disk and clear their dirty bits.
     pub(super) fn flush_all(&mut self, io: &dyn PageSource, size: PageSize) -> Result<()> {
-        for slot in self.frames.iter_mut() {
-            if let Some(frame) = slot {
-                if frame.dirty {
-                    io.write_page(frame.page_number, size, &frame.data)?;
-                    frame.dirty = false;
-                }
+        for slot in self.frames.iter_mut().flatten() {
+            if slot.dirty {
+                io.write_page(slot.page_number, size, &slot.data)?;
+                slot.dirty = false;
             }
         }
         Ok(())
@@ -301,19 +300,13 @@ impl Partition {
     /// transaction must be evicted so subsequent reads fetch clean data from
     /// the WAL/file rather than seeing partial writes.
     pub(super) fn drop_dirty_unpinned(&mut self) {
-        let mut to_drop = Vec::new();
-        for slot in self.frames.iter() {
-            if let Some(frame) = slot {
-                if frame.dirty && frame.pin_count == 0 {
-                    to_drop.push(frame.page_number);
-                }
-            }
-        }
-        for pn in to_drop {
-            if let Some(&idx) = self.page_map.get(&pn) {
-                self.frames[idx] = None;
-                self.page_map.remove(&pn);
-            }
+        for idx in 0..self.frames.len() {
+            let page_number = match &self.frames[idx] {
+                Some(frame) if frame.dirty && frame.pin_count == 0 => frame.page_number,
+                _ => continue,
+            };
+            self.frames[idx] = None;
+            self.page_map.remove(&page_number);
         }
     }
 

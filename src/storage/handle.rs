@@ -317,15 +317,13 @@ impl BufferPoolHandle {
     /// handles (in-memory / test).  The returned value must be passed to
     /// [`rollback_txn`](Self::rollback_txn) on failure.
     pub(crate) fn begin_txn(&self) -> Result<Option<u64>> {
-        match &self.journal {
-            None => Ok(None),
-            Some(journal) => {
-                let guard = journal
-                    .lock()
-                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                Ok(Some(guard.write_cursor()))
-            }
-        }
+        let Some(journal) = &self.journal else {
+            return Ok(None);
+        };
+        let guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        Ok(Some(guard.write_cursor()))
     }
 
     /// Write the commit frame to the journal.
@@ -472,15 +470,13 @@ impl BufferPoolHandle {
     /// `TimestampOracle::set_min` at construction so post-recovery commits
     /// are strictly above every durable pre-crash commit (plan T7).
     pub(crate) fn recovered_max_commit_ts(&self) -> Result<Option<crate::mvcc::timestamp::Ts>> {
-        match &self.journal {
-            None => Ok(None),
-            Some(journal) => {
-                let guard = journal
-                    .lock()
-                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                Ok(guard.recovered_max_commit_ts())
-            }
-        }
+        let Some(journal) = &self.journal else {
+            return Ok(None);
+        };
+        let guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        Ok(guard.recovered_max_commit_ts())
     }
 
     /// fsync the journal file — make all committed-but-unsynced frames durable.
@@ -488,15 +484,13 @@ impl BufferPoolHandle {
     /// Called by the engine's FullSync hot path. No-op when no journal is
     /// attached (in-memory / test handles).
     pub(crate) fn journal_sync(&self) -> Result<()> {
-        match &self.journal {
-            None => Ok(()),
-            Some(journal) => {
-                let guard = journal
-                    .lock()
-                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                guard.sync_journal()
-            }
-        }
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        let guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        guard.sync_journal()
     }
 
     /// Append an MVCC `ChainCommit` frame (Format Lock §A.2).

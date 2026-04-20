@@ -160,7 +160,7 @@ pub(super) fn handle_find(
 
     // Collect all matching documents (cursor is already fully buffered in
     // memory by the storage engine, so this is a cheap move operation).
-    let mut all_docs: Vec<Document> = Vec::new();
+    let mut all_docs: Vec<Document> = Vec::with_capacity(batch_size);
     for result in cursor {
         match result {
             Ok(d) => all_docs.push(d),
@@ -170,10 +170,10 @@ pub(super) fn handle_find(
 
     let split_at = batch_size.min(all_docs.len());
     let remaining: Vec<Document> = all_docs.drain(split_at..).collect();
-    let first_batch: bson::Array = all_docs
-        .iter()
-        .map(|d| bson::Bson::Document(d.clone()))
-        .collect();
+    let mut first_batch: bson::Array = Vec::with_capacity(all_docs.len());
+    for d in all_docs {
+        first_batch.push(bson::Bson::Document(d));
+    }
 
     // Store a server-side cursor for the remaining documents if any.
     let cursor_id: i64 = if remaining.is_empty() {
@@ -222,8 +222,8 @@ pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
 
     let mut total_matched: i64 = 0;
     let mut total_modified: i64 = 0;
-    let mut upserted: bson::Array = Vec::new();
-    let mut write_errors: bson::Array = Vec::new();
+    let mut upserted: bson::Array = Vec::with_capacity(updates.len());
+    let mut write_errors: bson::Array = Vec::with_capacity(updates.len());
 
     for (i, spec_bson) in updates.iter().enumerate() {
         let spec = match spec_bson.as_document() {
@@ -323,7 +323,7 @@ pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
     };
 
     let mut total_deleted: i64 = 0;
-    let mut write_errors: bson::Array = Vec::new();
+    let mut write_errors: bson::Array = Vec::with_capacity(deletes.len());
 
     for (i, spec_bson) in deletes.iter().enumerate() {
         let spec = match spec_bson.as_document() {
