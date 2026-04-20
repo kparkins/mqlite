@@ -9,7 +9,7 @@ use crate::query::eval_filter;
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::validation::validate_document;
 
-use super::doc_ops::{check_unique_constraints, ensure_id};
+use super::doc_helpers::{check_unique_constraints, ensure_id};
 
 /// Insert `doc` into `tree`, auto-assigning `_id` if absent.
 ///

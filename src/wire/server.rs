@@ -31,7 +31,9 @@
 //! - OP_QUERY → OP_REPLY  (initial handshake only)
 //! - OP_MSG   → OP_MSG    (all subsequent commands)
 
-use std::collections::HashMap;
+mod cursors;
+mod op_query;
+
 use std::sync::{
     atomic::{AtomicI32, Ordering},
     Arc,
@@ -51,6 +53,9 @@ use crate::{
 pub(super) use super::framing::{read_message, write_message};
 use super::handlers;
 
+pub(crate) use cursors::{cursor_sweep_task, ConnectionCursors};
+use op_query::{build_op_reply, parse_op_query_body, parse_op_query_db_name};
+
 // ---------------------------------------------------------------------------
 // Legacy opcodes (not in protocol.rs — used only for handshake interop)
 // ---------------------------------------------------------------------------
@@ -58,122 +63,6 @@ use super::handlers;
 /// OP_QUERY — legacy opcode used by MongoDB drivers for the *initial*
 /// `isMaster` / `hello` handshake before wire version is established.
 const OP_QUERY: i32 = 2004;
-
-/// OP_REPLY — legacy response opcode for OP_QUERY messages.
-const OP_REPLY: i32 = 1;
-
-// ---------------------------------------------------------------------------
-// Cursor idle timeout and per-connection cursor state
-// ---------------------------------------------------------------------------
-
-/// Cursors not accessed for longer than this duration are evicted.
-const CURSOR_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// A buffered cursor stored in the per-connection cursor map.
-#[allow(dead_code)] // cursor field used when data commands (getMore, killCursors) are added
-struct StoredCursor {
-    /// The buffered cursor data.
-    cursor: crate::Cursor<bson::Document>,
-    /// When this cursor was last accessed (used for idle eviction).
-    last_accessed: std::time::Instant,
-}
-
-/// Per-connection cursor state.
-///
-/// Tracks all open server-side cursors for one TCP connection.  When
-/// [`ConnectionCursors`] is dropped (i.e., when the connection closes),
-/// every stored cursor is released automatically — satisfying the
-/// acceptance criterion "connection close releases all associated cursors".
-pub(super) struct ConnectionCursors {
-    /// Cursor ID → stored cursor.
-    cursors: HashMap<i64, StoredCursor>,
-    /// Monotonically increasing cursor ID counter.  Starts at 1; cursor ID 0
-    /// is reserved in the MongoDB wire protocol to mean "no cursor".
-    next_cursor_id: i64,
-}
-
-#[allow(dead_code)] // methods used when data commands (getMore, killCursors) are added
-impl ConnectionCursors {
-    pub(super) fn new() -> Self {
-        ConnectionCursors {
-            cursors: HashMap::new(),
-            next_cursor_id: 1,
-        }
-    }
-
-    /// Store `cursor` and return its assigned cursor ID.
-    pub(super) fn store(&mut self, cursor: crate::Cursor<bson::Document>) -> i64 {
-        let id = self.next_cursor_id;
-        // Cursor ID 0 is reserved; skip it on overflow.
-        self.next_cursor_id = self.next_cursor_id.wrapping_add(1).max(1);
-        self.cursors.insert(
-            id,
-            StoredCursor {
-                cursor,
-                last_accessed: std::time::Instant::now(),
-            },
-        );
-        id
-    }
-
-    /// Remove and return the cursor identified by `id`, if present.
-    pub(super) fn remove(&mut self, id: i64) -> Option<crate::Cursor<bson::Document>> {
-        self.cursors.remove(&id).map(|e| e.cursor)
-    }
-
-    /// Return a mutable reference to the cursor for `id`, refreshing its
-    /// last-accessed timestamp.  Returns `None` if the cursor is not found.
-    pub(super) fn get_mut(&mut self, id: i64) -> Option<&mut crate::Cursor<bson::Document>> {
-        self.cursors.get_mut(&id).map(|e| {
-            e.last_accessed = std::time::Instant::now();
-            &mut e.cursor
-        })
-    }
-
-    /// Evict cursors that have been idle for longer than `timeout`.
-    ///
-    /// Returns the number of cursors evicted.
-    fn evict_idle(&mut self, timeout: std::time::Duration) -> usize {
-        let before = self.cursors.len();
-        self.cursors
-            .retain(|_, entry| entry.last_accessed.elapsed() < timeout);
-        before - self.cursors.len()
-    }
-
-    /// Number of currently open cursors.
-    fn len(&self) -> usize {
-        self.cursors.len()
-    }
-}
-
-/// Background task: periodically evict idle cursors for one connection.
-///
-/// Sweeps every 60 seconds using [`CURSOR_IDLE_TIMEOUT`].  Exits when
-/// `shutdown_rx` resolves, which happens automatically when the corresponding
-/// sender is dropped (i.e., when the connection handler returns).
-async fn cursor_sweep_task(
-    cursors: Arc<std::sync::Mutex<ConnectionCursors>>,
-    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let mut c = cursors.lock().unwrap_or_else(|e| e.into_inner());
-                let _evicted = c.evict_idle(CURSOR_IDLE_TIMEOUT);
-                #[cfg(feature = "tracing")]
-                if _evicted > 0 {
-                    tracing::debug!(
-                        target: "mqlite",
-                        evicted = _evicted,
-                        "mqlite::wire::cursor_evict"
-                    );
-                }
-            }
-            _ = &mut shutdown_rx => break,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -185,31 +74,31 @@ async fn cursor_sweep_task(
 /// `Arc`) into each connection task.  All fields behind `Arc` are shared
 /// across every connection so counters are global to the server instance.
 #[derive(Clone)]
-pub(super) struct ServerState {
+pub(crate) struct ServerState {
     /// Time when this `WireProtocol` instance was started.
     /// Used to compute uptime in the `serverStatus` response.
-    pub(super) start_time: Arc<std::time::Instant>,
+    pub(crate) start_time: Arc<std::time::Instant>,
 
     /// Monotonically increasing counter used to assign unique per-connection IDs.
     /// Starts at 1; each new connection receives the old value before increment.
-    pub(super) next_connection_id: Arc<AtomicI32>,
+    pub(crate) next_connection_id: Arc<AtomicI32>,
 
     /// Path to the database file.
     /// Used to locate the journal file (`<path>-journal`) for `serverStatus`.
-    pub(super) db_path: Option<std::path::PathBuf>,
+    pub(crate) db_path: Option<std::path::PathBuf>,
 
     /// `topologyVersion.processId` — a random [`ObjectId`] generated once at
     /// server start and included in every `hello` / `isMaster` response.
-    pub(super) topology_process_id: ObjectId,
+    pub(crate) topology_process_id: ObjectId,
 
     /// Shared client inner state — used by CRUD command handlers.
-    pub(super) database: Arc<ClientInner>,
+    pub(crate) database: Arc<ClientInner>,
 
     /// Keeps the temp directory alive for the lifetime of this state.
     /// Only populated when `ServerState` is constructed without an explicit
     /// database path (i.e., in tests via `default()` or `new()`).
     #[cfg(test)]
-    pub(super) _tempdir: Option<Arc<tempfile::TempDir>>,
+    pub(crate) _tempdir: Option<Arc<tempfile::TempDir>>,
 }
 
 #[cfg(test)]
@@ -234,7 +123,7 @@ impl ServerState {
     /// `db_path` is recorded as-is so callers can pass an explicit path or
     /// `None` when the exact path does not matter.
     #[cfg(test)]
-    pub(super) fn new(db_path: Option<std::path::PathBuf>) -> Self {
+    pub(crate) fn new(db_path: Option<std::path::PathBuf>) -> Self {
         let tempdir = tempfile::TempDir::new().expect("create tempdir for ServerState::new");
         let tmp_db_path = tempdir.path().join("mqlite_test.db");
         let client = Client::open(&tmp_db_path).expect("open tempdir-backed client");
@@ -264,17 +153,17 @@ impl ServerState {
     }
 
     /// Reserve and return the next connection ID (pre-increment).
-    pub(super) fn next_conn_id(&self) -> i32 {
+    pub(crate) fn next_conn_id(&self) -> i32 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Return server uptime in whole seconds.
-    pub(super) fn uptime_secs(&self) -> i64 {
+    pub(crate) fn uptime_secs(&self) -> i64 {
         self.start_time.elapsed().as_secs() as i64
     }
 
     /// Return the size of the journal file in bytes, or 0 if absent.
-    pub(super) fn journal_file_size(&self) -> u64 {
+    pub(crate) fn journal_file_size(&self) -> u64 {
         let journal_path = match &self.db_path {
             Some(p) => {
                 let mut s = p.as_os_str().to_owned();
@@ -287,7 +176,7 @@ impl ServerState {
     }
 
     /// Total number of connections that have been opened since server start.
-    pub(super) fn total_connections(&self) -> i32 {
+    pub(crate) fn total_connections(&self) -> i32 {
         // next_connection_id starts at 1; subtract 1 for the count of allocated IDs.
         self.next_connection_id
             .load(Ordering::Relaxed)
@@ -533,134 +422,6 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
 
         next_request_id = next_request_id.wrapping_add(1);
     }
-}
-
-// ---------------------------------------------------------------------------
-// OP_QUERY parsing and OP_REPLY generation
-// ---------------------------------------------------------------------------
-
-/// Parse an OP_QUERY message and return the command document.
-///
-/// OP_QUERY layout (after the 16-byte header):
-/// ```text
-/// flags             : int32
-/// fullCollectionName: cstring  (null-terminated)
-/// numberToSkip      : int32
-/// numberToReturn    : int32
-/// query             : BSON document  (the command)
-/// [returnFieldsSelector: BSON document]  (optional; ignored)
-/// ```
-fn parse_op_query_body(buf: &[u8]) -> Result<Document> {
-    if buf.len() < 4 {
-        return Err(crate::error::Error::InvalidWireMessage {
-            detail: "OP_QUERY body too short for flags".into(),
-        });
-    }
-    // Skip flags (4 bytes), then find the null terminator of fullCollectionName.
-    let after_flags = &buf[4..];
-    let null_pos = after_flags.iter().position(|&b| b == 0).ok_or_else(|| {
-        crate::error::Error::InvalidWireMessage {
-            detail: "OP_QUERY fullCollectionName not null-terminated".into(),
-        }
-    })?;
-    // Skip the null terminator, then skip numberToSkip (4) and numberToReturn (4).
-    let doc_offset = 4 + null_pos + 1 + 4 + 4;
-    if doc_offset + 4 > buf.len() {
-        return Err(crate::error::Error::InvalidWireMessage {
-            detail: "OP_QUERY body too short for query document".into(),
-        });
-    }
-    let doc_size =
-        i32::from_le_bytes(buf[doc_offset..doc_offset + 4].try_into().expect("4 bytes")) as usize;
-    if doc_offset + doc_size > buf.len() {
-        return Err(crate::error::Error::InvalidWireMessage {
-            detail: format!(
-                "OP_QUERY document size {} exceeds remaining buffer",
-                doc_size
-            ),
-        });
-    }
-    let raw = bson::RawDocumentBuf::from_bytes(buf[doc_offset..doc_offset + doc_size].to_vec())
-        .map_err(|e| crate::error::Error::InvalidWireMessage {
-            detail: format!("OP_QUERY BSON parse error: {}", e),
-        })?;
-    bson::from_slice::<Document>(raw.as_bytes()).map_err(|e| {
-        crate::error::Error::InvalidWireMessage {
-            detail: format!("OP_QUERY BSON deserialise error: {}", e),
-        }
-    })
-}
-
-/// Build an OP_REPLY response for an OP_QUERY request.
-///
-/// OP_REPLY layout:
-/// ```text
-/// MsgHeader      (16 bytes)
-/// responseFlags  : int32   (0 = no flags)
-/// cursorID       : int64   (0 = no cursor)
-/// startingFrom   : int32   (0)
-/// numberReturned : int32   (1)
-/// document       : BSON
-/// ```
-fn build_op_reply(request_id: i32, response_to: i32, body: &Document) -> Result<Vec<u8>> {
-    let bson_bytes = bson::to_vec(body)?;
-    // header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
-    let total = 16 + 4 + 8 + 4 + 4 + bson_bytes.len();
-    let header = MsgHeader {
-        message_length: total as i32,
-        request_id,
-        response_to,
-        op_code: OP_REPLY,
-    };
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&header.to_bytes());
-    out.extend_from_slice(&0i32.to_le_bytes()); // responseFlags
-    out.extend_from_slice(&0i64.to_le_bytes()); // cursorID
-    out.extend_from_slice(&0i32.to_le_bytes()); // startingFrom
-    out.extend_from_slice(&1i32.to_le_bytes()); // numberReturned
-    out.extend_from_slice(&bson_bytes);
-    Ok(out)
-}
-
-// ---------------------------------------------------------------------------
-// $db validation helpers
-// ---------------------------------------------------------------------------
-
-/// Extract the database name from an OP_QUERY body buffer.
-///
-/// OP_QUERY body layout (after the 16-byte `MsgHeader`):
-/// ```text
-/// flags             : int32
-/// fullCollectionName: cstring  (e.g. "admin.$cmd")
-/// numberToSkip      : int32
-/// numberToReturn    : int32
-/// query             : BSON document
-/// ```
-///
-/// Returns the part of `fullCollectionName` before the first `'.'` (the
-/// database name), or `None` if the buffer is too short or not valid UTF-8.
-fn parse_op_query_db_name(buf: &[u8]) -> Option<String> {
-    if buf.len() < 5 {
-        return None;
-    }
-    // Skip 4-byte flags field.
-    let after_flags = &buf[4..];
-    // Locate the null terminator of fullCollectionName.
-    let null_pos = after_flags.iter().position(|&b| b == 0)?;
-    let coll_name = std::str::from_utf8(&after_flags[..null_pos]).ok()?;
-    // Database name is the component before the first '.'.
-    Some(coll_name.split('.').next().unwrap_or("").to_owned())
-}
-
-/// Validate the `$db` field in an OP_MSG command body.
-///
-/// In the multi-database wire protocol (R2.1) any non-empty `$db` value is
-/// accepted — the database is created on first write ("use mydb" semantics).
-/// This function is retained for backward compatibility and always returns
-/// `None` (i.e., no error).
-#[allow(dead_code)]
-fn check_db_field(_body: &Document, _server_db_name: &str) -> Option<Document> {
-    None
 }
 
 // ---------------------------------------------------------------------------

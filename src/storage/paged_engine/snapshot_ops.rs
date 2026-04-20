@@ -20,7 +20,7 @@ use crate::storage::history_store::HistoryStore;
 use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedIndex};
 
 use super::btree_ops::btree_collscan;
-use super::doc_ops::{apply_projection_to_doc, sort_docs};
+use super::doc_helpers::{apply_projection_to_doc, sort_docs};
 use super::index_maint::{index_bounds_free, index_entry_id_free};
 use super::state::SharedState;
 

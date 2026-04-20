@@ -32,7 +32,9 @@
 
 mod btree_ops;
 mod catalog_ops;
+mod doc_helpers;
 mod doc_ops;
+mod index_build;
 mod index_maint;
 mod snapshot_ops;
 mod state;
@@ -60,19 +62,15 @@ use crate::options::{
 use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::BTree;
 use crate::storage::buffer_pool::PageSize;
-use crate::storage::catalog::IndexState;
 use crate::storage::handle::BufferPoolHandle;
-use crate::storage::secondary_index::build_index;
 use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
 use crate::storage_engine::StorageEngine;
 
 use self::catalog_ops::{
     new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,
 };
-use self::doc_ops::now_millis;
-use self::index_maint::{
-    install_pending_primary, install_pending_sec_index, ReserveOutcome,
-};
+use self::doc_helpers::now_millis;
+use self::index_maint::{install_pending_primary, install_pending_sec_index};
 use self::state::{MetadataState, OwnedLaneGuard, SharedState};
 
 // ---------------------------------------------------------------------------
@@ -282,276 +280,6 @@ impl PagedEngine {
         }
     }
 
-    /// Phase 1 of `create_index`: reserve an index slot.
-    ///
-    /// Allocates a root page for the index's B+ tree, writes an
-    /// `IndexEntry { state: Building }` into the catalog, initializes
-    /// the leaf page, and publishes a fresh snapshot so writers on the
-    /// target namespace dual-write to it while the build is in flight.
-    ///
-    /// Returns [`ReserveOutcome::AlreadyExists`] if an index of that
-    /// name already exists (idempotent call), otherwise
-    /// [`ReserveOutcome::Reserved`].
-    fn create_index_reserve(
-        &self,
-        ns: &str,
-        model: &IndexModel,
-        name: &str,
-    ) -> Result<ReserveOutcome> {
-        // Drive through `run_ddl` so we get the standard DDL envelope:
-        // metadata.write() + commit_seq + overlay/WAL + publish.
-        let outcome = std::cell::Cell::new(ReserveOutcome::Reserved);
-        self.run_ddl(|shared, md, overlay| {
-            let mut cat = md.catalog.lock().expect("catalog poisoned");
-            // Bootstrap collection if absent (matches pre-PR-9 create_index).
-            if cat.get_collection(ns)?.is_none() {
-                let data_root = cat.create_collection(ns, bson::doc! {}, now_millis())?;
-                drop(cat);
-                sync_catalog_root_overlay(shared, md, overlay)?;
-                let data_store = new_txn_store(shared, overlay);
-                BTree::create_at(data_store, data_root)?;
-                cat = md.catalog.lock().expect("catalog poisoned");
-            }
-
-            // Idempotent: if an index with this name already exists we
-            // treat the call as a no-op (matches pre-PR-9 semantics).
-            // We do NOT re-check state here — a caller seeing an
-            // in-progress Building entry from a prior failed build is
-            // reported as "exists"; the prior build's cleanup will have
-            // removed it if it failed. If cleanup itself failed and an
-            // orphan Building entry remains, callers can drop_index and
-            // retry.
-            if cat.get_index(ns, name)?.is_some() {
-                outcome.set(ReserveOutcome::AlreadyExists);
-                return Ok(());
-            }
-
-            let idx_root = cat.create_index(ns, model, name)?;
-            // `catalog.create_index` defaults `state` to `Ready`. Flip
-            // to `Building` so the published snapshot marks this index
-            // as not-yet-queryable.
-            let mut entry = cat
-                .get_index(ns, name)?
-                .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
-            entry.state = IndexState::Building;
-            cat.update_index(&entry)?;
-            drop(cat);
-            sync_catalog_root_overlay(shared, md, overlay)?;
-
-            // Initialize the freshly-allocated leaf page so the index
-            // tree is valid to open for writes during Phase 2.
-            let idx_store = new_txn_store(shared, overlay);
-            BTree::create_at(idx_store, idx_root)?;
-            Ok(())
-        })?;
-        Ok(outcome.get())
-    }
-
-    /// Phase 2 of `create_index`: populate the index from the data tree.
-    ///
-    /// Runs under `metadata.read()` + the target namespace's lane, so
-    /// writers on *other* namespaces proceed concurrently. Writers on
-    /// this namespace wait on the lane (same as any other ns-local
-    /// serialization). Any writer that commits DURING the build on this
-    /// ns is blocked out; writers between Phase 1 and Phase 2 have
-    /// already dual-written to the Building index (via
-    /// `maintain_secondary_on_*`).
-    fn create_index_build(&self, ns: &str, name: &str) -> Result<()> {
-        // Acquire the namespace lane under a short-lived metadata.read()
-        // guard — the read guard blocks drop_namespace (which needs
-        // metadata.write()) from racing with lane acquisition. Once the
-        // lane is in hand, drop the read guard so the long build scan
-        // below does NOT block DDL on other namespaces or bootstrapping
-        // of new namespaces (Gap-9 follow-up; fixes PR 9's known v1
-        // limitation).
-        let lane = self.lane_for(ns);
-        let _lane_guard = {
-            let _md_read = self.metadata.read().map_err(|_| {
-                Error::Internal("metadata RwLock poisoned".into())
-            })?;
-            self.acquire_lane(lane)?
-            // _md_read dropped here.
-        };
-
-        // Take the latest IndexEntry AND CollectionEntry under a brief
-        // metadata.read(). The root pages observed here are authoritative:
-        // we now hold the namespace lane, so no concurrent writer on this
-        // ns can advance them until we release the lane. drop_namespace of
-        // this ns would block on the lane; drop_index of this index may
-        // race and leave us with a missing entry — we error cleanly.
-        let (idx_entry, data_entry) = {
-            let md_read = self.metadata.read().map_err(|_| {
-                Error::Internal("metadata RwLock poisoned".into())
-            })?;
-            let cat = md_read.catalog.lock().expect("catalog poisoned");
-            let idx_entry = cat.get_index(ns, name)?.ok_or_else(|| {
-                Error::Internal(format!(
-                    "index '{}' on '{}' disappeared before build phase",
-                    name, ns
-                ))
-            })?;
-            let data_entry = cat.get_collection(ns)?.ok_or_else(|| {
-                Error::Internal(format!(
-                    "collection '{}' disappeared before build phase",
-                    ns
-                ))
-            })?;
-            (idx_entry, data_entry)
-        };
-
-        // Open a dedicated WAL transaction for the build — it's
-        // independent of Phase 1's txn (already committed) and Phase 3's
-        // txn (has not yet begun).
-        let mark = self.shared.handle.begin_txn()?;
-        let overlay = TxnOverlay::new_shared();
-        let ready_reservations = self
-            .shared
-            .handle
-            .allocator()
-            .drain_deferred_free_reservations();
-        if !ready_reservations.is_empty() {
-            let mut ov = overlay.lock().expect("TxnOverlay mutex poisoned");
-            for page in ready_reservations {
-                ov.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
-        }
-
-        let body: Result<()> = (|| {
-            let data_store = new_txn_store(&self.shared, &overlay);
-            let data_tree = BTree::open(
-                data_store,
-                data_entry.data_root_page,
-                data_entry.data_root_level,
-            );
-            let idx_store = new_txn_store(&self.shared, &overlay);
-            let mut idx_tree = BTree::open(
-                idx_store,
-                idx_entry.root_page,
-                idx_entry.root_level,
-            );
-            let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
-
-            // Persist the possibly-updated root + multikey flag. Note:
-            // we do NOT flip state to Ready here — that happens in
-            // Phase 3 under metadata.write() so readers see a
-            // consistent transition on the published snapshot.
-            let root_changed = idx_tree.root_page != idx_entry.root_page
-                || idx_tree.root_level != idx_entry.root_level;
-            let multikey_changed = any_multikey && !idx_entry.multikey;
-            if root_changed || multikey_changed {
-                let mut updated = idx_entry.clone();
-                if root_changed {
-                    updated.root_page = idx_tree.root_page;
-                    updated.root_level = idx_tree.root_level;
-                }
-                if multikey_changed {
-                    updated.multikey = true;
-                }
-                // Brief metadata.read() for the catalog write. Lane still
-                // protects same-ns serialization; read guard is acquired
-                // only for the duration of the catalog mutation + header
-                // sync so long-build scans don't block other-ns DDL.
-                let md_read = self.metadata.read().map_err(|_| {
-                    Error::Internal("metadata RwLock poisoned".into())
-                })?;
-                md_read
-                    .catalog
-                    .lock()
-                    .expect("catalog poisoned")
-                    .update_index(&updated)?;
-                sync_catalog_root_overlay(&self.shared, &md_read, &overlay)?;
-            }
-            Ok(())
-        })();
-
-        match body {
-            Ok(()) => {
-                // Commit the build txn. We intentionally do NOT hold
-                // commit_seq here — no timestamp is allocated (Phase 2
-                // has no primary writes), and no publish is performed.
-                // The only shared mutation is catalog root/multikey
-                // metadata, which is safe under the lane.
-                let overlay_inner = Arc::try_unwrap(overlay)
-                    .map_err(|_| {
-                        Error::Internal("TxnOverlay still referenced at build commit".into())
-                    })?
-                    .into_inner()
-                    .map_err(|_| Error::Internal("TxnOverlay mutex poisoned".into()))?;
-                let mut base = new_store(&self.shared);
-                overlay_inner.commit(&mut base, &self.shared.handle)?;
-                self.shared.handle.flush()?;
-                let db_page_count = self
-                    .shared
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.total_page_count)?;
-                let header_data = {
-                    let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
-                    page.data().to_vec()
-                };
-                let emergency = self.shared.handle.commit_txn(
-                    0,
-                    PageSize::Small4k,
-                    &header_data,
-                    db_page_count,
-                )?;
-                if emergency {
-                    let _ = self.shared.handle.emergency_checkpoint();
-                }
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.rollback_overlay_and_wal(overlay, mark);
-                Err(e)
-            }
-        }
-    }
-
-    /// Phase 3 of `create_index`: flip `state: Ready` under metadata.write
-    /// and publish the final snapshot.
-    fn create_index_commit(&self, ns: &str, name: &str) -> Result<()> {
-        self.run_ddl(|_shared, md, _overlay| {
-            let mut cat = md.catalog.lock().expect("catalog poisoned");
-            let mut entry = cat.get_index(ns, name)?.ok_or_else(|| {
-                Error::Internal(format!(
-                    "index '{}' on '{}' disappeared before commit phase",
-                    name, ns
-                ))
-            })?;
-            entry.state = IndexState::Ready;
-            cat.update_index(&entry)?;
-            // No catalog-root change unless the B+ tree reshaped; since
-            // we only did an update-in-place of the entry, keep the
-            // header in sync just in case.
-            drop(cat);
-            sync_catalog_root_overlay(_shared, md, _overlay)?;
-            Ok(())
-        })
-    }
-
-    /// Cleanup after a failed Phase 2: drop the orphan Building entry.
-    ///
-    /// This keeps the catalog in a state where a retried
-    /// `create_index(ns, same_name)` succeeds from Phase 1 instead of
-    /// hitting the idempotent-already-exists early return with a stale
-    /// Building entry.
-    fn create_index_cleanup(&self, ns: &str, name: &str) -> Result<()> {
-        self.run_ddl(|shared, md, overlay| {
-            let removed = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .drop_index(ns, name)?;
-            if removed {
-                sync_catalog_root_overlay(shared, md, overlay)?;
-            }
-            Ok(())
-        })
-    }
 
     /// CRUD write lifecycle.
     ///

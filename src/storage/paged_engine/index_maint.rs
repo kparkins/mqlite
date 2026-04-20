@@ -374,7 +374,7 @@ pub(super) enum ReserveOutcome {
 use crate::index::{IndexInfo, IndexModel};
 use crate::storage::secondary_index::generate_index_name;
 
-use super::doc_ops::validate_index_keys;
+use super::doc_helpers::validate_index_keys;
 
 pub(super) fn create_index(engine: &super::PagedEngine, ns: &str, model: &IndexModel) -> crate::error::Result<String> {
     validate_index_keys(&model.keys)?;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::Error;
 
 // -----------------------------------------------------------------------
 // Helper: make a simple key from a u64

@@ -10,8 +10,8 @@
 //!    surrogate mutex pair at the same relative positions and asserts it
 //!    completes without hanging (no circular-wait cycle is reachable
 //!    through the canonical order).
-//! 2. A source-audit test opens `src/storage/buffer_pool.rs` and checks
-//!    that the `BufferPool::reconcile` body contains the
+//! 2. A source-audit test opens `src/storage/buffer_pool/chains.rs` and
+//!    checks that the `BufferPool::reconcile` body contains the
 //!    `registry.oldest_required_ts()` call **before** any
 //!    `inner_32k.lock()` — any refactor that inverts those two lines
 //!    will fail the audit.
@@ -78,14 +78,18 @@ fn canonical_order_does_not_deadlock_under_contention() {
 #[test]
 fn reconcile_snapshots_registry_before_partition_lock() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let path = manifest_dir.join("src").join("storage").join("buffer_pool.rs");
+    let path = manifest_dir
+        .join("src")
+        .join("storage")
+        .join("buffer_pool")
+        .join("chains.rs");
     let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("cannot read {}: {e}", path.display());
     });
 
     let fn_start = body
         .find("pub(crate) fn reconcile(")
-        .expect("reconcile function not found in buffer_pool.rs");
+        .expect("reconcile function not found in buffer_pool/chains.rs");
     // Grab a generous slice — enough to include both key calls.
     let fn_slice = &body[fn_start..fn_start.saturating_add(4096).min(body.len())];
 
