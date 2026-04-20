@@ -581,6 +581,13 @@ impl StorageEngine for PagedEngine {
         // can finish their pin walks.
         self.shared.handle.read_view_registry().force_expire_all();
 
+        // Insert the drop guard BEFORE taking the metadata write lock so that
+        // any writer that starts after this point — including one that sneaks
+        // in between the metadata-write release and the caller observing the
+        // drop return — sees `dropped_namespaces` and refuses to re-bootstrap.
+        // On failure below we remove the guard again so retries can proceed.
+        let newly_dropped = self.dropped_namespaces.insert(ns.to_string());
+
         // Remove the lane from the map so no new writer picks it up, then
         // wait for any writer that grabbed the lane before the remove by
         // briefly locking the removed Arc. Release immediately.
@@ -623,13 +630,11 @@ impl StorageEngine for PagedEngine {
             }
             Ok(())
         });
-        // Record the drop so that `bootstrap_namespace` (called from `run_write`
-        // when the namespace is absent) does not auto-recreate it.  This prevents
-        // a racing insert — one that arrived after `drop_namespace` returned but
-        // whose `run_write` call saw ns_missing — from re-bootstrapping the
-        // namespace and committing stale data to the journal.
-        if result.is_ok() {
-            self.dropped_namespaces.insert(ns.to_string());
+        // The drop-guard was inserted before `run_ddl`.  If run_ddl failed and
+        // we're the thread that newly inserted it, roll it back so retries can
+        // proceed; otherwise leave the prior guard intact.
+        if result.is_err() && newly_dropped {
+            self.dropped_namespaces.remove(ns);
         }
         result
     }

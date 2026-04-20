@@ -5,6 +5,7 @@
 //! failure mode of the MWMR concurrency model.
 
 use bson::doc;
+use bson::oid::ObjectId;
 use bson::Document;
 use mqlite::{Client, Error, OpenOptions};
 use std::collections::HashSet;
@@ -239,8 +240,9 @@ fn drop_namespace_mid_write_burst() {
     let col = client
         .database("drop_mid")
         .collection::<Document>("victim");
-    for i in 0..10i32 {
-        col.insert_one(&doc! { "_id": i, "v": "seed" }).unwrap();
+    for _ in 0..10 {
+        col.insert_one(&doc! { "_id": ObjectId::new(), "v": "seed" })
+            .unwrap();
     }
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -254,11 +256,12 @@ fn drop_namespace_mid_write_burst() {
                 let col = c
                     .database("drop_mid")
                     .collection::<Document>("victim");
-                let mut next = (t as i32 + 1) * 1000;
                 while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     // Errors are allowed (NotFound after drop). Must not panic.
-                    let _ = col.insert_one(&doc! { "_id": next, "t": t as i32 });
-                    next += 4; // stride by thread count to avoid _id collisions
+                    let _ = col.insert_one(&doc! {
+                        "_id": ObjectId::new(),
+                        "t": t as i32,
+                    });
                 }
             })
         })
