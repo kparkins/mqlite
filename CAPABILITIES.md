@@ -49,9 +49,9 @@ Array: `$push` (with `$each`, `$position`, `$sort`, `$slice`), `$pull`, `$pullAl
 ### Durability modes
 
 `DurabilityMode` on `OpenOptions` selects journal-sync behavior:
-- `Strict` — fsync the journal on every commit (default).
-- `Batched` — amortize fsyncs across a small window.
-- `Relaxed` — filesystem-flushed only (no explicit fsync).
+- `FullSync` — fsync the journal on every commit. Zero data-loss window.
+- `Interval(Duration)` — fsync the journal at most once per configured interval (default `Interval(100ms)`).
+- `None` — no explicit fsync. All commits since the last checkpoint may be lost on crash.
 
 ---
 
@@ -69,15 +69,16 @@ Array: `$push` (with `$each`, `$position`, `$sort`, `$slice`), `$pull`, `$pullAl
 
 ### Locking and concurrency model
 
-Lock order (outer → inner):
-1. history-store partition
-2. `DeferredFreeQueue::pending`
-3. 32 KB main partition
-4. 4 KB main partition
-5. `ReadViewRegistry`
-6. writer mutex (`PagedEngine::inner`)
+**Reads** are mutex-free: every read operation does a single `ArcSwap::load()` on the published `PagedEngine::shared.published: ArcSwap<PublishedSnapshot>` and opens B-trees at the snapshotted root pages. No engine-level lock is acquired.
 
-Readers take none of these for a pure read other than a brief `DeferredFreeQueue::pending` on overflow-ref drop. Writers are single-at-a-time per-namespace.
+**Writes** acquire, in this order:
+1. `PagedEngine::metadata: RwLock<MetadataState>` — shared read-guard for CRUD (released before any inner acquire); exclusive write-guard only for DDL (`create_namespace`, `drop_namespace`, `drop_index`, `checkpoint`, `backup`).
+2. `PagedEngine::ns_lanes[ns]` — per-namespace lane mutex. Writers on different namespaces run concurrently; writers on the same namespace serialize here.
+3. `PagedEngine::commit_seq: Mutex<()>` — held across `commit_ts` allocation → primary install → journal append → snapshot publish, so `commit_ts`, journal-append order, and `publish_ts` agree.
+
+Inside that, the MVCC/buffer-pool lock order is: history-store partition → `DeferredFreeQueue::pending` → `AllocatorHandle::state` → 32 KB main partition → 4 KB main partition → `ReadViewRegistry`.
+
+Readers take none of these for a pure read other than a brief `DeferredFreeQueue::pending` on overflow-ref drop. The historical engine-global writer mutex (`PagedEngine::inner`) was retired in the v1 MWMR commit — see [ADR 0002](docs/adr/0002-mwmr.md).
 
 ### Durability and recovery
 
@@ -140,8 +141,8 @@ The wire shim has **no authentication and no TLS**. It is intended for local tes
 ## 6. Deployment profiles
 
 - **Embedded library.** Pure Rust crate, sync-only API, `rust-version = 1.70`, minimal dependency set (arc-swap, bson, dashmap, parking_lot, regex, smallvec, thiserror, crc32c, serde).
-- **Edge / IoT.** Single-file database, no server process, no background threads in the base crate. See `docs/IOT-DEPLOYMENT.md`.
-- **Test double.** Drop-in replacement for a MongoDB container in CI. See `docs/TEST-DOUBLE-COOKBOOK.md`.
+- **Edge / IoT.** Single-file database, no server process, no background threads in the base crate.
+- **Test double.** Drop-in replacement for a MongoDB container in CI (open a `tempfile::TempDir`-backed `.mqlite` per test).
 - **Local wire endpoint.** Run an embedded mongosh-accessible server with `--features wire`.
 
 ---

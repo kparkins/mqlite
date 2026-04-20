@@ -15,11 +15,10 @@ WiredTiger-style MVCC over a paged B-tree store with a dedicated history tier.
 ┌───────────────────────────────────────────────────────────────────────────┐
 │                              PagedEngine                                  │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │          inner: Mutex<BpBackend>   (position 6 — writer mutex)      │  │
-│  │  ┌─────────────────────┐  ┌──────────────────────────────────────┐  │  │
-│  │  │  active_txn:        │  │   txn_counter: AtomicU64             │  │  │
-│  │  │    Option<WriteTxn> │  │                                      │  │  │
-│  │  └─────────────────────┘  └──────────────────────────────────────┘  │  │
+│  │  shared.published: ArcSwap<PublishedSnapshot> (mutex-free read)     │  │
+│  │  metadata:         RwLock<MetadataState>      (DDL exclusive)       │  │
+│  │  ns_lanes:         DashMap<String, Mutex<()>> (per-ns write lane)   │  │
+│  │  commit_seq:       Mutex<()>                   (commit ordering)    │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 └───────┬────────────────────┬─────────────────────────────────┬────────────┘
         │                    │                                 │
@@ -66,17 +65,28 @@ WiredTiger-style MVCC over a paged B-tree store with a dedicated history tier.
 
 ### Lock Order (outer → inner)
 
+Engine-level locks (acquired by writers and DDL, never by readers):
+
 | Position | Resource | Notes |
 |---|---|---|
-| 1 | history-store partition | outermost |
+| A | `PagedEngine::metadata: RwLock<MetadataState>` | CRUD takes `read()` (released before acquiring inner locks); DDL (`create_namespace`, `drop_namespace`, `drop_index`, `checkpoint`, `backup`) takes `write()` exclusive |
+| B | `PagedEngine::ns_lanes[ns]: Mutex<()>` | per-namespace write lane; writers on different namespaces run concurrently, writers on the same namespace serialize here |
+| C | `PagedEngine::commit_seq: Mutex<()>` | commit-ordering fence held across `commit_ts` allocation → primary install → journal append → snapshot publish, so `commit_ts`, journal-append order, and `publish_ts` agree |
+
+Buffer-pool / MVCC locks (acquired inside the write path, and by reconcile):
+
+| Position | Resource | Notes |
+|---|---|---|
+| 1 | history-store partition | outermost buffer-pool lock |
 | 1.5 | `DeferredFreeQueue::pending` | brief, RAII push on refcount → 0 |
 | 2 | `AllocatorHandle::state` | alloc/free/refcount-header-write |
 | 3 | 32 KB main partition (`inner_32k`) | |
 | 4 | 4 KB main partition (`inner_4k`) | |
 | 5 | `ReadViewRegistry` | must be snapshotted BEFORE partition mutex in reconcile |
-| 6 | writer serialization (`PagedEngine::inner` Mutex) | one writer at a time |
 
-Readers acquire NONE of {AllocatorHandle::state, main partition, history-store partition} for pure reads. The only lock any reader path touches is `DeferredFreeQueue::pending` — briefly, when `OverflowRef::Drop` decrefs to 0 and pushes a `u32` before releasing.
+Readers acquire NONE of A–C and NONE of {AllocatorHandle::state, main partition, history-store partition}. A read is a single `shared.published.load()` plus B-tree traversal. The only lock any reader path touches is `DeferredFreeQueue::pending` — briefly, when `OverflowRef::Drop` decrefs to 0 and pushes a `u32` before releasing.
+
+The historical engine-global `PagedEngine::inner: Mutex<BpBackend>` was retired in v1 MWMR — see [ADR 0002](docs/adr/0002-mwmr.md).
 
 ## 2. Read Path (`find`)
 
@@ -84,10 +94,10 @@ Readers acquire NONE of {AllocatorHandle::state, main partition, history-store p
 User                PagedEngine         Registry      Oracle       BTree          BufferPool         ChainSnap         HistoryStore
  │                      │                   │            │            │                │                 │                 │
  │── find(filter) ─────>│                   │            │            │                │                 │                 │
- │                      │─ inner.lock() ──> (brief; tree lookup only)                                                      │
+ │                      │─ shared.published.load() ───> snap (atomic, mutex-free)                                          │
  │                      │─ now() ─────────────────────> read_ts                                                            │
  │                      │─ register(txn_id, Weak<RV>) ──>│            │                │                 │                 │
- │                      │─ inner.unlock() ──>            │            │                │                 │                 │
+ │                      │─ open BTree @ snap.namespaces[ns].data_root_page                                                 │
  │                      │                                             │                │                 │                 │
  │                      │── range_scan_mvcc(view, history_probe) ────>│                │                 │                 │
  │                      │                                             │─ read_leaf ───>│                 │                 │
@@ -122,7 +132,7 @@ User                PagedEngine         Registry      Oracle       BTree        
 User           PagedEngine        WriteTxn       Allocator      BTree           sec-idx          Oracle        BufferPool       Journal
  │                 │                  │              │             │                │                │              │              │
  │─ insert(doc) ─> │                  │              │             │                │                │              │              │
- │                 │─ inner.lock() ──────────────────────────────────────────────────────────────────────────── (pos 6)
+ │                 │─ metadata.read() ──> ns_lanes[ns].lock() ─────────────────────────────────────────────── (pos A → B)
  │                 │─ begin(txn_id) ─>│              │             │                │                │              │              │
  │                 │                  │─ drain_free_queue ──> (pos 1.5 → pos 2)
  │                 │<─── txn ─────────┤              │             │                │                │              │              │
@@ -133,6 +143,7 @@ User           PagedEngine        WriteTxn       Allocator      BTree           
  │                 │─ check unique + pending_sec_index conflict ─────────────────────>│                │              │              │
  │                 │─ stage_sec_index_insert(root, secKey, id) ──> WriteTxn.pending_sec_index                                        │
  │                 │                                                                                                                │
+ │                 │─ commit_seq.lock() ──────────────────────────────────────────────────────────────── (acquire pos C)        │
  │                 │─ commit(oracle, handle) ──>│                                                                                   │
  │                 │                             │─ allocate_commit_ts ────────────────────────────── > commit_ts (HLC)             │
  │                 │                             │                                                                                  │
@@ -150,8 +161,10 @@ User           PagedEngine        WriteTxn       Allocator      BTree           
  │                 │                             │─ append_chain_commit ──────────────────────────────────────────────────────── > │
  │                 │                             │  { commit_ts, refcount_deltas, page_writes, CRC32 }                               │
  │                 │                             │<─────────── fsync ─────────────────────────────────────────────────────────── ── │
+ │                 │                             │─ build PublishedSnapshot { publish_ts = commit_ts, new roots }                     │
+ │                 │                             │─ shared.published.store(Arc::new(snap)) ─── atomic publish ─── visible to readers │
  │                 │<─ Ok ────────────────────────┤                                                                                  │
- │                 │─ inner.unlock() ────────────────────────────────────────────────────────────────────────── (release pos 6)
+ │                 │─ commit_seq.unlock() → ns_lanes[ns].unlock() → metadata read-guard dropped ────── (release C → B → A)
  │<── Ok ──────────┤                                                                                                                 │
 ```
 
@@ -198,10 +211,10 @@ Checkpoint/pin-miss     BufferPool         Registry              Partition(3/4) 
 The only global stop-the-world path.
 
 ```
-User              PagedEngine         inner(pos6)        Registry(pos5)         Views(all)        free_subtree
+User              PagedEngine         metadata(pos A)    Registry(pos 5)       Views(all)        free_subtree
  │                    │                   │                   │                      │                 │
  │ drop_collection ─> │                   │                   │                      │                 │
- │                    │─ lock ───────────>│                   │                      │                 │
+ │                    │─ metadata.write() ──>│                │                      │                 │
  │                    │                                       │                      │                 │
  │                    │─ force_expire_all() ──────────────── >│                      │                 │
  │                    │                                       │─ snapshot Weak<RV>s  │                 │
@@ -215,10 +228,10 @@ User              PagedEngine         inner(pos6)        Registry(pos5)         
  │                    │                                       │                      │  (blocks until pin_ops_in_flight == 0)
  │                    │                                       │                      │                 │
  │                    │─ free_subtree(ns) ─────────────────────────────────────────────────────────── > │
- │                    │   (runs under writer mutex still held, chains drop via RAII,                   │
+ │                    │   (runs under metadata.write() still held, chains drop via RAII,               │
  │                    │    overflow pages decref/enqueue, drain in same pass)                          │
  │                    │<── Ok ─────────────────────────────────────────────────────────────────────── ┤
- │                    │─ unlock ─────────>│                                                             │
+ │                    │─ metadata.write() drop ──>│                                                     │
  │<── Ok ─────────────┤                                                                                 │
 ```
 
@@ -230,10 +243,11 @@ Post-barrier: pre-existing ReadViews are poisoned.
 ## 6. One-Line Mental Model
 
 ```
-READ   = ReadView pins read_ts → chain walk (CoW snapshot) → fallback to history store → fallback to on-disk cell
-WRITE  = WriteTxn holds writer mutex → stage primary + sec-index + overflow deltas → one ChainCommit frame @ one commit_ts → fsync
+READ   = load ArcSwap<PublishedSnapshot> (mutex-free) → ReadView pins read_ts → chain walk → history store → on-disk cell
+WRITE  = metadata.read() → ns_lanes[ns].lock() → stage primary + sec-index + overflow deltas
+         → commit_seq.lock() → commit_ts → install + fsync journal → publish snapshot
 GC     = on eviction, reconcile uses oldest_required_ts to drop dead entries + decref overflow (RAII) → writer drains free queue
-DROP   = writer mutex + force_expire_all views + pin_ops drain + free_subtree under same lock
+DROP   = metadata.write() + force_expire_all views + pin_ops drain + free_subtree under same write-guard
 ```
 
 ## 7. Why the History Store Exists

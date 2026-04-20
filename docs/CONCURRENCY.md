@@ -1,9 +1,10 @@
 # mqlite Concurrency Guide
 
-mqlite uses **in-process MWMR for readers** (via MVCC version chains) and
-**SWMR for writers**. Every read operation opens a `ReadView` that
-pins a point-in-time snapshot; concurrent writes do not disturb an
-in-progress read. Writers serialize on a single engine-level mutex.
+mqlite is **MWMR in-process**: reads are mutex-free (atomic snapshot load),
+and writers on different namespaces run concurrently. Every read operation
+opens a `ReadView` that pins a point-in-time snapshot; concurrent writes
+do not disturb an in-progress read. Writers on the same namespace serialize
+on a per-namespace lane mutex.
 
 ---
 
@@ -63,20 +64,29 @@ println!("{:?}", result2.unwrap().get("status")); // "inactive"
 # Ok::<(), mqlite::Error>(())
 ```
 
-### Writers: `WriteTxn` + serialization mutex
+### Writers: `WriteTxn` + per-namespace lanes
 
 Each write operation creates a `WriteTxn` that stages primary-key
 updates, secondary-index updates, and refcount deltas under a single
 `commit_ts`. At commit, all staged changes become atomically visible to
 new `ReadView`s.
 
-**The one remaining concurrency bottleneck**: both readers and writers
-acquire `PagedEngine::inner: Mutex<BpBackend>` (defined at
-`src/storage/paged_engine.rs:1421`). Readers take it for the duration of
-the scan; writers take it for the full `with_txn` call. This means reads
-and writes currently serialize even though MVCC visibility is fully
-functional inside the mutex. Removing the mutex from the read path is the
-primary goal of [ADR 0002](adr/0002-mwmr.md).
+**Lock acquisition on the write path** (see `src/storage/paged_engine.rs`):
+
+1. `PagedEngine::metadata: RwLock<MetadataState>` — shared read-guard, released before the lane is acquired.
+2. `PagedEngine::ns_lanes[ns]: Mutex<()>` — per-namespace lane. Writers on **different** namespaces run concurrently; writers on the **same** namespace serialize here.
+3. `PagedEngine::commit_seq: Mutex<()>` — held around `commit_ts` allocation → primary install → journal append → snapshot publish, so `commit_ts`, journal-append order, and `publish_ts` always agree across concurrent commits.
+
+**Reads take none of the above locks.** A read loads `shared.published:
+ArcSwap<PublishedSnapshot>` atomically, opens B-trees at the snapshot's
+root pages, and opens a `ReadView`. Reads and writes never block each
+other; writers on different namespaces never block each other.
+
+The historical engine-global writer mutex (`PagedEngine::inner:
+Mutex<BpBackend>`) was retired in v1 MWMR (see [ADR 0002](adr/0002-mwmr.md)).
+DDL operations (`create_collection`, `drop_collection`, `drop_index`,
+`checkpoint`, `backup`) still take `metadata.write()` exclusively and
+block all concurrent writers for their duration.
 
 **Writer exclusivity** is additionally enforced by an OS-level advisory
 file lock acquired at `Client::open()` time:
@@ -93,11 +103,10 @@ This prevents two separate **processes** from writing simultaneously.
 ### `drop_collection` force-expire barrier
 
 `drop_collection` is the one DDL operation that cannot proceed while any
-`ReadView` is live on the target collection. At
-`src/storage/paged_engine.rs:2050` the engine calls
-`read_view_registry().force_expire_all()`, which poisons every open
-`ReadView` globally and waits for `pin_ops_in_flight == 0` before freeing
-the collection's B-tree pages.
+`ReadView` is live on the target collection. Under `metadata.write()` the
+engine calls `read_view_registry().force_expire_all()`, which poisons
+every open `ReadView` globally and waits for `pin_ops_in_flight == 0`
+before freeing the collection's B-tree pages (see `src/storage/paged_engine.rs`).
 
 Any caller that holds a `ReadView` across a `drop_collection` will receive
 `Error::ReadViewExpired` on its next read and must open a fresh view.
@@ -175,9 +184,9 @@ the busy handler takes precedence.
 
 ## Multi-Threaded Write Patterns
 
-Because only one writer can run at a time, the key to good multi-threaded write
-performance is **serializing writes efficiently** at the application level.
-Two patterns work well:
+Writers on different namespaces (collections) run concurrently. Writers on
+the **same** namespace serialize on that namespace's lane mutex. The two
+patterns below are useful when same-namespace write throughput matters:
 
 ### Pattern 1: Dedicated Writer Thread with Channel
 
@@ -355,11 +364,11 @@ Yes, but only one process can be the writer. Open additional processes with
 succeed, and subsequent writes from either process will race — the OS advisory
 lock ensures only one wins at a time, with the loser receiving `WriterBusy`.
 
-**Q: Do I need to manually checkpoint the WAL?**
+**Q: Do I need to manually checkpoint the journal?**
 
-No. mqlite auto-checkpoints the WAL after every `wal_auto_checkpoint` pages
+No. mqlite auto-checkpoints the journal after every `journal_auto_checkpoint` pages
 (default: 1000 pages). On clean close, a full checkpoint is performed and the
-WAL file is removed.
+journal file is removed.
 
 **Q: Can readers see partial writes?**
 

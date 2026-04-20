@@ -69,14 +69,12 @@ Dropping the handle is non-blocking and leaves the journal on disk; the next ope
 ## Documentation
 
 - [API Reference (docs.rs)](https://docs.rs/mqlite)
-- [Architecture](ARCHITECTURE.md) — block diagrams and lock order
-- [Compatibility Matrix](docs/COMPATIBILITY.md)
-- [Concurrency Guide](docs/CONCURRENCY.md)
-- [Error Guide](docs/ERRORS.md)
-- [File Management Guide](docs/FILE-MANAGEMENT.md)
-- [IoT and Embedded Deployment Guide](docs/IOT-DEPLOYMENT.md)
-- [Migration Guide](docs/MIGRATION.md) (from the MongoDB Rust driver)
-- [Test Double Cookbook](docs/TEST-DOUBLE-COOKBOOK.md)
+- [Architecture](ARCHITECTURE.md) — engine internals, lock order, MVCC read/write/reconcile paths
+- [Capabilities](CAPABILITIES.md) — feature surface and what is not supported
+- [Compatibility Matrix](docs/COMPATIBILITY.md) — operator- and command-level MongoDB compatibility
+- [Concurrency Model](docs/CONCURRENCY.md) — MWMR reads, per-namespace write lanes, cross-process locking
+- [Errors](docs/ERRORS.md) — `Error` variants and MongoDB error-code mapping
+- [File Management](docs/FILE-MANAGEMENT.md) — backup, checkpoint, crash recovery
 - [Wire Protocol Security Advisory](docs/WIRE-SECURITY.md)
 - ADRs: [0001 MVCC](docs/adr/0001-mvcc.md), [0002 MWMR](docs/adr/0002-mwmr.md)
 

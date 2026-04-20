@@ -268,8 +268,8 @@ The WAL protocol relies on:
 Network filesystems frequently fail to provide all three guarantees. The result
 is database corruption that may not be detected immediately.
 
-Use mqlite only on **local block storage**: local SSDs, NVMe, SD cards (with
-caveats — see [IoT Deployment Guide](IOT-DEPLOYMENT.md)), or loop-mounted images.
+Use mqlite only on **local block storage**: local SSDs, NVMe, SD cards, or
+loop-mounted images.
 
 ---
 
