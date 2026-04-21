@@ -460,7 +460,12 @@ impl StorageEngine for PagedEngine {
         doc_ops::insert(self, ns, doc)
     }
 
-    fn find(&self, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>> {
+    fn find(
+        &self,
+        ns: &str,
+        filter: &Document,
+        opts: &FindOptions,
+    ) -> Result<(Vec<Document>, crate::query::explain::ExplainResult)> {
         doc_ops::find(self, ns, filter, opts)
     }
 
@@ -487,7 +492,7 @@ impl StorageEngine for PagedEngine {
         doc_ops::count(self, ns, filter)
     }
 
-    fn find_one_and_update_doc(
+    fn find_one_and_update(
         &self,
         ns: &str,
         filter: &Document,
@@ -497,7 +502,7 @@ impl StorageEngine for PagedEngine {
         doc_ops::find_one_and_update_doc(self, ns, filter, update, opts)
     }
 
-    fn find_one_and_delete_doc(
+    fn find_one_and_delete(
         &self,
         ns: &str,
         filter: &Document,
@@ -506,7 +511,7 @@ impl StorageEngine for PagedEngine {
         doc_ops::find_one_and_delete_doc(self, ns, filter, opts)
     }
 
-    fn find_one_and_replace_doc(
+    fn find_one_and_replace(
         &self,
         ns: &str,
         filter: &Document,

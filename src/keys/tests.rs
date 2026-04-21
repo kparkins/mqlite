@@ -1,4 +1,4 @@
-//! Tests for `key_encoding.rs`. See [`super`] for the production code.
+//! Tests for `keys.rs`. See [`super`] for the production code.
 
 use super::*;
 use bson::spec::BinarySubtype;

@@ -6,14 +6,14 @@ use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
 use crate::mvcc::transaction::Ns;
-use crate::key_encoding::encode_key;
+use crate::keys::encode_key;
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
     ReturnDocument, UpdateOptions,
 };
 use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::BTree;
-use crate::update_operators::{apply_update, is_operator_update, upsert_base_from_filter};
+use crate::update::{apply_update, is_operator_update, upsert_base_from_filter};
 use crate::validation::validate_document;
 
 use super::btree_ops::btree_insert_doc;
@@ -22,7 +22,9 @@ use super::doc_helpers::compare_docs;
 use super::index_maint::{
     maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
 };
-use super::snapshot_ops::{apply_find_opts, execute_snapshot_pairs_from_snap};
+use super::snapshot_ops::{
+    apply_find_opts, execute_snapshot_pairs_from_snap, execute_snapshot_pairs_only,
+};
 
 pub(super) fn insert(engine: &super::PagedEngine, ns: &str, mut doc: Document) -> Result<Bson> {
     let ns_arc = Ns::from(ns);
@@ -52,29 +54,41 @@ pub(super) fn insert(engine: &super::PagedEngine, ns: &str, mut doc: Document) -
     })
 }
 
-pub(super) fn find(engine: &super::PagedEngine, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>> {
+pub(super) fn find(
+    engine: &super::PagedEngine,
+    ns: &str,
+    filter: &Document,
+    opts: &FindOptions,
+) -> Result<(Vec<Document>, crate::query::explain::ExplainResult)> {
     let snap = engine.shared.published.load();
     let ns_snap = match snap.namespaces.get(ns) {
-        None => return Ok(Vec::new()),
+        None => {
+            // No namespace → planner never ran; report an empty collscan.
+            let plan = crate::query::planner::ScanPlan::CollScan;
+            return Ok((
+                Vec::new(),
+                crate::query::explain::ExplainResult::from_plan(&plan, 0),
+            ));
+        }
         Some(n) => n,
     };
-    let matched: Vec<Document> = execute_snapshot_pairs_from_snap(
+    let (plan, pairs) = execute_snapshot_pairs_from_snap(
         &engine.shared,
         ns,
         ns_snap,
         filter,
         snap.publish_ts,
         true,
-    )?
-    .into_iter()
-    .map(|(_, doc)| doc)
-    .collect();
-    Ok(apply_find_opts(matched, opts))
+    )?;
+    let docs_examined = pairs.len() as u64;
+    let matched: Vec<Document> = pairs.into_iter().map(|(_, doc)| doc).collect();
+    let explain = crate::query::explain::ExplainResult::from_plan(&plan, docs_examined);
+    Ok((apply_find_opts(matched, opts), explain))
 }
 
 pub(super) fn find_one(engine: &super::PagedEngine, ns: &str, filter: &Document) -> Result<Option<Document>> {
     let opts = FindOptions::new();
-    let mut results = find(engine, ns, filter, &opts)?;
+    let (mut results, _explain) = find(engine, ns, filter, &opts)?;
     Ok((!results.is_empty()).then(|| results.remove(0)))
 }
 
@@ -107,7 +121,7 @@ pub(super) fn update(
             });
         }
         Some(ns_snap) => {
-            execute_snapshot_pairs_from_snap(
+            execute_snapshot_pairs_only(
                 &engine.shared,
                 ns,
                 ns_snap,
@@ -186,7 +200,7 @@ pub(super) fn delete(engine: &super::PagedEngine, ns: &str, filter: &Document, m
     let pairs_to_delete: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
         None => return Ok(DeleteResult { deleted_count: 0 }),
         Some(ns_snap) => {
-            let pairs = execute_snapshot_pairs_from_snap(
+            let pairs = execute_snapshot_pairs_only(
                 &engine.shared,
                 ns,
                 ns_snap,
@@ -252,7 +266,7 @@ pub(super) fn count(engine: &super::PagedEngine, ns: &str, filter: &Document) ->
         Some(n) => n,
     };
     Ok(
-        execute_snapshot_pairs_from_snap(
+        execute_snapshot_pairs_only(
             &engine.shared,
             ns,
             ns_snap,
@@ -286,7 +300,7 @@ pub(super) fn find_one_and_update_doc(
             return Ok(None);
         }
         Some(ns_snap) => {
-            execute_snapshot_pairs_from_snap(
+            execute_snapshot_pairs_only(
                 &engine.shared,
                 ns,
                 ns_snap,
@@ -365,7 +379,7 @@ pub(super) fn find_one_and_delete_doc(
     let snap = engine.shared.published.load();
     let mut matched: Vec<(Vec<u8>, Document)> = match snap.namespaces.get(ns) {
         None => return Ok(None),
-        Some(ns_snap) => execute_snapshot_pairs_from_snap(
+        Some(ns_snap) => execute_snapshot_pairs_only(
             &engine.shared,
             ns,
             ns_snap,
@@ -437,7 +451,7 @@ pub(super) fn find_one_and_replace_doc(
             return Ok(None);
         }
         Some(ns_snap) => {
-            execute_snapshot_pairs_from_snap(
+            execute_snapshot_pairs_only(
                 &engine.shared,
                 ns,
                 ns_snap,

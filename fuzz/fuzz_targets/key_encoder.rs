@@ -18,7 +18,7 @@
 
 use bson::Bson;
 use libfuzzer_sys::fuzz_target;
-use mqlite::key_encoding::{encode_compound_key, encode_key};
+use mqlite::keys::{encode_compound_key, encode_key};
 use std::io::Cursor;
 
 fuzz_target!(|data: &[u8]| {

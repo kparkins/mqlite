@@ -1,5 +1,8 @@
 mod tests {
     use super::super::*;
+    use crate::error::Error;
+    use crate::options::OpenOptions;
+    use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
     #[cfg(unix)]
     use libc;
     use std::fs;
@@ -851,7 +854,7 @@ mod compat_tests {
         assert_eq!(with_index.len(), 9);
         assert_eq!(without_index.len(), 9);
         let ids = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
-            use crate::key_encoding::encode_key;
+            use crate::keys::encode_key;
             docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
         };
         assert_eq!(ids(&with_index), ids(&without_index));

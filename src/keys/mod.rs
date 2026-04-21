@@ -102,7 +102,7 @@ pub(crate) const COMPOUND_SEP: u8 = 0x01;
 /// # Examples
 ///
 /// ```rust
-/// use mqlite::key_encoding::encode_key;
+/// use mqlite::keys::encode_key;
 /// use bson::Bson;
 ///
 /// let k1 = encode_key(&Bson::Int32(-1));
@@ -125,7 +125,7 @@ pub fn encode_key(value: &Bson) -> Vec<u8> {
 /// # Examples
 ///
 /// ```rust
-/// use mqlite::key_encoding::encode_compound_key;
+/// use mqlite::keys::encode_compound_key;
 /// use bson::Bson;
 ///
 /// // Compound key: (name ASC, age DESC)
@@ -472,5 +472,4 @@ fn encode_signed_i64_be(buf: &mut Vec<u8>, v: i64) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "key_encoding_tests.rs"]
-mod tests_extracted;
+mod tests;

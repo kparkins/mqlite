@@ -21,7 +21,7 @@ use crate::{
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
 };
 
-use super::{reject_symlink, ClientInner};
+use super::{path::reject_symlink, ClientInner};
 
 impl ClientInner {
     pub(crate) fn insert_one<T: serde::Serialize>(
@@ -157,9 +157,8 @@ impl ClientInner {
                 "mqlite::find"
             );
         }
-        let docs = self.engine.find(name, &filter, &opts)?;
-        let docs_examined = docs.len() as u64;
-        Ok(Cursor::new(docs, docs_examined))
+        let (docs, explain) = self.engine.find(name, &filter, &opts)?;
+        Ok(Cursor::new(docs, explain))
     }
 
     pub(crate) fn update_one(
@@ -199,7 +198,7 @@ impl ClientInner {
     ) -> Result<Option<T>> {
         match self
             .engine
-            .find_one_and_update_doc(name, &filter, &update, &opts)?
+            .find_one_and_update(name, &filter, &update, &opts)?
         {
             None => Ok(None),
             Some(doc) => bson::from_document(doc)
@@ -214,7 +213,7 @@ impl ClientInner {
         filter: Document,
         opts: FindOneAndDeleteOptions,
     ) -> Result<Option<T>> {
-        match self.engine.find_one_and_delete_doc(name, &filter, &opts)? {
+        match self.engine.find_one_and_delete(name, &filter, &opts)? {
             None => Ok(None),
             Some(doc) => bson::from_document(doc)
                 .map(Some)
@@ -232,7 +231,7 @@ impl ClientInner {
         let replacement_doc = bson::to_document(replacement).map_err(Error::BsonSerialization)?;
         match self
             .engine
-            .find_one_and_replace_doc(name, &filter, &replacement_doc, &opts)?
+            .find_one_and_replace(name, &filter, &replacement_doc, &opts)?
         {
             None => Ok(None),
             Some(doc) => bson::from_document(doc)
@@ -242,7 +241,6 @@ impl ClientInner {
     }
 
     pub(crate) fn estimated_document_count(&self, name: &str) -> Result<u64> {
-        // Estimated count = exact count for the stub engine.
         self.engine.count(name, &Document::new())
     }
 

@@ -183,7 +183,7 @@ pub(crate) enum CellValue {
 /// A key–value cell in a leaf page.
 #[derive(Debug, Clone)]
 pub(super) struct LeafCell {
-    /// B+ tree key (encoded with [`crate::key_encoding`]).
+    /// B+ tree key (encoded with [`crate::keys`]).
     pub(super) key: Vec<u8>,
     /// The associated value.
     pub(super) value: CellValue,

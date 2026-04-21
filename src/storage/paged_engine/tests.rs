@@ -23,7 +23,7 @@ fn insert_and_find_one() {
 #[test]
 fn insert_missing_namespace_returns_empty_find() {
     let e = engine();
-    let found = e.find("test.users", &doc! {}, &FindOptions::new()).unwrap();
+    let (found, _) = e.find("test.users", &doc! {}, &FindOptions::new()).unwrap();
     assert!(found.is_empty());
 }
 
@@ -91,7 +91,7 @@ fn find_with_sort_and_limit() {
     let mut opts = FindOptions::new();
     opts.sort = Some(doc! { "v": 1 });
     opts.limit = Some(2);
-    let results = e.find("test.c", &doc! {}, &opts).unwrap();
+    let (results, _) = e.find("test.c", &doc! {}, &opts).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].get_i32("v").unwrap(), 1);
     assert_eq!(results[1].get_i32("v").unwrap(), 2);
@@ -155,7 +155,7 @@ fn find_one_and_delete_returns_doc() {
     let e = engine();
     e.insert("test.c", doc! { "x": 42 }).unwrap();
     let d = e
-        .find_one_and_delete_doc(
+        .find_one_and_delete(
             "test.c",
             &doc! { "x": 42 },
             &FindOneAndDeleteOptions::default(),
@@ -626,7 +626,7 @@ fn buffered_index_scan_range_gt() {
     }
 
     // Use $gt — only scores > 7 should be returned.
-    let results = e
+    let (results, _) = e
         .find(
             "test.players",
             &doc! { "score": { "$gt": 7i32 } },
@@ -656,7 +656,7 @@ fn buffered_index_scan_in_query() {
     e.insert("test.orders", doc! { "status": "closed",  "amount": 30i32 })
         .unwrap();
 
-    let results = e
+    let (results, _) = e
         .find(
             "test.orders",
             &doc! { "status": { "$in": ["pending", "active"] } },
@@ -718,7 +718,7 @@ fn buffered_compound_index_lookup() {
     .unwrap();
 
     // Equality on the leftmost field — planner selects the compound index.
-    let results = e
+    let (results, _) = e
         .find(
             "test.products",
             &doc! { "category": "books" },
@@ -788,7 +788,7 @@ fn swmr_concurrent_readers_do_not_block() {
             let e = Arc::clone(&e);
             thread::spawn(move || {
                 let opts = FindOptions::new();
-                let docs = e.find("test.c", &doc! {}, &opts).unwrap();
+                let (docs, _) = e.find("test.c", &doc! {}, &opts).unwrap();
                 assert_eq!(docs.len(), 20, "all 20 docs must be visible to every reader");
             })
         })

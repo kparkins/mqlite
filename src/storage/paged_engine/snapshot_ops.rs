@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
-use crate::key_encoding::{encode_compound_key, encode_key, COMPOUND_SEP};
+use crate::keys::{encode_compound_key, encode_key, COMPOUND_SEP};
 use crate::mvcc::read_view::ReadView;
 use crate::options::FindOptions;
 use crate::query::eval_filter;
@@ -256,7 +256,7 @@ pub(super) fn execute_snapshot_pairs_from_snap(
     filter: &Document,
     publish_ts: crate::mvcc::timestamp::Ts,
     allow_secondary_indexes: bool,
-) -> Result<Vec<(Vec<u8>, Document)>> {
+) -> Result<(ScanPlan, Vec<(Vec<u8>, Document)>)> {
     let ready_indexes: Vec<&PublishedIndex> = if allow_secondary_indexes {
         ns_snap
             .indexes
@@ -274,14 +274,49 @@ pub(super) fn execute_snapshot_pairs_from_snap(
         })
         .collect();
 
-    match select_plan(filter, &index_metas) {
+    let plan = select_plan(filter, &index_metas);
+    let pairs = execute_plan_from_snap(&plan, shared, ns, ns_snap, &ready_indexes, filter, publish_ts)?;
+    Ok((plan, pairs))
+}
+
+/// Thin wrapper around [`execute_snapshot_pairs_from_snap`] for non-find
+/// callers that don't need the [`ScanPlan`] back.
+pub(super) fn execute_snapshot_pairs_only(
+    shared: &SharedState,
+    ns: &str,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    publish_ts: crate::mvcc::timestamp::Ts,
+    allow_secondary_indexes: bool,
+) -> Result<Vec<(Vec<u8>, Document)>> {
+    let (_plan, pairs) = execute_snapshot_pairs_from_snap(
+        shared,
+        ns,
+        ns_snap,
+        filter,
+        publish_ts,
+        allow_secondary_indexes,
+    )?;
+    Ok(pairs)
+}
+
+fn execute_plan_from_snap(
+    plan: &ScanPlan,
+    shared: &SharedState,
+    ns: &str,
+    ns_snap: &NamespaceSnapshot,
+    ready_indexes: &[&PublishedIndex],
+    filter: &Document,
+    publish_ts: crate::mvcc::timestamp::Ts,
+) -> Result<Vec<(Vec<u8>, Document)>> {
+    match plan {
         ScanPlan::PrimaryKeyLookup { condition } => execute_primary_key_lookup_from_snap(
             shared,
             ns,
             ns_snap,
             filter,
             publish_ts,
-            &condition,
+            condition,
         ),
         ScanPlan::IndexScan {
             index_name,
@@ -291,12 +326,12 @@ pub(super) fn execute_snapshot_pairs_from_snap(
             shared,
             ns,
             ns_snap,
-            &ready_indexes,
+            ready_indexes,
             filter,
             publish_ts,
-            &index_name,
-            &primary_field,
-            &condition,
+            index_name,
+            primary_field,
+            condition,
         ),
         ScanPlan::CollScan => execute_collscan_from_snap(shared, ns, ns_snap, filter, publish_ts),
     }

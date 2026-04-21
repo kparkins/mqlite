@@ -3,7 +3,7 @@
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
-use crate::key_encoding::encode_key;
+use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
 use crate::query::eval_filter;
 use crate::storage::btree::{BTree, BTreePageStore};

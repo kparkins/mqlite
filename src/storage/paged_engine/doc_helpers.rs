@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
-use crate::key_encoding::encode_key;
+use crate::keys::encode_key;
 use crate::query::get_nested_field;
 use crate::storage::btree::{BTree, BTreePageStore, CellValue};
 use crate::storage::oid::ObjectIdGenerator;

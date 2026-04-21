@@ -63,11 +63,19 @@ pub trait StorageEngine: Send + Sync {
     /// Returns the inserted `_id` as [`Bson`].
     fn insert(&self, ns: &str, doc: Document) -> Result<Bson>;
 
-    /// Return all documents in `ns` that match `filter`.
+    /// Return all documents in `ns` that match `filter`, along with the
+    /// executed query plan.
     ///
     /// Applies sort, skip, limit, and projection from `opts` if set.
-    /// Returns an empty `Vec` when the namespace does not exist.
-    fn find(&self, ns: &str, filter: &Document, opts: &FindOptions) -> Result<Vec<Document>>;
+    /// Returns an empty `Vec` when the namespace does not exist; the
+    /// accompanying [`ExplainResult`] still reflects the plan the planner
+    /// would have chosen.
+    fn find(
+        &self,
+        ns: &str,
+        filter: &Document,
+        opts: &FindOptions,
+    ) -> Result<(Vec<Document>, crate::query::explain::ExplainResult)>;
 
     /// Return the first document in `ns` that matches `filter`, or `None`.
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>>;
@@ -106,7 +114,7 @@ pub trait StorageEngine: Send + Sync {
     /// document before or after modification (as specified by `opts`).
     ///
     /// Returns `None` when no document matches (and upsert is disabled).
-    fn find_one_and_update_doc(
+    fn find_one_and_update(
         &self,
         ns: &str,
         filter: &Document,
@@ -117,7 +125,7 @@ pub trait StorageEngine: Send + Sync {
     /// Atomically find a document, remove it, and return the removed document.
     ///
     /// Returns `None` when no document matches.
-    fn find_one_and_delete_doc(
+    fn find_one_and_delete(
         &self,
         ns: &str,
         filter: &Document,
@@ -128,7 +136,7 @@ pub trait StorageEngine: Send + Sync {
     /// the document before or after replacement (as specified by `opts`).
     ///
     /// Returns `None` when no document matches (and upsert is disabled).
-    fn find_one_and_replace_doc(
+    fn find_one_and_replace(
         &self,
         ns: &str,
         filter: &Document,

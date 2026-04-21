@@ -8,7 +8,7 @@ use bson::{Bson, Document};
 use serde::de::Error as SerdeDeError;
 
 use crate::error::{Error, Result};
-use crate::key_encoding::encode_key;
+use crate::keys::encode_key;
 
 // ---------------------------------------------------------------------------
 // Nested field access (dot notation)

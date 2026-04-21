@@ -7,6 +7,7 @@
 //! filter evaluation (comparison, logical, element, array operators, `$regex`),
 //! and query planning (index selection, sort, projection).
 
+pub(crate) mod explain;
 mod filter;
 pub(crate) mod planner;
 

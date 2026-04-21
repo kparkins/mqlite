@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
-use crate::key_encoding::{encode_compound_key, COMPOUND_SEP};
+use crate::keys::{encode_compound_key, COMPOUND_SEP};
 use crate::mvcc::transaction::WriteTxn;
 use crate::query::planner::IndexCondition;
 use crate::storage::btree::{BTree, CellValue};

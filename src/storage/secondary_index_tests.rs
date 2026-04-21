@@ -495,7 +495,7 @@
 
     #[test]
     fn build_index_populates_from_data_tree() {
-        use crate::key_encoding::encode_key;
+        use crate::keys::encode_key;
 
         let mut data_tree = fresh_tree();
         let mut idx_tree = fresh_tree();
@@ -533,7 +533,7 @@
 
     #[test]
     fn build_index_detects_multikey() {
-        use crate::key_encoding::encode_key;
+        use crate::keys::encode_key;
 
         let mut data_tree = fresh_tree();
         let mut idx_tree = fresh_tree();
@@ -559,7 +559,7 @@
 
     #[test]
     fn build_index_unique_detects_duplicate() {
-        use crate::key_encoding::encode_key;
+        use crate::keys::encode_key;
 
         let mut data_tree = fresh_tree();
         let mut idx_tree = fresh_tree();
@@ -614,7 +614,7 @@
         let score_100 = Bson::Int32(100);
         let fv = [(&score_100, true)];
         let (start, end) = {
-            use crate::key_encoding::encode_compound_key;
+            use crate::keys::encode_compound_key;
             let mut s = encode_compound_key(&fv);
             s.push(COMPOUND_SEP);
             let mut e = s.clone();

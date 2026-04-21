@@ -284,7 +284,7 @@ fn apply_rename(doc: &mut Document, args: &Document) -> Result<()> {
 
 /// Compare two BSON values using MongoDB's type ordering for `$min`/`$max`.
 fn bson_cmp(a: &Bson, b: &Bson) -> std::cmp::Ordering {
-    use crate::key_encoding::encode_key;
+    use crate::keys::encode_key;
     encode_key(a).cmp(&encode_key(b))
 }
 
@@ -692,5 +692,4 @@ pub(crate) fn upsert_base_from_filter(filter: &Document) -> Document {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "update_operators_tests.rs"]
 mod tests;

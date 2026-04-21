@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug example 'cli_demo'",
+      "cargo": {
+        "args": ["build", "--example=cli_demo"],
+        "filter": { "name": "cli_demo", "kind": "example" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in library 'mqlite'",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib"],
+        "filter": { "name": "mqlite", "kind": "lib" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

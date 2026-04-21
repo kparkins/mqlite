@@ -112,7 +112,7 @@ pub(crate) struct SecIndexWrite {
     /// Root page of the target secondary-index B+ tree. The install pass
     /// uses this to locate the tree at commit time.
     pub(crate) index_root_page: u32,
-    /// Compound key bytes (from `encode_compound_key` in `key_encoding`).
+    /// Compound key bytes (from `encode_compound_key` in `keys`).
     pub(crate) key: Vec<u8>,
     /// Operation kind — insert with id bytes or delete (tombstone).
     pub(crate) op: SecIndexOp,

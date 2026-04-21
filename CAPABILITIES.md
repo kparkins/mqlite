@@ -179,7 +179,7 @@ Concrete directions where mqlite could be extended. None are committed or schedu
 
 - **Aggregation pipeline.** The MVCC read path already produces point-in-time snapshots; adding a pipeline executor on top of cursors would unlock `$match → $group → $project`, `$lookup`, `$unwind`, and `$sort`/`$limit` pushdowns. The main design work is choosing whether to compile pipelines to iterator chains or to a small VM, and how to reuse index scans.
 - **`$expr` and aggregation-expression evaluation in filters.** Shares the expression evaluator with aggregation; probably worth building once and sharing.
-- **Positional array update operators** (`$`, `$[]`, `$[<identifier>]` with `arrayFilters`). The update-operator module already walks documents deeply; this is scoped work inside `src/update_operators.rs`.
+- **Positional array update operators** (`$`, `$[]`, `$[<identifier>]` with `arrayFilters`). The update-operator module already walks documents deeply; this is scoped work inside `src/update/`.
 - **`$text` / text indexes.** Requires a tokenizer, posting-list storage, and scoring. Non-trivial but self-contained.
 - **TTL indexes.** A background expirer thread scanning a TTL secondary index would round out the index story for session/cache workloads.
 - **Partial and wildcard indexes.** Straightforward extensions of the secondary-index builder.

@@ -101,7 +101,7 @@
 // ---------------------------------------------------------------------------
 
 /// BSON re-exports for ergonomic use without a direct `bson` dependency.
-pub mod bson_compat;
+pub mod bson;
 /// Client entry point: `Client::open(path)` → `client.database(name)` → `db.collection::<T>(name)`.
 pub mod client;
 /// Typed collection handles for CRUD operations.
@@ -115,7 +115,7 @@ pub mod error;
 /// Index definition and metadata types.
 pub mod index;
 /// BSON key encoding for B+ tree index storage.
-pub mod key_encoding;
+pub mod keys;
 /// Configuration options for database opening and query operations.
 pub mod options;
 /// Operation result types returned by write operations.
@@ -131,7 +131,7 @@ pub mod mvcc;
 mod query;
 mod storage;
 mod storage_engine;
-mod update_operators;
+mod update;
 mod validation;
 #[allow(dead_code)]
 mod journal;
@@ -147,7 +147,8 @@ pub mod wire;
 // Core entry points
 pub use client::Client;
 pub use collection::Collection;
-pub use cursor::{Cursor, ExplainResult};
+pub use cursor::Cursor;
+pub use query::explain::ExplainResult;
 pub use database::Database;
 
 // Error and Result
@@ -168,7 +169,7 @@ pub use index::{IndexInfo, IndexModel};
 pub use results::{BulkWriteError, DeleteResult, InsertManyResult, InsertOneResult, UpdateResult};
 
 // BSON re-exports — users don't need a direct `bson` dependency for basic usage
-pub use bson_compat::{doc, Bson, DateTime, Document, ObjectId};
+pub use bson::{doc, Bson, DateTime, Document, ObjectId};
 
 // Wire protocol entry point (feature-gated)
 #[cfg(feature = "wire")]
@@ -187,8 +188,8 @@ pub use wire::WireProtocol;
 /// Do **not** call this from application code.
 #[cfg(feature = "fuzz")]
 pub fn fuzz_eval_filter(
-    doc: &bson_compat::Document,
-    filter: &bson_compat::Document,
+    doc: &bson::Document,
+    filter: &bson::Document,
 ) -> Result<bool> {
     query::eval_filter(doc, filter)
 }
