@@ -156,40 +156,23 @@ pub(crate) struct ClientInner {
     /// Stored as `Arc` so the same fd can be shared with the `FilePageSource`
     /// backing the buffer pool.
     file_lock: Arc<AnyFileLock>,
-    /// Buffer pool handle.
-    #[allow(dead_code)]
-    pub(crate) buffer_pool: Option<Arc<BufferPoolHandle>>,
     /// Storage engine.  All CRUD operations are dispatched through this trait.
     pub(crate) engine: Box<dyn StorageEngine>,
-    /// Dedicated file handle for journal→main-file checkpoint I/O.
-    journal_main_file: Option<Arc<Mutex<std::fs::File>>>,
 }
 
 impl ClientInner {
-    fn new_with_buffer_pool(
+    fn new(
         path: Option<PathBuf>,
         opts: OpenOptions,
         file_lock: Arc<AnyFileLock>,
-        buffer_pool: Arc<BufferPoolHandle>,
-        catalog_root_page: u32,
-        catalog_root_level: u8,
-        journal_main_file: Option<Arc<Mutex<std::fs::File>>>,
-    ) -> Result<Self> {
-        let engine = PagedEngine::new_buffered_with_busy(
-            Arc::clone(&buffer_pool),
-            catalog_root_page,
-            catalog_root_level,
-            opts.busy_timeout,
-            opts.busy_handler.clone(),
-        )?;
-        Ok(ClientInner {
+        engine: Box<dyn StorageEngine>,
+    ) -> Self {
+        ClientInner {
             path,
             opts,
             file_lock,
-            buffer_pool: Some(buffer_pool),
-            engine: Box::new(engine),
-            journal_main_file,
-        })
+            engine,
+        }
     }
 }
 
@@ -443,18 +426,22 @@ impl Client {
             history_pool,
             file_header,
             journal,
-            Arc::clone(&journal_main_file),
+            journal_main_file,
         ));
 
-        let inner = Arc::new(ClientInner::new_with_buffer_pool(
-            Some(path.clone()),
-            opts,
-            file_lock,
+        let engine: Box<dyn StorageEngine> = Box::new(PagedEngine::new_buffered_with_busy(
             buffer_pool,
             catalog_root_page,
             catalog_root_level,
-            Some(journal_main_file),
+            opts.busy_timeout,
+            opts.busy_handler.clone(),
         )?);
+        let inner = Arc::new(ClientInner::new(
+            Some(path.clone()),
+            opts,
+            file_lock,
+            engine,
+        ));
         let _ = file_size; // used above, suppress warning
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -519,10 +506,7 @@ impl Client {
     /// when the client has no attached buffer pool.
     #[doc(hidden)]
     pub fn __read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
-        self.inner
-            .buffer_pool
-            .as_ref()
-            .map(|bp| Arc::clone(bp.read_view_registry()))
+        self.inner.engine.read_view_registry()
     }
 }
 

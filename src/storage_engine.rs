@@ -211,4 +211,10 @@ pub trait StorageEngine: Send + Sync {
     fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    /// Test-only accessor for the MVCC `ReadViewRegistry`.
+    #[doc(hidden)]
+    fn read_view_registry(&self) -> Option<std::sync::Arc<crate::mvcc::ReadViewRegistry>> {
+        None
+    }
 }

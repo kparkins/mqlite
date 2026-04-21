@@ -279,20 +279,7 @@ impl ClientInner {
             return Ok(());
         }
 
-        // Flush dirty buffer-pool pages (B+ tree nodes + file header) to the
-        // journal (if attached) or directly to the main file (legacy path).
-        self.engine.checkpoint()?;
-
-        // Journal checkpoint: move all committed journal frames into the main file
-        // and reset the journal to empty.
-        if let (Some(bp), Some(journal_file_mutex)) = (&self.buffer_pool, &self.journal_main_file) {
-            let mut journal_file = journal_file_mutex
-                .lock()
-                .map_err(|_| Error::Internal("journal main file mutex poisoned".into()))?;
-            bp.checkpoint_through_journal(&mut *journal_file)?;
-        }
-
-        Ok(())
+        self.engine.checkpoint()
     }
 
     /// Flush dirty pages to disk and, if configured for `FullSync`, call
@@ -352,12 +339,6 @@ impl ClientInner {
         // journal frames into the main file.  After this, the main file contains
         // the complete committed state and is safe to copy.
         self.engine.checkpoint()?;
-        if let (Some(bp), Some(journal_file_mutex)) = (&self.buffer_pool, &self.journal_main_file) {
-            let mut journal_file = journal_file_mutex
-                .lock()
-                .map_err(|_| Error::Internal("journal main file mutex poisoned".into()))?;
-            bp.checkpoint_through_journal(&mut *journal_file)?;
-        }
 
         // Determine the byte length of the database file.
         let file_size = std::fs::metadata(src_path)?.len();

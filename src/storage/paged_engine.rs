@@ -638,6 +638,10 @@ impl StorageEngine for PagedEngine {
         snapshot_ops::checkpoint(self)
     }
 
+    fn read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
+        Some(Arc::clone(self.shared.handle.read_view_registry()))
+    }
+
     fn close(&self) -> Result<()> {
         snapshot_ops::close(self)
     }

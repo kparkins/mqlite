@@ -342,7 +342,9 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
     crate::mvcc::metrics::set_deferred_free_queue_depth(
         engine.shared.handle.allocator().deferred_free_queue().depth() as u64,
     );
-    engine.shared.handle.flush()
+    engine.shared.handle.flush()?;
+    engine.shared.handle.emergency_checkpoint()?;
+    Ok(())
 }
 
 pub(super) fn close(engine: &super::PagedEngine) -> crate::error::Result<()> {
