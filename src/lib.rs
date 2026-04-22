@@ -103,13 +103,12 @@
 /// BSON re-exports for ergonomic use without a direct `bson` dependency.
 pub mod bson;
 /// Client entry point: `Client::open(path)` → `client.database(name)` → `db.collection::<T>(name)`.
+///
+/// The `Client`, `Database`, and `Collection<T>` handles all live in this module —
+/// they share the same `Arc<ClientInner>` and form a single ownership hierarchy.
 pub mod client;
-/// Typed collection handles for CRUD operations.
-pub mod collection;
 /// Lazy cursor for iterating query results.
 pub mod cursor;
-/// Lightweight database-namespace handle (returned by `Client::database`).
-pub mod database;
 /// Error types and MongoDB-compatible error codes.
 pub mod error;
 /// Index definition and metadata types.
@@ -130,7 +129,6 @@ pub mod results;
 pub mod mvcc;
 mod query;
 mod storage;
-mod storage_engine;
 mod update;
 mod validation;
 #[allow(dead_code)]
@@ -145,11 +143,9 @@ pub mod wire;
 // ---------------------------------------------------------------------------
 
 // Core entry points
-pub use client::Client;
-pub use collection::Collection;
+pub use client::{Client, Collection, Database};
 pub use cursor::Cursor;
 pub use query::explain::ExplainResult;
-pub use database::Database;
 
 // Error and Result
 pub use error::{Error, Result};
@@ -158,7 +154,7 @@ pub use error::{Error, Result};
 pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
 
 // Collection action types (returned by Collection methods; users chain options onto them)
-pub use collection::{
+pub use client::{
     Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update,
 };
 

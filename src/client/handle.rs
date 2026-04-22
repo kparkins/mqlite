@@ -4,9 +4,9 @@
 
 use std::{path::Path, sync::Arc};
 
-use crate::{database::Database, error::Result};
+use crate::error::Result;
 
-use super::inner::ClientInner;
+use super::{database::Database, inner::ClientInner};
 
 /// A connection to an mqlite database file.
 ///

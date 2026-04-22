@@ -97,7 +97,7 @@ const LOCK_RETRY_SLEEP: Duration = Duration::from_millis(1);
 
 /// Platform-agnostic file lock abstraction.
 ///
-/// One `FileLock` is held per open [`Database`](crate::database::Database)
+/// One `FileLock` is held per open [`Database`](crate::Database)
 /// handle.  It serializes writers across OS processes that open the same
 /// `.mqlite` file.
 ///

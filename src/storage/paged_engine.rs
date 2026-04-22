@@ -63,7 +63,7 @@ use crate::storage::btree::BTree;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
-use crate::storage_engine::StorageEngine;
+use super::engine::StorageEngine;
 
 use self::catalog_ops::{
     new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,

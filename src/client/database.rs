@@ -3,7 +3,7 @@
 //! [`Database`] is returned by [`crate::Client::database`] and represents a
 //! named namespace within the mqlite file.  It is a thin wrapper around
 //! `Arc<ClientInner>` plus the database name string — all storage state lives
-//! in the [`crate::client::ClientInner`] it references.
+//! in the [`super::ClientInner`] it references.
 //!
 //! # Object model
 //!
@@ -21,7 +21,8 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::{path::Path, sync::Arc};
 
-use crate::{client::ClientInner, collection::Collection, error::Result};
+use super::{Collection, ClientInner};
+use crate::error::Result;
 
 // ---------------------------------------------------------------------------
 // Database — lightweight namespace handle

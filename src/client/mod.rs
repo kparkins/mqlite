@@ -16,13 +16,21 @@
 //!
 //! ## Module layout
 //!
-//! - [`handle`]  — `Client` struct + lifecycle API (`database`, `checkpoint`,
+//! - [`handle`]     — `Client` struct + lifecycle API (`database`, `checkpoint`,
 //!   `backup`, `close`, `Drop`).
-//! - [`open`]    — `Client::open` and `Client::open_with_options` (the
+//! - [`database`]   — `Database` namespace handle returned by `Client::database`.
+//! - [`collection`] — `Collection<T>` typed CRUD handle returned by
+//!   `Database::collection`, plus its fluent action builders.
+//! - [`open`]       — `Client::open` and `Client::open_with_options` (the
 //!   disk-bootstrap sequence).
-//! - [`inner`]   — `ClientInner` shared state struct.
-//! - [`crud`]    — `impl ClientInner` CRUD and hot-backup methods.
-//! - [`path`]    — private path/header helpers shared by `open` and `crud`.
+//! - [`inner`]      — `ClientInner` shared state struct.
+//! - [`crud`]       — `impl ClientInner` CRUD and hot-backup methods.
+//! - [`path`]       — private path/header helpers shared by `open` and `crud`.
+
+/// Typed collection handles for CRUD operations.
+pub mod collection;
+/// Lightweight database-namespace handle (returned by `Client::database`).
+pub mod database;
 
 mod crud;
 mod handle;
@@ -33,5 +41,9 @@ mod path;
 #[cfg(test)]
 mod tests;
 
+pub use collection::{
+    Collection, Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update,
+};
+pub use database::Database;
 pub use handle::Client;
 pub(crate) use inner::ClientInner;

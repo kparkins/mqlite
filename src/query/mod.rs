@@ -1,7 +1,7 @@
 //! Query engine — filter evaluation, query planning, operator dispatch.
 //!
 //! This is a private internal module. The public API is exposed through
-//! [`Collection`](crate::collection::Collection).
+//! [`Collection`](crate::Collection).
 //!
 //! Provides BSON key encoding (MongoDB comparison ordering), error mapping,
 //! filter evaluation (comparison, logical, element, array operators, `$regex`),

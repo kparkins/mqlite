@@ -13,13 +13,13 @@ use crate::{
     options::OpenOptions,
     storage::{
         buffer_pool::BufferPool,
+        engine::StorageEngine,
         file_io::FilePageSource,
         handle::BufferPoolHandle,
         header::{FileHeader, HEADER_PAGE_SIZE},
         lock::{self, AnyFileLock, FileLock},
         paged_engine::PagedEngine,
     },
-    storage_engine::StorageEngine,
 };
 
 use super::{

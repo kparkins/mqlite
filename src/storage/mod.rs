@@ -1,13 +1,14 @@
 //! Storage engine — B+ tree, page manager, buffer pool.
 //!
 //! This is a private internal module. The public API is exposed through
-//! [`Collection`](crate::collection::Collection) and [`Database`](crate::database::Database).
+//! [`Collection`](crate::Collection) and [`Database`](crate::Database).
 
 pub(crate) mod allocator;
 pub(crate) mod btree;
 pub(crate) mod btree_store;
 pub(crate) mod buffer_pool;
 pub(crate) mod catalog;
+pub(crate) mod engine;
 pub(crate) mod file_io;
 pub(crate) mod handle;
 pub(crate) mod header;

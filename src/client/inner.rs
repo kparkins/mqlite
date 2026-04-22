@@ -3,13 +3,13 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{options::OpenOptions, storage::lock::AnyFileLock, storage_engine::StorageEngine};
+use crate::{options::OpenOptions, storage::{engine::StorageEngine, lock::AnyFileLock}};
 
 /// Internal shared state for a [`super::Client`].
 ///
 /// Wrapped in `Arc` and shared across [`super::Client`] clones,
-/// [`crate::database::Database`] handles, and
-/// [`crate::collection::Collection`] handles.
+/// [`super::Database`] handles, and
+/// [`super::Collection`] handles.
 ///
 /// ## Locking
 ///
