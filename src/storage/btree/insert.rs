@@ -101,7 +101,11 @@ impl<S: BTreePageStore> BTree<S> {
 
         if node.can_insert(cell_size) {
             // Insert and keep sorted.
-            let pos = node.binary_search(key).unwrap_err();
+            let Err(pos) = node.binary_search(key) else {
+                return Err(Error::DuplicateKey {
+                    detail: format!("key already exists (len={})", key.len()),
+                });
+            };
             node.cells.insert(pos, new_cell);
             let encoded = node.encode()?;
             self.store.write_leaf(page, &encoded)?;
@@ -120,7 +124,11 @@ impl<S: BTreePageStore> BTree<S> {
         new_cell: LeafCell,
     ) -> Result<Option<SplitResult>> {
         // Insert new_cell into the cell list (maintaining sorted order).
-        let pos = left_node.binary_search(&new_cell.key).unwrap_err();
+        let Err(pos) = left_node.binary_search(&new_cell.key) else {
+            return Err(Error::DuplicateKey {
+                detail: format!("key already exists (len={})", new_cell.key.len()),
+            });
+        };
         left_node.cells.insert(pos, new_cell);
 
         let total = left_node.cells.len();

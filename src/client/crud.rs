@@ -15,8 +15,8 @@ use crate::{
     error::{Error, Result},
     index::{IndexInfo, IndexModel},
     options::{
-        DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions,
-        FindOneAndUpdateOptions, FindOptions, InsertManyOptions, UpdateOptions,
+        DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
+        FindOptions, InsertManyOptions, UpdateOptions,
     },
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
 };
@@ -306,9 +306,7 @@ impl ClientInner {
         let src_path = match &self.path {
             Some(p) => p.as_path(),
             None => {
-                return Err(Error::Internal(
-                    "backup: no source path available".into(),
-                ));
+                return Err(Error::Internal("backup: no source path available".into()));
             }
         };
 

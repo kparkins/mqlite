@@ -17,6 +17,8 @@ pub(crate) mod lock;
 pub(crate) mod oid;
 pub(crate) mod page;
 pub(crate) mod paged_engine;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod phase0_probe;
 pub(crate) mod root_snapshot;
 pub(crate) mod secondary_index;
 pub(crate) mod txn_page_store;

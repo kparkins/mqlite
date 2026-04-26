@@ -101,6 +101,7 @@ impl ReadView {
     /// Construct a fresh, live `ReadView` not tracked by any registry.
     /// Prefer `ReadViewRegistry::open` on reader paths — this constructor
     /// exists for tests and internal snapshot fixtures.
+    #[must_use]
     pub fn new(read_ts: Ts, txn_id: u64) -> Self {
         Self {
             read_ts,
@@ -116,6 +117,7 @@ impl ReadView {
     /// the view's `txn_id`, bounding the duration that `read_ts` pins the
     /// `oldest_required_ts()` horizon. The registry slot also tracks a
     /// `Weak<ReadView>` so `force_expire_all` can iterate live views.
+    #[must_use]
     pub fn open(registry: Arc<ReadViewRegistry>, read_ts: Ts, txn_id: u64) -> Arc<Self> {
         let view = Arc::new(Self {
             read_ts,
@@ -131,6 +133,7 @@ impl ReadView {
     /// True iff this view has been force-expired. Readers MUST check this
     /// before acting on a cached `ReadView`; the engine returns
     /// `Error::ReadViewExpired` on any subsequent operation.
+    #[must_use]
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
     }
@@ -248,6 +251,7 @@ struct RegistrySlot {
 
 impl std::fmt::Debug for ReadViewRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[allow(clippy::unwrap_used)]
         let guard = self.inner.lock().unwrap();
         f.debug_struct("ReadViewRegistry")
             .field("live_views", &guard.len())
@@ -257,6 +261,7 @@ impl std::fmt::Debug for ReadViewRegistry {
 
 impl ReadViewRegistry {
     /// Construct an empty registry.
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(BTreeMap::new()),
@@ -268,6 +273,7 @@ impl ReadViewRegistry {
     /// across concurrently live views). Refreshes
     /// `mvcc.active_read_views` gauge.
     pub(crate) fn register(&self, txn_id: u64, read_ts: Ts, view: Weak<ReadView>) {
+        #[allow(clippy::unwrap_used)]
         let mut guard = self.inner.lock().unwrap();
         guard.insert(txn_id, RegistrySlot { read_ts, view });
         metrics::set_active_read_views(guard.len() as u64);
@@ -276,13 +282,16 @@ impl ReadViewRegistry {
     /// Remove `txn_id` from the registry. No-op if absent. Refreshes
     /// `mvcc.active_read_views` gauge.
     pub fn unregister(&self, txn_id: u64) {
+        #[allow(clippy::unwrap_used)]
         let mut guard = self.inner.lock().unwrap();
         guard.remove(&txn_id);
         metrics::set_active_read_views(guard.len() as u64);
     }
 
     /// Smallest `read_ts` across all live views, or `Ts::MAX` if empty.
+    #[must_use]
     pub fn oldest_required_ts(&self) -> Ts {
+        #[allow(clippy::unwrap_used)]
         let guard = self.inner.lock().unwrap();
         guard.values().map(|s| s.read_ts).min().unwrap_or(Ts::MAX)
     }
@@ -303,6 +312,7 @@ impl ReadViewRegistry {
     /// state.
     pub fn force_expire_all(&self) {
         let views: Vec<Weak<ReadView>> = {
+            #[allow(clippy::unwrap_used)]
             let guard = self.inner.lock().unwrap();
             guard.values().map(|s| s.view.clone()).collect()
         };
@@ -314,12 +324,16 @@ impl ReadViewRegistry {
     }
 
     /// Number of live views. Mainly for tests / observability.
+    #[must_use]
     pub fn len(&self) -> usize {
+        #[allow(clippy::unwrap_used)]
         self.inner.lock().unwrap().len()
     }
 
     /// True iff no live views are registered.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
+        #[allow(clippy::unwrap_used)]
         self.inner.lock().unwrap().is_empty()
     }
 }
@@ -381,6 +395,7 @@ impl ChainSnapshot {
     /// Deep-clones every entry (bumping overflow refcounts via
     /// `OverflowRef::Clone`) under the atomic-handoff protocol. See
     /// type-level docs for the poison contract.
+    #[must_use]
     pub fn new(
         source: &HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
         view: Option<Arc<ReadView>>,
@@ -428,6 +443,7 @@ impl ChainSnapshot {
     /// Visibility rule:
     /// - Pending entry (`start_ts == Ts::PENDING`): visible only to its own `txn_id`.
     /// - Committed entry: `start_ts <= read_ts < stop_ts`.
+    #[must_use]
     pub fn visible_at(&self, key: &[u8], view: &ReadView) -> Option<&VersionEntry> {
         self.chains.get(key).and_then(|chain| {
             chain.iter().find(|e| {
@@ -441,16 +457,19 @@ impl ChainSnapshot {
     }
 
     /// Number of distinct keys with chains in this snapshot.
+    #[must_use]
     pub fn key_count(&self) -> usize {
         self.chains.len()
     }
 
     /// True iff the snapshot holds no chains.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.chains.is_empty()
     }
 
     /// Length of the chain for `key`, or 0 if absent.
+    #[must_use]
     pub fn chain_len(&self, key: &[u8]) -> usize {
         self.chains.get(key).map_or(0, |c| c.len())
     }
@@ -528,25 +547,61 @@ mod tests {
 
         // Key A: chain of 3 overflow entries on pages 10, 11, 12.
         let mut chain_a = VecDeque::new();
-        chain_a.push_back(overflow_entry(&alloc, 10, Ts { physical_ms: 300, logical: 0 }));
-        chain_a.push_back(overflow_entry(&alloc, 11, Ts { physical_ms: 200, logical: 0 }));
-        chain_a.push_back(overflow_entry(&alloc, 12, Ts { physical_ms: 100, logical: 0 }));
+        chain_a.push_back(overflow_entry(
+            &alloc,
+            10,
+            Ts {
+                physical_ms: 300,
+                logical: 0,
+            },
+        ));
+        chain_a.push_back(overflow_entry(
+            &alloc,
+            11,
+            Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
+        ));
+        chain_a.push_back(overflow_entry(
+            &alloc,
+            12,
+            Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+        ));
         source.insert(b"A".to_vec(), Arc::new(chain_a));
 
         // Key B: chain of 1 overflow entry on page 20.
         let mut chain_b = VecDeque::new();
-        chain_b.push_back(overflow_entry(&alloc, 20, Ts { physical_ms: 400, logical: 0 }));
+        chain_b.push_back(overflow_entry(
+            &alloc,
+            20,
+            Ts {
+                physical_ms: 400,
+                logical: 0,
+            },
+        ));
         source.insert(b"B".to_vec(), Arc::new(chain_b));
 
         for p in [10, 11, 12, 20] {
-            assert_eq!(alloc.overflow_refcount(p), 1, "baseline refcount for page {p}");
+            assert_eq!(
+                alloc.overflow_refcount(p),
+                1,
+                "baseline refcount for page {p}"
+            );
         }
 
         let snap = ChainSnapshot::new(&source, None);
 
         // Post-construction: each overflow page refcount must be baseline + 1.
         for p in [10, 11, 12, 20] {
-            assert_eq!(alloc.overflow_refcount(p), 2, "post-snapshot refcount for page {p}");
+            assert_eq!(
+                alloc.overflow_refcount(p),
+                2,
+                "post-snapshot refcount for page {p}"
+            );
         }
         assert_eq!(snap.key_count(), 2);
         assert_eq!(snap.chain_len(b"A"), 3);
@@ -555,7 +610,11 @@ mod tests {
         // Drop: refcount returns to baseline; no leak, no double-decref.
         drop(snap);
         for p in [10, 11, 12, 20] {
-            assert_eq!(alloc.overflow_refcount(p), 1, "post-drop refcount for page {p}");
+            assert_eq!(
+                alloc.overflow_refcount(p),
+                1,
+                "post-drop refcount for page {p}"
+            );
         }
     }
 
@@ -576,11 +635,24 @@ mod tests {
         let alloc = fresh_allocator();
         let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
         let mut chain = VecDeque::new();
-        chain.push_back(overflow_entry(&alloc, 7, Ts { physical_ms: 100, logical: 0 }));
+        chain.push_back(overflow_entry(
+            &alloc,
+            7,
+            Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+        ));
         source.insert(b"k".to_vec(), Arc::new(chain));
         assert_eq!(alloc.overflow_refcount(7), 1);
 
-        let view = Arc::new(ReadView::new(Ts { physical_ms: 500, logical: 0 }, 42));
+        let view = Arc::new(ReadView::new(
+            Ts {
+                physical_ms: 500,
+                logical: 0,
+            },
+            42,
+        ));
         view.poisoned.store(true, Ordering::Release);
 
         let pre_ops = view.pin_ops_in_flight.load(Ordering::Acquire);
@@ -609,10 +681,23 @@ mod tests {
         let alloc = fresh_allocator();
         let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
         let mut chain = VecDeque::new();
-        chain.push_back(overflow_entry(&alloc, 9, Ts { physical_ms: 100, logical: 0 }));
+        chain.push_back(overflow_entry(
+            &alloc,
+            9,
+            Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+        ));
         source.insert(b"k".to_vec(), Arc::new(chain));
 
-        let view = Arc::new(ReadView::new(Ts { physical_ms: 500, logical: 0 }, 42));
+        let view = Arc::new(ReadView::new(
+            Ts {
+                physical_ms: 500,
+                logical: 0,
+            },
+            42,
+        ));
         // Not poisoned when `new` starts.
         assert!(!view.poisoned.load(Ordering::Acquire));
 
@@ -654,7 +739,13 @@ mod tests {
     #[test]
     fn force_expire_sets_poisoned_and_ticks_counter() {
         crate::mvcc::metrics::reset_read_views_force_expired();
-        let rv = ReadView::new(Ts { physical_ms: 100, logical: 0 }, 42);
+        let rv = ReadView::new(
+            Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+            42,
+        );
         assert!(!rv.poisoned.load(Ordering::Acquire));
         rv.force_expire();
         assert!(rv.poisoned.load(Ordering::Acquire));
@@ -678,9 +769,18 @@ mod tests {
     #[test]
     fn three_open_views_report_min_ts() {
         let reg = ReadViewRegistry::new();
-        let ts100 = Ts { physical_ms: 100, logical: 0 };
-        let ts200 = Ts { physical_ms: 200, logical: 0 };
-        let ts300 = Ts { physical_ms: 300, logical: 0 };
+        let ts100 = Ts {
+            physical_ms: 100,
+            logical: 0,
+        };
+        let ts200 = Ts {
+            physical_ms: 200,
+            logical: 0,
+        };
+        let ts300 = Ts {
+            physical_ms: 300,
+            logical: 0,
+        };
         let v100 = ReadView::open(reg.clone(), ts100, 1);
         let v200 = ReadView::open(reg.clone(), ts200, 2);
         let v300 = ReadView::open(reg.clone(), ts300, 3);
@@ -694,9 +794,18 @@ mod tests {
     #[test]
     fn drop_oldest_advances_horizon() {
         let reg = ReadViewRegistry::new();
-        let ts100 = Ts { physical_ms: 100, logical: 0 };
-        let ts200 = Ts { physical_ms: 200, logical: 0 };
-        let ts300 = Ts { physical_ms: 300, logical: 0 };
+        let ts100 = Ts {
+            physical_ms: 100,
+            logical: 0,
+        };
+        let ts200 = Ts {
+            physical_ms: 200,
+            logical: 0,
+        };
+        let ts300 = Ts {
+            physical_ms: 300,
+            logical: 0,
+        };
         let v100 = ReadView::open(reg.clone(), ts100, 1);
         let _v200 = ReadView::open(reg.clone(), ts200, 2);
         let _v300 = ReadView::open(reg.clone(), ts300, 3);
@@ -713,7 +822,13 @@ mod tests {
         // a no-op.
         let reg = ReadViewRegistry::new();
         {
-            let _rv = ReadView::new(Ts { physical_ms: 500, logical: 0 }, 99);
+            let _rv = ReadView::new(
+                Ts {
+                    physical_ms: 500,
+                    logical: 0,
+                },
+                99,
+            );
             assert!(reg.is_empty());
         }
         assert!(reg.is_empty());
@@ -730,19 +845,26 @@ mod tests {
         // Chain for key K: head is committed at ts=200, stop_ts=MAX; older
         // entry committed at ts=100, stopped at ts=200.
         let head = VersionEntry {
-            start_ts: Ts { physical_ms: 200, logical: 0 },
+            start_ts: Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
             stop_ts: Ts::MAX,
             txn_id: 7,
             data: VersionData::Inline(b"v2".to_vec()),
             is_tombstone: false,
         };
         let older = VersionEntry {
-            start_ts: Ts { physical_ms: 100, logical: 0 },
-            stop_ts: Ts { physical_ms: 200, logical: 0 },
+            start_ts: Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+            stop_ts: Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
             txn_id: 6,
-            data: VersionData::Overflow(
-                OverflowRef::new_owned(42, 256, alloc.clone()).unwrap(),
-            ),
+            data: VersionData::Overflow(OverflowRef::new_owned(42, 256, alloc.clone()).unwrap()),
             is_tombstone: false,
         };
         let mut chain = VecDeque::new();
@@ -752,15 +874,37 @@ mod tests {
 
         let snap = ChainSnapshot::new(&source, None);
 
-        let reader_old = ReadView::new(Ts { physical_ms: 150, logical: 0 }, 99);
-        let reader_new = ReadView::new(Ts { physical_ms: 250, logical: 0 }, 99);
-        let reader_pending = ReadView::new(Ts { physical_ms: 200, logical: 0 }, 99);
+        let reader_old = ReadView::new(
+            Ts {
+                physical_ms: 150,
+                logical: 0,
+            },
+            99,
+        );
+        let reader_new = ReadView::new(
+            Ts {
+                physical_ms: 250,
+                logical: 0,
+            },
+            99,
+        );
+        let reader_pending = ReadView::new(
+            Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
+            99,
+        );
 
-        let got_old = snap.visible_at(b"K", &reader_old).expect("entry visible at ts=150");
+        let got_old = snap
+            .visible_at(b"K", &reader_old)
+            .expect("entry visible at ts=150");
         assert_eq!(got_old.start_ts.physical_ms, 100);
         assert_eq!(got_old.txn_id, 6);
 
-        let got_new = snap.visible_at(b"K", &reader_new).expect("entry visible at ts=250");
+        let got_new = snap
+            .visible_at(b"K", &reader_new)
+            .expect("entry visible at ts=250");
         assert_eq!(got_new.start_ts.physical_ms, 200);
         assert_eq!(got_new.txn_id, 7);
 

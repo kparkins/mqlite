@@ -63,6 +63,10 @@ impl<'a, T: DeserializeOwned> Find<'a, T> {
     }
 
     /// Execute the find and return a [`Cursor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage engine cannot execute the query.
     pub fn run(self) -> Result<Cursor<T>> {
         self.coll
             .inner
@@ -87,6 +91,10 @@ impl<'a, T: Serialize + DeserializeOwned> InsertMany<'a, T> {
     }
 
     /// Execute the insert and return an [`InsertManyResult`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write cannot be flushed or synced.
     pub fn run(self) -> Result<InsertManyResult> {
         self.coll
             .inner
@@ -113,6 +121,10 @@ impl<'a, T> Update<'a, T> {
     }
 
     /// Execute the update and return an [`UpdateResult`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage engine cannot apply the update.
     pub fn run(self) -> Result<UpdateResult> {
         if self.multi {
             self.coll.inner.update_many(
@@ -163,6 +175,11 @@ impl<'a, T: Serialize + DeserializeOwned> FindOneAndUpdate<'a, T> {
     }
 
     /// Execute and return the document (before or after update, per [`return_document`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails or the returned document cannot be
+    /// deserialized into `T`.
     pub fn run(self) -> Result<Option<T>> {
         self.coll.inner.find_one_and_update_with_options(
             &self.coll.namespace(),
@@ -189,6 +206,11 @@ impl<'a, T: DeserializeOwned> FindOneAndDelete<'a, T> {
     }
 
     /// Execute and return the deleted document, or `None` if no document matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails or the returned document cannot be
+    /// deserialized into `T`.
     pub fn run(self) -> Result<Option<T>> {
         self.coll.inner.find_one_and_delete_with_options(
             &self.coll.namespace(),
@@ -229,6 +251,11 @@ impl<'a, T: Serialize + DeserializeOwned> FindOneAndReplace<'a, T> {
     }
 
     /// Execute and return the document (before or after replacement, per [`return_document`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the replacement cannot be serialized, the write
+    /// fails, or the returned document cannot be deserialized into `T`.
     pub fn run(self) -> Result<Option<T>> {
         self.coll.inner.find_one_and_replace_with_options(
             &self.coll.namespace(),

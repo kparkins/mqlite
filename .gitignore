@@ -3,6 +3,8 @@
 debug
 target
 .omc/
+.omx/
+omc/
 .qwen/
 .designs/
 .claude/
@@ -30,12 +32,22 @@ target
 # Gas Town local config
 CLAUDE.md
 
-# cargo-fuzz build artefacts (keep corpus/ and seeds/ committed)
+# cargo-fuzz build artifacts
 fuzz/target/
 fuzz/artifacts/
+fuzz/corpus/
+
+# Generated property-test regressions
+proptest-regressions/
+
+# Local planning / generated project docs
+docs/STORAGE-CONTRACTS-FROZEN.md
+docs/STORAGE-UPGRADE*.md
+docs/cck.md
+progress.txt
+
 .beads/
 .benchmarks/
 .plan-reviews/
 .prd-reviews/
 .runtime/
-

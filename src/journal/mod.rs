@@ -27,11 +27,17 @@
 //! journal pages into the main file and deletes the journal, leaving only
 //! `db.mqlite`.
 
-#[allow(dead_code)]
-pub(crate) mod shm;
+// Crate convention: `expect("N bytes")` on infallible array slices is used
+// throughout the journal module to keep the code readable and is acknowledged
+// as a non-issue by the team. The clippy lint is allowed at the module
+// boundary so denylist-mode CI does not trip on the pre-existing pattern.
+#![allow(clippy::expect_used)]
+
 #[allow(dead_code)]
 pub(crate) mod log_file;
 mod recovery;
+#[allow(dead_code)]
+pub(crate) mod shm;
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -46,9 +52,13 @@ use crate::storage::page::PAGE_SIZE_LEAF;
 
 use self::shm::JournalIndex;
 
+pub(crate) use self::recovery::ParsedLogicalFrames;
+
 use self::log_file::{
-    try_skip_chain_commit, JournalFrameHeader, JournalHeader, JournalPageSize,
-    JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
+    try_skip_chain_commit, try_skip_checkpoint_commit_boundary, try_skip_logical_txn, BoundaryScan,
+    CheckpointCommitBoundaryFrame, CheckpointEpoch, JournalFrameHeader, JournalHeader,
+    JournalOffset, JournalPageSize, LogicalTxnFrame, PageId, JOURNAL_FRAME_HEADER_SIZE,
+    JOURNAL_HEADER_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,6 +97,12 @@ pub(crate) struct JournalManager {
     /// to floor [`TimestampOracle`] so every post-recovery commit is strictly
     /// greater than any durable commit from the previous lifetime.
     pub(super) recovered_max_commit_ts: Option<Ts>,
+    /// Phase 2 §5.1 Pass 1 hand-off: logical frames collected during
+    /// `recover_existing`, consumed exactly once by
+    /// [`SharedState::new`](crate::storage::paged_engine::state::SharedState::new)
+    /// via [`take_parsed_logical_frames`](Self::take_parsed_logical_frames)
+    /// for Pass 2 validation (§5.2).
+    pub(crate) parsed_logical_frames: ParsedLogicalFrames,
 }
 
 impl JournalManager {
@@ -116,8 +132,7 @@ impl JournalManager {
         // Does a journal file already exist?
         if journal_path.exists() {
             // Try to recover it.
-            let recovered =
-                Self::recover_existing(&journal_path, salt1, salt2, main_file)?;
+            let recovered = Self::recover_existing(&journal_path, salt1, salt2, main_file)?;
             if let Some(mgr) = recovered {
                 return Ok(mgr);
             }
@@ -150,6 +165,7 @@ impl JournalManager {
             write_cursor: JOURNAL_HEADER_SIZE as u64,
             last_committed_db_page_count: None,
             recovered_max_commit_ts: None,
+            parsed_logical_frames: ParsedLogicalFrames::default(),
         })
     }
 
@@ -196,6 +212,68 @@ impl JournalManager {
             commit_ts,
             refcount_deltas,
             page_writes,
+        };
+        let bytes = frame.encode()?;
+        let frame_offset = self.write_cursor;
+        self.journal_file
+            .seek(SeekFrom::Start(frame_offset))
+            .map_err(Error::Io)?;
+        self.journal_file.write_all(&bytes).map_err(Error::Io)?;
+        self.journal_file.flush().map_err(Error::Io)?;
+        self.write_cursor += bytes.len() as u64;
+        Ok(frame_offset)
+    }
+
+    /// Append a `LogicalTxnFrame` to the journal (§6.4). Returns the byte
+    /// offset at which the frame was written.
+    ///
+    /// Encodes before any file I/O, so an oversize frame returns
+    /// [`Error::JournalFrameTooLarge`] without touching the journal.
+    ///
+    /// The in-memory [`JournalIndex`] is not updated: logical frames carry
+    /// no `page_number` and recovery scans them linearly (§5).
+    pub(crate) fn append_logical_txn(&mut self, frame: LogicalTxnFrame) -> Result<u64> {
+        let bytes = frame.encode()?;
+        let frame_offset = self.write_cursor;
+        self.journal_file
+            .seek(SeekFrom::Start(frame_offset))
+            .map_err(Error::Io)?;
+        self.journal_file.write_all(&bytes).map_err(Error::Io)?;
+        self.journal_file.flush().map_err(Error::Io)?;
+        self.write_cursor += bytes.len() as u64;
+        crate::mvcc::metrics::record_logical_txn_append_bytes(bytes.len() as u64);
+        // §7 / US-024 AC#3 — duration timing is sampled OUTSIDE the
+        // commit_seq critical section by `LogicalTxnAppendPercentileRefresh`
+        // in `src/storage/paged_engine.rs::run_write_existing`. The
+        // RAII guard captures `Instant::now()` BEFORE acquiring the
+        // commit_seq mutex and samples elapsed AFTER releasing it
+        // (LIFO drop order). No `Instant::now()` inside the journal
+        // critical section.
+        Ok(frame_offset)
+    }
+
+    /// Append a [`CheckpointCommitBoundaryFrame`] to the journal (§3.11).
+    ///
+    /// Returns the [`JournalOffset`] at which the frame was written. Encodes
+    /// before any file I/O; zero `checkpoint_epoch` is rejected at encode time
+    /// (zero is reserved per §3.11).
+    ///
+    /// The in-memory [`JournalIndex`] is not updated: boundary frames carry no
+    /// `page_number` and recovery scans them linearly in Pass 1.
+    pub(crate) fn append_checkpoint_commit_boundary(
+        &mut self,
+        ce: CheckpointEpoch,
+        lo: Ts,
+        hi: Ts,
+        cutoff: PageId,
+    ) -> Result<JournalOffset> {
+        let frame = CheckpointCommitBoundaryFrame {
+            salt1: self.salt1,
+            salt2: self.salt2,
+            checkpoint_epoch: ce.0,
+            covers_commit_ts_lo: lo,
+            covers_commit_ts_hi: hi,
+            overflow_cutoff_page: cutoff.0,
         };
         let bytes = frame.encode()?;
         let frame_offset = self.write_cursor;
@@ -336,6 +414,34 @@ impl JournalManager {
                 continue;
             }
 
+            // Phase 2 §6.5 / US-018: LogicalTxnFrame frames also carry
+            // no `page_number` for the per-page linear scan — skip past
+            // them so subsequent legacy page frames are still visited.
+            if let Some((n, _frame)) =
+                try_skip_logical_txn(&mut self.journal_file, self.salt1, self.salt2)?
+            {
+                cursor += n;
+                continue;
+            }
+
+            // Phase 2 §6.5 / US-018: CheckpointCommitBoundaryFrame frames
+            // (kind 0x04) also carry no page_number; the per-page linear
+            // scan skips past them. A `Torn` boundary halts the scan
+            // (§3.11 point 4) — same semantics as Pass 1 recovery: bytes
+            // past a torn boundary are not durable.
+            match try_skip_checkpoint_commit_boundary(
+                &mut self.journal_file,
+                self.salt1,
+                self.salt2,
+            )? {
+                BoundaryScan::Valid(n, _frame) => {
+                    cursor += n;
+                    continue;
+                }
+                BoundaryScan::Torn => break,
+                BoundaryScan::NotBoundary => {}
+            }
+
             let Some(frame_hdr) =
                 JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?
             else {
@@ -397,11 +503,8 @@ impl JournalManager {
                 .seek(SeekFrom::Start(header_offset))
                 .map_err(Error::Io)?;
             let mut hbuf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
-            self.journal_file
-                .read_exact(&mut hbuf)
-                .map_err(Error::Io)?;
-            let page_size_u32 =
-                u32::from_le_bytes(hbuf[16..20].try_into().expect("4 bytes"));
+            self.journal_file.read_exact(&mut hbuf).map_err(Error::Io)?;
+            let page_size_u32 = u32::from_le_bytes(hbuf[16..20].try_into().expect("4 bytes"));
             let page_size_bytes = JournalPageSize::from_u32(page_size_u32)?.bytes();
 
             let mut page_data = vec![0u8; page_size_bytes];
@@ -480,6 +583,14 @@ impl JournalManager {
         self.write_cursor
     }
 
+    /// Return the journal's database-lifetime salt values `(salt1, salt2)`
+    /// for callers (e.g. `WriteTxn::emit_logical_txn_frame`) that need to
+    /// stamp a [`LogicalTxnFrame`] before handing it off to
+    /// [`append_logical_txn`](Self::append_logical_txn).
+    pub(crate) fn salts(&self) -> (u32, u32) {
+        (self.salt1, self.salt2)
+    }
+
     /// Return a reference to the in-memory journal index (for inspection in tests).
     pub(crate) fn index(&self) -> &JournalIndex {
         &self.index
@@ -494,6 +605,14 @@ impl JournalManager {
         self.recovered_max_commit_ts
     }
 
+    /// Take the `ParsedLogicalFrames` collected during Pass 1 recovery
+    /// (§5.3). Leaves `Default::default()` in its place so the second call
+    /// returns an empty struct. Consumed exactly once by Pass 2 in
+    /// [`SharedState::new`](crate::storage::paged_engine::state::SharedState::new).
+    pub(crate) fn take_parsed_logical_frames(&mut self) -> ParsedLogicalFrames {
+        std::mem::take(&mut self.parsed_logical_frames)
+    }
+
     /// Returns `true` if journal recovery wrote at least one committed page
     /// batch to the main database file during `open_or_create`.
     ///
@@ -503,7 +622,6 @@ impl JournalManager {
     pub(crate) fn did_recover_pages(&self) -> bool {
         self.last_committed_db_page_count.is_some()
     }
-
 
     // -----------------------------------------------------------------------
     // Rollback
@@ -553,6 +671,38 @@ impl JournalManager {
             {
                 scan += n;
                 continue;
+            }
+
+            // Phase 2 §6.5 / US-018: LogicalTxnFrame carries no page_number
+            // for the legacy per-page index, but truncate_to must skip past
+            // it so the scan continues into any following legacy page
+            // frames. Without this skip, a rollback (rollback_txn →
+            // truncate_to) after a successful CRUD commit would rebuild
+            // the index halted at the logical frame and lose every
+            // legacy page frame written after it.
+            if let Some((n, _frame)) =
+                try_skip_logical_txn(&mut self.journal_file, self.salt1, self.salt2)?
+            {
+                scan += n;
+                continue;
+            }
+
+            // Phase 2 §6.5 / US-018: CheckpointCommitBoundaryFrame (kind
+            // 0x04) also carries no page_number — skip past valid frames
+            // and halt at torn ones (same §3.11 point 4 semantics as
+            // Pass 1 recovery; the index rebuild must not see bytes
+            // past a torn boundary).
+            match try_skip_checkpoint_commit_boundary(
+                &mut self.journal_file,
+                self.salt1,
+                self.salt2,
+            )? {
+                BoundaryScan::Valid(n, _frame) => {
+                    scan += n;
+                    continue;
+                }
+                BoundaryScan::Torn => break,
+                BoundaryScan::NotBoundary => {}
             }
 
             let Some(frame_hdr) =

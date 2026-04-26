@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use bson::Document;
 
 use crate::options::IndexOptions;
@@ -28,15 +26,14 @@ pub struct IndexModel {
 /// Typestate marker: builder has no keys set yet.
 pub struct NoKeys;
 /// Typestate marker: builder has keys set.
-pub struct HasKeys;
+pub struct HasKeys(Document);
 
 /// Builder for [`IndexModel`].
 ///
 /// Call `.keys(doc)` first to transition from `NoKeys` to `HasKeys`, then `.build()`.
 pub struct IndexModelBuilder<S = NoKeys> {
-    keys: Option<Document>,
     options: IndexOptions,
-    _state: PhantomData<S>,
+    state: S,
 }
 
 impl IndexModel {
@@ -44,9 +41,8 @@ impl IndexModel {
     #[must_use]
     pub fn builder() -> IndexModelBuilder<NoKeys> {
         IndexModelBuilder {
-            keys: None,
             options: IndexOptions::default(),
-            _state: PhantomData,
+            state: NoKeys,
         }
     }
 }
@@ -56,9 +52,8 @@ impl<S> IndexModelBuilder<S> {
     #[must_use]
     pub fn options(self, options: IndexOptions) -> IndexModelBuilder<S> {
         IndexModelBuilder {
-            keys: self.keys,
             options,
-            _state: PhantomData,
+            state: self.state,
         }
     }
 }
@@ -68,9 +63,8 @@ impl IndexModelBuilder<NoKeys> {
     #[must_use]
     pub fn keys(self, keys: Document) -> IndexModelBuilder<HasKeys> {
         IndexModelBuilder {
-            keys: Some(keys),
             options: self.options,
-            _state: PhantomData,
+            state: HasKeys(keys),
         }
     }
 }
@@ -79,9 +73,9 @@ impl IndexModelBuilder<HasKeys> {
     /// Build the [`IndexModel`]. Infallible — the typestate guarantees keys are present.
     #[must_use]
     pub fn build(self) -> IndexModel {
+        let HasKeys(keys) = self.state;
         IndexModel {
-            // SAFETY: HasKeys typestate guarantees keys is Some.
-            keys: self.keys.expect("HasKeys typestate guarantees keys is Some"),
+            keys,
             options: self.options,
         }
     }

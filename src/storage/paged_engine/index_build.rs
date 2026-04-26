@@ -18,7 +18,7 @@ use crate::storage::catalog::IndexState;
 use crate::storage::secondary_index::build_index;
 use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
 
-use super::catalog_ops::{new_store, new_txn_store, sync_catalog_root_overlay};
+use super::catalog_ops::{catalog_lock, new_store, new_txn_store, sync_catalog_root_overlay};
 use super::doc_helpers::now_millis;
 use super::index_maint::ReserveOutcome;
 use super::PagedEngine;
@@ -44,15 +44,17 @@ impl PagedEngine {
         // metadata.write() + commit_seq + overlay/WAL + publish.
         let outcome = std::cell::Cell::new(ReserveOutcome::Reserved);
         self.run_ddl(|shared, md, overlay| {
-            let mut cat = md.catalog.lock().expect("catalog poisoned");
+            let mut cat = catalog_lock(md);
             // Bootstrap collection if absent.
             if cat.get_collection(ns)?.is_none() {
-                let data_root = cat.create_collection(ns, bson::doc! {}, now_millis())?;
+                // Phase 1 §10.7 — allocate durable namespace id.
+                let ns_id = cat.allocate_namespace_id();
+                let data_root = cat.create_collection(ns, ns_id, bson::doc! {}, now_millis())?;
                 drop(cat);
                 sync_catalog_root_overlay(shared, md, overlay)?;
                 let data_store = new_txn_store(shared, overlay);
                 BTree::create_at(data_store, data_root)?;
-                cat = md.catalog.lock().expect("catalog poisoned");
+                cat = catalog_lock(md);
             }
 
             // Idempotent: if an index with this name already exists we
@@ -68,7 +70,9 @@ impl PagedEngine {
                 return Ok(());
             }
 
-            let idx_root = cat.create_index(ns, model, name)?;
+            // Phase 1 §10.7 — allocate durable index id.
+            let idx_id = cat.allocate_index_id();
+            let idx_root = cat.create_index(ns, idx_id, model, name)?;
             // `catalog.create_index` defaults `state` to `Ready`. Flip
             // to `Building` so the published snapshot marks this index
             // as not-yet-queryable.
@@ -107,9 +111,10 @@ impl PagedEngine {
         // of new namespaces.
         let lane = self.lane_for(ns);
         let _lane_guard = {
-            let _md_read = self.metadata.read().map_err(|_| {
-                Error::Internal("metadata RwLock poisoned".into())
-            })?;
+            let _md_read = self
+                .metadata
+                .read()
+                .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
             self.acquire_lane(lane)?
             // _md_read dropped here.
         };
@@ -121,10 +126,11 @@ impl PagedEngine {
         // this ns would block on the lane; drop_index of this index may
         // race and leave us with a missing entry — we error cleanly.
         let (idx_entry, data_entry) = {
-            let md_read = self.metadata.read().map_err(|_| {
-                Error::Internal("metadata RwLock poisoned".into())
-            })?;
-            let cat = md_read.catalog.lock().expect("catalog poisoned");
+            let md_read = self
+                .metadata
+                .read()
+                .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+            let cat = catalog_lock(&md_read);
             let idx_entry = cat.get_index(ns, name)?.ok_or_else(|| {
                 Error::Internal(format!(
                     "index '{}' on '{}' disappeared before build phase",
@@ -169,11 +175,7 @@ impl PagedEngine {
                 data_entry.data_root_level,
             );
             let idx_store = new_txn_store(&self.shared, &mut overlay);
-            let mut idx_tree = BTree::open(
-                idx_store,
-                idx_entry.root_page,
-                idx_entry.root_level,
-            );
+            let mut idx_tree = BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
             let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
 
             // Persist the possibly-updated root + multikey flag. Note:
@@ -196,14 +198,11 @@ impl PagedEngine {
                 // protects same-ns serialization; read guard is acquired
                 // only for the duration of the catalog mutation + header
                 // sync so long-build scans don't block other-ns DDL.
-                let md_read = self.metadata.read().map_err(|_| {
-                    Error::Internal("metadata RwLock poisoned".into())
-                })?;
-                md_read
-                    .catalog
-                    .lock()
-                    .expect("catalog poisoned")
-                    .update_index(&updated)?;
+                let md_read = self
+                    .metadata
+                    .read()
+                    .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+                catalog_lock(&md_read).update_index(&updated)?;
                 sync_catalog_root_overlay(&self.shared, &md_read, &mut overlay)?;
             }
             Ok(())
@@ -250,7 +249,7 @@ impl PagedEngine {
     /// and publish the final snapshot.
     pub(super) fn create_index_commit(&self, ns: &str, name: &str) -> Result<()> {
         self.run_ddl(|_shared, md, _overlay| {
-            let mut cat = md.catalog.lock().expect("catalog poisoned");
+            let mut cat = catalog_lock(md);
             let mut entry = cat.get_index(ns, name)?.ok_or_else(|| {
                 Error::Internal(format!(
                     "index '{}' on '{}' disappeared before commit phase",
@@ -276,11 +275,7 @@ impl PagedEngine {
     /// Building entry.
     pub(super) fn create_index_cleanup(&self, ns: &str, name: &str) -> Result<()> {
         self.run_ddl(|shared, md, overlay| {
-            let removed = md
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .drop_index(ns, name)?;
+            let removed = catalog_lock(md).drop_index(ns, name)?;
             if removed {
                 sync_catalog_root_overlay(shared, md, overlay)?;
             }

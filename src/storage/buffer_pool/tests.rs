@@ -473,6 +473,64 @@ fn re_pinned_page_retains_in_memory_modifications() {
     );
 }
 
+#[test]
+fn writer_publish_does_not_mutate_existing_reader_snapshot() {
+    let io = MockIo::new();
+    let mut seed = vec![0x11; PageSize::Large32k.bytes()];
+    seed[0] = 0xA1;
+    seed[PageSize::Large32k.bytes() / 2] = 0xB2;
+    seed[PageSize::Large32k.bytes() - 1] = 0xC3;
+    io.seed(60, seed);
+
+    let pool = desktop_pool(Arc::clone(&io));
+
+    let reader = pool.pin(60, PageSize::Large32k).unwrap();
+    let mut writer = pool.pin(60, PageSize::Large32k).unwrap();
+
+    let mid = PageSize::Large32k.bytes() / 2;
+    let last = PageSize::Large32k.bytes() - 1;
+    let writer_buf = writer.data_mut();
+    writer_buf.fill(0xEE);
+    writer_buf[0] = 0x1A;
+    writer_buf[mid] = 0x2B;
+    writer_buf[last] = 0x3C;
+
+    assert_eq!(reader.data()[0], 0xA1, "reader must keep pre-write byte 0");
+    assert_eq!(
+        reader.data()[mid],
+        0xB2,
+        "reader must keep pre-write mid byte"
+    );
+    assert_eq!(
+        reader.data()[last],
+        0xC3,
+        "reader must keep pre-write last byte"
+    );
+
+    drop(writer);
+
+    assert_eq!(
+        reader.data()[0],
+        0xA1,
+        "published write must not mutate an existing reader snapshot"
+    );
+    assert_eq!(reader.data()[mid], 0xB2);
+    assert_eq!(reader.data()[last], 0xC3);
+
+    let fresh = pool.pin(60, PageSize::Large32k).unwrap();
+    assert_eq!(fresh.data()[0], 0x1A, "new pin must see published byte 0");
+    assert_eq!(
+        fresh.data()[mid],
+        0x2B,
+        "new pin must see published mid byte"
+    );
+    assert_eq!(
+        fresh.data()[last],
+        0x3C,
+        "new pin must see published last byte"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Capacity / frame counts
 // -----------------------------------------------------------------------
@@ -732,11 +790,7 @@ mod reconcile {
             metrics::overflow_pages_freed_snapshot() > depth_before,
             "drain must record at least one freed page"
         );
-        assert_eq!(
-            alloc.deferred_free_queue().depth(),
-            0,
-            "queue drained"
-        );
+        assert_eq!(alloc.deferred_free_queue().depth(), 0, "queue drained");
     }
 
     #[test]

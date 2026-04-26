@@ -3,10 +3,15 @@
 //! * `drop_collection_barrier` — open N ReadViews, issue `drop_collection`,
 //!   verify every registered view is force-expired, new reads return empty,
 //!   no deadlock.
+//! * `drop_same_session_resurrection_guard` — drop_namespace blocks implicit
+//!   same-session re-bootstrap (Contract 3.6); explicit create_namespace clears
+//!   the guard and subsequent inserts succeed.
 //! * `reader_stable_across_other_ns_commits` — ReadView `read_ts` pin keeps
 //!   a reader's snapshot stable while an unrelated namespace commits.
 //! * `overflow_pages_stable_under_mixed_load` — 4W/4R/ReadView-churn for a
 //!   short soak; `mvcc.overflow.pages_in_use` stays bounded (no leak).
+
+#![cfg(feature = "test-hooks")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -60,7 +65,10 @@ fn drop_collection_barrier() {
     for i in 0..5u64 {
         views.push(ReadView::open(
             Arc::clone(&registry),
-            Ts { physical_ms: 1_000 + i, logical: 0 },
+            Ts {
+                physical_ms: 1_000 + i,
+                logical: 0,
+            },
             1_000 + i,
         ));
     }
@@ -81,10 +89,7 @@ fn drop_collection_barrier() {
             "view {i} must be poisoned after drop_collection barrier",
         );
         assert!(
-            matches!(
-                v.check_active(),
-                Err(mqlite::Error::ReadViewExpired)
-            ),
+            matches!(v.check_active(), Err(mqlite::Error::ReadViewExpired)),
             "poisoned view must surface Error::ReadViewExpired",
         );
     }
@@ -104,9 +109,71 @@ fn drop_collection_barrier() {
 
     // Dropping the views releases the registry horizon.
     drop(views);
+    assert!(registry.is_empty(), "all views must unregister on drop",);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 3.6 — same-session resurrection guard (direct assertion)
+// ---------------------------------------------------------------------------
+
+/// Directly asserts the `dropped_namespaces` resurrection-guard from Contract 3.6.
+///
+/// Sequence:
+/// 1. create_namespace "ns" implicitly (via first insert).
+/// 2. Prove insert works.
+/// 3. drop_namespace "ns" via `db.drop_collection`.
+/// 4. Attempt an implicit use (insert without explicit create_namespace).
+/// 5. Assert the attempt fails with `Error::CollectionNotFound` — the variant
+///    returned by `bootstrap_namespace` at src/storage/paged_engine.rs:191-193
+///    when `dropped_namespaces` contains the name.
+/// 6. Call create_namespace explicitly (via `db.create_collection`).
+/// 7. Insert into the recreated namespace — assert it succeeds.
+///
+/// Contract ref: docs/STORAGE-CONTRACTS-FROZEN.md §3.6.
+/// Guard source:  src/storage/paged_engine.rs:183-194, :566-628.
+#[test]
+fn drop_same_session_resurrection_guard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("resurrection_guard.mqlite");
+
+    let client = Client::open(&db_path).expect("open client");
+    let db = client.database("testdb");
+    let col = db.collection::<Document>("ns");
+
+    // Step 1-2: implicit create via first insert; prove it works.
+    col.insert_one(&doc! { "_id": 1, "v": "before-drop" })
+        .expect("initial insert must succeed");
+    assert_eq!(
+        col.count_documents(doc! {}).expect("count"),
+        1,
+        "collection must contain 1 document before drop",
+    );
+
+    // Step 3: drop the namespace.
+    db.drop_collection("ns")
+        .expect("drop_collection must succeed");
+
+    // Step 4-5: implicit re-use must be blocked by the resurrection guard.
+    // The guard returns Error::CollectionNotFound (not a string-matched error).
+    let err = col
+        .insert_one(&doc! { "_id": 2, "v": "post-drop-implicit" })
+        .expect_err("insert after drop without explicit create must fail");
     assert!(
-        registry.is_empty(),
-        "all views must unregister on drop",
+        matches!(err, mqlite::Error::CollectionNotFound { .. }),
+        "resurrection guard must return Error::CollectionNotFound, got: {err:?}",
+    );
+
+    // Step 6: explicit create_namespace clears the guard.
+    db.create_collection("ns")
+        .expect("explicit create_collection must succeed");
+
+    // Step 7: insert into the recreated namespace must succeed.
+    col.insert_one(&doc! { "_id": 3, "v": "after-explicit-create" })
+        .expect("insert after explicit create must succeed");
+    assert_eq!(
+        col.count_documents(doc! {}).expect("count after recreate"),
+        1,
+        "recreated collection must contain exactly 1 document",
     );
 }
 
@@ -152,7 +219,9 @@ fn reader_stable_across_other_ns_commits() {
     // snapshots on the engine the reader is loading from.
     let writer_client = client_a.clone();
     let writer_handle: thread::JoinHandle<()> = thread::spawn(move || {
-        let col_b = writer_client.database("db_b").collection::<Document>("other");
+        let col_b = writer_client
+            .database("db_b")
+            .collection::<Document>("other");
         for j in 0..100i32 {
             col_b
                 .insert_one(&doc! { "_id": j, "noise": format!("noise-{j}") })
@@ -280,7 +349,10 @@ fn overflow_pages_stable_under_mixed_load() {
         while !s_churn.load(Ordering::Relaxed) {
             let _v = ReadView::open(
                 Arc::clone(&reg),
-                Ts { physical_ms: txn, logical: 0 },
+                Ts {
+                    physical_ms: txn,
+                    logical: 0,
+                },
                 txn,
             );
             txn += 1;

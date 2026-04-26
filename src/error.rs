@@ -274,10 +274,26 @@ pub enum Error {
         got: &'static str,
     },
 
+    /// A Phase 2 journal frame would exceed the hard byte cap on write.
+    ///
+    /// Returned by the `LogicalTxnFrame` encoder when the computed
+    /// `total_frame_bytes` exceeds `LOGICAL_TXN_MAX_FRAME_SIZE`; the encoder
+    /// bails before any byte is appended so the journal stays well-formed.
+    #[error(
+        "JournalFrameTooLarge: logical_frame_bytes={logical_frame_bytes} \
+         exceeds max_bytes={max_bytes}"
+    )]
+    JournalFrameTooLarge {
+        /// Computed encoded size of the offending frame in bytes.
+        logical_frame_bytes: usize,
+        /// Hard byte cap imposed by the journal format.
+        max_bytes: usize,
+    },
 }
 
 impl Error {
     /// Return the MongoDB-compatible error code for this error, if one applies.
+    #[must_use]
     pub fn code(&self) -> Option<i32> {
         match self {
             Error::DuplicateKey { .. } => Some(codes::DUPLICATE_KEY),

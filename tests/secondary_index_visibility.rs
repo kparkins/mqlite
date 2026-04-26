@@ -76,10 +76,25 @@ fn tombstone_elision_ticks_counter() {
 
     // Chain head is a tombstone committed at ts=200.
     let snap = snap_with(vec![
-        entry(Ts { physical_ms: 200, logical: 0 }, Ts::MAX, 5, b"", true),
         entry(
-            Ts { physical_ms: 100, logical: 0 },
-            Ts { physical_ms: 200, logical: 0 },
+            Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
+            Ts::MAX,
+            5,
+            b"",
+            true,
+        ),
+        entry(
+            Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+            Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
             4,
             b"pk-1",
             false,
@@ -87,15 +102,21 @@ fn tombstone_elision_ticks_counter() {
     ]);
 
     // Reader at ts>=200 sees the tombstone and elides the primary fetch.
-    let reader = ReadView::new(Ts { physical_ms: 300, logical: 0 }, 99);
+    let reader = ReadView::new(
+        Ts {
+            physical_ms: 300,
+            logical: 0,
+        },
+        99,
+    );
     let result = sec_index_probe(&snap, &reader);
-    assert!(result.is_none(), "tombstone elision must skip the primary fetch");
+    assert!(
+        result.is_none(),
+        "tombstone elision must skip the primary fetch"
+    );
 
     let after = secondary_index_tombstone_hits_snapshot();
-    assert_eq!(
-        after, before + 1,
-        "tombstone hit must tick the counter"
-    );
+    assert_eq!(after, before + 1, "tombstone hit must tick the counter");
 }
 
 #[test]
@@ -106,14 +127,23 @@ fn live_sec_entry_does_not_tick_counter() {
 
     // Chain head is a live (non-tombstone) entry.
     let snap = snap_with(vec![entry(
-        Ts { physical_ms: 100, logical: 0 },
+        Ts {
+            physical_ms: 100,
+            logical: 0,
+        },
         Ts::MAX,
         4,
         b"pk-7",
         false,
     )]);
 
-    let reader = ReadView::new(Ts { physical_ms: 150, logical: 0 }, 99);
+    let reader = ReadView::new(
+        Ts {
+            physical_ms: 150,
+            logical: 0,
+        },
+        99,
+    );
     let result = sec_index_probe(&snap, &reader);
     assert_eq!(result.as_deref(), Some(&b"pk-7"[..]));
 
@@ -128,10 +158,25 @@ fn reader_below_tombstone_ts_sees_live_entry_and_no_tick() {
     let before = secondary_index_tombstone_hits_snapshot();
 
     let snap = snap_with(vec![
-        entry(Ts { physical_ms: 200, logical: 0 }, Ts::MAX, 5, b"", true),
         entry(
-            Ts { physical_ms: 100, logical: 0 },
-            Ts { physical_ms: 200, logical: 0 },
+            Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
+            Ts::MAX,
+            5,
+            b"",
+            true,
+        ),
+        entry(
+            Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+            Ts {
+                physical_ms: 200,
+                logical: 0,
+            },
             4,
             b"pk-1",
             false,
@@ -139,10 +184,19 @@ fn reader_below_tombstone_ts_sees_live_entry_and_no_tick() {
     ]);
 
     // Reader at ts between 100 and 200 sees the live entry, not the tombstone.
-    let reader = ReadView::new(Ts { physical_ms: 150, logical: 0 }, 99);
+    let reader = ReadView::new(
+        Ts {
+            physical_ms: 150,
+            logical: 0,
+        },
+        99,
+    );
     let result = sec_index_probe(&snap, &reader);
     assert_eq!(result.as_deref(), Some(&b"pk-1"[..]));
 
     let after = secondary_index_tombstone_hits_snapshot();
-    assert_eq!(after, before, "live-at-this-ts entry must not tick tombstone counter");
+    assert_eq!(
+        after, before,
+        "live-at-this-ts entry must not tick tombstone counter"
+    );
 }

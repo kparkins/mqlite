@@ -37,8 +37,15 @@ fn tombstone(start: Ts, stop: Ts, txn: u64) -> VersionEntry {
 
 #[test]
 fn key_schema_encode_decode_roundtrip() {
-    let key =
-        encode_history_key(7, KIND_PRIMARY, b"abc", Ts { physical_ms: 100, logical: 5 });
+    let key = encode_history_key(
+        7,
+        KIND_PRIMARY,
+        b"abc",
+        Ts {
+            physical_ms: 100,
+            logical: 5,
+        },
+    );
     // (ns=7 BE) || (kind=0) || b"abc" || (ts BE 12B)
     // 4 + 1 + 3 + 12 = 20
     assert_eq!(key.len(), 20);
@@ -46,13 +53,25 @@ fn key_schema_encode_decode_roundtrip() {
     assert_eq!(key[4], KIND_PRIMARY);
     assert_eq!(&key[5..8], b"abc");
     let ts_buf: [u8; 12] = key[8..20].try_into().unwrap();
-    assert_eq!(Ts::from_be_bytes(ts_buf), Ts { physical_ms: 100, logical: 5 });
+    assert_eq!(
+        Ts::from_be_bytes(ts_buf),
+        Ts {
+            physical_ms: 100,
+            logical: 5
+        }
+    );
 
     let (ns, kind, key_bytes, start_ts) = decode_history_key(&key).unwrap();
     assert_eq!(ns, 7);
     assert_eq!(kind, KIND_PRIMARY);
     assert_eq!(key_bytes, b"abc");
-    assert_eq!(start_ts, Ts { physical_ms: 100, logical: 5 });
+    assert_eq!(
+        start_ts,
+        Ts {
+            physical_ms: 100,
+            logical: 5
+        }
+    );
 }
 
 #[test]
@@ -131,15 +150,35 @@ fn version_entry_truncated_buffer_errors() {
 fn cold_read_probe_returns_newest_version_below_read_ts() {
     let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
     // Three versions of doc "d" at ts 5, 10, 50 — all in ns=3.
-    hs.insert(3, KIND_PRIMARY, b"d", &inline_entry(ts(5, 0), ts(10, 0), 1, b"v5"))
-        .unwrap();
-    hs.insert(3, KIND_PRIMARY, b"d", &inline_entry(ts(10, 0), ts(50, 0), 2, b"v10"))
-        .unwrap();
-    hs.insert(3, KIND_PRIMARY, b"d", &inline_entry(ts(50, 0), ts(100, 0), 3, b"v50"))
-        .unwrap();
+    hs.insert(
+        3,
+        KIND_PRIMARY,
+        b"d",
+        &inline_entry(ts(5, 0), ts(10, 0), 1, b"v5"),
+    )
+    .unwrap();
+    hs.insert(
+        3,
+        KIND_PRIMARY,
+        b"d",
+        &inline_entry(ts(10, 0), ts(50, 0), 2, b"v10"),
+    )
+    .unwrap();
+    hs.insert(
+        3,
+        KIND_PRIMARY,
+        b"d",
+        &inline_entry(ts(50, 0), ts(100, 0), 3, b"v50"),
+    )
+    .unwrap();
     // Noise in another namespace — must not leak into the ns=3 probe.
-    hs.insert(4, KIND_PRIMARY, b"d", &inline_entry(ts(5, 0), ts(100, 0), 9, b"other"))
-        .unwrap();
+    hs.insert(
+        4,
+        KIND_PRIMARY,
+        b"d",
+        &inline_entry(ts(5, 0), ts(100, 0), 9, b"other"),
+    )
+    .unwrap();
 
     // read_ts = 30 → should return v10.
     let got = hs.probe_primary(3, b"d", ts(30, 0)).unwrap().unwrap();
@@ -163,8 +202,13 @@ fn cold_read_probe_returns_newest_version_below_read_ts() {
 fn cold_read_probe_respects_namespace_and_kind_boundaries() {
     let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
     // Same key bytes, same ns, different kind_tag → must not cross.
-    hs.insert(1, KIND_PRIMARY, b"K", &inline_entry(ts(10, 0), ts(20, 0), 1, b"primary"))
-        .unwrap();
+    hs.insert(
+        1,
+        KIND_PRIMARY,
+        b"K",
+        &inline_entry(ts(10, 0), ts(20, 0), 1, b"primary"),
+    )
+    .unwrap();
     hs.insert(
         1,
         KIND_SEC_INDEX_BASE,
@@ -200,8 +244,13 @@ fn sec_index_tombstone_hides_candidate_and_ticks_metric() {
         &inline_entry(ts(10, 0), ts(50, 0), 1, b"real"),
     )
     .unwrap();
-    hs.insert(1, KIND_SEC_INDEX_BASE, b"K", &tombstone(ts(50, 0), Ts::MAX, 2))
-        .unwrap();
+    hs.insert(
+        1,
+        KIND_SEC_INDEX_BASE,
+        b"K",
+        &tombstone(ts(50, 0), Ts::MAX, 2),
+    )
+    .unwrap();
 
     crate::mvcc::metrics::reset_secondary_index_tombstone_hits();
     let got = hs
@@ -231,8 +280,13 @@ fn history_store_isolated_from_main_data_store() {
     let main_root_before = main_tree.root_page;
 
     let mut hs = HistoryStore::create(hist_store).unwrap();
-    hs.insert(1, KIND_PRIMARY, b"K", &inline_entry(ts(10, 0), Ts::MAX, 1, b"v"))
-        .unwrap();
+    hs.insert(
+        1,
+        KIND_PRIMARY,
+        b"K",
+        &inline_entry(ts(10, 0), Ts::MAX, 1, b"v"),
+    )
+    .unwrap();
     // A full probe round-trip would also traverse the history store only.
     let _ = hs.probe_primary(1, b"K", ts(100, 0)).unwrap();
 
@@ -262,12 +316,7 @@ fn gc_pass_deletes_exactly_the_expired_entries() {
             1,
             KIND_PRIMARY,
             &key,
-            &inline_entry(
-                ts(i, 0),
-                ts(i + 1, 0),
-                i,
-                format!("v{i}").as_bytes(),
-            ),
+            &inline_entry(ts(i, 0), ts(i + 1, 0), i, format!("v{i}").as_bytes()),
         )
         .unwrap();
     }
@@ -278,7 +327,10 @@ fn gc_pass_deletes_exactly_the_expired_entries() {
     // plus i == 2999 where stop_ts = 3000 (exactly equal, also expired).
     // So i in 0..=2999 → 3000 entries.
     assert_eq!(result.entries_deleted, 3000);
-    assert_eq!(result.pages_freed, 0, "no overflow entries → no pages freed");
+    assert_eq!(
+        result.pages_freed, 0,
+        "no overflow entries → no pages freed"
+    );
     assert_eq!(
         crate::mvcc::metrics::history_store_gc_passes_snapshot(),
         1,

@@ -3,8 +3,7 @@
 ///
 /// The key idea: if an index is used, `docs_examined` should be close to the
 /// number of matching documents. Without an index, it equals the full collection size.
-
-use mqlite::{Client, ObjectId, doc};
+use mqlite::{doc, Client, ObjectId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,7 +62,10 @@ fn main() -> mqlite::Result<()> {
     )?;
 
     let indexes = logs.list_indexes()?;
-    println!("Indexes: {:?}\n", indexes.iter().map(|i| &i.name).collect::<Vec<_>>());
+    println!(
+        "Indexes: {:?}\n",
+        indexes.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
 
     // --- Test 1: Query with index (equality on indexed field) ---
     println!("=== Test 1: Find all 'error' logs (indexed on `level`) ===");
@@ -105,7 +107,8 @@ fn main() -> mqlite::Result<()> {
     println!("=== Summary ===");
     println!(
         "Indexed query (level='error'): examined {} docs for {} matches",
-        explain.docs_examined, matched.len()
+        explain.docs_examined,
+        matched.len()
     );
 
     // Clean up

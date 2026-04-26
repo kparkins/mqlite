@@ -124,6 +124,8 @@ pub mod results;
 // `mvcc` is `pub` but `#[doc(hidden)]` — integration tests need to
 // reference `ReadView` / `ReadViewRegistry` / `Ts` through the crate root,
 // but the module is not part of the stable surface.
+#[allow(dead_code)]
+mod journal;
 #[doc(hidden)]
 #[allow(dead_code)]
 pub mod mvcc;
@@ -131,8 +133,6 @@ mod query;
 mod storage;
 mod update;
 mod validation;
-#[allow(dead_code)]
-mod journal;
 
 // Wire protocol shim (feature-gated)
 #[cfg(feature = "wire")]
@@ -152,11 +152,12 @@ pub use error::{Error, Result};
 
 // Configuration
 pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
 
 // Collection action types (returned by Collection methods; users chain options onto them)
-pub use client::{
-    Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update,
-};
+pub use client::{Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update};
 
 // Index
 pub use index::{IndexInfo, IndexModel};
@@ -183,9 +184,154 @@ pub use wire::WireProtocol;
 ///
 /// Do **not** call this from application code.
 #[cfg(feature = "fuzz")]
-pub fn fuzz_eval_filter(
-    doc: &bson::Document,
-    filter: &bson::Document,
-) -> Result<bool> {
+pub fn fuzz_eval_filter(doc: &bson::Document, filter: &bson::Document) -> Result<bool> {
     query::eval_filter(doc, filter)
+}
+
+/// Phase 2 §9.2 / US-023 fuzz entry — `LogicalTxnFrame::decode` in
+/// `Scanning` context. Returns the decoded frame on success, `None` on
+/// any clean rejection. Never panics on arbitrary input.
+///
+/// Exposed **only** under the `fuzz` feature. Do not call from
+/// application code.
+#[cfg(feature = "fuzz")]
+pub fn fuzz_logical_txn_decode_scanning(buf: &[u8], salt1: u32, salt2: u32) -> Result<()> {
+    use crate::journal::log_file::{DecodeCtx, LogicalTxnFrame};
+    let _ = LogicalTxnFrame::decode(buf, salt1, salt2, DecodeCtx::Scanning)?;
+    Ok(())
+}
+
+/// Phase 2 §9.2 / US-023 fuzz entry — `try_skip_logical_txn` cursor
+/// post-condition probe. Validates that the helper either advances by
+/// the returned count OR fully rewinds on rejection.
+///
+/// Exposed **only** under the `fuzz` feature. Do not call from
+/// application code.
+#[cfg(feature = "fuzz")]
+pub fn fuzz_try_skip_logical_txn(buf: &[u8], salt1: u32, salt2: u32) -> Result<()> {
+    use crate::journal::log_file::try_skip_logical_txn;
+    use std::io::{Cursor, Seek, SeekFrom};
+    let mut cursor = Cursor::new(buf);
+    let start = cursor.stream_position().map_err(crate::error::Error::Io)?;
+    match try_skip_logical_txn(&mut cursor, salt1, salt2)? {
+        Some((n, _frame)) => {
+            // Helper advanced — cursor must be at start + n.
+            let pos = cursor.stream_position().map_err(crate::error::Error::Io)?;
+            assert_eq!(pos, start + n, "advance contract");
+        }
+        None => {
+            // Helper rejected — cursor must be back at start.
+            let pos = cursor.stream_position().map_err(crate::error::Error::Io)?;
+            assert_eq!(pos, start, "rewind contract");
+        }
+    }
+    let _ = SeekFrom::Start(0); // keep import alive
+    Ok(())
+}
+
+/// Phase 2 §9.2 / US-023 fuzz entry — recovery over an arbitrary
+/// journal-file body. Creates a fresh DB via `Client::open_with_options`,
+/// closes it, overwrites the `-journal` sidecar with the fuzzed bytes,
+/// then re-opens. Recovery either succeeds (replay) or returns a
+/// recoverable error — neither path may panic / loop / UB.
+///
+/// AC#6 also requires that `read_page_linear` not panic for any page
+/// number after recovery. The post-open page probe below drives the
+/// read path through pages 1..=8 via the public-API CRUD surface, which
+/// internally calls `JournalManager::read_page_linear`. A panic in the
+/// scan dispatch (e.g., a logical-frame skip helper that doesn't rewind
+/// on a fuzzed boundary) would surface here.
+///
+/// Exposed **only** under the `fuzz` feature. Do not call from
+/// application code.
+#[cfg(feature = "fuzz")]
+pub fn fuzz_logical_txn_recover(body: &[u8]) -> std::result::Result<(), ()> {
+    let dir = tempfile::tempdir().map_err(|_| ())?;
+    let db_path = dir.path().join("fuzz.mqlite");
+
+    // Create a fresh DB so the journal salts are known.
+    {
+        let _client = match Client::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        // Drop the client cleanly so the main file has a stable header.
+    }
+
+    // Overwrite the journal sidecar with fuzzed bytes.
+    let journal_path = {
+        let mut p = db_path.as_os_str().to_owned();
+        p.push("-journal");
+        std::path::PathBuf::from(p)
+    };
+    let _ = std::fs::write(&journal_path, body);
+
+    // Reopen — exercises the full recovery scan over the fuzzed body.
+    // Any panic / infinite loop / UB will surface here.
+    let client = match Client::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+
+    // §9.2 / US-023 AC#6: drive `read_page_linear` post-recovery via
+    // the public-API path. Each `find` traverses the catalog and
+    // collection roots, which dispatches through the journal read
+    // surface for any page that lives in the journal-but-not-main-file
+    // window. Pages 1-8 cover the header, catalog root, and a couple
+    // of likely-allocated B-tree pages — enough surface to surface
+    // any frame-kind skip helper panic seeded from the fuzzed body.
+    let db = client.database("fuzz_db");
+    for col in &["c0", "c1"] {
+        if let Ok(cursor) = db
+            .collection::<bson::Document>(col)
+            .find(bson::doc! {})
+            .run()
+        {
+            for d in cursor.take(4) {
+                let _ = d;
+            }
+        }
+    }
+    drop(client);
+
+    // AC#6 explicit: directly call `JournalManager::read_page_linear`
+    // for a span of page numbers post-recovery. The recovery scan
+    // above already exercised the linear walk during `Client::open`;
+    // this loop additionally drives the on-demand linear-scan path
+    // that `read_page_linear` takes for any page index. Any panic /
+    // UB / infinite loop in the frame-kind skip dispatch on the
+    // fuzzed body would surface here.
+    fuzz_drive_read_page_linear(&db_path);
+    Ok(())
+}
+
+/// §9.2 / US-023 AC#6 — directly drive
+/// `JournalManager::read_page_linear` for a span of page numbers
+/// against the fuzzed journal body. Opens a fresh `JournalManager`
+/// off the same db_path, then invokes `read_page_linear` for pages
+/// 1..=16. Errors are swallowed; the contract under fuzz is "no
+/// panic / UB / infinite loop", not "succeeds".
+#[cfg(feature = "fuzz")]
+fn fuzz_drive_read_page_linear(db_path: &std::path::Path) {
+    use crate::journal::JournalManager;
+    use crate::storage::header::FileHeader;
+    use std::fs::OpenOptions;
+    use std::io::Read;
+
+    let Ok(mut main_file) = OpenOptions::new().read(true).write(true).open(db_path) else {
+        return;
+    };
+    let mut header_bytes = [0u8; crate::storage::header::HEADER_PAGE_SIZE];
+    if main_file.read_exact(&mut header_bytes).is_err() {
+        return;
+    }
+    let Ok(header) = FileHeader::from_bytes(&header_bytes) else {
+        return;
+    };
+    let Ok(mut mgr) = JournalManager::open_or_create(db_path, &header, &mut main_file) else {
+        return;
+    };
+    for page in 1u32..=16 {
+        let _ = mgr.read_page_linear(page);
+    }
 }

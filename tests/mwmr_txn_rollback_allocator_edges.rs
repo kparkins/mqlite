@@ -37,7 +37,6 @@ use std::sync::{
 };
 use std::thread;
 
-
 // ---------------------------------------------------------------------------
 // TC1: Failing insert leaves no trace
 // ---------------------------------------------------------------------------
@@ -55,7 +54,8 @@ fn tc1_failing_insert_leaves_no_trace() {
     let col = client.database("d").collection::<Document>("c");
 
     // Successful seed insert.
-    col.insert_one(&doc! { "_id": 1, "x": true }).expect("seed insert");
+    col.insert_one(&doc! { "_id": 1, "x": true })
+        .expect("seed insert");
 
     // Checkpoint so we get a stable baseline file size.
     client.checkpoint().expect("checkpoint");
@@ -83,10 +83,16 @@ fn tc1_failing_insert_leaves_no_trace() {
     let client2 = Client::open(&path).expect("reopen");
     let col2 = client2.database("d").collection::<Document>("c");
     let count = col2.count_documents(doc! {}).expect("count");
-    assert_eq!(count, 1, "TC1: count must remain 1 after 500 failed inserts");
+    assert_eq!(
+        count, 1,
+        "TC1: count must remain 1 after 500 failed inserts"
+    );
 
     // Verify the field from the failed inserts never landed.
-    let doc = col2.find_one(doc! { "_id": 1 }).expect("find_one").expect("must exist");
+    let doc = col2
+        .find_one(doc! { "_id": 1 })
+        .expect("find_one")
+        .expect("must exist");
     assert!(
         doc.get("y").is_none(),
         "TC1: rolled-back field 'y' must not appear in the stored document"
@@ -111,7 +117,8 @@ fn tc2_rollback_many_small_inserts_no_leaked_pages() {
     // Successful batch: 100 docs with a 50-byte blob each.
     let blob: String = "a".repeat(50);
     for i in 0..100i32 {
-        col.insert_one(&doc! { "_id": i, "blob": &blob }).expect("batch insert");
+        col.insert_one(&doc! { "_id": i, "blob": &blob })
+            .expect("batch insert");
     }
 
     // Force flush so file size reflects the committed data.
@@ -173,7 +180,8 @@ fn tc3_alloc_then_free_in_same_txn() {
 
     // Seed 10 documents.
     for i in 0..10i32 {
-        col.insert_one(&doc! { "_id": i, "val": i * 10 }).expect("seed");
+        col.insert_one(&doc! { "_id": i, "val": i * 10 })
+            .expect("seed");
     }
     client.checkpoint().expect("checkpoint");
 
@@ -186,8 +194,14 @@ fn tc3_alloc_then_free_in_same_txn() {
             )
             .run()
             .expect("update_one");
-        assert_eq!(result.matched_count, 1, "TC3: update {i} must match one doc");
-        assert_eq!(result.modified_count, 1, "TC3: update {i} must modify one doc");
+        assert_eq!(
+            result.matched_count, 1,
+            "TC3: update {i} must match one doc"
+        );
+        assert_eq!(
+            result.modified_count, 1,
+            "TC3: update {i} must modify one doc"
+        );
     }
 
     // Count must remain 10.
@@ -202,7 +216,10 @@ fn tc3_alloc_then_free_in_same_txn() {
             .expect("doc must exist");
         let val = d.get_i32("val").expect("val field present");
         assert_eq!(val, i * 100, "TC3: doc {i} must have updated val");
-        assert!(d.get_bool("updated").unwrap_or(false), "TC3: 'updated' field must be set");
+        assert!(
+            d.get_bool("updated").unwrap_or(false),
+            "TC3: 'updated' field must be set"
+        );
     }
 
     // Reopen must see the same state.
@@ -263,46 +280,56 @@ fn tc4_overflow_page_alloc_under_churn() {
     let pa = payload_a.clone();
     let pb = payload_b.clone();
 
-    let result = std::panic::catch_unwind(move || {
-        let client = Client::open(&path_clone).expect("open client");
-        let col = client.database("d").collection::<Document>("c");
+    let result =
+        std::panic::catch_unwind(move || {
+            let client = Client::open(&path_clone).expect("open client");
+            let col = client.database("d").collection::<Document>("c");
 
-        // Seed phase: 200 docs with overflow payloads.
-        for i in 0..DOC_COUNT {
-            col.insert_one(&doc! { "_id": i, "data": &pa }).expect("seed insert");
-        }
-        client.checkpoint().expect("checkpoint after seed");
-        let size_after_seed = std::fs::metadata(&path_clone).expect("stat after seed").len();
-
-        // Churn phase: delete + re-insert with alternating payload.
-        // BUG: the engine panics here on `delete_one` when the leaf's version
-        // chain is non-empty.
-        for round in 0..CHURN_ROUNDS {
+            // Seed phase: 200 docs with overflow payloads.
             for i in 0..DOC_COUNT {
-                col.delete_one(doc! { "_id": i }).expect("delete in churn");
-                let payload = if round % 2 == 0 { &pb } else { &pa };
-                col.insert_one(&doc! { "_id": i, "data": payload }).expect("reinsert in churn");
+                col.insert_one(&doc! { "_id": i, "data": &pa })
+                    .expect("seed insert");
             }
-        }
+            client.checkpoint().expect("checkpoint after seed");
+            let size_after_seed = std::fs::metadata(&path_clone)
+                .expect("stat after seed")
+                .len();
 
-        client.checkpoint().expect("checkpoint after churn");
-        drop(client);
+            // Churn phase: delete + re-insert with alternating payload.
+            // BUG: the engine panics here on `delete_one` when the leaf's version
+            // chain is non-empty.
+            for round in 0..CHURN_ROUNDS {
+                for i in 0..DOC_COUNT {
+                    col.delete_one(doc! { "_id": i }).expect("delete in churn");
+                    let payload = if round % 2 == 0 { &pb } else { &pa };
+                    col.insert_one(&doc! { "_id": i, "data": payload })
+                        .expect("reinsert in churn");
+                }
+            }
 
-        let size_after_churn = std::fs::metadata(&path_clone).expect("stat after churn").len();
+            client.checkpoint().expect("checkpoint after churn");
+            drop(client);
 
-        // Bound: file must not have grown by more than 3x the post-seed size.
-        assert!(
+            let size_after_churn = std::fs::metadata(&path_clone)
+                .expect("stat after churn")
+                .len();
+
+            // Bound: file must not have grown by more than 3x the post-seed size.
+            assert!(
             size_after_churn < size_after_seed * 3,
             "TC4: file grew from {} to {} bytes across {} churn rounds — overflow pages not reused",
             size_after_seed, size_after_churn, CHURN_ROUNDS,
         );
 
-        // Final count must equal DOC_COUNT.
-        let client2 = Client::open(&path_clone).expect("reopen");
-        let col2 = client2.database("d").collection::<Document>("c");
-        let count = col2.count_documents(doc! {}).expect("count");
-        assert_eq!(count, DOC_COUNT as u64, "TC4: final count must equal {DOC_COUNT}");
-    });
+            // Final count must equal DOC_COUNT.
+            let client2 = Client::open(&path_clone).expect("reopen");
+            let col2 = client2.database("d").collection::<Document>("c");
+            let count = col2.count_documents(doc! {}).expect("count");
+            assert_eq!(
+                count, DOC_COUNT as u64,
+                "TC4: final count must equal {DOC_COUNT}"
+            );
+        });
 
     // Do NOT re-raise the panic here with panic!() — doing so would run
     // a second panic unwind through the test harness while the global
@@ -345,7 +372,8 @@ fn tc5_buffer_pool_invalidation_on_rollback() {
     let col = client.database("d").collection::<Document>("c");
 
     // Insert and read back {_id:1} to warm the buffer pool frame.
-    col.insert_one(&doc! { "_id": 1, "val": "original" }).expect("insert _id:1");
+    col.insert_one(&doc! { "_id": 1, "val": "original" })
+        .expect("insert _id:1");
     let doc1 = col
         .find_one(doc! { "_id": 1 })
         .expect("find_one")
@@ -363,7 +391,8 @@ fn tc5_buffer_pool_invalidation_on_rollback() {
     }
 
     // Insert {_id:2} — must succeed.
-    col.insert_one(&doc! { "_id": 2, "val": "second" }).expect("insert _id:2");
+    col.insert_one(&doc! { "_id": 2, "val": "second" })
+        .expect("insert _id:2");
 
     // Read {_id:2} — must return the correct data from the committed insert.
     let doc2 = col
@@ -506,7 +535,8 @@ fn tc6_cross_collection_independence_under_txn_isolation() {
     assert!(
         size_final < size_after_seed * 5,
         "TC6: file size grew from {} to {} — suspected page leak from failed B inserts",
-        size_after_seed, size_final,
+        size_after_seed,
+        size_final,
     );
 }
 
@@ -528,7 +558,8 @@ fn tc7_concurrent_readers_during_failing_writes() {
 
     // Seed a few committed docs.
     for i in 0..5i32 {
-        col.insert_one(&doc! { "_id": i, "committed": true }).expect("seed");
+        col.insert_one(&doc! { "_id": i, "committed": true })
+            .expect("seed");
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -620,7 +651,8 @@ fn tc8_allocator_drain_safety() {
     // Step 1: seed 100 docs.
     let blob: String = "x".repeat(128);
     for i in 0..100i32 {
-        col.insert_one(&doc! { "_id": i, "blob": &blob }).expect("seed insert");
+        col.insert_one(&doc! { "_id": i, "blob": &blob })
+            .expect("seed insert");
     }
     client.checkpoint().expect("checkpoint after seed");
     let size_after_seed = std::fs::metadata(&path).expect("stat after seed").len();
@@ -631,7 +663,8 @@ fn tc8_allocator_drain_safety() {
     assert_eq!(count_after_delete, 0, "TC8: all docs must be deleted");
 
     // Step 3: Insert a sentinel doc so dup-_id attempts have something to clash with.
-    col.insert_one(&doc! { "_id": 9999, "sentinel": true }).expect("sentinel insert");
+    col.insert_one(&doc! { "_id": 9999, "sentinel": true })
+        .expect("sentinel insert");
 
     // Now attempt 50 dup-_id failing inserts.
     for i in 0..50u32 {
@@ -661,7 +694,10 @@ fn tc8_allocator_drain_safety() {
     let client2 = Client::open(&path).expect("reopen");
     let col2 = client2.database("d").collection::<Document>("c");
     let count = col2.count_documents(doc! {}).expect("count final");
-    assert_eq!(count, 101, "TC8: final count must be 101 (100 new + 1 sentinel)");
+    assert_eq!(
+        count, 101,
+        "TC8: final count must be 101 (100 new + 1 sentinel)"
+    );
 
     // Sentinel must still be there.
     let sentinel = col2

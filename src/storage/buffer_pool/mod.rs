@@ -16,18 +16,16 @@
 //!
 //! ## Thread safety
 //!
-//! Each partition is protected by a separate [`Mutex`].  The data pointer
-//! inside [`PinnedPage`] is stable for the duration of the pin because:
+//! Each partition is protected by a separate [`Mutex`].  The page image inside
+//! [`PinnedPage`] is an atomically loaded snapshot:
 //!
 //! 1. CLOCK eviction skips frames whose `pin_count > 0`.
-//! 2. Frame backing storage (`Box<[u8]>`) never moves — frame slots are
-//!    pre-allocated at pool creation with fixed capacity and are never
-//!    reallocated.
+//! 2. Readers hold an `Arc` to the loaded image, so a concurrent writer publish
+//!    cannot mutate the bytes they are reading.
 //!
 //! Callers must ensure that at most one [`PinnedPage`] for a given page number
-//! calls [`data_mut`](PinnedPage::data_mut) at a time.  Multiple concurrent
-//! read-only pins (using only [`data`](PinnedPage::data)) are safe.  The
-//! database-level single-writer lock enforces this at a higher level.
+//! calls [`data_mut`](PinnedPage::data_mut) at a time. The database-level
+//! single-writer lock enforces this at a higher level.
 //
 // LOCK-ORDER (CRITICAL-1): this file owns positions **3** (32 KB
 // partition mutex, `BufferPool::inner_32k`) and **4** (4 KB partition
@@ -44,8 +42,7 @@
 mod chains;
 mod partition;
 
-use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::mvcc::metrics;
@@ -121,42 +118,34 @@ pub(crate) trait PageSource: Send + Sync {
 ///   [`flush`](BufferPool::flush).
 /// - Drop — automatically unpins the page (decrements `pin_count`).
 ///
-/// # Safety
-///
-/// The pointer inside is stable because CLOCK eviction refuses to evict
-/// pinned frames and the frame's `Box<[u8]>` never moves.  Do not call
-/// `data_mut` on two different `PinnedPage`s for the same page concurrently;
-/// the database-level writer lock prevents this.
+/// Reads use the page snapshot loaded when this guard was pinned. Writes copy
+/// that snapshot into a private buffer, then publish the replacement image when
+/// the guard is dropped.
 pub(crate) struct PinnedPage<'pool> {
     pool: &'pool BufferPool,
     page_number: u32,
     page_size: PageSize,
-    ptr: NonNull<[u8]>,
+    snapshot: Arc<Vec<u8>>,
+    write_buf: Option<Vec<u8>>,
     dirty: bool,
 }
-
-// SAFETY: The raw pointer points to a heap-allocated Box inside the pool.
-// The pool is Send+Sync; the PinnedPage is only shared across threads under
-// the database-level read lock (for immutable access).
-unsafe impl Send for PinnedPage<'_> {}
-unsafe impl Sync for PinnedPage<'_> {}
 
 impl<'pool> PinnedPage<'pool> {
     /// Read-only view of the page data.
     #[inline]
     pub(crate) fn data(&self) -> &[u8] {
-        // SAFETY: pointer is valid while pin_count > 0; no mutable alias
-        // while holding only a shared reference to this guard.
-        unsafe { self.ptr.as_ref() }
+        self.write_buf
+            .as_deref()
+            .unwrap_or_else(|| self.snapshot.as_slice())
     }
 
     /// Mutable view of the page data; marks the page dirty.
     #[inline]
     pub(crate) fn data_mut(&mut self) -> &mut [u8] {
         self.dirty = true;
-        // SAFETY: same stability guarantee; exclusivity enforced by the
-        // single-writer database lock.
-        unsafe { self.ptr.as_mut() }
+        self.write_buf
+            .get_or_insert_with(|| self.snapshot.as_ref().clone())
+            .as_mut_slice()
     }
 
     /// Explicitly mark this page as modified without writing any bytes.
@@ -174,10 +163,11 @@ impl<'pool> PinnedPage<'pool> {
 
 impl Drop for PinnedPage<'_> {
     fn drop(&mut self) {
+        let data = self.write_buf.take();
         // Errors are intentionally swallowed — Drop must not panic.
         let _ = self
             .pool
-            .unpin_internal(self.page_number, self.page_size, self.dirty);
+            .unpin_internal(self.page_number, self.page_size, self.dirty, data);
     }
 }
 
@@ -247,16 +237,14 @@ impl BufferPool {
 
         let idx = guard.pin_page(page_number, self.io.as_ref(), size_enum)?;
 
-        // Obtain raw pointer while still holding the lock.
-        // SAFETY: Vec backing does not reallocate (fixed capacity);
-        // eviction is prevented by pin_count > 0 set above.
-        let ptr = guard.data_ptr_mut(idx);
+        let snapshot = guard.data_snapshot(idx);
 
         Ok(PinnedPage {
             pool: self,
             page_number,
             page_size: size_enum,
-            ptr,
+            snapshot,
+            write_buf: None,
             dirty: false,
         })
     }
@@ -299,31 +287,28 @@ impl BufferPool {
         };
 
         // 2. Pin + reconcile victim under the partition lock.
-        let (ptr, dropped) = {
+        let (snapshot, dropped) = {
             let mut guard = lock
                 .lock()
                 .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
             let (idx, dropped) =
                 guard.pin_page_reconciling(page_number, ort, self.io.as_ref(), size_enum)?;
-            // SAFETY: Vec backing does not reallocate (fixed capacity);
-            // eviction is prevented by pin_count > 0 set above.
-            (guard.data_ptr_mut(idx), dropped)
+            (guard.data_snapshot(idx), dropped)
         };
 
         // 3. Tick counters + drain deferred-free queue outside the latch.
         if dropped > 0 {
             metrics::record_reconcile_entries_dropped(dropped as u64);
         }
-        metrics::set_deferred_free_queue_depth(
-            allocator.deferred_free_queue().depth() as u64,
-        );
+        metrics::set_deferred_free_queue_depth(allocator.deferred_free_queue().depth() as u64);
         allocator.drain_free_queue(self.io.as_ref())?;
 
         Ok(PinnedPage {
             pool: self,
             page_number,
             page_size: size_enum,
-            ptr,
+            snapshot,
+            write_buf: None,
             dirty: false,
         })
     }
@@ -393,10 +378,7 @@ impl BufferPool {
             Some(i) => i,
             None => return Ok(()),
         };
-        let pin_count = guard.frames[idx]
-            .as_ref()
-            .map(|f| f.pin_count)
-            .unwrap_or(0);
+        let pin_count = guard.frames[idx].as_ref().map(|f| f.pin_count).unwrap_or(0);
         if pin_count > 0 {
             return Err(Error::Internal(format!(
                 "buffer pool invalidate_page: page {page_number} is pinned \
@@ -415,14 +397,20 @@ impl BufferPool {
 
     /// Decrement pin count; propagate `dirty` flag.  Called from
     /// [`PinnedPage::drop`].
-    fn unpin_internal(&self, page_number: u32, size: PageSize, dirty: bool) -> Result<()> {
+    fn unpin_internal(
+        &self,
+        page_number: u32,
+        size: PageSize,
+        dirty: bool,
+        data: Option<Vec<u8>>,
+    ) -> Result<()> {
         let lock = match size {
             PageSize::Small4k => &self.inner_4k,
             PageSize::Large32k => &self.inner_32k,
         };
         lock.lock()
             .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
-            .unpin_page(page_number, dirty)
+            .unpin_page(page_number, dirty, data)
     }
 }
 

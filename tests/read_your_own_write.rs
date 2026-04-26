@@ -42,7 +42,13 @@ fn snap_with(entries: Vec<VersionEntry>) -> ChainSnapshot {
 fn writer_sees_own_pending_insert() {
     let snap = snap_with(vec![pending_entry(b"new-value")]);
 
-    let writer_view = ReadView::new(Ts { physical_ms: 500, logical: 0 }, WRITER_TXN_ID);
+    let writer_view = ReadView::new(
+        Ts {
+            physical_ms: 500,
+            logical: 0,
+        },
+        WRITER_TXN_ID,
+    );
     let seen = snap
         .visible_at(KEY, &writer_view)
         .expect("writer must see its own pending insert");
@@ -58,7 +64,10 @@ fn pending_insert_hidden_from_other_txn() {
     let snap = snap_with(vec![pending_entry(b"new-value")]);
 
     let other_reader = ReadView::new(
-        Ts { physical_ms: 500, logical: 0 },
+        Ts {
+            physical_ms: 500,
+            logical: 0,
+        },
         OTHER_READER_TXN_ID,
     );
     assert!(
@@ -70,7 +79,10 @@ fn pending_insert_hidden_from_other_txn() {
 #[test]
 fn writer_sees_own_pending_over_older_committed() {
     // Chain mid-txn: pending head (writer) above a committed prior version.
-    let ts100 = Ts { physical_ms: 100, logical: 0 };
+    let ts100 = Ts {
+        physical_ms: 100,
+        logical: 0,
+    };
     let prior = VersionEntry {
         start_ts: ts100,
         stop_ts: Ts::MAX,
@@ -81,12 +93,26 @@ fn writer_sees_own_pending_over_older_committed() {
     let snap = snap_with(vec![pending_entry(b"new"), prior]);
 
     // Writer reads its own new value.
-    let writer_view = ReadView::new(Ts { physical_ms: 150, logical: 0 }, WRITER_TXN_ID);
-    let seen = snap.visible_at(KEY, &writer_view).expect("writer sees its pending entry");
+    let writer_view = ReadView::new(
+        Ts {
+            physical_ms: 150,
+            logical: 0,
+        },
+        WRITER_TXN_ID,
+    );
+    let seen = snap
+        .visible_at(KEY, &writer_view)
+        .expect("writer sees its pending entry");
     assert_eq!(seen.txn_id, WRITER_TXN_ID);
 
     // Concurrent reader ignores the pending head and falls through to "old".
-    let concurrent = ReadView::new(Ts { physical_ms: 150, logical: 0 }, OTHER_READER_TXN_ID);
+    let concurrent = ReadView::new(
+        Ts {
+            physical_ms: 150,
+            logical: 0,
+        },
+        OTHER_READER_TXN_ID,
+    );
     let seen_other = snap
         .visible_at(KEY, &concurrent)
         .expect("concurrent reader sees prior committed version");

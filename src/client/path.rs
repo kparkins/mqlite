@@ -82,6 +82,7 @@ pub(super) fn create_db_file_secure(path: &Path) -> Result<std::fs::File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)?;
 
     #[cfg(unix)]

@@ -64,10 +64,7 @@ fn build_chain(head_ts: Ts, aged: usize, aged_start: u64) -> Arc<VecDeque<Versio
 fn seeded_chain_map(head_ts: Ts) -> ChainMap {
     let mut m = HashMap::new();
     for k in KEYS {
-        m.insert(
-            k.to_vec(),
-            build_chain(head_ts, INITIAL_AGED_ENTRIES, 100),
-        );
+        m.insert(k.to_vec(), build_chain(head_ts, INITIAL_AGED_ENTRIES, 100));
     }
     m
 }
@@ -177,13 +174,7 @@ fn readers_never_observe_missing_version_under_reconcile() {
             let mut k: u64 = 0;
             let txn_id_base = 1_000 + i * 10_000;
             while !stop.load(Ordering::Relaxed) {
-                reader_step(
-                    &chains,
-                    &registry,
-                    &oracle,
-                    txn_id_base + k,
-                    &mismatches,
-                );
+                reader_step(&chains, &registry, &oracle, txn_id_base + k, &mismatches);
                 k = k.wrapping_add(1);
             }
         }));

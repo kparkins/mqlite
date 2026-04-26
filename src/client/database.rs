@@ -21,7 +21,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::{path::Path, sync::Arc};
 
-use super::{Collection, ClientInner};
+use super::{ClientInner, Collection};
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
@@ -107,6 +107,10 @@ impl Database {
     /// List the names of all collections in this database namespace.
     ///
     /// Returns only the **unqualified** collection names (without the `db.` prefix).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if collection metadata cannot be read.
     pub fn list_collection_names(&self) -> Result<Vec<String>> {
         let prefix = format!("{}.", self.db_name);
         let all = self.inner.list_collection_names()?;
@@ -118,6 +122,10 @@ impl Database {
     }
 
     /// Drop a collection and all its indexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collection cannot be dropped.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         self.inner.drop_collection(&self.qualified(name))
     }
@@ -125,6 +133,10 @@ impl Database {
     /// Create a collection explicitly.
     ///
     /// Collections are also created automatically on first write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collection cannot be created.
     pub fn create_collection(&self, name: &str) -> Result<()> {
         self.inner.create_collection(&self.qualified(name))
     }
@@ -136,11 +148,19 @@ impl Database {
     /// Force a WAL checkpoint, writing all committed data to the main file.
     ///
     /// See also [`crate::Client::checkpoint`] for a handle-based version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint I/O fails.
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.checkpoint()
     }
 
     /// Hot backup to a destination file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backup cannot be written.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         self.inner.backup(dest.as_ref())
     }
@@ -153,6 +173,10 @@ impl Database {
     /// Note: this consumes the `Database` handle.  The underlying file remains
     /// open as long as any other `Client`, `Database`, or `Collection` handles
     /// that share the same `Arc<ClientInner>` are alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the final checkpoint fails.
     pub fn close(self) -> Result<()> {
         self.inner.checkpoint()
     }

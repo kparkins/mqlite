@@ -33,7 +33,8 @@ fn fullsync_survives_crash_without_checkpoint() {
         .unwrap();
         let col = client.database("d").collection::<Document>("c");
         for i in 0..50i32 {
-            col.insert_one(&doc! { "_id": i, "v": format!("v-{i}") }).unwrap();
+            col.insert_one(&doc! { "_id": i, "v": format!("v-{i}") })
+                .unwrap();
         }
         // Intentional drop — checkpoint runs here on the last handle.
     }

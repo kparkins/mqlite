@@ -85,11 +85,13 @@ impl OverflowRef {
     }
 
     /// Page number of the first page in the chain.
+    #[must_use]
     pub fn first_page(&self) -> u32 {
         self.first_page
     }
 
     /// Total payload length across the entire chain.
+    #[must_use]
     pub fn total_length(&self) -> u64 {
         self.total_length
     }
@@ -110,6 +112,7 @@ impl Clone for OverflowRef {
         // saturate if something else has pushed the count up to u32::MAX —
         // which requires > 4 billion concurrent pins on one chain. That's
         // a bug, and `Clone` is infallible by trait contract, so we panic.
+        #[allow(clippy::expect_used)]
         self.allocator
             .incref_overflow(self.first_page)
             .expect("refcount is bounded by CAS saturation at u32::MAX - 1; overflow means > 4B concurrent pins (pin leak)");

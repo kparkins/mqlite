@@ -75,7 +75,11 @@ pub(crate) fn parse_op_query_body(buf: &[u8]) -> Result<Document> {
 /// numberReturned : int32   (1)
 /// document       : BSON
 /// ```
-pub(crate) fn build_op_reply(request_id: i32, response_to: i32, body: &Document) -> Result<Vec<u8>> {
+pub(crate) fn build_op_reply(
+    request_id: i32,
+    response_to: i32,
+    body: &Document,
+) -> Result<Vec<u8>> {
     let bson_bytes = bson::to_vec(body)?;
     // header(16) + responseFlags(4) + cursorID(8) + startingFrom(4) + numberReturned(4) + doc
     let total = 16 + 4 + 8 + 4 + 4 + bson_bytes.len();

@@ -61,8 +61,7 @@ pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Doc
         };
 
         // Reject manual creation of the _id_ index.
-        let is_id_key = key.len() == 1
-            && key.get_i32("_id").ok() == Some(1);
+        let is_id_key = key.len() == 1 && key.get_i32("_id").ok() == Some(1);
         let is_id_name = spec.get_str("name").ok() == Some("_id_");
         if is_id_key || is_id_name {
             return err_bad_value("cannot manually create _id_ index");

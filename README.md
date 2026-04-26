@@ -78,6 +78,10 @@ Dropping the handle is non-blocking and leaves the journal on disk; the next ope
 - [Wire Protocol Security Advisory](docs/WIRE-SECURITY.md)
 - ADRs: [0001 MVCC](docs/adr/0001-mvcc.md), [0002 MWMR](docs/adr/0002-mwmr.md)
 
+## Release policy
+
+Prior to v1.0, mqlite makes no on-disk format stability guarantees between tagged releases. Any release may change the binary layout of the database file, the journal, or catalog entries in a way that requires existing files to be discarded and recreated. The phrase "pre-release format" in the internal design documents refers to this policy. Starting at v1.0, format changes will be gated behind explicit migration paths or version flags.
+
 ## License
 
 MIT OR Apache-2.0

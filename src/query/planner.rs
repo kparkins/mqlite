@@ -34,7 +34,6 @@
 
 use bson::{Bson, Document};
 
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -48,6 +47,7 @@ pub(crate) struct IndexMeta<'a> {
 }
 
 /// An execution plan returned by [`select_plan`].
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ScanPlan {
     /// Full collection scan — no suitable index found.
     CollScan,
@@ -76,6 +76,7 @@ pub(crate) enum ScanPlan {
 /// `IndexCondition` check), but false positives are acceptable (the full
 /// filter handles the final rejection).
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum IndexCondition {
     /// Point equality: `{field: val}` or `{field: {$eq: val}}`.
     Eq(Bson),
@@ -396,5 +397,4 @@ mod tests {
         let plan = select_plan(&doc! { "email": { "$exists": false } }, &indexes);
         assert!(matches!(plan, ScanPlan::CollScan));
     }
-
 }

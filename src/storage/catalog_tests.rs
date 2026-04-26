@@ -21,6 +21,25 @@ fn index_model(keys: Document) -> IndexModel {
     IndexModel::builder().keys(keys).build()
 }
 
+/// Phase 1 §10.7 — allocate a durable namespace id and create a
+/// collection in one call. Used by tests that don't need to observe
+/// the allocated id directly.
+fn create_coll(cat: &mut Catalog<MemPageStore>, name: &str) -> Result<u32> {
+    let id = cat.allocate_namespace_id();
+    cat.create_collection(name, id, doc! {}, now())
+}
+
+/// Phase 1 §10.7 — allocate a durable index id and create an index.
+fn create_idx(
+    cat: &mut Catalog<MemPageStore>,
+    collection: &str,
+    keys: Document,
+    index_name: &str,
+) -> Result<u32> {
+    let id = cat.allocate_index_id();
+    cat.create_index(collection, id, &index_model(keys), index_name)
+}
+
 // -----------------------------------------------------------------------
 // Key encoding
 // -----------------------------------------------------------------------
@@ -65,6 +84,7 @@ fn index_keys_for_same_collection_group_together() {
 #[test]
 fn collection_entry_roundtrip() {
     let entry = CollectionEntry {
+        id: 7,
         name: "orders".to_owned(),
         data_root_page: 42,
         data_root_level: 1,
@@ -76,6 +96,7 @@ fn collection_entry_roundtrip() {
     let bytes = entry.to_bson_bytes().unwrap();
     let decoded = CollectionEntry::from_bson_bytes(&bytes).unwrap();
     assert_eq!(decoded, entry);
+    assert_eq!(decoded.id, 7);
 }
 
 // -----------------------------------------------------------------------
@@ -85,6 +106,7 @@ fn collection_entry_roundtrip() {
 #[test]
 fn index_entry_roundtrip() {
     let entry = IndexEntry {
+        id: 11,
         name: "email_1".to_owned(),
         collection: "users".to_owned(),
         root_page: 99,
@@ -99,6 +121,115 @@ fn index_entry_roundtrip() {
     let bytes = entry.to_bson_bytes().unwrap();
     let decoded = IndexEntry::from_bson_bytes(&bytes).unwrap();
     assert_eq!(decoded, entry);
+    assert_eq!(decoded.id, 11);
+}
+
+// -----------------------------------------------------------------------
+// Durable id allocation (Phase 1 §10.7, US-002)
+// -----------------------------------------------------------------------
+
+#[test]
+fn allocate_namespace_id_is_monotonic_starting_at_one() {
+    let mut cat = make_catalog();
+    assert_eq!(cat.allocate_namespace_id(), 1);
+    assert_eq!(cat.allocate_namespace_id(), 2);
+    assert_eq!(cat.allocate_namespace_id(), 3);
+}
+
+#[test]
+fn allocate_index_id_is_monotonic_starting_at_one() {
+    let mut cat = make_catalog();
+    assert_eq!(cat.allocate_index_id(), 1);
+    assert_eq!(cat.allocate_index_id(), 2);
+    assert_eq!(cat.allocate_index_id(), 3);
+}
+
+#[test]
+fn allocate_ns_and_index_counters_are_independent() {
+    let mut cat = make_catalog();
+    assert_eq!(cat.allocate_namespace_id(), 1);
+    assert_eq!(cat.allocate_index_id(), 1);
+    assert_eq!(cat.allocate_namespace_id(), 2);
+    assert_eq!(cat.allocate_index_id(), 2);
+}
+
+#[test]
+fn created_collection_carries_monotonic_id() {
+    let mut cat = make_catalog();
+    create_coll(&mut cat, "alpha").unwrap();
+    create_coll(&mut cat, "beta").unwrap();
+    let a = cat.get_collection("alpha").unwrap().unwrap();
+    let b = cat.get_collection("beta").unwrap().unwrap();
+    assert!(a.id >= 1);
+    assert!(b.id > a.id);
+}
+
+#[test]
+fn created_index_carries_monotonic_id() {
+    let mut cat = make_catalog();
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
+    create_idx(&mut cat, "users", doc! { "age": 1 }, "age_1").unwrap();
+    let e = cat.get_index("users", "email_1").unwrap().unwrap();
+    let a = cat.get_index("users", "age_1").unwrap().unwrap();
+    assert!(e.id >= 1);
+    assert!(a.id > e.id);
+}
+
+// -----------------------------------------------------------------------
+// find_collection_by_id / find_index_by_id (Phase 1 §10.7, US-003)
+// -----------------------------------------------------------------------
+
+#[test]
+fn find_collection_by_id_returns_entry_for_present_id() {
+    let mut cat = make_catalog();
+    create_coll(&mut cat, "alpha").unwrap();
+    create_coll(&mut cat, "beta").unwrap();
+    create_coll(&mut cat, "gamma").unwrap();
+    let a = cat.get_collection("alpha").unwrap().unwrap();
+    let found = cat.find_collection_by_id(a.id).unwrap().unwrap();
+    assert_eq!(found.name, "alpha");
+    assert_eq!(found.id, a.id);
+}
+
+#[test]
+fn find_collection_by_id_returns_none_for_reserved_zero() {
+    let mut cat = make_catalog();
+    create_coll(&mut cat, "alpha").unwrap();
+    assert!(cat.find_collection_by_id(0).unwrap().is_none());
+}
+
+#[test]
+fn find_collection_by_id_returns_none_for_missing_id() {
+    let mut cat = make_catalog();
+    create_coll(&mut cat, "alpha").unwrap();
+    assert!(cat.find_collection_by_id(i64::MAX).unwrap().is_none());
+}
+
+#[test]
+fn find_index_by_id_returns_entry_for_present_id() {
+    let mut cat = make_catalog();
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
+    let idx = cat.get_index("users", "email_1").unwrap().unwrap();
+    let (coll, found) = cat.find_index_by_id(idx.id).unwrap().unwrap();
+    assert_eq!(coll.name, "users");
+    assert_eq!(found.name, "email_1");
+    assert_eq!(found.id, idx.id);
+}
+
+#[test]
+fn find_index_by_id_returns_none_for_reserved_zero() {
+    let cat = make_catalog();
+    assert!(cat.find_index_by_id(0).unwrap().is_none());
+}
+
+#[test]
+fn find_index_by_id_returns_none_for_missing_id() {
+    let mut cat = make_catalog();
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
+    assert!(cat.find_index_by_id(i64::MAX).unwrap().is_none());
 }
 
 // -----------------------------------------------------------------------
@@ -108,7 +239,7 @@ fn index_entry_roundtrip() {
 #[test]
 fn create_and_get_collection() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
+    create_coll(&mut cat, "users").unwrap();
 
     let entry = cat.get_collection("users").unwrap().expect("should exist");
     assert_eq!(entry.name, "users");
@@ -118,14 +249,14 @@ fn create_and_get_collection() {
 #[test]
 fn create_collection_allocates_data_root_page() {
     let mut cat = make_catalog();
-    let data_page = cat.create_collection("users", doc! {}, now()).unwrap();
+    let data_page = create_coll(&mut cat, "users").unwrap();
     assert!(data_page > 0, "data root page must be > 0");
 }
 
 #[test]
 fn create_collection_does_not_create_id_index_entry() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
+    create_coll(&mut cat, "users").unwrap();
 
     let idx = cat.get_index("users", "_id_").unwrap();
     assert!(idx.is_none(), "_id_ index must not exist");
@@ -134,8 +265,8 @@ fn create_collection_does_not_create_id_index_entry() {
 #[test]
 fn create_collection_duplicate_returns_error() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    let result = cat.create_collection("users", doc! {}, now());
+    create_coll(&mut cat, "users").unwrap();
+    let result = create_coll(&mut cat, "users");
     assert!(matches!(result, Err(Error::DuplicateKey { .. })));
 }
 
@@ -152,9 +283,9 @@ fn list_collections_empty() {
 #[test]
 fn list_collections_returns_all() {
     let mut cat = make_catalog();
-    cat.create_collection("alpha", doc! {}, now()).unwrap();
-    cat.create_collection("beta", doc! {}, now()).unwrap();
-    cat.create_collection("gamma", doc! {}, now()).unwrap();
+    create_coll(&mut cat, "alpha").unwrap();
+    create_coll(&mut cat, "beta").unwrap();
+    create_coll(&mut cat, "gamma").unwrap();
 
     let names: Vec<String> = cat
         .list_collections()
@@ -172,9 +303,8 @@ fn list_collections_returns_all() {
 #[test]
 fn drop_collection_removes_collection_and_indexes() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
-        .unwrap();
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
 
     let removed = cat.drop_collection("users").unwrap();
     assert!(removed);
@@ -196,38 +326,33 @@ fn drop_collection_nonexistent_returns_false() {
 #[test]
 fn create_index_requires_collection() {
     let mut cat = make_catalog();
-    let result = cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1");
+    let result = create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1");
     assert!(matches!(result, Err(Error::CollectionNotFound { .. })));
 }
 
 #[test]
 fn create_index_allocates_root_page() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    let page = cat
-        .create_index("users", &index_model(doc! { "email": 1 }), "email_1")
-        .unwrap();
+    create_coll(&mut cat, "users").unwrap();
+    let page = create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
     assert!(page > 0);
 }
 
 #[test]
 fn create_index_duplicate_returns_error() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
-        .unwrap();
-    let result = cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1");
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
+    let result = create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1");
     assert!(matches!(result, Err(Error::DuplicateKey { .. })));
 }
 
 #[test]
 fn list_indexes_returns_only_user_indexes() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
-        .unwrap();
-    cat.create_index("users", &index_model(doc! { "age": -1 }), "age_-1")
-        .unwrap();
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
+    create_idx(&mut cat, "users", doc! { "age": -1 }, "age_-1").unwrap();
 
     let names: Vec<String> = cat
         .list_indexes("users")
@@ -249,12 +374,10 @@ fn list_indexes_empty_for_unknown_collection() {
 #[test]
 fn indexes_from_different_collections_dont_leak() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    cat.create_collection("orders", doc! {}, now()).unwrap();
-    cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
-        .unwrap();
-    cat.create_index("orders", &index_model(doc! { "total": 1 }), "total_1")
-        .unwrap();
+    create_coll(&mut cat, "users").unwrap();
+    create_coll(&mut cat, "orders").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
+    create_idx(&mut cat, "orders", doc! { "total": 1 }, "total_1").unwrap();
 
     let user_idxs = cat.list_indexes("users").unwrap();
     assert!(user_idxs.iter().all(|e| e.collection == "users"));
@@ -266,11 +389,9 @@ fn indexes_from_different_collections_dont_leak() {
 #[test]
 fn drop_index_removes_only_target_index() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
-        .unwrap();
-    cat.create_index("users", &index_model(doc! { "age": 1 }), "age_1")
-        .unwrap();
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
+    create_idx(&mut cat, "users", doc! { "age": 1 }, "age_1").unwrap();
 
     let removed = cat.drop_index("users", "email_1").unwrap();
     assert!(removed);
@@ -282,7 +403,7 @@ fn drop_index_removes_only_target_index() {
 #[test]
 fn drop_index_nonexistent_returns_false() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
+    create_coll(&mut cat, "users").unwrap();
     assert!(!cat.drop_index("users", "ghost").unwrap());
 }
 
@@ -293,7 +414,7 @@ fn drop_index_nonexistent_returns_false() {
 #[test]
 fn update_collection_changes_document_count() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
+    create_coll(&mut cat, "users").unwrap();
     let mut entry = cat.get_collection("users").unwrap().unwrap();
     entry.document_count = 42;
     let updated = cat.update_collection(&entry).unwrap();
@@ -306,9 +427,8 @@ fn update_collection_changes_document_count() {
 #[test]
 fn update_index_changes_entry_count() {
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
-    cat.create_index("users", &index_model(doc! { "email": 1 }), "email_1")
-        .unwrap();
+    create_coll(&mut cat, "users").unwrap();
+    create_idx(&mut cat, "users", doc! { "email": 1 }, "email_1").unwrap();
     let mut entry = cat.get_index("users", "email_1").unwrap().unwrap();
     entry.entry_count = 777;
     let updated = cat.update_index(&entry).unwrap();
@@ -335,8 +455,7 @@ fn root_page_may_change_after_inserts() {
     // Insert enough collections to potentially trigger a root split.
     // A single leaf page holds dozens of entries; 30 should be enough.
     for i in 0..30 {
-        cat.create_collection(&format!("coll_{i:03}"), doc! {}, now())
-            .unwrap();
+        create_coll(&mut cat, &format!("coll_{i:03}")).unwrap();
     }
     // We don't assert a specific root page; just that the method is accessible.
     let _ = cat.root_page();
@@ -350,7 +469,7 @@ fn root_page_may_change_after_inserts() {
 #[test]
 fn open_with_fallback_new_db_creates_empty_catalog() {
     let store = MemPageStore::new();
-    let (cat, used_backup) = open_with_fallback(store, 0, 0, 0, 0, |_| true).unwrap();
+    let (cat, used_backup) = open_with_fallback(store, 0, 0, 0, 0, 1, 1, |_| true).unwrap();
     assert!(!used_backup);
     assert!(cat.list_collections().unwrap().is_empty());
 }
@@ -359,7 +478,7 @@ fn open_with_fallback_new_db_creates_empty_catalog() {
 fn open_with_fallback_uses_backup_when_primary_fails() {
     // Build a real catalog first to get a valid root page.
     let mut cat = make_catalog();
-    cat.create_collection("users", doc! {}, now()).unwrap();
+    create_coll(&mut cat, "users").unwrap();
     let backup_root = cat.root_page();
     let backup_level = cat.root_level();
 
@@ -373,6 +492,8 @@ fn open_with_fallback_uses_backup_when_primary_fails() {
         0,
         backup_root,
         backup_level,
+        1,
+        1,
         |page| page != corrupt_primary,
     )
     .unwrap();
@@ -383,7 +504,7 @@ fn open_with_fallback_uses_backup_when_primary_fails() {
 #[test]
 fn open_with_fallback_both_corrupt_returns_error() {
     let store = MemPageStore::new();
-    let result = open_with_fallback(store, 1, 0, 2, 0, |_| false);
+    let result = open_with_fallback(store, 1, 0, 2, 0, 1, 1, |_| false);
     assert!(matches!(result, Err(Error::CorruptDatabase { .. })));
 }
 
@@ -394,21 +515,19 @@ fn open_with_fallback_both_corrupt_returns_error() {
 #[test]
 fn create_drop_create_same_collection() {
     let mut cat = make_catalog();
-    let ts = now();
-    cat.create_collection("users", doc! {}, ts).unwrap();
+    create_coll(&mut cat, "users").unwrap();
     cat.drop_collection("users").unwrap();
     // Must succeed (not duplicate-key) after drop.
-    cat.create_collection("users", doc! {}, ts).unwrap();
+    create_coll(&mut cat, "users").unwrap();
     assert!(cat.get_collection("users").unwrap().is_some());
 }
 
 #[test]
 fn dropping_one_collection_leaves_others_intact() {
     let mut cat = make_catalog();
-    let ts = now();
-    cat.create_collection("alpha", doc! {}, ts).unwrap();
-    cat.create_collection("beta", doc! {}, ts).unwrap();
-    cat.create_collection("gamma", doc! {}, ts).unwrap();
+    create_coll(&mut cat, "alpha").unwrap();
+    create_coll(&mut cat, "beta").unwrap();
+    create_coll(&mut cat, "gamma").unwrap();
 
     cat.drop_collection("beta").unwrap();
 

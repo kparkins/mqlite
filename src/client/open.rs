@@ -36,6 +36,11 @@ impl Client {
     ///
     /// Automatically replays the journal on recovery. Uses sensible defaults
     /// (64MB buffer pool, 100ms durability interval, 5s busy timeout).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid, the file cannot be opened or
+    /// locked, the database header is corrupt, or journal recovery fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Client> {
         Client::open_with_options(path, OpenOptions::new())
     }
@@ -54,6 +59,11 @@ impl Client {
     ///
     /// `open_with_options` acquires an OS-level advisory lock on the database
     /// file before returning.  Returns [`Error::WriterBusy`] on timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid, the file cannot be opened or
+    /// locked, the database header is corrupt, or journal recovery fails.
     pub fn open_with_options(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Client> {
         let path = path.as_ref().to_owned();
 
@@ -125,7 +135,7 @@ impl Client {
             }
         } else if (file_size as usize) < HEADER_PAGE_SIZE {
             return Err(Error::CorruptDatabase {
-                path: path.clone(),
+                path,
                 detail: format!(
                     "file is truncated: {} bytes (minimum {} required for a \
                      valid page-0 header)",
@@ -166,11 +176,8 @@ impl Client {
             .open(&path)
             .map_err(Error::Io)?;
 
-        let journal_mgr = JournalManager::open_or_create(
-            &path,
-            &file_header,
-            &mut journal_io_file,
-        )?;
+        let journal_mgr =
+            JournalManager::open_or_create(&path, &file_header, &mut journal_io_file)?;
 
         // Re-read the file header after journal recovery — but ONLY when
         // recovery actually wrote committed page frames to the main file.
@@ -188,8 +195,12 @@ impl Client {
         let file_header = if journal_mgr.did_recover_pages() {
             use std::io::{Read, Seek, SeekFrom};
             let mut hdr_buf = [0u8; HEADER_PAGE_SIZE];
-            journal_io_file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
-            journal_io_file.read_exact(&mut hdr_buf).map_err(Error::Io)?;
+            journal_io_file
+                .seek(SeekFrom::Start(0))
+                .map_err(Error::Io)?;
+            journal_io_file
+                .read_exact(&mut hdr_buf)
+                .map_err(Error::Io)?;
             FileHeader::from_bytes(&hdr_buf).unwrap_or(file_header)
         } else {
             file_header
@@ -199,7 +210,9 @@ impl Client {
 
         let journal = Arc::new(Mutex::new(journal_mgr));
 
-        let file_src = Arc::new(FilePageSource::new(Arc::clone(&file_lock) as Arc<dyn FileLock>));
+        let file_src = Arc::new(FilePageSource::new(
+            Arc::clone(&file_lock) as Arc<dyn FileLock>
+        ));
         let layered_source: Box<dyn crate::storage::buffer_pool::PageSource> =
             Box::new(JournalLayeredSource::new(
                 Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,

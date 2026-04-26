@@ -302,10 +302,7 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
         self.base.read_internal(page)
     }
 
-    fn read_leaf(
-        &self,
-        page: u32,
-    ) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
+    fn read_leaf(&self, page: u32) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
         if let Some(buf) = self.overlay.overlay_32k.get(&page).cloned() {
             // The chain snapshot lives on the shared frame; a txn-local
             // byte overlay doesn't duplicate chains. Pin-and-snapshot
@@ -401,9 +398,7 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
             self.overlay.touched_4k.retain(|p| *p != page);
         }
         self.overlay.reservations.retain(|r| {
-            r.page != page
-                || r.size != PageSize::Small4k
-                || r.origin != PageOrigin::NewAlloc
+            r.page != page || r.size != PageSize::Small4k || r.origin != PageOrigin::NewAlloc
         });
         self.base.free_internal(page)
     }
@@ -413,9 +408,7 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
             self.overlay.touched_32k.retain(|p| *p != page);
         }
         self.overlay.reservations.retain(|r| {
-            r.page != page
-                || r.size != PageSize::Large32k
-                || r.origin != PageOrigin::NewAlloc
+            r.page != page || r.size != PageSize::Large32k || r.origin != PageOrigin::NewAlloc
         });
         self.base.free_leaf(page)
     }
@@ -429,11 +422,7 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
     // carrying a replacement — that is worse, not better, for
     // correctness. See the module docstring.
 
-    fn take_chain(
-        &mut self,
-        page: u32,
-        key: &[u8],
-    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
+    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
         self.base.take_chain(page, key)
     }
 

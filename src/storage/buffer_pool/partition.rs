@@ -6,8 +6,9 @@
 //! routes calls to the appropriate partition.
 
 use std::collections::{HashMap, VecDeque};
-use std::ptr::NonNull;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
@@ -21,9 +22,12 @@ use super::{PageSize, PageSource};
 
 pub(super) struct Frame {
     pub(super) page_number: u32,
-    /// Heap-allocated page data; length equals the partition's page size.
-    /// The `Box` pointer is stable (never moved) for the lifetime of this slot.
-    pub(super) data: Box<[u8]>,
+    /// Atomically published page bytes; length equals the partition's page size.
+    ///
+    /// Readers clone an `Arc` snapshot and copy from it without holding the
+    /// partition mutex. Writers publish a fresh `Arc` on unpin, so readers never
+    /// observe an in-place half-write of a B-tree page.
+    pub(super) data: ArcSwap<Vec<u8>>,
     pub(super) pin_count: u32,
     pub(super) dirty: bool,
     pub(super) ref_bit: bool,
@@ -110,7 +114,8 @@ impl Partition {
         if let Some(frame) = &self.frames[idx] {
             let was_dirty = frame.dirty;
             if was_dirty {
-                io.write_page(frame.page_number, size, &frame.data)?;
+                let data = frame.data.load_full();
+                io.write_page(frame.page_number, size, data.as_slice())?;
             }
             self.page_map.remove(&frame.page_number);
             #[cfg(feature = "tracing")]
@@ -133,9 +138,9 @@ impl Partition {
     ) -> Result<usize> {
         // Cache hit path
         if let Some(&idx) = self.page_map.get(&page_number) {
-            let frame = self.frames[idx]
-                .as_mut()
-                .expect("page_map invariant: frame must exist at mapped slot");
+            let frame = self.frames[idx].as_mut().ok_or_else(|| {
+                Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+            })?;
             frame.pin_count += 1;
             frame.ref_bit = true;
             return Ok(idx);
@@ -154,12 +159,12 @@ impl Partition {
         self.evict_frame(idx, io, size)?;
 
         // Load from disk
-        let mut data = vec![0u8; self.page_size].into_boxed_slice();
+        let mut data = vec![0u8; self.page_size];
         io.read_page(page_number, size, &mut data)?;
 
         self.frames[idx] = Some(Frame {
             page_number,
-            data,
+            data: ArcSwap::from_pointee(data),
             pin_count: 1,
             dirty: false,
             ref_bit: true,
@@ -185,9 +190,9 @@ impl Partition {
     ) -> Result<(usize, usize)> {
         // Cache hit — no victim, no reconciliation.
         if let Some(&idx) = self.page_map.get(&page_number) {
-            let frame = self.frames[idx]
-                .as_mut()
-                .expect("page_map invariant: frame must exist at mapped slot");
+            let frame = self.frames[idx].as_mut().ok_or_else(|| {
+                Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+            })?;
             frame.pin_count += 1;
             frame.ref_bit = true;
             return Ok((idx, 0));
@@ -211,12 +216,12 @@ impl Partition {
         self.evict_frame(idx, io, size)?;
 
         // Load from disk
-        let mut data = vec![0u8; self.page_size].into_boxed_slice();
+        let mut data = vec![0u8; self.page_size];
         io.read_page(page_number, size, &mut data)?;
 
         self.frames[idx] = Some(Frame {
             page_number,
-            data,
+            data: ArcSwap::from_pointee(data),
             pin_count: 1,
             dirty: false,
             ref_bit: true,
@@ -259,17 +264,22 @@ impl Partition {
         dropped
     }
 
-    /// Decrement `pin_count`; optionally mark the frame dirty.
-    pub(super) fn unpin_page(&mut self, page_number: u32, dirty: bool) -> Result<()> {
+    /// Decrement `pin_count`; optionally publish a dirty page image.
+    pub(super) fn unpin_page(
+        &mut self,
+        page_number: u32,
+        dirty: bool,
+        data: Option<Vec<u8>>,
+    ) -> Result<()> {
         let idx = self.page_map.get(&page_number).copied().ok_or_else(|| {
             Error::Internal(format!(
                 "buffer pool unpin: page {page_number} is not in the pool"
             ))
         })?;
 
-        let frame = self.frames[idx]
-            .as_mut()
-            .expect("page_map invariant: frame must exist at mapped slot");
+        let frame = self.frames[idx].as_mut().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
 
         if frame.pin_count == 0 {
             return Err(Error::Internal(format!(
@@ -278,6 +288,16 @@ impl Partition {
         }
         frame.pin_count -= 1;
         if dirty {
+            if let Some(data) = data {
+                if data.len() != self.page_size {
+                    return Err(Error::Internal(format!(
+                        "buffer pool unpin: page {page_number} image has {} bytes, expected {}",
+                        data.len(),
+                        self.page_size
+                    )));
+                }
+                frame.data.store(Arc::new(data));
+            }
             frame.dirty = true;
         }
         Ok(())
@@ -287,7 +307,8 @@ impl Partition {
     pub(super) fn flush_all(&mut self, io: &dyn PageSource, size: PageSize) -> Result<()> {
         for slot in self.frames.iter_mut().flatten() {
             if slot.dirty {
-                io.write_page(slot.page_number, size, &slot.data)?;
+                let data = slot.data.load_full();
+                io.write_page(slot.page_number, size, data.as_slice())?;
                 slot.dirty = false;
             }
         }
@@ -310,17 +331,13 @@ impl Partition {
         }
     }
 
-    /// Return a raw mutable pointer to the frame's data buffer.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `pin_count > 0` for the frame at `idx`
-    /// (preventing eviction) and must not create concurrent mutable aliases.
-    pub(super) fn data_ptr_mut(&mut self, idx: usize) -> NonNull<[u8]> {
+    /// Return an atomic snapshot of the frame's current page bytes.
+    #[allow(clippy::expect_used)]
+    pub(super) fn data_snapshot(&self, idx: usize) -> Arc<Vec<u8>> {
         let frame = self.frames[idx]
-            .as_mut()
-            .expect("data_ptr_mut: frame slot must be occupied");
-        NonNull::from(frame.data.as_mut())
+            .as_ref()
+            .expect("data_snapshot: frame slot must be occupied");
+        frame.data.load_full()
     }
 
     // -----------------------------------------------------------------------

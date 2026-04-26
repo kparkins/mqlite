@@ -32,6 +32,8 @@ use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 
+type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
+
 /// Reader-path history fallthrough.
 ///
 /// Bound to a specific `(ns_id, kind_tag)` at the call site — the BTree
@@ -40,12 +42,13 @@ use crate::mvcc::version::VersionEntry;
 /// means the probe found the newest visible history version (tombstones
 /// included — the caller treats tombstones as "key absent").
 pub(crate) trait HistoryProbe {
-    fn probe(&self, key: &[u8], read_ts: crate::mvcc::timestamp::Ts)
-        -> Result<Option<VersionEntry>>;
+    fn probe(
+        &self,
+        key: &[u8],
+        read_ts: crate::mvcc::timestamp::Ts,
+    ) -> Result<Option<VersionEntry>>;
 }
-use crate::storage::page::{
-    OVERFLOW_HEADER_SIZE, PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF,
-};
+use crate::storage::page::{OVERFLOW_HEADER_SIZE, PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -75,12 +78,12 @@ pub(super) const MIN_LEAF_BYTES: usize = PAGE_SIZE_LEAF as usize / 2;
 // Submodules
 // ---------------------------------------------------------------------------
 
-mod node;
 mod chain;
+mod node;
 
+use chain::*;
 pub(crate) use node::CellValue;
 use node::{InternalNode, LeafNode};
-use chain::*;
 
 // ---------------------------------------------------------------------------
 // Page store abstraction
@@ -111,10 +114,7 @@ pub(crate) trait BTreePageStore {
     fn read_leaf(
         &self,
         page: u32,
-    ) -> Result<(
-        Box<[u8; PAGE_SIZE_LEAF as usize]>,
-        Option<ChainSnapshot>,
-    )>;
+    ) -> Result<(Box<[u8; PAGE_SIZE_LEAF as usize]>, Option<ChainSnapshot>)>;
 
     /// Write a 4 KB internal page.
     fn write_internal(&mut self, page: u32, data: &[u8; PAGE_SIZE_INTERNAL as usize])
@@ -145,11 +145,7 @@ pub(crate) trait BTreePageStore {
     // -----------------------------------------------------------------------
 
     /// Remove and return the version chain for `key` on leaf `page`.
-    fn take_chain(
-        &mut self,
-        page: u32,
-        key: &[u8],
-    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>>;
+    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>>;
 
     /// Install a version chain for `key` on leaf `page`. Overwrites any
     /// existing chain for that key.
@@ -183,10 +179,7 @@ pub(crate) trait BTreePageStore {
     /// whose ReadView predates the delete commit.
     ///
     /// Returns an empty vector if the frame is not resident.
-    fn take_all_chains(
-        &mut self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>>;
+    fn take_all_chains(&mut self, page: u32) -> Result<VersionChainDrain>;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,10 +225,7 @@ impl BTreePageStore for MemPageStore {
     fn read_leaf(
         &self,
         page: u32,
-    ) -> Result<(
-        Box<[u8; PAGE_SIZE_LEAF as usize]>,
-        Option<ChainSnapshot>,
-    )> {
+    ) -> Result<(Box<[u8; PAGE_SIZE_LEAF as usize]>, Option<ChainSnapshot>)> {
         let buf = self
             .leaf_pages
             .get(&page)
@@ -284,15 +274,8 @@ impl BTreePageStore for MemPageStore {
         Ok(())
     }
 
-    fn take_chain(
-        &mut self,
-        page: u32,
-        key: &[u8],
-    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
-        Ok(self
-            .leaf_chains
-            .get_mut(&page)
-            .and_then(|m| m.remove(key)))
+    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
+        Ok(self.leaf_chains.get_mut(&page).and_then(|m| m.remove(key)))
     }
 
     fn put_chain(
@@ -301,18 +284,12 @@ impl BTreePageStore for MemPageStore {
         key: Vec<u8>,
         chain: Arc<VecDeque<VersionEntry>>,
     ) -> Result<()> {
-        self.leaf_chains
-            .entry(page)
-            .or_default()
-            .insert(key, chain);
+        self.leaf_chains.entry(page).or_default().insert(key, chain);
         Ok(())
     }
 
     fn chains_empty(&self, page: u32) -> Result<bool> {
-        Ok(self
-            .leaf_chains
-            .get(&page)
-            .map_or(true, |m| m.is_empty()))
+        Ok(self.leaf_chains.get(&page).map_or(true, |m| m.is_empty()))
     }
 
     fn clear_chains(&mut self, page: u32) -> Result<()> {

@@ -45,6 +45,7 @@ use bson::{doc, DateTime, Document};
 use crate::error::{Error, Result};
 use crate::index::IndexModel;
 use crate::storage::btree::{BTree, BTreePageStore, MemPageStore};
+use crate::storage::root_snapshot::{IndexId, NamespaceId};
 
 // ---------------------------------------------------------------------------
 // Key prefix constants
@@ -66,6 +67,10 @@ const INDEX_KEY_SEP: u8 = 0x00;
 /// Metadata stored in the catalog for a single collection.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CollectionEntry {
+    /// Durable monotonic identifier. Allocated from the header counter
+    /// `next_namespace_id` at create time; stable across splits and
+    /// renames (Phase 1 §10.7).
+    pub id: i64,
     /// Collection name (e.g. `"users"`).
     pub name: String,
     /// Root page of the `_id` index B+ tree (the primary data tree).
@@ -86,6 +91,7 @@ impl CollectionEntry {
     /// Serialize to BSON bytes.
     pub(crate) fn to_bson_bytes(&self) -> Result<Vec<u8>> {
         let doc = doc! {
+            "id": self.id,
             "name": &self.name,
             "dataRootPage": self.data_root_page as i64,
             "dataRootLevel": self.data_root_level as i32,
@@ -100,6 +106,9 @@ impl CollectionEntry {
     /// Deserialize from BSON bytes.
     pub(crate) fn from_bson_bytes(bytes: &[u8]) -> Result<Self> {
         let doc: Document = bson::from_slice(bytes).map_err(Error::BsonDeserialization)?;
+        let id = doc
+            .get_i64("id")
+            .map_err(|e| Error::Internal(format!("catalog: missing 'id': {e}")))?;
         let name = doc
             .get_str("name")
             .map_err(|e| Error::Internal(format!("catalog: missing 'name': {e}")))?
@@ -127,6 +136,7 @@ impl CollectionEntry {
             .map_err(|e| Error::Internal(format!("catalog: missing 'options': {e}")))?
             .clone();
         Ok(CollectionEntry {
+            id,
             name,
             data_root_page,
             data_root_level,
@@ -149,24 +159,22 @@ impl CollectionEntry {
 /// `Ready` is the default for backwards compatibility: catalog records
 /// written before this field existed do not carry it and deserialize as
 /// `Ready` (fully populated and usable).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum IndexState {
     /// Index has a catalog entry but its contents may be incomplete.
     /// Not usable for query planning; writers must still dual-write.
     Building,
     /// Index is fully populated and ready to serve queries.
+    #[default]
     Ready,
-}
-
-impl Default for IndexState {
-    fn default() -> Self {
-        Self::Ready
-    }
 }
 
 /// Metadata stored in the catalog for a single index.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IndexEntry {
+    /// Durable monotonic identifier. Allocated from the header counter
+    /// `next_index_id` at create time; stable across splits (Phase 1 §10.7).
+    pub id: i64,
     /// Index name (e.g. `"email_1"`).
     pub name: String,
     /// Name of the collection this index belongs to.
@@ -198,6 +206,7 @@ impl IndexEntry {
             IndexState::Ready => "ready",
         };
         let doc = doc! {
+            "id": self.id,
             "name": &self.name,
             "collection": &self.collection,
             "rootPage": self.root_page as i64,
@@ -215,6 +224,9 @@ impl IndexEntry {
     /// Deserialize from BSON bytes.
     pub(crate) fn from_bson_bytes(bytes: &[u8]) -> Result<Self> {
         let doc: Document = bson::from_slice(bytes).map_err(Error::BsonDeserialization)?;
+        let id = doc
+            .get_i64("id")
+            .map_err(|e| Error::Internal(format!("catalog: missing 'id': {e}")))?;
         let name = doc
             .get_str("name")
             .map_err(|e| Error::Internal(format!("catalog: missing 'name': {e}")))?
@@ -261,6 +273,7 @@ impl IndexEntry {
             Err(_) => IndexState::Ready,
         };
         Ok(IndexEntry {
+            id,
             name,
             collection,
             root_page,
@@ -357,6 +370,15 @@ fn index_prefix_end(collection: &str) -> Vec<u8> {
 /// The [`open_with_fallback`] constructor encapsulates steps 1–2.
 pub(crate) struct Catalog<S: BTreePageStore> {
     tree: BTree<S>,
+    /// In-memory mirror of the file-header `next_namespace_id` counter
+    /// (Phase 1 §10.7). Advanced by `allocate_namespace_id`; callers
+    /// persist the post-alloc value to the header atomically with the
+    /// catalog commit.
+    next_namespace_id: i64,
+    /// In-memory mirror of the file-header `next_index_id` counter
+    /// (Phase 1 §10.7). Advanced by `allocate_index_id`; same
+    /// persistence rules as `next_namespace_id`.
+    next_index_id: i64,
 }
 
 impl<S: BTreePageStore> Catalog<S> {
@@ -366,18 +388,38 @@ impl<S: BTreePageStore> Catalog<S> {
 
     /// Create a new empty catalog in `store`, allocating its root leaf page.
     ///
-    /// Returns the catalog with its fresh root page allocated.
+    /// Returns the catalog with its fresh root page allocated and durable
+    /// id counters initialized to `1` (§10.7: id `0` is reserved).
     pub(crate) fn create(store: S) -> Result<Self> {
         let tree = BTree::create(store)?;
-        Ok(Catalog { tree })
+        Ok(Catalog {
+            tree,
+            next_namespace_id: 1,
+            next_index_id: 1,
+        })
     }
 
     /// Open an existing catalog at `root_page`/`root_level`.
     ///
+    /// `next_namespace_id` / `next_index_id` are the persisted values
+    /// from the file header (§10.7). Callers MUST pass the values from
+    /// the header so the in-memory counter never returns an already
+    /// allocated id on reopen.
+    ///
     /// No I/O is performed here; the first operation will read pages lazily.
-    pub(crate) fn open(store: S, root_page: u32, root_level: u8) -> Self {
+    pub(crate) fn open(
+        store: S,
+        root_page: u32,
+        root_level: u8,
+        next_namespace_id: i64,
+        next_index_id: i64,
+    ) -> Self {
         let tree = BTree::open(store, root_page, root_level);
-        Catalog { tree }
+        Catalog {
+            tree,
+            next_namespace_id,
+            next_index_id,
+        }
     }
 
     /// Page number of the current catalog root.
@@ -391,6 +433,49 @@ impl<S: BTreePageStore> Catalog<S> {
     /// Level of the current catalog root (0 = leaf, >0 = internal at that level).
     pub(crate) fn root_level(&self) -> u8 {
         self.tree.root_level
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable id allocation (Phase 1 §10.7)
+    // -----------------------------------------------------------------------
+
+    /// Current value of the in-memory `next_namespace_id` counter.
+    ///
+    /// Callers persist this to `FileHeader::next_namespace_id`
+    /// atomically with the catalog commit.
+    pub(crate) fn next_namespace_id(&self) -> i64 {
+        self.next_namespace_id
+    }
+
+    /// Current value of the in-memory `next_index_id` counter.
+    pub(crate) fn next_index_id(&self) -> i64 {
+        self.next_index_id
+    }
+
+    /// Allocate a fresh durable `NamespaceId` (§10.7). Bumps the counter
+    /// by 1 and returns the pre-bump value. Always returns a value `>= 1`
+    /// because id `0` is reserved and the counter starts at `1` on fresh
+    /// DB + is loaded from the header on reopen.
+    pub(crate) fn allocate_namespace_id(&mut self) -> NamespaceId {
+        let id = self.next_namespace_id;
+        debug_assert!(id >= 1, "allocate_namespace_id must never return 0");
+        self.next_namespace_id = self
+            .next_namespace_id
+            .checked_add(1)
+            .expect("next_namespace_id overflow");
+        id
+    }
+
+    /// Allocate a fresh durable `IndexId` (§10.7). Same protocol as
+    /// `allocate_namespace_id`.
+    pub(crate) fn allocate_index_id(&mut self) -> IndexId {
+        let id = self.next_index_id;
+        debug_assert!(id >= 1, "allocate_index_id must never return 0");
+        self.next_index_id = self
+            .next_index_id
+            .checked_add(1)
+            .expect("next_index_id overflow");
+        id
     }
 
     // -----------------------------------------------------------------------
@@ -414,9 +499,14 @@ impl<S: BTreePageStore> Catalog<S> {
     pub(crate) fn create_collection(
         &mut self,
         name: &str,
+        id: NamespaceId,
         options: Document,
         now_millis: i64,
     ) -> Result<u32> {
+        debug_assert!(
+            id >= 1,
+            "CollectionEntry.id must be >= 1 (id 0 is reserved, §10.7)"
+        );
         // Reject if already present.
         let coll_key = collection_key(name);
         if self.tree.search(&coll_key)?.is_some() {
@@ -430,6 +520,7 @@ impl<S: BTreePageStore> Catalog<S> {
 
         // Insert collection entry.
         let coll_entry = CollectionEntry {
+            id,
             name: name.to_owned(),
             data_root_page,
             data_root_level: 0,
@@ -544,9 +635,14 @@ impl<S: BTreePageStore> Catalog<S> {
     pub(crate) fn create_index(
         &mut self,
         collection: &str,
+        id: IndexId,
         model: &IndexModel,
         index_name: &str,
     ) -> Result<u32> {
+        debug_assert!(
+            id >= 1,
+            "IndexEntry.id must be >= 1 (id 0 is reserved, §10.7)"
+        );
         // Verify the collection exists.
         if self.get_collection(collection)?.is_none() {
             return Err(Error::CollectionNotFound {
@@ -558,9 +654,7 @@ impl<S: BTreePageStore> Catalog<S> {
         let idx_key = index_key(collection, index_name);
         if self.tree.search(&idx_key)?.is_some() {
             return Err(Error::DuplicateKey {
-                detail: format!(
-                    "index '{index_name}' already exists on collection '{collection}'"
-                ),
+                detail: format!("index '{index_name}' already exists on collection '{collection}'"),
             });
         }
 
@@ -568,6 +662,7 @@ impl<S: BTreePageStore> Catalog<S> {
         let root_page = self.tree.store.alloc_leaf()?;
 
         let entry = IndexEntry {
+            id,
             name: index_name.to_owned(),
             collection: collection.to_owned(),
             root_page,
@@ -586,6 +681,55 @@ impl<S: BTreePageStore> Catalog<S> {
         self.tree.insert(&idx_key, &bytes)?;
 
         Ok(root_page)
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable id lookup helpers (Phase 1 §10.7, US-003)
+    // -----------------------------------------------------------------------
+
+    /// Find a collection by its durable id (Phase 1 §10.7). Linear scan
+    /// over the in-memory catalog. Acceptable because catalogs are small
+    /// (tens to low hundreds of entries) and this helper runs off the
+    /// hot path (Phase 2 post-open validation, diagnostics, Phase 4
+    /// reconcile-time resolution). Phase 1 intentionally does NOT add a
+    /// sidecar `HashMap<NamespaceId, …>` inside `Catalog`.
+    ///
+    /// Returns `None` for any id that was never allocated (including the
+    /// reserved id `0`). Callers handle `None` per Phase 2 §5
+    /// (log-and-proceed) or Phase 4 (hard error).
+    #[allow(dead_code)]
+    pub(crate) fn find_collection_by_id(&self, id: NamespaceId) -> Result<Option<CollectionEntry>> {
+        if id <= 0 {
+            return Ok(None);
+        }
+        for entry in self.list_collections()? {
+            if entry.id == id {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find an index by its durable id (Phase 1 §10.7). Returns the
+    /// owning `CollectionEntry` alongside the `IndexEntry`. Same linear-
+    /// scan discipline as `find_collection_by_id`; same `None` handling
+    /// rule for callers (Phase 2 §5 / Phase 4).
+    #[allow(dead_code)]
+    pub(crate) fn find_index_by_id(
+        &self,
+        id: IndexId,
+    ) -> Result<Option<(CollectionEntry, IndexEntry)>> {
+        if id <= 0 {
+            return Ok(None);
+        }
+        for coll in self.list_collections()? {
+            for idx in self.list_indexes(&coll.name)? {
+                if idx.id == id {
+                    return Ok(Some((coll, idx)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Remove an index entry from the catalog.
@@ -679,12 +823,15 @@ pub(crate) fn new_mem_catalog() -> Result<Catalog<MemPageStore>> {
 /// verify its CRC32C checksum.
 ///
 /// If both roots are 0 (new database), a fresh catalog is created.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_with_fallback<S, F>(
     store: S,
     primary_root: u32,
     primary_level: u8,
     backup_root: u32,
     backup_level: u8,
+    next_namespace_id: i64,
+    next_index_id: i64,
     try_open_page: F,
 ) -> Result<(Catalog<S>, bool)>
 where
@@ -699,13 +846,31 @@ where
 
     // Try primary.
     if primary_root != 0 && try_open_page(primary_root) {
-        return Ok((Catalog::open(store, primary_root, primary_level), false));
+        return Ok((
+            Catalog::open(
+                store,
+                primary_root,
+                primary_level,
+                next_namespace_id,
+                next_index_id,
+            ),
+            false,
+        ));
     }
 
     // Primary failed — try backup.
     if backup_root != 0 && try_open_page(backup_root) {
         // Signal to the caller that the backup was used (log a warning).
-        return Ok((Catalog::open(store, backup_root, backup_level), true));
+        return Ok((
+            Catalog::open(
+                store,
+                backup_root,
+                backup_level,
+                next_namespace_id,
+                next_index_id,
+            ),
+            true,
+        ));
     }
 
     // Both roots are corrupt.

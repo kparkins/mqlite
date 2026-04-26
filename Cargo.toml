@@ -15,7 +15,10 @@ wire = ["dep:tokio", "dep:tokio-util"]
 tracing = ["dep:tracing"]
 # Exposes internal functions (eval_filter, etc.) for fuzz targets.
 # Do NOT enable in production builds.
-fuzz = []
+fuzz = ["dep:tempfile"]
+# Exposes crash-cut probes and hidden state accessors for integration tests.
+# Do NOT enable in production builds.
+test-hooks = []
 # Enables loom-based concurrency stress tests. Run with:
 #   RUSTFLAGS="--cfg loom" cargo test --release --features loom-tests --test loom_common
 loom-tests = []
@@ -42,18 +45,34 @@ libc = "0.2"
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
-
 # Optional: wire feature
-tokio = { version = "1", features = ["full"], optional = true }
-tokio-util = { version = "0.7", optional = true }
+[dependencies.tokio]
+version = "1"
+features = ["full"]
+optional = true
+
+[dependencies.tokio-util]
+version = "0.7"
+optional = true
 
 # Optional: tracing feature
-tracing = { version = "0.1", optional = true }
+[dependencies.tracing]
+version = "0.1"
+optional = true
+
+# Optional: fuzz feature uses tempfile to synthesize tempdir-backed
+# DBs from arbitrary fuzzed bytes (see `fuzz_logical_txn_recover`).
+# Not pulled in for production builds.
+[dependencies.tempfile]
+version = "3"
+optional = true
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 loom = "0.7"
+proptest = "1"
+serial_test = "3"
 
 [[example]]
 name = "wire_server"
@@ -79,6 +98,34 @@ debug = true
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[[bench]]
+name = "writers_same_ns"
+harness = false
+
+[[bench]]
+name = "writers_diff_ns"
+harness = false
+
+[[bench]]
+name = "payload_sizes"
+harness = false
+
+[[bench]]
+name = "durability_modes"
+harness = false
+
+[[bench]]
+name = "index_build"
+harness = false
+
+[[bench]]
+name = "reopen"
+harness = false
+
+[[bench]]
+name = "read_epoch_root_neutral"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

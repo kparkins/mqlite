@@ -44,12 +44,7 @@ mod refcount_model {
             if cur == u32::MAX {
                 return Err(());
             }
-            match count.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
+            match count.compare_exchange_weak(cur, cur + 1, Ordering::Release, Ordering::Acquire) {
                 Ok(_) => return Ok(cur + 1),
                 Err(observed) => cur = observed,
             }
@@ -78,8 +73,7 @@ mod refcount_model {
             let c_drop = count.clone();
 
             let cloner = thread::spawn(move || {
-                incref(&c_clone)
-                    .expect("incref on non-saturated refcount must succeed");
+                incref(&c_clone).expect("incref on non-saturated refcount must succeed");
             });
 
             let dropper = thread::spawn(move || {

@@ -23,6 +23,8 @@ use crate::storage::allocator::AllocatorHandle;
 
 use super::{BufferPool, PageSize};
 
+type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
+
 impl BufferPool {
     // -----------------------------------------------------------------------
     // MVCC version-chain helpers (T3.5)
@@ -47,9 +49,9 @@ impl BufferPool {
         let Some(&idx) = guard.page_map.get(&page) else {
             return Ok(None);
         };
-        let frame = guard.frames[idx]
-            .as_mut()
-            .expect("page_map invariant: frame must exist at mapped slot");
+        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
         Ok(frame.version_chains.remove(key))
     }
 
@@ -69,9 +71,9 @@ impl BufferPool {
                 "buffer pool put_chain: page {page} is not resident"
             ))
         })?;
-        let frame = guard.frames[idx]
-            .as_mut()
-            .expect("page_map invariant: frame must exist at mapped slot");
+        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
         frame.version_chains.insert(key, chain);
         Ok(())
     }
@@ -99,9 +101,9 @@ impl BufferPool {
         let Some(&idx) = guard.page_map.get(&page) else {
             return Ok(None);
         };
-        let frame = guard.frames[idx]
-            .as_ref()
-            .expect("page_map invariant: frame must exist at mapped slot");
+        let frame = guard.frames[idx].as_ref().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
         Ok(Some(ChainSnapshot::new(&frame.version_chains, view)))
     }
 
@@ -127,9 +129,9 @@ impl BufferPool {
         let Some(&idx) = guard.page_map.get(&page) else {
             return Ok(());
         };
-        let frame = guard.frames[idx]
-            .as_mut()
-            .expect("page_map invariant: frame must exist at mapped slot");
+        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
         frame.version_chains.clear();
         Ok(())
     }
@@ -142,10 +144,7 @@ impl BufferPool {
     /// entries (whose cells were already removed earlier in the txn)
     /// onto the merged-into sibling so MVCC readers whose ReadView
     /// predates the delete still observe them.
-    pub(crate) fn take_all_chains_on_page(
-        &self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
+    pub(crate) fn take_all_chains_on_page(&self, page: u32) -> Result<VersionChainDrain> {
         let mut guard = self
             .inner_32k
             .lock()
@@ -153,9 +152,9 @@ impl BufferPool {
         let Some(&idx) = guard.page_map.get(&page) else {
             return Ok(Vec::new());
         };
-        let frame = guard.frames[idx]
-            .as_mut()
-            .expect("page_map invariant: frame must exist at mapped slot");
+        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
         Ok(std::mem::take(&mut frame.version_chains)
             .into_iter()
             .collect())
@@ -171,9 +170,9 @@ impl BufferPool {
         let Some(&idx) = guard.page_map.get(&page) else {
             return Ok(true);
         };
-        let frame = guard.frames[idx]
-            .as_ref()
-            .expect("page_map invariant: frame must exist at mapped slot");
+        let frame = guard.frames[idx].as_ref().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
         Ok(frame.version_chains.is_empty())
     }
 
@@ -230,9 +229,9 @@ impl BufferPool {
             let Some(&idx) = guard.page_map.get(&page) else {
                 return Ok(0);
             };
-            let frame = guard.frames[idx]
-                .as_mut()
-                .expect("page_map invariant: frame must exist at mapped slot");
+            let frame = guard.frames[idx].as_mut().ok_or_else(|| {
+                Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+            })?;
 
             let mut dropped_count = 0usize;
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.version_chains.len());
@@ -278,9 +277,7 @@ impl BufferPool {
         // 3. Tick the reconcile counter and refresh the queue-depth gauge
         //    using the current queue size (drain below is authoritative).
         metrics::record_reconcile_entries_dropped(dropped as u64);
-        metrics::set_deferred_free_queue_depth(
-            allocator.deferred_free_queue().depth() as u64,
-        );
+        metrics::set_deferred_free_queue_depth(allocator.deferred_free_queue().depth() as u64);
 
         // 4. Writer-serialized drain — caller holds the writer lock. The
         //    drain re-checks refcount under Acquire before freeing.

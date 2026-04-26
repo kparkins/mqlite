@@ -48,11 +48,7 @@ mod model {
     /// Atomic decref — mirrors `AllocatorHandle::decref_overflow`.
     /// Enqueues the page to the deferred-free queue when the
     /// post-decrement value is 0, mirroring `OverflowRef::drop`.
-    fn decref_and_maybe_enqueue(
-        count: &AtomicU32,
-        queue: &Mutex<Vec<u32>>,
-        page: u32,
-    ) -> u32 {
+    fn decref_and_maybe_enqueue(count: &AtomicU32, queue: &Mutex<Vec<u32>>, page: u32) -> u32 {
         let prev = count.fetch_sub(1, Ordering::Release);
         debug_assert!(prev > 0, "decref on already-zero refcount");
         let post = prev - 1;
@@ -76,10 +72,7 @@ mod model {
         // clobbered it — which it cannot, because any free is gated on
         // refcount == 0.
         let seen = payload.load(Ordering::Acquire);
-        assert_eq!(
-            seen, 0xDEADBEEF,
-            "reader observed corrupted payload — UAF"
-        );
+        assert_eq!(seen, 0xDEADBEEF, "reader observed corrupted payload — UAF");
         decref_and_maybe_enqueue(count, queue, page);
     }
 
@@ -93,10 +86,7 @@ mod model {
         page: u32,
     ) {
         let seen = payload.load(Ordering::Acquire);
-        assert_eq!(
-            seen, 0xDEADBEEF,
-            "writer observed corrupted payload — UAF"
-        );
+        assert_eq!(seen, 0xDEADBEEF, "writer observed corrupted payload — UAF");
         decref_and_maybe_enqueue(count, queue, page);
     }
 

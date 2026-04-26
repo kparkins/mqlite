@@ -62,6 +62,7 @@ impl Ts {
     };
 
     /// Smallest `Ts` strictly greater than `self`, or `None` on overflow.
+    #[must_use]
     pub fn successor(self) -> Option<Ts> {
         if self.logical < u32::MAX {
             Some(Ts {
@@ -81,6 +82,7 @@ impl Ts {
     /// Serialize to 12 bytes in little-endian order (Ts-LE).
     ///
     /// Layout: `physical_ms` (8 B LE) || `logical` (4 B LE).
+    #[must_use]
     pub fn to_le_bytes(self) -> [u8; 12] {
         let mut out = [0u8; 12];
         out[0..8].copy_from_slice(&self.physical_ms.to_le_bytes());
@@ -89,6 +91,7 @@ impl Ts {
     }
 
     /// Inverse of [`Ts::to_le_bytes`].
+    #[must_use]
     pub fn from_le_bytes(bytes: [u8; 12]) -> Ts {
         let mut p = [0u8; 8];
         p.copy_from_slice(&bytes[0..8]);
@@ -105,6 +108,7 @@ impl Ts {
     /// Layout: `physical_ms` (8 B BE) || `logical` (4 B BE). Bytewise
     /// unsigned comparison of the result matches lexicographic ordering of
     /// the underlying `Ts`, which is why the history store uses this form.
+    #[must_use]
     pub fn to_be_bytes(self) -> [u8; 12] {
         let mut out = [0u8; 12];
         out[0..8].copy_from_slice(&self.physical_ms.to_be_bytes());
@@ -113,6 +117,7 @@ impl Ts {
     }
 
     /// Inverse of [`Ts::to_be_bytes`].
+    #[must_use]
     pub fn from_be_bytes(bytes: [u8; 12]) -> Ts {
         let mut p = [0u8; 8];
         p.copy_from_slice(&bytes[0..8]);
@@ -198,6 +203,7 @@ impl<C: WallClock> std::fmt::Debug for TimestampOracle<C> {
 
 impl TimestampOracle {
     /// Construct an oracle backed by the system wall clock.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_clock(SystemWallClock)
     }
@@ -205,6 +211,7 @@ impl TimestampOracle {
 
 impl<C: WallClock> TimestampOracle<C> {
     /// Construct an oracle backed by a caller-supplied clock (tests / replay).
+    #[must_use]
     pub fn with_clock(clock: C) -> Self {
         Self {
             hlc: Mutex::new(HlcState {
@@ -254,6 +261,7 @@ impl<C: WallClock> TimestampOracle<C> {
 
     /// Peek at the most recent `(physical_ms, logical)` pair without issuing
     /// a new timestamp.
+    #[must_use]
     pub fn now(&self) -> Ts {
         #[allow(clippy::unwrap_used)]
         let st = self.hlc.lock().unwrap();
@@ -466,9 +474,8 @@ mod tests {
     #[test]
     fn commit_strictly_monotonic_under_regressing_wall_clock_s7() {
         // Wall clock regresses at step 2 (100 → 50).
-        let oracle = TimestampOracle::with_clock(Box::new(ScriptedClock::new(vec![
-            100, 50, 100, 150,
-        ])));
+        let oracle =
+            TimestampOracle::with_clock(Box::new(ScriptedClock::new(vec![100, 50, 100, 150])));
 
         let mut prev = None;
         for _ in 0..4 {

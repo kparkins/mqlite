@@ -231,7 +231,9 @@ impl<S: BTreePageStore> BTree<S> {
         combined.extend(right_node.cells);
 
         let split_at = Self::choose_leaf_redistribution_split(&combined, original_left_len)
-            .ok_or_else(|| Error::Internal("leaf redistribution could not find a valid split".into()))?;
+            .ok_or_else(|| {
+                Error::Internal("leaf redistribution could not find a valid split".into())
+            })?;
 
         let right_cells = combined.split_off(split_at);
         let separator_key = right_cells[0].key.clone();
@@ -256,6 +258,7 @@ impl<S: BTreePageStore> BTree<S> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn merge_leaf_into_left(
         &mut self,
         parent_page: u32,

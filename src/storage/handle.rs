@@ -36,12 +36,12 @@ use std::fs::File;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::journal::log_file::JournalPageSize;
+use crate::journal::JournalManager;
 use crate::mvcc::read_view::ReadViewRegistry;
 use crate::storage::allocator::AllocatorHandle;
-use crate::storage::buffer_pool::{BufferPool, PageSource, PageSize, PinnedPage};
+use crate::storage::buffer_pool::{BufferPool, PageSize, PageSource, PinnedPage};
 use crate::storage::header::FileHeader;
-use crate::journal::JournalManager;
-use crate::journal::log_file::JournalPageSize;
 
 // ---------------------------------------------------------------------------
 // BufferPoolPageSource — PageSource adapter for BufferPool
@@ -513,6 +513,50 @@ impl BufferPoolHandle {
                 crate::mvcc::metrics::record_journal_chain_commit_frame();
                 Ok(offset)
             }
+        }
+    }
+
+    /// Append a Phase 2 `LogicalTxnFrame` (§3, §4, §6.4) between
+    /// `allocate_commit_ts` and the subsequent `ChainCommit`. Encodes before
+    /// any file I/O so an oversize frame returns [`Error::JournalFrameTooLarge`]
+    /// without touching the journal.
+    ///
+    /// Returns the byte offset at which the frame was written. No-op
+    /// (returns `Ok(0)`) on journal-less handles.
+    pub(crate) fn append_logical_txn(
+        &self,
+        frame: crate::journal::log_file::LogicalTxnFrame,
+    ) -> Result<u64> {
+        match &self.journal {
+            None => Ok(0),
+            Some(journal) => {
+                let mut guard = journal
+                    .lock()
+                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+                guard.append_logical_txn(frame)
+            }
+        }
+    }
+
+    /// Expose the journal's database-lifetime salt values for callers that
+    /// need to stamp new journal frames outside `JournalManager::append_*`.
+    /// Returns `None` on journal-less handles.
+    pub(crate) fn journal_salts(&self) -> Option<(u32, u32)> {
+        let guard = self.journal.as_ref()?.lock().ok()?;
+        Some(guard.salts())
+    }
+
+    /// Consume the Pass 1 `ParsedLogicalFrames` populated by journal
+    /// recovery. Take-once semantics: after the first call the journal
+    /// leaves `Default::default()` behind. Returns an empty struct on
+    /// journal-less handles.
+    pub(crate) fn take_parsed_logical_frames(&self) -> crate::journal::ParsedLogicalFrames {
+        match &self.journal {
+            None => crate::journal::ParsedLogicalFrames::default(),
+            Some(journal) => match journal.lock() {
+                Ok(mut guard) => guard.take_parsed_logical_frames(),
+                Err(_) => crate::journal::ParsedLogicalFrames::default(),
+            },
         }
     }
 }

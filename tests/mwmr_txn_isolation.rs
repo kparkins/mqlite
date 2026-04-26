@@ -31,9 +31,7 @@ fn rollback_leaves_no_dirty_frames() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rollback.mqlite");
     let client = Client::open(&path).unwrap();
-    let col = client
-        .database("d")
-        .collection::<bson::Document>("c");
+    let col = client.database("d").collection::<bson::Document>("c");
 
     // Insert one doc — this commits successfully.
     col.insert_one(&doc! { "_id": 1, "ok": true }).unwrap();
@@ -288,9 +286,7 @@ fn reader_survives_concurrent_free_list_churn() {
         .unwrap();
     assert_eq!(after, baseline, "stable data must survive the churn");
 
-    let churn_col = client
-        .database("d")
-        .collection::<bson::Document>("churn");
+    let churn_col = client.database("d").collection::<bson::Document>("churn");
     let churn_left: Vec<_> = churn_col
         .find(doc! {})
         .run()

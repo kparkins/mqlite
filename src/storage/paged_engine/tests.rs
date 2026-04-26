@@ -1,5 +1,5 @@
-use super::*;
 use super::btree_ops::btree_collscan;
+use super::*;
 use crate::mvcc::read_view::ReadView;
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -117,9 +117,7 @@ fn drop_namespace_removes_documents() {
 fn create_and_list_indexes() {
     let e = engine();
     e.create_namespace("test.c").unwrap();
-    let model = IndexModel::builder()
-        .keys(doc! { "email": 1 })
-        .build();
+    let model = IndexModel::builder().keys(doc! { "email": 1 }).build();
     let name = e.create_index("test.c", &model).unwrap();
     assert_eq!(name, "email_1");
     let indexes = e.list_indexes("test.c").unwrap();
@@ -172,7 +170,7 @@ fn find_one_and_delete_returns_doc() {
 // an in-memory mock I/O layer so they remain hermetic and fast.
 // -----------------------------------------------------------------------
 
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSource, PageSize};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
 use crate::storage::header::FileHeader;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
@@ -220,8 +218,7 @@ fn buffered_engine() -> (PagedEngine, Arc<MockIo>) {
     ));
     let header = FileHeader::new_now();
     let handle = Arc::new(BufferPoolHandle::new(pool, history_pool, header));
-    let engine = PagedEngine::new_buffered(handle, 0, 0)
-        .expect("create buffered engine");
+    let engine = PagedEngine::new_buffered(handle, 0, 0).expect("create buffered engine");
     (engine, io)
 }
 
@@ -417,9 +414,7 @@ fn buffered_data_survives_reopen() {
     drop(e);
 
     let e2 = reopen_engine(&io);
-    let found = e2
-        .find_one("prod.users", &doc! { "name": "Bob" })
-        .unwrap();
+    let found = e2.find_one("prod.users", &doc! { "name": "Bob" }).unwrap();
     assert!(
         found.is_some(),
         "document inserted before checkpoint must be visible after reopen"
@@ -481,26 +476,15 @@ fn buffered_create_index_builds_from_existing_docs() {
     let (e, _io) = buffered_engine();
 
     // Insert documents BEFORE creating the index.
-    e.insert(
-        "test.items",
-        doc! { "sku": "A", "price": 10i32 },
-    )
-    .unwrap();
-    e.insert(
-        "test.items",
-        doc! { "sku": "B", "price": 20i32 },
-    )
-    .unwrap();
-    e.insert(
-        "test.items",
-        doc! { "sku": "C", "price": 30i32 },
-    )
-    .unwrap();
+    e.insert("test.items", doc! { "sku": "A", "price": 10i32 })
+        .unwrap();
+    e.insert("test.items", doc! { "sku": "B", "price": 20i32 })
+        .unwrap();
+    e.insert("test.items", doc! { "sku": "C", "price": 30i32 })
+        .unwrap();
 
     // Create an index on "sku".
-    let idx = IndexModel::builder()
-        .keys(doc! { "sku": 1 })
-        .build();
+    let idx = IndexModel::builder().keys(doc! { "sku": 1 }).build();
     let name = e.create_index("test.items", &idx).unwrap();
     assert_eq!(name, "sku_1");
 
@@ -518,16 +502,20 @@ fn buffered_create_index_builds_from_existing_docs() {
 fn buffered_index_maintained_on_insert() {
     let (e, _io) = buffered_engine();
 
-    let idx = IndexModel::builder()
-        .keys(doc! { "email": 1 })
-        .build();
+    let idx = IndexModel::builder().keys(doc! { "email": 1 }).build();
     e.create_index("test.users", &idx).unwrap();
 
     // Insert after index creation.
-    e.insert("test.users", doc! { "email": "alice@test.com", "role": "admin" })
-        .unwrap();
-    e.insert("test.users", doc! { "email": "bob@test.com", "role": "user" })
-        .unwrap();
+    e.insert(
+        "test.users",
+        doc! { "email": "alice@test.com", "role": "admin" },
+    )
+    .unwrap();
+    e.insert(
+        "test.users",
+        doc! { "email": "bob@test.com", "role": "user" },
+    )
+    .unwrap();
 
     // Both documents must be found via the index.
     let alice = e
@@ -549,9 +537,7 @@ fn buffered_index_maintained_on_insert() {
 fn buffered_index_maintained_on_delete() {
     let (e, _io) = buffered_engine();
 
-    let idx = IndexModel::builder()
-        .keys(doc! { "email": 1 })
-        .build();
+    let idx = IndexModel::builder().keys(doc! { "email": 1 }).build();
     e.create_index("test.users", &idx).unwrap();
 
     e.insert("test.users", doc! { "email": "charlie@test.com" })
@@ -576,9 +562,7 @@ fn buffered_index_maintained_on_delete() {
 fn buffered_index_maintained_on_update() {
     let (e, _io) = buffered_engine();
 
-    let idx = IndexModel::builder()
-        .keys(doc! { "email": 1 })
-        .build();
+    let idx = IndexModel::builder().keys(doc! { "email": 1 }).build();
     e.create_index("test.users", &idx).unwrap();
 
     e.insert("test.users", doc! { "email": "old@test.com" })
@@ -615,9 +599,7 @@ fn buffered_index_maintained_on_update() {
 fn buffered_index_scan_range_gt() {
     let (e, _io) = buffered_engine();
 
-    let idx = IndexModel::builder()
-        .keys(doc! { "score": 1 })
-        .build();
+    let idx = IndexModel::builder().keys(doc! { "score": 1 }).build();
     e.create_index("test.players", &idx).unwrap();
 
     for i in 0i32..10 {
@@ -644,9 +626,7 @@ fn buffered_index_scan_range_gt() {
 fn buffered_index_scan_in_query() {
     let (e, _io) = buffered_engine();
 
-    let idx = IndexModel::builder()
-        .keys(doc! { "status": 1 })
-        .build();
+    let idx = IndexModel::builder().keys(doc! { "status": 1 }).build();
     e.create_index("test.orders", &idx).unwrap();
 
     e.insert("test.orders", doc! { "status": "pending", "amount": 10i32 })
@@ -736,9 +716,7 @@ fn buffered_compound_index_lookup() {
 fn buffered_index_survives_reopen() {
     let (e, io) = buffered_engine();
 
-    let idx = IndexModel::builder()
-        .keys(doc! { "username": 1 })
-        .build();
+    let idx = IndexModel::builder().keys(doc! { "username": 1 }).build();
     e.create_index("test.accounts", &idx).unwrap();
 
     e.insert("test.accounts", doc! { "username": "alice" })
@@ -789,7 +767,11 @@ fn swmr_concurrent_readers_do_not_block() {
             thread::spawn(move || {
                 let opts = FindOptions::new();
                 let (docs, _) = e.find("test.c", &doc! {}, &opts).unwrap();
-                assert_eq!(docs.len(), 20, "all 20 docs must be visible to every reader");
+                assert_eq!(
+                    docs.len(),
+                    20,
+                    "all 20 docs must be visible to every reader"
+                );
             })
         })
         .collect();
@@ -802,7 +784,7 @@ fn swmr_concurrent_readers_do_not_block() {
 /// Verify that a reader can observe a consistent snapshot while a
 /// concurrent writer is modifying the collection.
 ///
-/// Readers load a `PublishedSnapshot` without taking the engine mutex.
+/// Readers load a `ReadEpoch` without taking the engine mutex.
 /// A reader that loaded the snapshot before the writer commits will still
 /// see the pre-write state because `publish_ts` pins the `ReadView` at
 /// that timestamp.
@@ -813,8 +795,7 @@ fn swmr_reader_sees_snapshot_isolation() {
 
     let e = Arc::new(engine());
     // Insert an initial document.
-    e.insert("test.snap", doc! { "status": "before" })
-        .unwrap();
+    e.insert("test.snap", doc! { "status": "before" }).unwrap();
 
     // Barrier: reader loads snapshot, signals writer; writer commits,
     // then signals reader to finish.
@@ -825,13 +806,13 @@ fn swmr_reader_sees_snapshot_isolation() {
     let reader = thread::spawn(move || {
         // Load the published snapshot BEFORE the writer commits.
         let snap = e_reader.shared.published.load_full();
-        let publish_ts = snap.publish_ts;
+        let publish_ts = snap.visible_ts;
 
         // Tell the writer we have our snapshot.
         barrier_reader.wait();
 
         // Scan using the snapshot's root pages and publish_ts (no mutex).
-        let matched = if let Some(ns_snap) = snap.namespaces.get("test.snap") {
+        let matched = if let Some(ns_snap) = snap.catalog.get_by_name("test.snap") {
             let store = BufferPoolPageStore::new(Arc::clone(&e_reader.shared.handle));
             let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
             let txn_id = e_reader.shared.txn_counter.fetch_add(1, Ordering::Relaxed);
@@ -896,5 +877,363 @@ fn swmr_concurrent_writers_serialize() {
 
     // After all writers complete, total doc count must be 8 * 10 = 80.
     let count = e.count("test.concurrent", &doc! {}).unwrap();
-    assert_eq!(count, 80, "all 80 documents must be present after concurrent writes");
+    assert_eq!(
+        count, 80,
+        "all 80 documents must be present after concurrent writes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 §10.2 / US-005 — publish_commit unit tests
+// ---------------------------------------------------------------------------
+
+/// §10.2 / US-005: calling `publish_commit` with `published_catalog_dirty=false`
+/// reuses the previous `Arc<PublishedCatalog>` — same allocation, testable
+/// with `Arc::ptr_eq`.
+#[test]
+fn publish_commit_root_neutral_reuses_catalog_arc() {
+    use super::publish::{publish_commit, PublishDirty};
+
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.ptr_eq").unwrap();
+
+    // Capture the current epoch.
+    let prev = e.shared.published.load_full();
+    let prev_catalog_arc = Arc::clone(&prev.catalog);
+
+    // Force a publish with no published-catalog dirty. `publish_commit`
+    // must clone the previous catalog Arc rather than build a new one.
+    let md_w = e.metadata.write().unwrap();
+    let _commit = e.commit_seq.lock().unwrap();
+    let next_ts = e.shared.oracle.commit().unwrap();
+    let new_epoch = {
+        let cat = md_w.catalog.lock().unwrap();
+        publish_commit(&e.shared, &cat, next_ts, PublishDirty::default()).unwrap()
+    };
+
+    assert!(
+        Arc::ptr_eq(&prev_catalog_arc, &new_epoch.catalog),
+        "root-neutral publish must reuse the previous catalog Arc (Phase 1 §4.2)"
+    );
+    assert!(
+        new_epoch.visible_ts > prev.visible_ts,
+        "visible_ts must advance on every publish"
+    );
+}
+
+/// §10.2 / US-005: calling `publish_commit` with `published_catalog_dirty=true`
+/// always builds a fresh `Arc<PublishedCatalog>` — the new epoch's catalog
+/// must be a distinct allocation from the prior epoch's catalog.
+#[test]
+fn publish_commit_dirty_path_builds_new_catalog_arc() {
+    use super::publish::{publish_commit, PublishDirty};
+
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.rebuild").unwrap();
+
+    let prev = e.shared.published.load_full();
+    let prev_catalog_arc = Arc::clone(&prev.catalog);
+
+    let md_w = e.metadata.write().unwrap();
+    let _commit = e.commit_seq.lock().unwrap();
+    let next_ts = e.shared.oracle.commit().unwrap();
+    let dirty = PublishDirty {
+        published_catalog_dirty: true,
+        catalog_header_dirty: false,
+    };
+    let new_epoch = {
+        let cat = md_w.catalog.lock().unwrap();
+        publish_commit(&e.shared, &cat, next_ts, dirty).unwrap()
+    };
+
+    assert!(
+        !Arc::ptr_eq(&prev_catalog_arc, &new_epoch.catalog),
+        "dirty publish must build a fresh catalog Arc (Phase 1 §4.1)"
+    );
+}
+
+/// Phase 1 §6.3 / US-007: the `debug_assert!` in `publish_commit`
+/// rejects a stale `visible_ts`. This guards against a regression where
+/// a caller hands in `oracle.now()` and two metadata-only commits in
+/// the same millisecond would land equal visible_ts. Gated on
+/// `debug_assertions` because `debug_assert!` is a no-op in release.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(
+    expected = "visible_ts must be strictly monotonic; caller must use commit_ts or oracle.commit()"
+)]
+fn publish_commit_rejects_stale_visible_ts() {
+    use super::publish::{publish_commit, PublishDirty};
+
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.stale").unwrap();
+    let prev = e.shared.published.load_full();
+    // Inject a stale Ts (equal to the current one) — must panic via
+    // the monotonicity debug_assert.
+    let md_w = e.metadata.write().unwrap();
+    let _commit = e.commit_seq.lock().unwrap();
+    let cat = md_w.catalog.lock().unwrap();
+    let _ = publish_commit(&e.shared, &cat, prev.visible_ts, PublishDirty::default());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 §10.5 / US-008 + US-009 — ReadOpScope single-load discipline
+// ---------------------------------------------------------------------------
+
+/// §10.8 #15 — `find_one` performs exactly one epoch load.
+#[test]
+fn find_one_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.find_one").unwrap();
+    e.insert("test.find_one", bson::doc! { "_id": 1, "v": "a" })
+        .unwrap();
+
+    let _scope = ReadOpScope::new(1);
+    let _ = e
+        .find_one("test.find_one", &bson::doc! { "_id": 1 })
+        .unwrap();
+}
+
+/// §10.8 #16 — `find` (range scan) performs exactly one epoch load.
+#[test]
+fn find_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.find_range").unwrap();
+    for i in 0..5 {
+        e.insert("test.find_range", bson::doc! { "_id": i, "v": i })
+            .unwrap();
+    }
+
+    let _scope = ReadOpScope::new(1);
+    let _ = e
+        .find(
+            "test.find_range",
+            &bson::doc! {},
+            &crate::options::FindOptions::new(),
+        )
+        .unwrap();
+}
+
+/// §10.8 #18 — `count` performs exactly one epoch load.
+#[test]
+fn count_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.count_scope").unwrap();
+    e.insert("test.count_scope", bson::doc! { "_id": 1 })
+        .unwrap();
+
+    let _scope = ReadOpScope::new(1);
+    let _ = e.count("test.count_scope", &bson::doc! {}).unwrap();
+}
+
+/// §10.8 #15 / US-008: the missing-namespace read path also performs
+/// exactly one epoch load (returns empty without re-loading).
+#[test]
+fn find_on_missing_namespace_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    // No namespace; read must not re-load the epoch looking for one.
+    let _scope = ReadOpScope::new(1);
+    let _ = e
+        .find(
+            "test.absent",
+            &bson::doc! {},
+            &crate::options::FindOptions::new(),
+        )
+        .unwrap();
+}
+
+/// US-008 sanity check: two reads in a row consume two load_published
+/// calls, but each wrapped in its own `ReadOpScope::new(1)` stays
+/// within the limit.
+#[test]
+fn consecutive_reads_each_within_scope() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.consec").unwrap();
+    e.insert("test.consec", bson::doc! { "_id": 1 }).unwrap();
+
+    {
+        let _scope = ReadOpScope::new(1);
+        let _ = e.find_one("test.consec", &bson::doc! { "_id": 1 }).unwrap();
+    }
+    {
+        let _scope = ReadOpScope::new(1);
+        let _ = e.count("test.consec", &bson::doc! {}).unwrap();
+    }
+}
+
+/// §10.8 #19 — `publish_commit` (the `published.store` step) runs
+/// strictly AFTER `commit_txn`. Unit test (not integration) because
+/// the publish-pause rendezvous hook is `#[cfg(test)]`-gated
+/// (§11 #10: no new `Arc` / `Mutex` in production builds).
+///
+/// The test installs a 2-party `Barrier` that the writer waits on
+/// between `commit_txn` and `publish_commit`. The reader observes
+/// the pre-publish `ReadEpoch` while the writer is pinned at the
+/// barrier, then releases it and observes the new epoch.
+#[test]
+fn publish_happens_strictly_after_commit_txn() {
+    use super::test_accessors::install_publish_pause;
+    use std::sync::Barrier;
+
+    let (engine_raw, _io) = buffered_engine();
+    let engine: Arc<PagedEngine> = Arc::new(engine_raw);
+    engine.create_namespace("test.rdv").unwrap();
+    engine
+        .insert("test.rdv", bson::doc! { "_id": 0i32 })
+        .unwrap();
+    let pre_ts = engine.shared.published.load_full().visible_ts;
+
+    let gate = Arc::new(Barrier::new(2));
+    let _guard = install_publish_pause(&engine.shared, Arc::clone(&gate));
+
+    let writer_engine = Arc::clone(&engine);
+    let writer = std::thread::spawn(move || {
+        writer_engine
+            .insert("test.rdv", bson::doc! { "_id": 1i32 })
+            .unwrap();
+    });
+
+    // Spin briefly so the writer has time to reach the gate. Even if
+    // it hasn't, any load before the writer publishes sees pre_ts.
+    for _ in 0..200 {
+        std::thread::yield_now();
+    }
+    let observed_paused = engine.shared.published.load_full().visible_ts;
+    assert_eq!(
+        observed_paused, pre_ts,
+        "§10.8 #19: reader must observe pre-publish visible_ts while writer \
+         is paused between commit_txn and publish_commit"
+    );
+
+    gate.wait();
+    writer.join().expect("writer thread panicked");
+
+    let post_ts = engine.shared.published.load_full().visible_ts;
+    assert!(
+        post_ts > pre_ts,
+        "§10.8 #19: after release the published visible_ts must advance"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// US-009 — additional ReadOpScope coverage for compound read ops
+// ---------------------------------------------------------------------------
+
+/// `update`'s read phase (filter planning via execute_snapshot_pairs_only)
+/// performs exactly one published load before the write phase takes
+/// over (the write phase does not re-load — it uses `metadata.read()`).
+#[test]
+fn update_read_phase_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.u_scope").unwrap();
+    e.insert("test.u_scope", bson::doc! { "_id": 1, "v": 0 })
+        .unwrap();
+
+    let _scope = ReadOpScope::new(1);
+    let _ = e
+        .update(
+            "test.u_scope",
+            &bson::doc! { "_id": 1 },
+            &bson::doc! { "$set": { "v": 1 } },
+            &UpdateOptions::default(),
+            false,
+        )
+        .unwrap();
+}
+
+/// `delete`'s read phase performs exactly one published load.
+#[test]
+fn delete_read_phase_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.d_scope").unwrap();
+    e.insert("test.d_scope", bson::doc! { "_id": 1 }).unwrap();
+    e.insert("test.d_scope", bson::doc! { "_id": 2 }).unwrap();
+
+    let _scope = ReadOpScope::new(1);
+    let _ = e
+        .delete("test.d_scope", &bson::doc! { "_id": 1 }, false)
+        .unwrap();
+}
+
+/// `find_one_and_delete`'s read phase performs exactly one published load.
+#[test]
+fn find_one_and_delete_read_phase_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.foad_scope").unwrap();
+    e.insert("test.foad_scope", bson::doc! { "_id": 1 })
+        .unwrap();
+
+    let _scope = ReadOpScope::new(1);
+    let _ = e
+        .find_one_and_delete(
+            "test.foad_scope",
+            &bson::doc! { "_id": 1 },
+            &FindOneAndDeleteOptions::default(),
+        )
+        .unwrap();
+}
+
+/// `list_indexes` (src/storage/paged_engine/index_maint.rs:433-449) is
+/// a pure read-path op — exactly one published load.
+#[test]
+fn list_indexes_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.li_scope").unwrap();
+    let _scope = ReadOpScope::new(1);
+    let _ = e.list_indexes("test.li_scope").unwrap();
+}
+
+/// `list_namespaces` (src/storage/paged_engine.rs) — pure read path,
+/// one published load.
+#[test]
+fn list_namespaces_performs_one_epoch_load() {
+    use super::state::ReadOpScope;
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.ln_a").unwrap();
+    e.create_namespace("test.ln_b").unwrap();
+
+    let _scope = ReadOpScope::new(1);
+    let names = <PagedEngine as StorageEngine>::list_namespaces(&e).unwrap();
+    assert!(names.len() >= 2);
+}
+
+/// §10.1 — `catalog_gen` is strictly monotonic across two
+/// rebuild-inducing commits and unchanged across an epoch-only
+/// (root-neutral) publish. The Phase 5 §10.17.1 / §10.21 CV-5 revalidation
+/// path in the sequencer depends on this contract.
+#[test]
+fn catalog_gen_advances_on_rebuild_and_holds_on_reuse() {
+    use std::sync::atomic::Ordering;
+    let (e, _io) = buffered_engine();
+
+    // Two DDL commits → each advances catalog_gen.
+    let g0 = e.shared.catalog_gen.load(Ordering::Acquire);
+    e.create_namespace("test.cg1").unwrap();
+    let g1 = e.shared.catalog_gen.load(Ordering::Acquire);
+    e.create_namespace("test.cg2").unwrap();
+    let g2 = e.shared.catalog_gen.load(Ordering::Acquire);
+    assert!(g1 > g0, "first DDL publish must advance catalog_gen");
+    assert!(g2 > g1, "second DDL publish must advance catalog_gen");
+
+    // Prime namespace so the next inserts are root-neutral CRUD.
+    e.insert("test.cg1", bson::doc! { "_id": 0 }).unwrap();
+    let g3 = e.shared.catalog_gen.load(Ordering::Acquire);
+    // Root-neutral CRUD does NOT rebuild, so catalog_gen holds.
+    for i in 1..=5 {
+        e.insert("test.cg1", bson::doc! { "_id": i }).unwrap();
+    }
+    let g4 = e.shared.catalog_gen.load(Ordering::Acquire);
+    assert_eq!(
+        g4, g3,
+        "5 root-neutral CRUD publishes must NOT advance catalog_gen"
+    );
 }

@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::mvcc::deferred_free::DeferredFreeQueue;
-use crate::storage::buffer_pool::{PageSource, PageSize};
+use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 
 // ---------------------------------------------------------------------------
@@ -366,12 +366,7 @@ impl AllocatorHandle {
             if cur == u32::MAX {
                 return Err(Error::RefcountOverflow);
             }
-            match atomic.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
+            match atomic.compare_exchange_weak(cur, cur + 1, Ordering::Release, Ordering::Acquire) {
                 Ok(_) => return Ok(cur + 1),
                 Err(observed) => {
                     crate::mvcc::metrics::record_overflow_refcount_cas_retry();
@@ -455,7 +450,8 @@ impl AllocatorHandle {
         }
 
         let mut state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut freed = 0usize;
@@ -484,7 +480,7 @@ impl AllocatorHandle {
             self.inner.deferred_free_queue.push_many(requeue);
         }
         crate::mvcc::metrics::set_deferred_free_queue_depth(
-            self.inner.deferred_free_queue.depth() as u64,
+            self.inner.deferred_free_queue.depth() as u64
         );
         Ok(freed)
     }
@@ -528,7 +524,7 @@ impl AllocatorHandle {
             self.inner.deferred_free_queue.push_many(requeue);
         }
         crate::mvcc::metrics::set_deferred_free_queue_depth(
-            self.inner.deferred_free_queue.depth() as u64,
+            self.inner.deferred_free_queue.depth() as u64
         );
         ready
     }
@@ -552,7 +548,8 @@ impl AllocatorHandle {
     /// buffer pool) to persist the change to disk.
     pub(crate) fn alloc_4k(&self, io: &dyn PageSource) -> Result<u32> {
         let mut state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -566,7 +563,8 @@ impl AllocatorHandle {
     /// Updates the in-memory free list and marks the header dirty.
     pub(crate) fn alloc_32k(&self, io: &dyn PageSource) -> Result<u32> {
         let mut state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -585,7 +583,8 @@ impl AllocatorHandle {
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_4k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
         let mut state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -600,7 +599,8 @@ impl AllocatorHandle {
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_32k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
         let mut state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -623,7 +623,8 @@ impl AllocatorHandle {
         F: FnOnce(&FileHeader) -> R,
     {
         let state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         Ok(f(&state.header))
@@ -638,7 +639,8 @@ impl AllocatorHandle {
         F: FnOnce(&mut FileHeader),
     {
         let mut state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         f(&mut state.header);
@@ -659,7 +661,8 @@ impl AllocatorHandle {
     /// complete, before the WAL commit frame is written.
     pub(crate) fn flush_header(&self, io: &dyn PageSource) -> Result<()> {
         let mut state = self
-            .inner.state
+            .inner
+            .state
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         if state.header_dirty {
@@ -674,7 +677,7 @@ impl AllocatorHandle {
     /// last [`flush_header`](Self::flush_header) call.
     #[allow(dead_code)]
     pub(crate) fn is_header_dirty(&self) -> bool {
-        self.inner.state.lock().map_or(false, |s| s.header_dirty)
+        self.inner.state.lock().is_ok_and(|s| s.header_dirty)
     }
 }
 

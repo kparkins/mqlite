@@ -24,6 +24,9 @@ use super::doc_helpers::{apply_projection_to_doc, sort_docs};
 use super::index_maint::{index_bounds_free, index_entry_id_free};
 use super::state::SharedState;
 
+type SnapshotPairs = Vec<(Vec<u8>, Document)>;
+type PlannedSnapshotPairs = (ScanPlan, SnapshotPairs);
+
 pub(super) fn open_snapshot_read_view(
     shared: &SharedState,
     publish_ts: crate::mvcc::timestamp::Ts,
@@ -71,7 +74,7 @@ pub(super) fn execute_primary_key_lookup_from_snap(
     filter: &Document,
     publish_ts: crate::mvcc::timestamp::Ts,
     condition: &PrimaryKeyCondition,
-) -> Result<Vec<(Vec<u8>, Document)>> {
+) -> Result<SnapshotPairs> {
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
     let view = open_snapshot_read_view(shared, publish_ts);
@@ -127,9 +130,10 @@ impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryPr
         key: &[u8],
         read_ts: crate::mvcc::timestamp::Ts,
     ) -> Result<Option<crate::mvcc::version::VersionEntry>> {
-        let guard = self.store.lock().map_err(|_| {
-            Error::Internal("history_store mutex poisoned".into())
-        })?;
+        let guard = self
+            .store
+            .lock()
+            .map_err(|_| Error::Internal("history_store mutex poisoned".into()))?;
         guard.probe_primary(self.ns_id, key, read_ts)
     }
 }
@@ -160,7 +164,11 @@ pub(super) fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Ve
     docs
 }
 
-/// Index scan using a [`PublishedSnapshot`] instead of the catalog.
+/// Index scan using a published `NamespaceSnapshot` instead of the catalog.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "snapshot index scans pass planner-selected context directly to avoid a one-use args wrapper"
+)]
 pub(super) fn execute_index_scan_from_snap(
     shared: &SharedState,
     ns: &str,
@@ -177,7 +185,8 @@ pub(super) fn execute_index_scan_from_snap(
         .find(|i| i.name == index_name)
         .ok_or_else(|| Error::Internal(format!("index '{}' not in snapshot", index_name)))?;
 
-    let ascending = idx_snap.key_pattern
+    let ascending = idx_snap
+        .key_pattern
         .get(primary_field)
         .map(|v| !matches!(v, Bson::Int32(-1) | Bson::Int64(-1)))
         .unwrap_or(true);
@@ -189,7 +198,9 @@ pub(super) fn execute_index_scan_from_snap(
             let mut p = encode_compound_key(&[(v, ascending)]);
             p.push(COMPOUND_SEP);
             let mut p_next = p.clone();
-            *p_next.last_mut().expect("compound key always contains at least COMPOUND_SEP") += 1;
+            if let Some(last) = p_next.last_mut() {
+                *last += 1;
+            }
             let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
             let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
             for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
@@ -241,7 +252,7 @@ pub(super) fn execute_collscan_from_snap(
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     publish_ts: crate::mvcc::timestamp::Ts,
-) -> Result<Vec<(Vec<u8>, Document)>> {
+) -> Result<SnapshotPairs> {
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
     let view = open_snapshot_read_view(shared, publish_ts);
@@ -256,7 +267,7 @@ pub(super) fn execute_snapshot_pairs_from_snap(
     filter: &Document,
     publish_ts: crate::mvcc::timestamp::Ts,
     allow_secondary_indexes: bool,
-) -> Result<(ScanPlan, Vec<(Vec<u8>, Document)>)> {
+) -> Result<PlannedSnapshotPairs> {
     let ready_indexes: Vec<&PublishedIndex> = if allow_secondary_indexes {
         ns_snap
             .indexes
@@ -275,7 +286,15 @@ pub(super) fn execute_snapshot_pairs_from_snap(
         .collect();
 
     let plan = select_plan(filter, &index_metas);
-    let pairs = execute_plan_from_snap(&plan, shared, ns, ns_snap, &ready_indexes, filter, publish_ts)?;
+    let pairs = execute_plan_from_snap(
+        &plan,
+        shared,
+        ns,
+        ns_snap,
+        &ready_indexes,
+        filter,
+        publish_ts,
+    )?;
     Ok((plan, pairs))
 }
 
@@ -288,7 +307,7 @@ pub(super) fn execute_snapshot_pairs_only(
     filter: &Document,
     publish_ts: crate::mvcc::timestamp::Ts,
     allow_secondary_indexes: bool,
-) -> Result<Vec<(Vec<u8>, Document)>> {
+) -> Result<SnapshotPairs> {
     let (_plan, pairs) = execute_snapshot_pairs_from_snap(
         shared,
         ns,
@@ -308,16 +327,11 @@ fn execute_plan_from_snap(
     ready_indexes: &[&PublishedIndex],
     filter: &Document,
     publish_ts: crate::mvcc::timestamp::Ts,
-) -> Result<Vec<(Vec<u8>, Document)>> {
+) -> Result<SnapshotPairs> {
     match plan {
-        ScanPlan::PrimaryKeyLookup { condition } => execute_primary_key_lookup_from_snap(
-            shared,
-            ns,
-            ns_snap,
-            filter,
-            publish_ts,
-            condition,
-        ),
+        ScanPlan::PrimaryKeyLookup { condition } => {
+            execute_primary_key_lookup_from_snap(shared, ns, ns_snap, filter, publish_ts, condition)
+        }
         ScanPlan::IndexScan {
             index_name,
             primary_field,
@@ -342,12 +356,13 @@ fn execute_plan_from_snap(
 // ---------------------------------------------------------------------------
 
 pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()> {
-    let md = engine.metadata.write().map_err(|_| {
-        crate::error::Error::Internal("metadata RwLock poisoned".into())
-    })?;
+    let md = engine
+        .metadata
+        .write()
+        .map_err(|_| crate::error::Error::Internal("metadata RwLock poisoned".into()))?;
 
     let (root_page, root_level) = {
-        let cat = md.catalog.lock().expect("catalog poisoned");
+        let cat = super::catalog_ops::catalog_lock(&md);
         (cat.root_page(), cat.root_level())
     };
     engine.shared.handle.allocator().update_header(|h| {
@@ -356,15 +371,27 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         h.catalog_root_backup = root_page;
     })?;
 
-    let ort = engine.shared.handle.read_view_registry().oldest_required_ts();
+    let ort = engine
+        .shared
+        .handle
+        .read_view_registry()
+        .oldest_required_ts();
     {
-        let mut hs = engine.shared.history_store.lock().map_err(|_| crate::error::Error::StatePoisoned { component: "history_store" })?;
+        let mut hs =
+            engine
+                .shared
+                .history_store
+                .lock()
+                .map_err(|_| crate::error::Error::StatePoisoned {
+                    component: "history_store",
+                })?;
         hs.gc_pass(ort)?;
     }
     let lag_ms = if ort == crate::mvcc::timestamp::Ts::MAX {
         0
     } else {
-        engine.shared
+        engine
+            .shared
             .oracle
             .now()
             .physical_ms
@@ -375,7 +402,12 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         engine.shared.handle.allocator().overflow_pages_in_use() as u64,
     );
     crate::mvcc::metrics::set_deferred_free_queue_depth(
-        engine.shared.handle.allocator().deferred_free_queue().depth() as u64,
+        engine
+            .shared
+            .handle
+            .allocator()
+            .deferred_free_queue()
+            .depth() as u64,
     );
     engine.shared.handle.flush()?;
     engine.shared.handle.emergency_checkpoint()?;
@@ -390,6 +422,8 @@ pub(super) fn journal_sync(engine: &super::PagedEngine) -> crate::error::Result<
     engine.shared.handle.journal_sync()
 }
 
-pub(super) fn snapshot_bytes(_engine: &super::PagedEngine) -> crate::error::Result<Option<Vec<u8>>> {
+pub(super) fn snapshot_bytes(
+    _engine: &super::PagedEngine,
+) -> crate::error::Result<Option<Vec<u8>>> {
     Ok(None)
 }

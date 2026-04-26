@@ -1,4 +1,4 @@
-use mqlite::{Client, ObjectId, doc};
+use mqlite::{doc, Client, ObjectId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,10 +20,30 @@ fn main() -> mqlite::Result<()> {
 
     // --- Insert some tasks ---
     println!("\n--- Inserting tasks ---");
-    let t1 = Task { id: None, title: "Write unit tests".into(), done: false, priority: 3 };
-    let t2 = Task { id: None, title: "Review PR".into(), done: false, priority: 1 };
-    let t3 = Task { id: None, title: "Update docs".into(), done: true, priority: 2 };
-    let t4 = Task { id: None, title: "Fix login bug".into(), done: false, priority: 1 };
+    let t1 = Task {
+        id: None,
+        title: "Write unit tests".into(),
+        done: false,
+        priority: 3,
+    };
+    let t2 = Task {
+        id: None,
+        title: "Review PR".into(),
+        done: false,
+        priority: 1,
+    };
+    let t3 = Task {
+        id: None,
+        title: "Update docs".into(),
+        done: true,
+        priority: 2,
+    };
+    let t4 = Task {
+        id: None,
+        title: "Fix login bug".into(),
+        done: false,
+        priority: 1,
+    };
 
     tasks.insert_one(&t1)?;
     println!("  ✓ Inserted: {}", t1.title);
@@ -35,16 +55,24 @@ fn main() -> mqlite::Result<()> {
     println!("  ✓ Inserted: {}", t4.title);
 
     // --- Count all tasks ---
-    println!("\n--- Total tasks: {} ---", tasks.estimated_document_count()?);
+    println!(
+        "\n--- Total tasks: {} ---",
+        tasks.estimated_document_count()?
+    );
 
     // --- Find all pending (not done) tasks, sorted by priority ---
     println!("\n--- Pending tasks (sorted by priority) ---");
-    let cursor = tasks.find(doc! { "done": false })
+    let cursor = tasks
+        .find(doc! { "done": false })
         .sort(doc! { "priority": 1 })
         .run()?;
     for task in cursor.take(10) {
         let t = task?;
-        println!("  [{priority}] {title}", priority = t.priority, title = t.title);
+        println!(
+            "  [{priority}] {title}",
+            priority = t.priority,
+            title = t.title
+        );
     }
 
     // --- Find one task by filter ---
@@ -55,19 +83,29 @@ fn main() -> mqlite::Result<()> {
 
     // --- Update a task ---
     println!("\n--- Marking 'Review PR' as done ---");
-    let result = tasks.update_one(
-        doc! { "title": "Review PR" },
-        doc! { "$set": { "done": true } },
-    ).run()?;
+    let result = tasks
+        .update_one(
+            doc! { "title": "Review PR" },
+            doc! { "$set": { "done": true } },
+        )
+        .run()?;
     println!("  Updated {} document(s)", result.modified_count);
 
     // --- Find all tasks after update ---
     println!("\n--- All tasks after update ---");
-    let cursor = tasks.find(doc! {}).sort(doc! { "priority": 1, "title": 1 }).run()?;
+    let cursor = tasks
+        .find(doc! {})
+        .sort(doc! { "priority": 1, "title": 1 })
+        .run()?;
     for task in cursor.take(10) {
         let t = task?;
         let status = if t.done { "✓" } else { "○" };
-        println!("  {} [{priority}] {}", status, t.title, priority = t.priority);
+        println!(
+            "  {} [{priority}] {}",
+            status,
+            t.title,
+            priority = t.priority
+        );
     }
 
     // --- Delete a task ---
@@ -76,7 +114,10 @@ fn main() -> mqlite::Result<()> {
     println!("  Deleted {} document(s)", result.deleted_count);
 
     // --- Final count ---
-    println!("\n--- Final count: {} ---", tasks.estimated_document_count()?);
+    println!(
+        "\n--- Final count: {} ---",
+        tasks.estimated_document_count()?
+    );
 
     // --- List collections ---
     println!("--- Collections: {:?} ---", db.list_collection_names()?);

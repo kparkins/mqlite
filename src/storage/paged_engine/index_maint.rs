@@ -10,21 +10,18 @@ use crate::mvcc::transaction::WriteTxn;
 use crate::query::planner::IndexCondition;
 use crate::storage::btree::{BTree, CellValue};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::catalog::IndexEntry;
+use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::secondary_index::{
     update_index_on_delete, update_index_on_insert, update_index_on_update,
 };
 use crate::storage::txn_page_store::TxnOverlay;
 
-use super::catalog_ops::{new_txn_store, sync_catalog_root_overlay};
+use super::catalog_ops::{catalog_lock, new_txn_store, sync_catalog_root_overlay};
 use super::state::{MetadataState, SharedState};
 
 /// Retrieve the serialised `_id` value stored in an index tree entry.
-pub(super) fn index_entry_id_free(
-    handle: &Arc<BufferPoolHandle>,
-    cv: CellValue,
-) -> Result<Bson> {
+pub(super) fn index_entry_id_free(handle: &Arc<BufferPoolHandle>, cv: CellValue) -> Result<Bson> {
     let bytes = match cv {
         CellValue::Inline(b) => b,
         CellValue::Overflow {
@@ -55,13 +52,13 @@ pub(super) fn index_bounds_free(
     }
     fn prefix_next(val: &Bson, asc: bool) -> Vec<u8> {
         let mut p = prefix(val, asc);
-        *p.last_mut().expect("prefix always contains at least COMPOUND_SEP") += 1;
+        if let Some(last) = p.last_mut() {
+            *last += 1;
+        }
         p
     }
     match condition {
-        IndexCondition::Eq(v) => {
-            (Some(prefix(v, ascending)), Some(prefix_next(v, ascending)))
-        }
+        IndexCondition::Eq(v) => (Some(prefix(v, ascending)), Some(prefix_next(v, ascending))),
         IndexCondition::Any => (None, None),
         IndexCondition::In(_) => (None, None),
         IndexCondition::Range { gt, gte, lt, lte } => {
@@ -95,6 +92,19 @@ pub(super) fn index_bounds_free(
 }
 
 /// Persist updated root/level and multikey flag for an index entry.
+///
+/// Phase 1 §10.3 — mutates `txn.publish_dirty` per the §10.3 table:
+///   - root moved on a Ready index: mark_published + mark_header.
+///   - root moved on a Building index: mark_header only (readers ignore
+///     Building per §3.3 / §4.3, so the published payload does not
+///     change).
+///   - multikey flip (root unchanged): mark_header only — multikey is
+///     not a published field (§10.3), but the catalog tree changed on
+///     disk.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "index-root sync threads existing commit context without introducing a one-use args type"
+)]
 pub(super) fn sync_index_entry(
     shared: &SharedState,
     md: &MetadataState,
@@ -103,6 +113,7 @@ pub(super) fn sync_index_entry(
     new_root: u32,
     new_level: u8,
     new_multikey: bool,
+    txn: &mut WriteTxn,
 ) -> Result<()> {
     let root_changed = new_root != orig.root_page || new_level != orig.root_level;
     let multikey_changed = new_multikey && !orig.multikey;
@@ -117,8 +128,21 @@ pub(super) fn sync_index_entry(
     if multikey_changed {
         updated.multikey = true;
     }
-    md.catalog.lock().expect("catalog poisoned").update_index(&updated)?;
-    sync_catalog_root_overlay(shared, md, overlay)
+    catalog_lock(md).update_index(&updated)?;
+    sync_catalog_root_overlay(shared, md, overlay)?;
+    // Phase 1 §10.3 — classify the catalog mutation we just persisted.
+    if root_changed {
+        txn.mark_header();
+        if matches!(orig.state, IndexState::Ready) {
+            txn.mark_published();
+        }
+    } else if multikey_changed {
+        // multikey is NOT a published field — only the on-disk catalog
+        // tree changed, so the reader-visible Arc<PublishedCatalog> may
+        // be reused at publish time.
+        txn.mark_header();
+    }
+    Ok(())
 }
 
 /// Maintain all secondary indexes after a document insert.
@@ -131,7 +155,7 @@ pub(super) fn maintain_secondary_on_insert(
     doc_id: &Bson,
     txn: &mut WriteTxn,
 ) -> Result<()> {
-    let entries = md.catalog.lock().expect("catalog poisoned").list_indexes(ns)?;
+    let entries = catalog_lock(md).list_indexes(ns)?;
     for entry in entries {
         let store = new_txn_store(shared, overlay);
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
@@ -149,6 +173,7 @@ pub(super) fn maintain_secondary_on_insert(
             new_root,
             new_level,
             is_multikey,
+            txn,
         )?;
     }
     Ok(())
@@ -164,7 +189,7 @@ pub(super) fn maintain_secondary_on_delete(
     doc_id: &Bson,
     txn: &mut WriteTxn,
 ) -> Result<()> {
-    let entries = md.catalog.lock().expect("catalog poisoned").list_indexes(ns)?;
+    let entries = catalog_lock(md).list_indexes(ns)?;
     for entry in entries {
         update_index_on_delete(doc, doc_id, &entry, txn)?;
         sync_index_entry(
@@ -175,12 +200,17 @@ pub(super) fn maintain_secondary_on_delete(
             entry.root_page,
             entry.root_level,
             false,
+            txn,
         )?;
     }
     Ok(())
 }
 
 /// Maintain all secondary indexes when a document is replaced.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "update maintenance mirrors the insert/delete helpers plus old/new document ids"
+)]
 pub(super) fn maintain_secondary_on_update(
     shared: &SharedState,
     md: &MetadataState,
@@ -192,13 +222,12 @@ pub(super) fn maintain_secondary_on_update(
     new_id: &Bson,
     txn: &mut WriteTxn,
 ) -> Result<()> {
-    let entries = md.catalog.lock().expect("catalog poisoned").list_indexes(ns)?;
+    let entries = catalog_lock(md).list_indexes(ns)?;
     for entry in entries {
         let store = new_txn_store(shared, overlay);
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-        let is_multikey = update_index_on_update(
-            old_doc, new_doc, old_id, new_id, &idx_tree, &entry, txn,
-        )?;
+        let is_multikey =
+            update_index_on_update(old_doc, new_doc, old_id, new_id, &idx_tree, &entry, txn)?;
         let (new_root, new_level) = (idx_tree.root_page, idx_tree.root_level);
         drop(idx_tree);
         sync_index_entry(
@@ -209,6 +238,7 @@ pub(super) fn maintain_secondary_on_update(
             new_root,
             new_level,
             is_multikey,
+            txn,
         )?;
     }
     Ok(())
@@ -221,6 +251,7 @@ pub(super) fn install_pending_sec_index(
     md: &MetadataState,
     overlay: &mut TxnOverlay,
     writes: Vec<crate::mvcc::SecIndexWrite>,
+    txn: &mut WriteTxn,
 ) -> Result<()> {
     if writes.is_empty() {
         return Ok(());
@@ -230,7 +261,7 @@ pub(super) fn install_pending_sec_index(
 
     let mut entry_by_root: StdHashMap<u32, IndexEntry> = StdHashMap::new();
     {
-        let cat = md.catalog.lock().expect("catalog poisoned");
+        let cat = catalog_lock(md);
         let collections = cat.list_collections()?;
         for coll in &collections {
             for entry in cat.list_indexes(&coll.name)? {
@@ -290,6 +321,7 @@ pub(super) fn install_pending_sec_index(
             state.current_root,
             state.current_level,
             state.entry.multikey,
+            txn,
         )?;
     }
 
@@ -313,12 +345,7 @@ pub(super) fn install_pending_primary(
     use crate::storage::buffer_pool::PageSize;
 
     for write in writes {
-        let (root_page, root_level) = match md
-            .catalog
-            .lock()
-            .expect("catalog poisoned")
-            .get_collection(&write.ns)?
-        {
+        let (root_page, root_level) = match catalog_lock(md).get_collection(&write.ns)? {
             Some(c) => (c.data_root_page, c.data_root_level),
             None => continue,
         };
@@ -376,7 +403,11 @@ use crate::storage::secondary_index::generate_index_name;
 
 use super::doc_helpers::validate_index_keys;
 
-pub(super) fn create_index(engine: &super::PagedEngine, ns: &str, model: &IndexModel) -> crate::error::Result<String> {
+pub(super) fn create_index(
+    engine: &super::PagedEngine,
+    ns: &str,
+    model: &IndexModel,
+) -> crate::error::Result<String> {
     validate_index_keys(&model.keys)?;
     let name = model
         .options
@@ -404,7 +435,11 @@ pub(super) fn create_index(engine: &super::PagedEngine, ns: &str, model: &IndexM
     Ok(name)
 }
 
-pub(super) fn drop_index(engine: &super::PagedEngine, ns: &str, name: &str) -> crate::error::Result<()> {
+pub(super) fn drop_index(
+    engine: &super::PagedEngine,
+    ns: &str,
+    name: &str,
+) -> crate::error::Result<()> {
     if name == "_id_" {
         return Err(crate::error::Error::InvalidWireMessage {
             detail: "drop of '_id_' index is not permitted".to_string(),
@@ -413,11 +448,7 @@ pub(super) fn drop_index(engine: &super::PagedEngine, ns: &str, name: &str) -> c
     let lane_arc = engine.lane_for(ns);
     let _lane_guard = engine.acquire_lane(lane_arc)?;
     engine.run_ddl(|shared, md, overlay| {
-        let removed = md
-            .catalog
-            .lock()
-            .expect("catalog poisoned")
-            .drop_index(ns, name)?;
+        let removed = catalog_lock(md).drop_index(ns, name)?;
         if removed {
             sync_catalog_root_overlay(shared, md, overlay)?;
             Ok(())
@@ -430,9 +461,12 @@ pub(super) fn drop_index(engine: &super::PagedEngine, ns: &str, name: &str) -> c
     })
 }
 
-pub(super) fn list_indexes(engine: &super::PagedEngine, ns: &str) -> crate::error::Result<Vec<IndexInfo>> {
-    let snap = engine.shared.published.load();
-    let ns_snap = match snap.namespaces.get(ns) {
+pub(super) fn list_indexes(
+    engine: &super::PagedEngine,
+    ns: &str,
+) -> crate::error::Result<Vec<IndexInfo>> {
+    let snap = engine.shared.load_published();
+    let ns_snap = match snap.catalog.get_by_name(ns) {
         None => return Ok(Vec::new()),
         Some(n) => n,
     };

@@ -28,10 +28,12 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<OpMsg> {
     let mut header_buf = [0u8; MsgHeader::SIZE];
     tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut header_buf))
         .await
-        .map_err(|_| crate::error::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "read_message: timed out waiting for message header",
-        )))??;
+        .map_err(|_| {
+            crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read_message: timed out waiting for message header",
+            ))
+        })??;
 
     // Peek at the declared message length without fully parsing the header yet.
     let declared_len = i32::from_le_bytes(
@@ -63,12 +65,17 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<OpMsg> {
     msg_buf[..MsgHeader::SIZE].copy_from_slice(&header_buf);
 
     // Step 3: read the remainder of the message.
-    tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut msg_buf[MsgHeader::SIZE..]))
-        .await
-        .map_err(|_| crate::error::Error::Io(std::io::Error::new(
+    tokio::time::timeout(
+        READ_TIMEOUT,
+        stream.read_exact(&mut msg_buf[MsgHeader::SIZE..]),
+    )
+    .await
+    .map_err(|_| {
+        crate::error::Error::Io(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "read_message: timed out waiting for message body",
-        )))??;
+        ))
+    })??;
 
     // Step 4: parse and validate.
     OpMsg::parse(&msg_buf)

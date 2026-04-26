@@ -216,7 +216,7 @@ fn lane_acquisition_busy_timeout_10ms() {
     // Each result is either Ok or WriterBusy — anything else is a bug.
     for (name, res) in [("A", res_a), ("B", res_b)] {
         match res {
-            Ok(_) => {} // success
+            Ok(_) => {}                  // success
             Err(Error::WriterBusy) => {} // acceptable — busy_timeout triggered
             Err(e) => panic!("thread {name}: unexpected error: {e:?}"),
         }
@@ -237,9 +237,7 @@ fn drop_namespace_mid_write_burst() {
     let client = Client::open(&path).unwrap();
 
     // Seed 10 docs.
-    let col = client
-        .database("drop_mid")
-        .collection::<Document>("victim");
+    let col = client.database("drop_mid").collection::<Document>("victim");
     for _ in 0..10 {
         col.insert_one(&doc! { "_id": ObjectId::new(), "v": "seed" })
             .unwrap();
@@ -253,9 +251,7 @@ fn drop_namespace_mid_write_burst() {
             let c = client.clone();
             let stop2 = stop.clone();
             thread::spawn(move || {
-                let col = c
-                    .database("drop_mid")
-                    .collection::<Document>("victim");
+                let col = c.database("drop_mid").collection::<Document>("victim");
                 while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     // Errors are allowed (NotFound after drop). Must not panic.
                     let _ = col.insert_one(&doc! {
@@ -317,9 +313,7 @@ fn bootstrap_race_new_namespace() {
             let b = barrier.clone();
             thread::spawn(move || {
                 b.wait(); // all fire simultaneously to maximize bootstrap contention
-                let col = c
-                    .database("boot")
-                    .collection::<Document>("race_ns");
+                let col = c.database("boot").collection::<Document>("race_ns");
                 col.insert_one(&doc! { "_id": t, "thread": t })
                     .expect("insert into new namespace must succeed");
             })
@@ -384,8 +378,7 @@ fn commit_seq_monotonicity_under_churn() {
             .count_documents(doc! {})
             .unwrap();
         assert_eq!(
-            count,
-            PER_THREAD as u64,
+            count, PER_THREAD as u64,
             "ns{t} must have {PER_THREAD} docs after churn; got {count}"
         );
         // Spot-check: each expected _id is visible.
@@ -431,9 +424,7 @@ fn poisoning_behavior_panicking_writer() {
     // Writer thread that inserts then panics.
     let c = client.clone();
     let panicking = thread::spawn(move || {
-        let col = c
-            .database("poison_test")
-            .collection::<Document>("x");
+        let col = c.database("poison_test").collection::<Document>("x");
         // Insert may succeed or fail (DuplicateKey for _id 0) — we don't care.
         // We then unconditionally panic.
         let _ = col.insert_one(&doc! { "_id": 1, "before_panic": true });
@@ -471,7 +462,7 @@ fn poisoning_behavior_panicking_writer() {
             // What's NOT acceptable is a panic, which would already have
             // propagated above. We just document the actual error:
             let _ = e; // suppress unused-variable warning
-            // Not asserting is_ok() — a clean Err is fine.
+                       // Not asserting is_ok() — a clean Err is fine.
         }
     }
 }
@@ -499,9 +490,7 @@ fn same_ns_serialization_no_gaps_no_dups() {
             let b = barrier.clone();
             thread::spawn(move || {
                 b.wait();
-                let col = c
-                    .database("serial")
-                    .collection::<Document>("shared");
+                let col = c.database("serial").collection::<Document>("shared");
                 for i in 0..PER_THREAD {
                     let id = t * PER_THREAD + i;
                     col.insert_one(&doc! { "_id": id, "thread": t, "seq": i })
@@ -546,7 +535,8 @@ fn same_ns_serialization_no_gaps_no_dups() {
 
     let expected: HashSet<i32> = (0..(THREADS * PER_THREAD)).collect();
     assert_eq!(
-        ids, expected,
+        ids,
+        expected,
         "expected _ids 0..{} with no gaps",
         THREADS * PER_THREAD
     );
@@ -572,26 +562,26 @@ fn interleaving_insert_many_same_ns_count_100() {
     let ba = barrier.clone();
     let h_a = thread::spawn(move || {
         ba.wait();
-        let col = ca
-            .database("batch")
-            .collection::<Document>("shared");
+        let col = ca.database("batch").collection::<Document>("shared");
         let docs: Vec<Document> = (0..50i32)
             .map(|i| doc! { "_id": i, "batch": "a" })
             .collect();
-        col.insert_many(&docs).run().expect("insert_many batch A must succeed")
+        col.insert_many(&docs)
+            .run()
+            .expect("insert_many batch A must succeed")
     });
 
     let cb = client.clone();
     let bb = barrier.clone();
     let h_b = thread::spawn(move || {
         bb.wait();
-        let col = cb
-            .database("batch")
-            .collection::<Document>("shared");
+        let col = cb.database("batch").collection::<Document>("shared");
         let docs: Vec<Document> = (50..100i32)
             .map(|i| doc! { "_id": i, "batch": "b" })
             .collect();
-        col.insert_many(&docs).run().expect("insert_many batch B must succeed")
+        col.insert_many(&docs)
+            .run()
+            .expect("insert_many batch B must succeed")
     });
 
     h_a.join().expect("thread A panicked");
@@ -602,7 +592,10 @@ fn interleaving_insert_many_same_ns_count_100() {
         .collection::<Document>("shared")
         .count_documents(doc! {})
         .unwrap();
-    assert_eq!(count, 100, "both insert_many batches must land; got {count}");
+    assert_eq!(
+        count, 100,
+        "both insert_many batches must land; got {count}"
+    );
 
     // Verify no torn rows: every _id 0..100 is present exactly once.
     let all_docs: Vec<Document> = client

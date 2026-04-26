@@ -139,11 +139,7 @@ fn tc03_concurrent_create_index_different_fields() {
         b1.wait();
         c1.database("d")
             .collection::<Document>("col")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "field_a": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "field_a": 1 }).build())
             .unwrap()
     });
 
@@ -153,11 +149,7 @@ fn tc03_concurrent_create_index_different_fields() {
         b2.wait();
         c2.database("d")
             .collection::<Document>("col")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "field_b": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "field_b": 1 }).build())
             .unwrap()
     });
 
@@ -167,8 +159,16 @@ fn tc03_concurrent_create_index_different_fields() {
     let indexes = col.list_indexes().unwrap();
     let has_a = indexes.iter().any(|i| i.name == name_a);
     let has_b = indexes.iter().any(|i| i.name == name_b);
-    assert!(has_a, "{} missing from list_indexes after concurrent build", name_a);
-    assert!(has_b, "{} missing from list_indexes after concurrent build", name_b);
+    assert!(
+        has_a,
+        "{} missing from list_indexes after concurrent build",
+        name_a
+    );
+    assert!(
+        has_b,
+        "{} missing from list_indexes after concurrent build",
+        name_b
+    );
 
     // Both indexes must cover pre-seeded docs.
     let cnt_a = col.count_documents(doc! { "field_a": 5 }).unwrap();
@@ -196,11 +196,7 @@ fn tc04_drop_ready_index() {
     }
 
     let idx_name = col
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "val": 1 })
-                .build(),
-        )
+        .create_index(IndexModel::builder().keys(doc! { "val": 1 }).build())
         .unwrap();
 
     // Verify present.
@@ -250,11 +246,7 @@ fn tc05_drop_wins_race_during_build() {
         c_build
             .database("d")
             .collection::<Document>("col")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "tag": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
         // Either Ok (build finished before drop) or Err (drop won). Both allowed.
     });
 
@@ -301,11 +293,7 @@ fn tc06_create_index_empty_collection() {
     // Force namespace creation with one insert then delete... or just create_index
     // directly — the spec says create_index on an empty collection should succeed.
     let idx_name = col
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "email": 1 })
-                .build(),
-        )
+        .create_index(IndexModel::builder().keys(doc! { "email": 1 }).build())
         .unwrap();
 
     let indexes = col.list_indexes().unwrap();
@@ -338,16 +326,10 @@ fn tc07_create_index_bootstraps_collection() {
     let client = Client::open(&path).unwrap();
 
     // Deliberately do NOT insert any doc before create_index.
-    let col = client
-        .database("d")
-        .collection::<Document>("brand_new");
+    let col = client.database("d").collection::<Document>("brand_new");
 
     let idx_name = col
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "score": 1 })
-                .build(),
-        )
+        .create_index(IndexModel::builder().keys(doc! { "score": 1 }).build())
         .unwrap();
 
     // Collection now exists (even if empty).
@@ -363,7 +345,8 @@ fn tc07_create_index_bootstraps_collection() {
     );
 
     // Insert a doc and query via the index.
-    col.insert_one(&doc! { "_id": 1i32, "score": 42i32 }).unwrap();
+    col.insert_one(&doc! { "_id": 1i32, "score": 42i32 })
+        .unwrap();
     let cnt = col.count_documents(doc! { "score": 42i32 }).unwrap();
     assert_eq!(cnt, 1, "inserted doc must be findable via the index");
 }
@@ -383,16 +366,14 @@ fn tc08_multikey_index_query() {
 
     let col = client.database("d").collection::<Document>("mk");
     // Insert docs; one has an array field.
-    col.insert_one(&doc! { "_id": 1i32, "arr": [1i32, 2i32, 3i32] }).unwrap();
-    col.insert_one(&doc! { "_id": 2i32, "arr": [4i32, 5i32] }).unwrap();
+    col.insert_one(&doc! { "_id": 1i32, "arr": [1i32, 2i32, 3i32] })
+        .unwrap();
+    col.insert_one(&doc! { "_id": 2i32, "arr": [4i32, 5i32] })
+        .unwrap();
     col.insert_one(&doc! { "_id": 3i32, "arr": 7i32 }).unwrap(); // scalar
 
     let idx_name = col
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "arr": 1 })
-                .build(),
-        )
+        .create_index(IndexModel::builder().keys(doc! { "arr": 1 }).build())
         .unwrap();
 
     // Index must be present in list_indexes.
@@ -427,8 +408,10 @@ fn tc09_unique_index_build_time_violation() {
     let client = Client::open(&path).unwrap();
 
     let col = client.database("d").collection::<Document>("users");
-    col.insert_one(&doc! { "_id": 1i32, "email": "dup@example.com" }).unwrap();
-    col.insert_one(&doc! { "_id": 2i32, "email": "dup@example.com" }).unwrap();
+    col.insert_one(&doc! { "_id": 1i32, "email": "dup@example.com" })
+        .unwrap();
+    col.insert_one(&doc! { "_id": 2i32, "email": "dup@example.com" })
+        .unwrap();
 
     let result = col.create_index(
         IndexModel::builder()
@@ -486,11 +469,7 @@ fn tc10_dual_write_during_build_all_docs_indexed() {
         c_idx
             .database("d")
             .collection::<Document>("docs")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "tag": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
             .unwrap()
     });
 
@@ -555,11 +534,7 @@ fn tc11_building_index_invisible_to_queries() {
         c_build
             .database("d")
             .collection::<Document>("bigcol")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "status": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "status": 1 }).build())
             .unwrap();
     });
 
@@ -572,9 +547,7 @@ fn tc11_building_index_invisible_to_queries() {
         thread::sleep(std::time::Duration::from_millis(10));
         let col_q = c_query.database("d").collection::<Document>("bigcol");
         // Must succeed and return correct count (falls back to collscan).
-        let cnt = col_q
-            .count_documents(doc! { "status": "active" })
-            .unwrap();
+        let cnt = col_q.count_documents(doc! { "status": "active" }).unwrap();
         cnt
     });
 
@@ -589,7 +562,10 @@ fn tc11_building_index_invisible_to_queries() {
 
     // After build completes, query via the ready index also correct.
     let final_count = col.count_documents(doc! { "status": "active" }).unwrap();
-    assert_eq!(final_count, 1000, "post-build query must return correct count");
+    assert_eq!(
+        final_count, 1000,
+        "post-build query must return correct count"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -621,11 +597,7 @@ fn tc12_create_index_vs_drop_collection_no_panic() {
         let _ = c_idx
             .database("d")
             .collection::<Document>("victim")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "score": 1 })
-                    .build(),
-            );
+            .create_index(IndexModel::builder().keys(doc! { "score": 1 }).build());
     });
 
     // Thread B: drop the collection.
@@ -633,10 +605,7 @@ fn tc12_create_index_vs_drop_collection_no_panic() {
     let client_drop = client.clone();
     let drop_thread = thread::spawn(move || {
         b_drop.wait();
-        client_drop
-            .database("d")
-            .drop_collection("victim")
-            .unwrap();
+        client_drop.database("d").drop_collection("victim").unwrap();
     });
 
     // Both threads must complete without panicking.
@@ -681,9 +650,6 @@ fn tc13_drop_reserved_id_index_rejected() {
                 "error detail should mention '_id_', got: {detail}"
             );
         }
-        other => panic!(
-            "expected Error::InvalidWireMessage, got: {:?}",
-            other
-        ),
+        other => panic!("expected Error::InvalidWireMessage, got: {:?}", other),
     }
 }

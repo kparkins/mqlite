@@ -771,7 +771,10 @@ fn t3_5_merge_into_left_migrates_orphan_chain() {
         .unwrap();
 
     assert!(tree.delete(&key(5)).unwrap());
-    assert_eq!(tree.root_level, 0, "merge should collapse the two-leaf root");
+    assert_eq!(
+        tree.root_level, 0,
+        "merge should collapse the two-leaf root"
+    );
     assert_eq!(tree.get(&key(4)).unwrap(), Some(v.clone()));
 
     let orphan = tree
@@ -804,7 +807,10 @@ fn t3_5_merge_into_right_migrates_orphan_chain() {
         .unwrap();
 
     assert!(tree.delete(&key(0)).unwrap());
-    assert_eq!(tree.root_level, 0, "merge should collapse the two-leaf root");
+    assert_eq!(
+        tree.root_level, 0,
+        "merge should collapse the two-leaf root"
+    );
     assert_eq!(tree.get(&key(1)).unwrap(), Some(v.clone()));
 
     let orphan = tree
@@ -845,7 +851,11 @@ fn t3_5_left_underflow_redistributes_when_merge_would_overflow() {
     assert_eq!(leaf_cell_count(&tree, right), 3);
 
     for i in 0u64..6 {
-        assert_eq!(tree.get(&key(i)).unwrap(), Some(v.clone()), "key {i} missing");
+        assert_eq!(
+            tree.get(&key(i)).unwrap(),
+            Some(v.clone()),
+            "key {i} missing"
+        );
     }
     assert!(tree.get(&key(6)).unwrap().is_none());
 }
@@ -879,7 +889,11 @@ fn t3_5_right_underflow_redistributes_when_merge_would_overflow() {
     assert_eq!(leaf_cell_count(&tree, right), 3);
 
     for i in 1u64..7 {
-        assert_eq!(tree.get(&key(i)).unwrap(), Some(v.clone()), "key {i} missing");
+        assert_eq!(
+            tree.get(&key(i)).unwrap(),
+            Some(v.clone()),
+            "key {i} missing"
+        );
     }
     assert!(tree.get(&key(0)).unwrap().is_none());
 }

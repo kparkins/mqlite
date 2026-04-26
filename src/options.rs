@@ -287,4 +287,3 @@ pub(crate) struct FindOneAndReplaceOptions {
     /// Sort order — determines which document to replace when multiple match.
     pub sort: Option<Document>,
 }
-

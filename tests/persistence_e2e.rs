@@ -18,8 +18,8 @@
 //!   * targeted `find_one` queries using the indexed fields return the
 //!     expected documents
 
-use mqlite::{doc, Client, IndexModel, IndexOptions};
 use bson::Document;
+use mqlite::{doc, Client, IndexModel, IndexOptions};
 
 /// Total document counts per collection.
 const USERS_COUNT: i32 = 4_000;
@@ -72,7 +72,10 @@ fn end_to_end_persistence_across_three_databases() {
             let pre_close = col
                 .find_one(doc! { "email": REF_USER_EMAIL })
                 .expect("find_one users pre-close");
-            assert!(pre_close.is_some(), "reference user must exist before close");
+            assert!(
+                pre_close.is_some(),
+                "reference user must exist before close"
+            );
         }
 
         // ---- products (3 000 docs, unique sku index) ------------------

@@ -90,6 +90,11 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // -------------------------------------------------------------------------
 
     /// Insert a single document. Returns the `_id` of the inserted document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the storage engine rejects
+    /// the insert.
     pub fn insert_one(&self, doc: &T) -> Result<InsertOneResult> {
         self.inner.insert_one(&self.namespace(), doc)
     }
@@ -108,6 +113,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn insert_many<'a>(&'a self, docs: &'a [T]) -> InsertMany<'a, T> {
         InsertMany {
             coll: self,
@@ -121,6 +127,11 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // -------------------------------------------------------------------------
 
     /// Find the first document matching `filter`. Returns `None` if no document matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be evaluated or deserialization
+    /// into `T` fails.
     pub fn find_one(&self, filter: Document) -> Result<Option<T>> {
         self.inner.find_one(&self.namespace(), filter)
     }
@@ -141,6 +152,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn find(&self, filter: Document) -> Find<'_, T> {
         Find {
             coll: self,
@@ -168,6 +180,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn update_one(&self, filter: Document, update: Document) -> Update<'_, T> {
         Update {
             coll: self,
@@ -181,6 +194,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// Update all documents matching `filter`.
     ///
     /// Returns an [`Update`] action. Chain option methods before calling `.run()`.
+    #[must_use]
     pub fn update_many(&self, filter: Document, update: Document) -> Update<'_, T> {
         Update {
             coll: self,
@@ -196,11 +210,19 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // -------------------------------------------------------------------------
 
     /// Delete the first document matching `filter`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete cannot be applied by the storage engine.
     pub fn delete_one(&self, filter: Document) -> Result<DeleteResult> {
         self.inner.delete_one(&self.namespace(), filter)
     }
 
     /// Delete all documents matching `filter`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete cannot be applied by the storage engine.
     pub fn delete_many(&self, filter: Document) -> Result<DeleteResult> {
         self.inner.delete_many(&self.namespace(), filter)
     }
@@ -226,6 +248,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn find_one_and_update(
         &self,
         filter: Document,
@@ -242,6 +265,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// Atomically find the first document matching `filter`, delete it, and return it.
     ///
     /// Returns a [`FindOneAndDelete`] action. Chain option methods before calling `.run()`.
+    #[must_use]
     pub fn find_one_and_delete(&self, filter: Document) -> FindOneAndDelete<'_, T> {
         FindOneAndDelete {
             coll: self,
@@ -254,6 +278,7 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// and return a document. By default returns the document **before** the replacement.
     ///
     /// Returns a [`FindOneAndReplace`] action. Chain option methods before calling `.run()`.
+    #[must_use]
     pub fn find_one_and_replace<'a>(
         &'a self,
         filter: Document,
@@ -272,11 +297,19 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // -------------------------------------------------------------------------
 
     /// Return an approximate count of all documents in the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage engine cannot read collection metadata.
     pub fn estimated_document_count(&self) -> Result<u64> {
         self.inner.estimated_document_count(&self.namespace())
     }
 
     /// Return the exact count of documents matching `filter`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be evaluated.
     pub fn count_documents(&self, filter: Document) -> Result<u64> {
         self.inner.count_documents(&self.namespace(), filter)
     }
@@ -286,16 +319,29 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     // -------------------------------------------------------------------------
 
     /// Create an index on the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index definition is unsupported or index build
+    /// fails.
     pub fn create_index(&self, model: IndexModel) -> Result<String> {
         self.inner.create_index(&self.namespace(), model)
     }
 
     /// Drop an index by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be found or dropped.
     pub fn drop_index(&self, index_name: &str) -> Result<()> {
         self.inner.drop_index(&self.namespace(), index_name)
     }
 
     /// List all indexes on the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if index metadata cannot be read.
     pub fn list_indexes(&self) -> Result<Vec<IndexInfo>> {
         self.inner.list_indexes(&self.namespace())
     }

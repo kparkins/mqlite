@@ -63,13 +63,19 @@ pub(crate) struct BufferPoolPageStore {
 impl BufferPoolPageStore {
     /// Create a `BufferPoolPageStore` backed by `handle`'s main pool.
     pub(crate) fn new(handle: Arc<BufferPoolHandle>) -> Self {
-        Self { handle, is_history: false }
+        Self {
+            handle,
+            is_history: false,
+        }
     }
 
     /// Create a `BufferPoolPageStore` backed by `handle`'s dedicated
     /// history-store pool.
     pub(crate) fn new_history(handle: Arc<BufferPoolHandle>) -> Self {
-        Self { handle, is_history: true }
+        Self {
+            handle,
+            is_history: true,
+        }
     }
 
     /// Borrow the underlying [`BufferPoolHandle`].
@@ -112,10 +118,7 @@ impl BTreePageStore for BufferPoolPageStore {
         // pinned auto-unpins here
     }
 
-    fn read_leaf(
-        &self,
-        page: u32,
-    ) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
+    fn read_leaf(&self, page: u32) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
         let pinned = self.fetch(page, PageSize::Large32k)?;
         let mut buf = Box::new([0u8; LEAF_SIZE]);
         buf.copy_from_slice(pinned.data());
@@ -179,11 +182,7 @@ impl BTreePageStore for BufferPoolPageStore {
     // `Frame::version_chains` map for the 32 KB leaf partition.
     // -----------------------------------------------------------------------
 
-    fn take_chain(
-        &mut self,
-        page: u32,
-        key: &[u8],
-    ) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
+    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
         self.handle.pool().take_chain(page, key)
     }
 
@@ -208,7 +207,9 @@ impl BTreePageStore for BufferPoolPageStore {
         if self.is_history {
             return Ok(());
         }
-        self.handle.pool().clear_chains_on_page(page, PageSize::Large32k)
+        self.handle
+            .pool()
+            .clear_chains_on_page(page, PageSize::Large32k)
     }
 
     fn take_all_chains(
@@ -231,7 +232,7 @@ mod tests {
     use super::*;
     use crate::storage::btree::{BTree, BTreePageStore};
     use crate::storage::buffer_pool::default_sizes;
-    use crate::storage::buffer_pool::{BufferPool, PageSource, PageSize};
+    use crate::storage::buffer_pool::{BufferPool, PageSize, PageSource};
     use crate::storage::header::FileHeader;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;

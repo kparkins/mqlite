@@ -21,9 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
-use mqlite::mvcc::{
-    ChainSnapshot, ReadView, ReadViewRegistry, Ts, VersionData, VersionEntry,
-};
+use mqlite::mvcc::{ChainSnapshot, ReadView, ReadViewRegistry, Ts, VersionData, VersionEntry};
 
 #[test]
 fn read_view_unregisters_across_panic() {
@@ -31,7 +29,10 @@ fn read_view_unregisters_across_panic() {
     assert!(registry.is_empty());
     assert_eq!(registry.oldest_required_ts(), Ts::MAX);
 
-    let ts = Ts { physical_ms: 100, logical: 0 };
+    let ts = Ts {
+        physical_ms: 100,
+        logical: 0,
+    };
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         let view = ReadView::open(registry.clone(), ts, 1);
@@ -60,7 +61,10 @@ fn read_view_unregisters_across_panic() {
 fn chain_snapshot_releases_arcs_across_panic() {
     // Build a source chain holding exactly one Arc we can observe.
     let entry = VersionEntry {
-        start_ts: Ts { physical_ms: 100, logical: 0 },
+        start_ts: Ts {
+            physical_ms: 100,
+            logical: 0,
+        },
         stop_ts: Ts::MAX,
         txn_id: 1,
         data: VersionData::Inline(b"payload".to_vec()),
@@ -96,9 +100,18 @@ fn chain_snapshot_releases_arcs_across_panic() {
 #[test]
 fn multiple_views_survive_panic_unwind_horizon_coherent() {
     let registry = ReadViewRegistry::new();
-    let ts100 = Ts { physical_ms: 100, logical: 0 };
-    let ts200 = Ts { physical_ms: 200, logical: 0 };
-    let ts300 = Ts { physical_ms: 300, logical: 0 };
+    let ts100 = Ts {
+        physical_ms: 100,
+        logical: 0,
+    };
+    let ts200 = Ts {
+        physical_ms: 200,
+        logical: 0,
+    };
+    let ts300 = Ts {
+        physical_ms: 300,
+        logical: 0,
+    };
 
     // Keep v200 alive across the panic — simulates a sibling reader
     // that shouldn't be affected by the failing writer.

@@ -113,6 +113,24 @@ pub(crate) const KIND_SEC_INDEX_BASE: u8 = 0x01;
 #[allow(dead_code)]
 pub(crate) const KIND_RESERVED: u8 = 0xFF;
 
+fn ts_from_le_slice(bytes: &[u8]) -> Ts {
+    let mut out = [0u8; 12];
+    out.copy_from_slice(bytes);
+    Ts::from_le_bytes(out)
+}
+
+fn u32_from_le_slice(bytes: &[u8]) -> u32 {
+    let mut out = [0u8; 4];
+    out.copy_from_slice(bytes);
+    u32::from_le_bytes(out)
+}
+
+fn u64_from_le_slice(bytes: &[u8]) -> u64 {
+    let mut out = [0u8; 8];
+    out.copy_from_slice(bytes);
+    u64::from_le_bytes(out)
+}
+
 // ---------------------------------------------------------------------------
 // Key encoding / decoding
 // ---------------------------------------------------------------------------
@@ -215,9 +233,9 @@ pub(crate) fn decode_version_entry_value(
             "history_store: value buffer truncated before fixed header".into(),
         ));
     }
-    let start_ts = Ts::from_le_bytes(bytes[0..12].try_into().expect("12 bytes"));
-    let stop_ts = Ts::from_le_bytes(bytes[12..24].try_into().expect("12 bytes"));
-    let txn_id = u64::from_le_bytes(bytes[24..32].try_into().expect("8 bytes"));
+    let start_ts = ts_from_le_slice(&bytes[0..12]);
+    let stop_ts = ts_from_le_slice(&bytes[12..24]);
+    let txn_id = u64_from_le_slice(&bytes[24..32]);
     let is_tombstone = bytes[32] != 0;
     let data_kind = bytes[33];
     let data = match data_kind {
@@ -227,11 +245,11 @@ pub(crate) fn decode_version_entry_value(
                     "history_store: inline value missing length prefix".into(),
                 ));
             }
-            let len = u32::from_le_bytes(bytes[34..38].try_into().expect("4 bytes")) as usize;
+            let len = u32_from_le_slice(&bytes[34..38]) as usize;
             let start = 38usize;
-            let end = start.checked_add(len).ok_or_else(|| {
-                Error::Internal("history_store: inline length overflow".into())
-            })?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| Error::Internal("history_store: inline length overflow".into()))?;
             if bytes.len() < end {
                 return Err(Error::Internal(
                     "history_store: inline payload truncated".into(),
@@ -245,14 +263,10 @@ pub(crate) fn decode_version_entry_value(
                     "history_store: overflow value truncated".into(),
                 ));
             }
-            let first_page =
-                u32::from_le_bytes(bytes[34..38].try_into().expect("4 bytes"));
-            let total_length =
-                u64::from_le_bytes(bytes[38..46].try_into().expect("8 bytes"));
+            let first_page = u32_from_le_slice(&bytes[34..38]);
+            let total_length = u64_from_le_slice(&bytes[38..46]);
             let alloc = allocator.ok_or_else(|| {
-                Error::Internal(
-                    "history_store: overflow entry requires allocator handle".into(),
-                )
+                Error::Internal("history_store: overflow entry requires allocator handle".into())
             })?;
             VersionData::Overflow(OverflowRef::new_owned(
                 first_page,
@@ -295,6 +309,11 @@ pub(crate) struct HistoryStore<S: BTreePageStore> {
 
 impl<S: BTreePageStore> HistoryStore<S> {
     /// Create a new history store over a freshly-built B-tree.
+    ///
+    /// Phase 1 uses [`HistoryStore::create_empty_root`] at open time;
+    /// this raw constructor stays as part of the API surface for
+    /// Phase 4 (§8.11) history repopulation.
+    #[allow(dead_code)]
     pub(crate) fn create(store: S) -> Result<Self> {
         Ok(Self {
             tree: BTree::create(store)?,
@@ -302,7 +321,29 @@ impl<S: BTreePageStore> HistoryStore<S> {
         })
     }
 
+    /// Phase 1 §10.7 — allocate a fresh empty root page in `store` and
+    /// return the persisted page id. Used by open-time bootstrap when the
+    /// file header's `history_store_root_page` is `0` (fresh DB). The
+    /// caller writes the returned page id into `FileHeader::history_store_root_page`
+    /// atomically with the rest of open-time initialization, so reopen
+    /// can call [`HistoryStore::open`] with a valid page id.
+    pub(crate) fn create_empty_root(store: S) -> Result<(Self, u32)> {
+        let tree = BTree::create(store)?;
+        let root_page = tree.root_page;
+        Ok((
+            Self {
+                tree,
+                overflow_allocator: None,
+            },
+            root_page,
+        ))
+    }
+
     /// Open an existing history store at `root_page` / `root_level`.
+    ///
+    /// Phase 1 uses [`HistoryStore::create_empty_root`] at open time;
+    /// Phase 4 (§8.11) wires this constructor for cross-lifetime
+    /// history repopulation.
     #[allow(dead_code)]
     pub(crate) fn open(store: S, root_page: u32, root_level: u8) -> Self {
         Self {
@@ -460,8 +501,7 @@ impl<S: BTreePageStore> HistoryStore<S> {
             if value_bytes.len() < 34 {
                 continue;
             }
-            let stop_ts =
-                Ts::from_le_bytes(value_bytes[12..24].try_into().expect("12 bytes"));
+            let stop_ts = ts_from_le_slice(&value_bytes[12..24]);
             if stop_ts == Ts::MAX || stop_ts > ort {
                 continue;
             }
@@ -470,10 +510,8 @@ impl<S: BTreePageStore> HistoryStore<S> {
                 if value_bytes.len() < 46 {
                     continue;
                 }
-                let first_page =
-                    u32::from_le_bytes(value_bytes[34..38].try_into().expect("4 bytes"));
-                let total_length =
-                    u64::from_le_bytes(value_bytes[38..46].try_into().expect("8 bytes"));
+                let first_page = u32_from_le_slice(&value_bytes[34..38]);
+                let total_length = u64_from_le_slice(&value_bytes[38..46]);
                 Some((first_page, total_length))
             } else {
                 None
@@ -515,9 +553,7 @@ impl<S: BTreePageStore> HistoryStore<S> {
 
 /// Resolve a `CellValue` from `BTree::range_scan` into the raw bytes that
 /// were stored at insert time.
-fn cell_value_bytes(
-    value: crate::storage::btree::CellValue,
-) -> Result<Vec<u8>> {
+fn cell_value_bytes(value: crate::storage::btree::CellValue) -> Result<Vec<u8>> {
     use crate::storage::btree::CellValue;
     match value {
         CellValue::Inline(bytes) => Ok(bytes),
@@ -526,7 +562,6 @@ fn cell_value_bytes(
         )),
     }
 }
-
 
 #[cfg(test)]
 #[path = "history_store_tests.rs"]

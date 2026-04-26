@@ -456,6 +456,753 @@ pub fn reset_force_expire_spin_stalls() {
 }
 
 // ===========================================================================
+// Phase-0 observability counters (5 signals)
+//
+// Each counter below is observation only — must not be read or written while
+// holding either the lane mutex or commit_seq mutex in a way that extends the
+// critical section. Writes are lock-free atomic fetch_add/store calls; reads
+// (`_snapshot` / `_reset`) are test-only and must not race with active
+// writers.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// P1 — published_snapshot_rebuilds_total  (counter)
+// ---------------------------------------------------------------------------
+
+/// Total number of full published-catalog rebuilds performed via
+/// `publish_commit` (Phase 1 §10.2 / §10.10). One tick per publish
+/// whose `dirty.published_catalog_dirty == true`. Phase 1 US-012 also
+/// exposes this via `published_catalog_rebuild_count`; the two
+/// counters tick in lock-step.
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static PUBLISHED_SNAPSHOT_REBUILDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one published-snapshot rebuild.
+pub fn record_published_snapshot_rebuild() {
+    PUBLISHED_SNAPSHOT_REBUILDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the published-snapshot-rebuilds counter.
+pub fn published_snapshot_rebuilds_snapshot() -> u64 {
+    PUBLISHED_SNAPSHOT_REBUILDS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the published-snapshot-rebuilds counter.
+pub fn reset_published_snapshot_rebuilds() {
+    PUBLISHED_SNAPSHOT_REBUILDS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// P2a — crud_commits_root_neutral_total  (counter)
+// ---------------------------------------------------------------------------
+
+/// CRUD commits whose body did NOT persist updated tree-root metadata
+/// (no `sync_catalog_root_overlay` call during the txn).
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static CRUD_COMMITS_ROOT_NEUTRAL_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one root-neutral CRUD commit.
+pub fn record_crud_commit_root_neutral() {
+    CRUD_COMMITS_ROOT_NEUTRAL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the root-neutral CRUD-commits counter.
+pub fn crud_commits_root_neutral_snapshot() -> u64 {
+    CRUD_COMMITS_ROOT_NEUTRAL_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the root-neutral CRUD-commits counter.
+pub fn reset_crud_commits_root_neutral() {
+    CRUD_COMMITS_ROOT_NEUTRAL_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// P2b — crud_commits_root_changing_total  (counter)
+// ---------------------------------------------------------------------------
+
+/// CRUD commits whose body DID persist updated tree-root metadata (the
+/// `sync_catalog_root_overlay` path fired at least once during the txn).
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static CRUD_COMMITS_ROOT_CHANGING_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one root-changing CRUD commit.
+pub fn record_crud_commit_root_changing() {
+    CRUD_COMMITS_ROOT_CHANGING_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the root-changing CRUD-commits counter.
+pub fn crud_commits_root_changing_snapshot() -> u64 {
+    CRUD_COMMITS_ROOT_CHANGING_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the root-changing CRUD-commits counter.
+pub fn reset_crud_commits_root_changing() {
+    CRUD_COMMITS_ROOT_CHANGING_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// P3a — lane_wait_ns_total  (counter, cumulative nanoseconds)
+// ---------------------------------------------------------------------------
+
+/// Cumulative nanoseconds CRUD writers spent waiting to acquire their
+/// per-namespace lane mutex. Timed with `Instant::now()` reads taken OUTSIDE
+/// the critical section; the write-side record call is a lock-free atomic
+/// add that does not extend the critical section.
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static LANE_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record N nanoseconds of lane-acquisition wait.
+pub fn record_lane_wait_ns(ns: u64) {
+    if ns > 0 {
+        LANE_WAIT_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot the lane-wait cumulative-nanoseconds counter.
+pub fn lane_wait_ns_snapshot() -> u64 {
+    LANE_WAIT_NS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the lane-wait counter.
+pub fn reset_lane_wait_ns() {
+    LANE_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// P3b — commit_seq_wait_ns_total  (counter, cumulative nanoseconds)
+// ---------------------------------------------------------------------------
+
+/// Cumulative nanoseconds CRUD writers spent waiting to acquire the global
+/// `commit_seq` mutex. Timed with `Instant::now()` reads taken OUTSIDE the
+/// critical section; the write-side record call is a lock-free atomic add
+/// that does not extend the critical section.
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static COMMIT_SEQ_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record N nanoseconds of commit_seq-acquisition wait.
+pub fn record_commit_seq_wait_ns(ns: u64) {
+    if ns > 0 {
+        COMMIT_SEQ_WAIT_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot the commit_seq-wait cumulative-nanoseconds counter.
+pub fn commit_seq_wait_ns_snapshot() -> u64 {
+    COMMIT_SEQ_WAIT_NS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the commit_seq-wait counter.
+pub fn reset_commit_seq_wait_ns() {
+    COMMIT_SEQ_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// P4a — recovery_legacy_page_frames_total  (counter)
+// ---------------------------------------------------------------------------
+
+/// Total number of legacy page-replay frames processed by the recovery loop
+/// (`JournalFrameHeader` frames — non-commit and commit).
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static RECOVERY_LEGACY_PAGE_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one legacy page-frame seen by recovery.
+pub fn record_recovery_legacy_page_frame() {
+    RECOVERY_LEGACY_PAGE_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the legacy-page-frames recovery counter.
+pub fn recovery_legacy_page_frames_snapshot() -> u64 {
+    RECOVERY_LEGACY_PAGE_FRAMES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the legacy-page-frames recovery counter.
+pub fn reset_recovery_legacy_page_frames() {
+    RECOVERY_LEGACY_PAGE_FRAMES_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// P4b — recovery_chain_commit_frames_total  (counter)
+// ---------------------------------------------------------------------------
+
+/// Total number of `ChainCommit` frames processed by the recovery loop.
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static RECOVERY_CHAIN_COMMIT_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one ChainCommit frame seen by recovery.
+pub fn record_recovery_chain_commit_frame() {
+    RECOVERY_CHAIN_COMMIT_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the ChainCommit-frames recovery counter.
+pub fn recovery_chain_commit_frames_snapshot() -> u64 {
+    RECOVERY_CHAIN_COMMIT_FRAMES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the ChainCommit-frames recovery counter.
+pub fn reset_recovery_chain_commit_frames() {
+    RECOVERY_CHAIN_COMMIT_FRAMES_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// P5 — emergency_checkpoint_triggers_total  (counter)
+// ---------------------------------------------------------------------------
+
+/// Total number of times the engine's emergency-checkpoint path fired after
+/// `commit_txn` reported the journal-index hot threshold was reached.
+///
+/// Observation only — must not be read or written while holding either the
+/// lane mutex or commit_seq mutex in a way that extends the critical section.
+pub static EMERGENCY_CHECKPOINT_TRIGGERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one emergency-checkpoint trigger.
+pub fn record_emergency_checkpoint_trigger() {
+    EMERGENCY_CHECKPOINT_TRIGGERS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the emergency-checkpoint triggers counter.
+pub fn emergency_checkpoint_triggers_snapshot() -> u64 {
+    EMERGENCY_CHECKPOINT_TRIGGERS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the emergency-checkpoint triggers counter.
+pub fn reset_emergency_checkpoint_triggers() {
+    EMERGENCY_CHECKPOINT_TRIGGERS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ===========================================================================
+// Phase 1 §10.10 counters (US-012)
+// ===========================================================================
+//
+// These four counters make the publish-decision table (§4.1 / §10.3)
+// observable. They are wired inside `publish_commit` (src/storage/
+// paged_engine/publish.rs) so every CRUD + DDL publish path ticks them
+// consistently. Observation only — no lock held while reading or
+// writing. Gated on `Ordering::Relaxed` since counters are advisory.
+
+// ---------------------------------------------------------------------------
+// read_epoch_publish_count (counter)
+// ---------------------------------------------------------------------------
+
+/// Total number of `publish_commit` invocations (one tick per
+/// `published.store`). Advances monotonically with every CRUD + DDL
+/// publish, including root-neutral commits that reuse the prior
+/// `Arc<PublishedCatalog>`.
+///
+/// Observation only — no lock held while reading or writing.
+pub static READ_EPOCH_PUBLISH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record one publish (always ticked by `publish_commit`).
+pub fn record_read_epoch_publish() {
+    READ_EPOCH_PUBLISH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the publish counter.
+pub fn read_epoch_publish_count_snapshot() -> u64 {
+    READ_EPOCH_PUBLISH_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the publish counter.
+pub fn reset_read_epoch_publish_count() {
+    READ_EPOCH_PUBLISH_COUNT.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// published_catalog_rebuild_count (counter)
+// ---------------------------------------------------------------------------
+
+/// Number of publishes that built a FRESH `Arc<PublishedCatalog>`
+/// (i.e. `dirty.published_catalog_dirty == true`). Root-neutral CRUD
+/// reuses the prior Arc and does NOT tick this counter.
+///
+/// Observation only — no lock held while reading or writing.
+pub static PUBLISHED_CATALOG_REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record one catalog-Arc rebuild.
+pub fn record_published_catalog_rebuild() {
+    PUBLISHED_CATALOG_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the catalog-rebuild counter.
+pub fn published_catalog_rebuild_count_snapshot() -> u64 {
+    PUBLISHED_CATALOG_REBUILD_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the catalog-rebuild counter.
+pub fn reset_published_catalog_rebuild_count() {
+    PUBLISHED_CATALOG_REBUILD_COUNT.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// catalog_header_sync_count (counter)
+// ---------------------------------------------------------------------------
+
+/// Number of publishes whose txn had `catalog_header_dirty == true`
+/// (i.e. `sync_catalog_root_overlay` ran during the body). Ticks on
+/// every root-moving CRUD and on every DDL; does NOT tick on
+/// root-neutral CRUD or on multikey-only flips where the on-disk
+/// header did not change.
+///
+/// Observation only — no lock held while reading or writing.
+pub static CATALOG_HEADER_SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record one catalog-header sync.
+pub fn record_catalog_header_sync() {
+    CATALOG_HEADER_SYNC_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the header-sync counter.
+pub fn catalog_header_sync_count_snapshot() -> u64 {
+    CATALOG_HEADER_SYNC_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the header-sync counter.
+pub fn reset_catalog_header_sync_count() {
+    CATALOG_HEADER_SYNC_COUNT.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// root_neutral_commit_count (counter)
+// ---------------------------------------------------------------------------
+
+/// Number of publishes whose txn had BOTH flags clear — i.e.
+/// root-neutral CRUD commits that reuse the prior catalog Arc and
+/// skip `sync_catalog_root_overlay`.
+///
+/// Observation only — no lock held while reading or writing.
+pub static ROOT_NEUTRAL_COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record one root-neutral publish.
+pub fn record_root_neutral_commit() {
+    ROOT_NEUTRAL_COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the root-neutral counter.
+pub fn root_neutral_commit_count_snapshot() -> u64 {
+    ROOT_NEUTRAL_COMMIT_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the root-neutral counter.
+pub fn reset_root_neutral_commit_count() {
+    ROOT_NEUTRAL_COMMIT_COUNT.store(0, Ordering::Relaxed);
+}
+
+// ===========================================================================
+// Phase 2 §7 — LogicalTxnFrame Pass 2 post-open validation counters
+// ===========================================================================
+//
+// Pass 2 runs inside `SharedState::new` immediately after
+// `catalog_open_with_fallback`. For each op in each parsed logical frame
+// it resolves `ns_id` / `index_id` against the live catalog and records
+// the outcome. Per §3.2 / §3.11 Pass 2 must never mutate durable state —
+// these counters are the only observable side-effect.
+
+// ---------------------------------------------------------------------------
+// logical_txn_pass2_resolved_ops_total (counter)
+// ---------------------------------------------------------------------------
+
+/// Total ops that Pass 2 resolved against the live catalog at open.
+///
+/// Observation only — Pass 2 runs once during open, ticked per-op.
+pub static LOGICAL_TXN_PASS2_RESOLVED_OPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one resolved Pass 2 op (ns_id or index_id matched).
+pub fn record_logical_txn_pass2_resolved_op() {
+    LOGICAL_TXN_PASS2_RESOLVED_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the Pass 2 resolved-ops counter.
+pub fn logical_txn_pass2_resolved_ops_snapshot() -> u64 {
+    LOGICAL_TXN_PASS2_RESOLVED_OPS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the Pass 2 resolved-ops counter.
+pub fn reset_logical_txn_pass2_resolved_ops() {
+    LOGICAL_TXN_PASS2_RESOLVED_OPS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// logical_txn_pass2_unresolved_ops_total (counter)
+// ---------------------------------------------------------------------------
+
+/// Total ops that Pass 2 could not resolve (ns_id / index_id absent from
+/// the live catalog). Phase 2 treats these as log-and-proceed; Phase 4
+/// promotes to a hard error per §8.13.
+///
+/// Observation only — ticked per-op during open.
+pub static LOGICAL_TXN_PASS2_UNRESOLVED_OPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one unresolved Pass 2 op.
+pub fn record_logical_txn_pass2_unresolved_op() {
+    LOGICAL_TXN_PASS2_UNRESOLVED_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the Pass 2 unresolved-ops counter.
+pub fn logical_txn_pass2_unresolved_ops_snapshot() -> u64 {
+    LOGICAL_TXN_PASS2_UNRESOLVED_OPS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the Pass 2 unresolved-ops counter.
+pub fn reset_logical_txn_pass2_unresolved_ops() {
+    LOGICAL_TXN_PASS2_UNRESOLVED_OPS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ===========================================================================
+// Phase 2 §3.8 — Pass 1 sweep counters (US-014)
+// ===========================================================================
+//
+// Observable proof of the recovery warnings emitted by the orphan-logical
+// sweep and the unmatched-ChainCommit detection. Tests use these to
+// verify §3.8(b) and case (c) tolerance behavior without depending on
+// the optional `tracing` feature.
+
+// ---------------------------------------------------------------------------
+// logical_txn_pass1_orphan_logical_dropped_total (counter)
+// ---------------------------------------------------------------------------
+
+/// Total logical frames discarded by the Pass 1 orphan-sweep (§3.8(b)).
+/// Each tick corresponds to a logical frame whose commit_ts has no
+/// matching ChainCommit in the same recovery scan.
+pub static LOGICAL_TXN_PASS1_ORPHAN_LOGICAL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one orphan-logical frame dropped by Pass 1.
+pub fn record_logical_txn_pass1_orphan_logical_dropped() {
+    LOGICAL_TXN_PASS1_ORPHAN_LOGICAL_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the orphan-logical-dropped counter.
+pub fn logical_txn_pass1_orphan_logical_dropped_snapshot() -> u64 {
+    LOGICAL_TXN_PASS1_ORPHAN_LOGICAL_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the orphan-logical-dropped counter.
+pub fn reset_logical_txn_pass1_orphan_logical_dropped() {
+    LOGICAL_TXN_PASS1_ORPHAN_LOGICAL_DROPPED_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// logical_txn_pass1_unmatched_chain_commit_total (counter)
+// ---------------------------------------------------------------------------
+
+/// Total ChainCommit frames seen during Pass 1 that had no matching
+/// LogicalTxnFrame at the same `commit_ts` (case (c) Phase 2 tolerance,
+/// §3.7 envelope violation; Phase 4 §8.13.3 promotes this to hard error).
+pub static LOGICAL_TXN_PASS1_UNMATCHED_CHAIN_COMMIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one unmatched ChainCommit (no paired logical frame).
+pub fn record_logical_txn_pass1_unmatched_chain_commit() {
+    LOGICAL_TXN_PASS1_UNMATCHED_CHAIN_COMMIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the unmatched-ChainCommit counter.
+pub fn logical_txn_pass1_unmatched_chain_commit_snapshot() -> u64 {
+    LOGICAL_TXN_PASS1_UNMATCHED_CHAIN_COMMIT_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the unmatched-ChainCommit counter.
+pub fn reset_logical_txn_pass1_unmatched_chain_commit() {
+    LOGICAL_TXN_PASS1_UNMATCHED_CHAIN_COMMIT_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// logical_txn_pass1_pre_boundary_dropped_total (counter) — §3.11
+// ---------------------------------------------------------------------------
+
+/// Total logical frames discarded by the Pass 1 checkpoint-boundary cull
+/// (§3.11). Each tick corresponds to a logical frame whose `commit_ts <=`
+/// the highest observed `covers_commit_ts_hi` — i.e. already fully
+/// reconciled to the main file by a prior checkpoint.
+pub static LOGICAL_TXN_PASS1_PRE_BOUNDARY_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one pre-boundary logical frame dropped by Pass 1.
+pub fn record_logical_txn_pass1_pre_boundary_dropped() {
+    LOGICAL_TXN_PASS1_PRE_BOUNDARY_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the pre-boundary-dropped counter.
+pub fn logical_txn_pass1_pre_boundary_dropped_snapshot() -> u64 {
+    LOGICAL_TXN_PASS1_PRE_BOUNDARY_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the pre-boundary-dropped counter.
+pub fn reset_logical_txn_pass1_pre_boundary_dropped() {
+    LOGICAL_TXN_PASS1_PRE_BOUNDARY_DROPPED_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// recovery_checkpoint_boundary_frames_total (counter) — §3.11
+// ---------------------------------------------------------------------------
+
+/// Total valid `CheckpointCommitBoundaryFrame`s parsed by Pass 1 (§3.11).
+/// Torn/truncated boundary frames are treated as absent and do NOT tick
+/// this counter.
+pub static RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one valid boundary frame seen by recovery.
+pub fn record_recovery_checkpoint_boundary_frame() {
+    RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the boundary-frames recovery counter.
+pub fn recovery_checkpoint_boundary_frames_snapshot() -> u64 {
+    RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the boundary-frames recovery counter.
+pub fn reset_recovery_checkpoint_boundary_frames() {
+    RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// recovery_torn_checkpoint_boundary_total (counter) — §3.11 point 4
+// ---------------------------------------------------------------------------
+
+/// Total torn `CheckpointCommitBoundaryFrame`s observed by Pass 1 — bytes
+/// at the offset have the boundary kind discriminant `0x04` but the frame
+/// failed CRC or was truncated. Each tick corresponds to a scan that
+/// halted at the torn boundary and resumed from the previous valid
+/// boundary's `covers_commit_ts_hi` (§3.11 point 4).
+pub static RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one torn boundary observed by recovery.
+pub fn record_recovery_torn_checkpoint_boundary() {
+    RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the torn-boundary recovery counter.
+pub fn recovery_torn_checkpoint_boundary_snapshot() -> u64 {
+    RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the torn-boundary recovery counter.
+pub fn reset_recovery_torn_checkpoint_boundary() {
+    RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ===========================================================================
+// Phase 2 §7 / US-024 observability counters (9 named signals)
+// ===========================================================================
+//
+// The five Phase 2-only counters added below complement the four already
+// defined above (LOGICAL_TXN_PASS2_RESOLVED_OPS_TOTAL,
+// LOGICAL_TXN_PASS2_UNRESOLVED_OPS_TOTAL, RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL,
+// and the orphan/pre-boundary counters) to satisfy the §7 nine-signal set.
+
+// ---------------------------------------------------------------------------
+// (1) logical_txn_append_bytes_total — counter
+// ---------------------------------------------------------------------------
+
+/// Total bytes appended via `JournalManager::append_logical_txn`.
+/// Increments by the encoded frame size on every successful append
+/// (after the I/O completes; failures do not tick).
+pub static LOGICAL_TXN_APPEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record an append of `n` bytes.
+pub fn record_logical_txn_append_bytes(n: u64) {
+    LOGICAL_TXN_APPEND_BYTES_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Snapshot the append-bytes counter.
+pub fn logical_txn_append_bytes_snapshot() -> u64 {
+    LOGICAL_TXN_APPEND_BYTES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the append-bytes counter.
+pub fn reset_logical_txn_append_bytes() {
+    LOGICAL_TXN_APPEND_BYTES_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// (2) logical_txn_append_duration_ms_p50 — gauge (latest-value approximation)
+// (3) logical_txn_append_duration_ms_p95 — gauge (latest-value approximation)
+// (4) logical_txn_append_duration_ms_p99 — gauge (latest-value approximation)
+// ---------------------------------------------------------------------------
+//
+// Per §7 the three duration signals MAY be implemented as latest-value
+// gauges if a full streaming-histogram is out of scope. This module
+// keeps a small 64-slot ring of recent samples and computes p50/p95/p99
+// in two phases:
+//
+//   1. `record_logical_txn_append_duration_ms(ms)` runs INSIDE the
+//      commit-envelope critical section and performs only one atomic
+//      `fetch_add` on the ring index plus one atomic `store` on the
+//      slot. O(1).
+//   2. `recompute_logical_txn_append_percentiles()` sorts the 64-slot
+//      ring and stores p50/p95/p99 into the gauge atomics. Called
+//      OUTSIDE the commit_seq critical section by an RAII guard
+//      declared before the commit_seq mutex guard so Rust's LIFO
+//      drop order makes recompute run with no mutex held (US-024
+//      AC#3 / §7 guardrail).
+//
+// Lock-free in both phases; uses three independent atomics for the
+// gauges so the recompute window can race without locking. Approximate
+// — the percentile values lag the true distribution by up to ~SAMPLE_RING
+// observations, which is acceptable for §7 observability.
+
+/// Latest p50 of `append_logical_txn` durations in ms.
+pub static LOGICAL_TXN_APPEND_DURATION_MS_P50: AtomicU64 = AtomicU64::new(0);
+/// Latest p95 of `append_logical_txn` durations in ms.
+pub static LOGICAL_TXN_APPEND_DURATION_MS_P95: AtomicU64 = AtomicU64::new(0);
+/// Latest p99 of `append_logical_txn` durations in ms.
+pub static LOGICAL_TXN_APPEND_DURATION_MS_P99: AtomicU64 = AtomicU64::new(0);
+
+const APPEND_SAMPLE_RING: usize = 64;
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_ATOMIC_U64: AtomicU64 = AtomicU64::new(0);
+static APPEND_SAMPLE_RING_BUF: [AtomicU64; APPEND_SAMPLE_RING] =
+    [ZERO_ATOMIC_U64; APPEND_SAMPLE_RING];
+static APPEND_SAMPLE_RING_INDEX: AtomicU64 = AtomicU64::new(0);
+
+/// Push one `append_logical_txn` duration sample (in milliseconds) into
+/// the ring buffer. Cheap — only an atomic increment + atomic store.
+/// Safe to call inside the commit-envelope critical section (§7
+/// guardrail: keep work inside the commit_seq mutex minimal).
+///
+/// The percentile gauges are NOT updated by this function. The caller
+/// MUST call [`recompute_logical_txn_append_percentiles`] OUTSIDE the
+/// commit-envelope critical section to refresh the p50/p95/p99 gauges.
+/// This split keeps the lock-held work O(1) and the heavier sort/store
+/// work outside the critical section, per the §7 / US-024 AC#3
+/// constraint.
+pub fn record_logical_txn_append_duration_ms(ms: u64) {
+    let idx =
+        APPEND_SAMPLE_RING_INDEX.fetch_add(1, Ordering::Relaxed) as usize % APPEND_SAMPLE_RING;
+    APPEND_SAMPLE_RING_BUF[idx].store(ms, Ordering::Relaxed);
+}
+
+/// Recompute the p50/p95/p99 gauges from the ring buffer. Sorts a
+/// 64-element u64 array in place — a few microseconds of work that
+/// MUST run outside the commit-envelope critical section so the
+/// commit_seq lock holders do not pay for percentile maintenance
+/// (§7 guardrail / US-024 AC#3).
+///
+/// Idempotent. Safe to call from any thread; lock-free recompute.
+pub fn recompute_logical_txn_append_percentiles() {
+    let mut samples: [u64; APPEND_SAMPLE_RING] = [0; APPEND_SAMPLE_RING];
+    for (i, slot) in APPEND_SAMPLE_RING_BUF.iter().enumerate() {
+        samples[i] = slot.load(Ordering::Relaxed);
+    }
+    samples.sort_unstable();
+    let p50 = samples[APPEND_SAMPLE_RING / 2];
+    let p95 = samples[(APPEND_SAMPLE_RING * 95) / 100];
+    let p99 = samples[(APPEND_SAMPLE_RING * 99) / 100];
+    LOGICAL_TXN_APPEND_DURATION_MS_P50.store(p50, Ordering::Relaxed);
+    LOGICAL_TXN_APPEND_DURATION_MS_P95.store(p95, Ordering::Relaxed);
+    LOGICAL_TXN_APPEND_DURATION_MS_P99.store(p99, Ordering::Relaxed);
+}
+
+/// Snapshot the p50 gauge.
+pub fn logical_txn_append_duration_ms_p50_snapshot() -> u64 {
+    LOGICAL_TXN_APPEND_DURATION_MS_P50.load(Ordering::Relaxed)
+}
+
+/// Snapshot the p95 gauge.
+pub fn logical_txn_append_duration_ms_p95_snapshot() -> u64 {
+    LOGICAL_TXN_APPEND_DURATION_MS_P95.load(Ordering::Relaxed)
+}
+
+/// Snapshot the p99 gauge.
+pub fn logical_txn_append_duration_ms_p99_snapshot() -> u64 {
+    LOGICAL_TXN_APPEND_DURATION_MS_P99.load(Ordering::Relaxed)
+}
+
+/// Reset the p50/p95/p99 gauges and the underlying sample ring.
+pub fn reset_logical_txn_append_durations() {
+    for slot in APPEND_SAMPLE_RING_BUF.iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
+    APPEND_SAMPLE_RING_INDEX.store(0, Ordering::Relaxed);
+    LOGICAL_TXN_APPEND_DURATION_MS_P50.store(0, Ordering::Relaxed);
+    LOGICAL_TXN_APPEND_DURATION_MS_P95.store(0, Ordering::Relaxed);
+    LOGICAL_TXN_APPEND_DURATION_MS_P99.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// (5) parsed_logical_frames_len — gauge (reset per open)
+// ---------------------------------------------------------------------------
+
+/// Length of the `ParsedLogicalFrames` vector handed off from Pass 1
+/// to Pass 2 at the most recent open. Reset on each open before Pass 1
+/// runs so the gauge reflects the current lifetime, not cumulative.
+pub static PARSED_LOGICAL_FRAMES_LEN: AtomicU64 = AtomicU64::new(0);
+
+/// Set the gauge.
+pub fn set_parsed_logical_frames_len(n: u64) {
+    PARSED_LOGICAL_FRAMES_LEN.store(n, Ordering::Relaxed);
+}
+
+/// Snapshot the gauge.
+pub fn parsed_logical_frames_len_snapshot() -> u64 {
+    PARSED_LOGICAL_FRAMES_LEN.load(Ordering::Relaxed)
+}
+
+/// Reset the gauge.
+pub fn reset_parsed_logical_frames_len() {
+    PARSED_LOGICAL_FRAMES_LEN.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// (8) logical_txn_recovery_discarded_frames_total — counter
+// ---------------------------------------------------------------------------
+
+/// Total logical frames discarded by recovery for any reason
+/// (orphan-sweep + pre-boundary cull). Sum across the §3.8(b) and
+/// §3.11 paths.
+pub static LOGICAL_TXN_RECOVERY_DISCARDED_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one discarded frame.
+pub fn record_logical_txn_recovery_discarded_frame() {
+    LOGICAL_TXN_RECOVERY_DISCARDED_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the discarded counter.
+pub fn logical_txn_recovery_discarded_frames_snapshot() -> u64 {
+    LOGICAL_TXN_RECOVERY_DISCARDED_FRAMES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the discarded counter.
+pub fn reset_logical_txn_recovery_discarded_frames() {
+    LOGICAL_TXN_RECOVERY_DISCARDED_FRAMES_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// (9) logical_txn_torn_frames_total — counter
+// ---------------------------------------------------------------------------
+
+/// Total torn LogicalTxnFrames observed by recovery — frames whose CRC
+/// or structural validation failed mid-scan. Tracks tail corruption
+/// against the §4.6 disposition table.
+pub static LOGICAL_TXN_TORN_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one torn frame.
+pub fn record_logical_txn_torn_frame() {
+    LOGICAL_TXN_TORN_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the torn counter.
+pub fn logical_txn_torn_frames_snapshot() -> u64 {
+    LOGICAL_TXN_TORN_FRAMES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the torn counter.
+pub fn reset_logical_txn_torn_frames() {
+    LOGICAL_TXN_TORN_FRAMES_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -649,5 +1396,84 @@ mod tests {
         assert_eq!(force_expire_spin_stalls_snapshot(), 1);
         reset_force_expire_spin_stalls();
         assert_eq!(force_expire_spin_stalls_snapshot(), 0);
+    }
+
+    // --- Phase-0 observability counters (unit-level reset/record/snapshot) ---
+
+    #[test]
+    fn published_snapshot_rebuilds_counter_unit() {
+        reset_published_snapshot_rebuilds();
+        record_published_snapshot_rebuild();
+        record_published_snapshot_rebuild();
+        assert_eq!(published_snapshot_rebuilds_snapshot(), 2);
+        reset_published_snapshot_rebuilds();
+        assert_eq!(published_snapshot_rebuilds_snapshot(), 0);
+    }
+
+    #[test]
+    fn crud_commits_root_neutral_counter_unit() {
+        reset_crud_commits_root_neutral();
+        record_crud_commit_root_neutral();
+        assert_eq!(crud_commits_root_neutral_snapshot(), 1);
+        reset_crud_commits_root_neutral();
+        assert_eq!(crud_commits_root_neutral_snapshot(), 0);
+    }
+
+    #[test]
+    fn crud_commits_root_changing_counter_unit() {
+        reset_crud_commits_root_changing();
+        record_crud_commit_root_changing();
+        assert_eq!(crud_commits_root_changing_snapshot(), 1);
+        reset_crud_commits_root_changing();
+        assert_eq!(crud_commits_root_changing_snapshot(), 0);
+    }
+
+    #[test]
+    fn lane_wait_ns_counter_unit() {
+        reset_lane_wait_ns();
+        record_lane_wait_ns(500);
+        record_lane_wait_ns(0); // no-op
+        record_lane_wait_ns(250);
+        assert_eq!(lane_wait_ns_snapshot(), 750);
+        reset_lane_wait_ns();
+        assert_eq!(lane_wait_ns_snapshot(), 0);
+    }
+
+    #[test]
+    fn commit_seq_wait_ns_counter_unit() {
+        reset_commit_seq_wait_ns();
+        record_commit_seq_wait_ns(1000);
+        record_commit_seq_wait_ns(0);
+        assert_eq!(commit_seq_wait_ns_snapshot(), 1000);
+        reset_commit_seq_wait_ns();
+        assert_eq!(commit_seq_wait_ns_snapshot(), 0);
+    }
+
+    #[test]
+    fn recovery_legacy_page_frames_counter_unit() {
+        reset_recovery_legacy_page_frames();
+        record_recovery_legacy_page_frame();
+        record_recovery_legacy_page_frame();
+        assert_eq!(recovery_legacy_page_frames_snapshot(), 2);
+        reset_recovery_legacy_page_frames();
+        assert_eq!(recovery_legacy_page_frames_snapshot(), 0);
+    }
+
+    #[test]
+    fn recovery_chain_commit_frames_counter_unit() {
+        reset_recovery_chain_commit_frames();
+        record_recovery_chain_commit_frame();
+        assert_eq!(recovery_chain_commit_frames_snapshot(), 1);
+        reset_recovery_chain_commit_frames();
+        assert_eq!(recovery_chain_commit_frames_snapshot(), 0);
+    }
+
+    #[test]
+    fn emergency_checkpoint_triggers_counter_unit() {
+        reset_emergency_checkpoint_triggers();
+        record_emergency_checkpoint_trigger();
+        assert_eq!(emergency_checkpoint_triggers_snapshot(), 1);
+        reset_emergency_checkpoint_triggers();
+        assert_eq!(emergency_checkpoint_triggers_snapshot(), 0);
     }
 }

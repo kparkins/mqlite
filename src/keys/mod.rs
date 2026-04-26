@@ -110,6 +110,7 @@ pub(crate) const COMPOUND_SEP: u8 = 0x01;
 /// let k3 = encode_key(&Bson::Int64(1));
 /// assert!(k1 < k2 && k2 < k3);
 /// ```
+#[must_use]
 pub fn encode_key(value: &Bson) -> Vec<u8> {
     // Most scalar encodings fit in <= 32 bytes (numbers use 18, ObjectId uses 13).
     let mut buf = Vec::with_capacity(32);
@@ -134,6 +135,7 @@ pub fn encode_key(value: &Bson) -> Vec<u8> {
 ///     (&Bson::Int32(30), false),
 /// ]);
 /// ```
+#[must_use]
 pub fn encode_compound_key(fields: &[(&Bson, bool)]) -> Vec<u8> {
     // Rough estimate: 32 bytes per field plus separators.
     let mut buf = Vec::with_capacity(fields.len() * 33);

@@ -44,7 +44,13 @@ fn snap_after_commit(commit_ts: Ts, pre_commit_ts: Ts) -> ChainSnapshot {
     // Primary chain: new doc as head (stop=MAX), old doc stopped at commit_ts.
     let mut primary = VecDeque::new();
     primary.push_back(entry(commit_ts, Ts::MAX, WRITER_TXN_ID, b"doc-v2", false));
-    primary.push_back(entry(pre_commit_ts, commit_ts, /* prior */ 1, b"doc-v1", false));
+    primary.push_back(entry(
+        pre_commit_ts,
+        commit_ts,
+        /* prior */ 1,
+        b"doc-v1",
+        false,
+    ));
     source.insert(PRIMARY_KEY.to_vec(), Arc::new(primary));
 
     // Sec-index (old key `status=active`): tombstone head at commit_ts,
@@ -56,7 +62,13 @@ fn snap_after_commit(commit_ts: Ts, pre_commit_ts: Ts) -> ChainSnapshot {
 
     // Sec-index (new key `status=inactive`): fresh insert at commit_ts.
     let mut new_idx = VecDeque::new();
-    new_idx.push_back(entry(commit_ts, Ts::MAX, WRITER_TXN_ID, b"pk/user-1", false));
+    new_idx.push_back(entry(
+        commit_ts,
+        Ts::MAX,
+        WRITER_TXN_ID,
+        b"pk/user-1",
+        false,
+    ));
     source.insert(SEC_NEW_KEY.to_vec(), Arc::new(new_idx));
 
     ChainSnapshot::new(&source, None)
@@ -64,16 +76,34 @@ fn snap_after_commit(commit_ts: Ts, pre_commit_ts: Ts) -> ChainSnapshot {
 
 #[test]
 fn all_three_chain_entries_share_commit_ts() {
-    let commit_ts = Ts { physical_ms: 1_000, logical: 0 };
-    let pre_commit = Ts { physical_ms: 500, logical: 0 };
+    let commit_ts = Ts {
+        physical_ms: 1_000,
+        logical: 0,
+    };
+    let pre_commit = Ts {
+        physical_ms: 500,
+        logical: 0,
+    };
     let snap = snap_after_commit(commit_ts, pre_commit);
 
     // Reader AFTER commit sees the post-update state for ALL three chains.
-    let reader_after = ReadView::new(Ts { physical_ms: 1_500, logical: 0 }, 99);
+    let reader_after = ReadView::new(
+        Ts {
+            physical_ms: 1_500,
+            logical: 0,
+        },
+        99,
+    );
 
-    let primary_hit = snap.visible_at(PRIMARY_KEY, &reader_after).expect("primary visible");
-    let old_idx_hit = snap.visible_at(SEC_OLD_KEY, &reader_after).expect("old-idx visible");
-    let new_idx_hit = snap.visible_at(SEC_NEW_KEY, &reader_after).expect("new-idx visible");
+    let primary_hit = snap
+        .visible_at(PRIMARY_KEY, &reader_after)
+        .expect("primary visible");
+    let old_idx_hit = snap
+        .visible_at(SEC_OLD_KEY, &reader_after)
+        .expect("old-idx visible");
+    let new_idx_hit = snap
+        .visible_at(SEC_NEW_KEY, &reader_after)
+        .expect("new-idx visible");
 
     // Contract: the THREE VersionEntry's observed here all share commit_ts.
     assert_eq!(primary_hit.start_ts, commit_ts);
@@ -85,7 +115,10 @@ fn all_three_chain_entries_share_commit_ts() {
         VersionData::Inline(v) => assert_eq!(v, b"doc-v2"),
         _ => panic!("expected inline"),
     }
-    assert!(old_idx_hit.is_tombstone, "old-idx entry must be a tombstone");
+    assert!(
+        old_idx_hit.is_tombstone,
+        "old-idx entry must be a tombstone"
+    );
     match &new_idx_hit.data {
         VersionData::Inline(v) => assert_eq!(v, b"pk/user-1"),
         _ => panic!("expected inline"),
@@ -94,15 +127,31 @@ fn all_three_chain_entries_share_commit_ts() {
 
 #[test]
 fn reader_below_commit_ts_sees_pre_update_everywhere() {
-    let commit_ts = Ts { physical_ms: 1_000, logical: 0 };
-    let pre_commit = Ts { physical_ms: 500, logical: 0 };
+    let commit_ts = Ts {
+        physical_ms: 1_000,
+        logical: 0,
+    };
+    let pre_commit = Ts {
+        physical_ms: 500,
+        logical: 0,
+    };
     let snap = snap_after_commit(commit_ts, pre_commit);
 
     // Reader strictly between pre_commit and commit_ts observes v1.
-    let reader_before = ReadView::new(Ts { physical_ms: 750, logical: 0 }, 99);
+    let reader_before = ReadView::new(
+        Ts {
+            physical_ms: 750,
+            logical: 0,
+        },
+        99,
+    );
 
-    let primary_hit = snap.visible_at(PRIMARY_KEY, &reader_before).expect("primary visible");
-    let old_idx_hit = snap.visible_at(SEC_OLD_KEY, &reader_before).expect("old-idx visible");
+    let primary_hit = snap
+        .visible_at(PRIMARY_KEY, &reader_before)
+        .expect("primary visible");
+    let old_idx_hit = snap
+        .visible_at(SEC_OLD_KEY, &reader_before)
+        .expect("old-idx visible");
     let new_idx_hit = snap.visible_at(SEC_NEW_KEY, &reader_before);
 
     assert_eq!(primary_hit.start_ts, pre_commit);
@@ -114,26 +163,40 @@ fn reader_below_commit_ts_sees_pre_update_everywhere() {
     assert!(!old_idx_hit.is_tombstone);
     assert_eq!(old_idx_hit.start_ts, pre_commit);
     // The new sec-index key did not exist before commit_ts.
-    assert!(new_idx_hit.is_none(), "new sec-index key must be invisible pre-commit");
+    assert!(
+        new_idx_hit.is_none(),
+        "new sec-index key must be invisible pre-commit"
+    );
 }
 
 #[test]
 fn no_read_ts_witnesses_partial_commit() {
     // Sweep read_ts's around commit_ts and verify the observable state is
     // either fully-pre or fully-post — never a mix.
-    let commit_ts = Ts { physical_ms: 1_000, logical: 0 };
-    let pre_commit = Ts { physical_ms: 500, logical: 0 };
+    let commit_ts = Ts {
+        physical_ms: 1_000,
+        logical: 0,
+    };
+    let pre_commit = Ts {
+        physical_ms: 500,
+        logical: 0,
+    };
     let snap = snap_after_commit(commit_ts, pre_commit);
 
     let sample_points: Vec<u64> = (0..=20).map(|i| 900 + i * 10).collect();
     for ts_ms in sample_points {
-        let rv = ReadView::new(Ts { physical_ms: ts_ms, logical: 0 }, 99);
+        let rv = ReadView::new(
+            Ts {
+                physical_ms: ts_ms,
+                logical: 0,
+            },
+            99,
+        );
         let p = snap.visible_at(PRIMARY_KEY, &rv);
         let o = snap.visible_at(SEC_OLD_KEY, &rv);
         let n = snap.visible_at(SEC_NEW_KEY, &rv);
 
-        let post =
-            p.map(|e| e.start_ts == commit_ts).unwrap_or(false)
+        let post = p.map(|e| e.start_ts == commit_ts).unwrap_or(false)
             && o.map(|e| e.is_tombstone).unwrap_or(false)
             && n.is_some();
         let pre = p.map(|e| e.start_ts == pre_commit).unwrap_or(false)

@@ -461,4 +461,3 @@ fn build_regex(pattern: &str, options: &str) -> Result<regex::Regex> {
     b.build()
         .map_err(|e| bad_value(&format!("invalid $regex pattern: {e}")))
 }
-

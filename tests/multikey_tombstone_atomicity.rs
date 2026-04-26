@@ -67,14 +67,30 @@ fn snap_after_multikey_update(commit_ts: Ts, pre_commit: Ts) -> ChainSnapshot {
 
 #[test]
 fn orphan_tombstone_shares_commit_ts_with_primary() {
-    let commit_ts = Ts { physical_ms: 900, logical: 0 };
-    let pre_commit = Ts { physical_ms: 400, logical: 0 };
+    let commit_ts = Ts {
+        physical_ms: 900,
+        logical: 0,
+    };
+    let pre_commit = Ts {
+        physical_ms: 400,
+        logical: 0,
+    };
     let snap = snap_after_multikey_update(commit_ts, pre_commit);
 
-    let reader_after = ReadView::new(Ts { physical_ms: 1_500, logical: 0 }, 99);
+    let reader_after = ReadView::new(
+        Ts {
+            physical_ms: 1_500,
+            logical: 0,
+        },
+        99,
+    );
 
-    let pri = snap.visible_at(PRIMARY_KEY, &reader_after).expect("primary");
-    let green = snap.visible_at(IDX_GREEN, &reader_after).expect("green idx");
+    let pri = snap
+        .visible_at(PRIMARY_KEY, &reader_after)
+        .expect("primary");
+    let green = snap
+        .visible_at(IDX_GREEN, &reader_after)
+        .expect("green idx");
     assert_eq!(
         pri.start_ts, commit_ts,
         "primary update must be stamped with commit_ts"
@@ -88,11 +104,23 @@ fn orphan_tombstone_shares_commit_ts_with_primary() {
 
 #[test]
 fn unaffected_sec_keys_retain_precommit_ts() {
-    let commit_ts = Ts { physical_ms: 900, logical: 0 };
-    let pre_commit = Ts { physical_ms: 400, logical: 0 };
+    let commit_ts = Ts {
+        physical_ms: 900,
+        logical: 0,
+    };
+    let pre_commit = Ts {
+        physical_ms: 400,
+        logical: 0,
+    };
     let snap = snap_after_multikey_update(commit_ts, pre_commit);
 
-    let reader_after = ReadView::new(Ts { physical_ms: 1_500, logical: 0 }, 99);
+    let reader_after = ReadView::new(
+        Ts {
+            physical_ms: 1_500,
+            logical: 0,
+        },
+        99,
+    );
 
     for (label, key) in [("red", IDX_RED), ("blue", IDX_BLUE)] {
         let e = snap
@@ -114,14 +142,30 @@ fn no_reader_witnesses_torn_multikey_state() {
     // Across a grid of read_ts's bracketing commit_ts, readers must see
     // a coherent snapshot: either (primary-v1 + green live) or (primary-v2
     // + green tombstone). Red and blue remain live across the span.
-    let commit_ts = Ts { physical_ms: 900, logical: 0 };
-    let pre_commit = Ts { physical_ms: 400, logical: 0 };
+    let commit_ts = Ts {
+        physical_ms: 900,
+        logical: 0,
+    };
+    let pre_commit = Ts {
+        physical_ms: 400,
+        logical: 0,
+    };
     let snap = snap_after_multikey_update(commit_ts, pre_commit);
 
     for ts_ms in [500u64, 700, 899, 900, 901, 1_000, 2_000] {
-        let rv = ReadView::new(Ts { physical_ms: ts_ms, logical: 0 }, 99);
-        let pri = snap.visible_at(PRIMARY_KEY, &rv).expect("primary always visible");
-        let green = snap.visible_at(IDX_GREEN, &rv).expect("green entry always visible");
+        let rv = ReadView::new(
+            Ts {
+                physical_ms: ts_ms,
+                logical: 0,
+            },
+            99,
+        );
+        let pri = snap
+            .visible_at(PRIMARY_KEY, &rv)
+            .expect("primary always visible");
+        let green = snap
+            .visible_at(IDX_GREEN, &rv)
+            .expect("green entry always visible");
         let is_post = pri.start_ts == commit_ts;
         if is_post {
             assert!(

@@ -86,6 +86,7 @@ impl<S: BTreePageStore> BTree<S> {
                 }));
             }
         }
+        let chain_present = snap.as_ref().is_some_and(|snap| snap.chain_len(key) > 0);
         // History fallthrough: the chain had no entry visible at
         // `view.read_ts` — an evicted entry in the history store might.
         if let Some(probe) = history {
@@ -102,6 +103,9 @@ impl<S: BTreePageStore> BTree<S> {
                     )?,
                 }));
             }
+        }
+        if chain_present {
+            return Ok(None);
         }
         // Fall back to the on-disk cell (dual-write intermediate).
         let node = LeafNode::parse(&buf[..])?;
@@ -224,9 +228,7 @@ impl<S: BTreePageStore> BTree<S> {
 
                 // Chain-first: a visible VersionEntry wins over the on-disk
                 // cell. If the entry is a tombstone, skip the key entirely.
-                let chain_hit = snap
-                    .as_ref()
-                    .and_then(|s| s.visible_at(&cell.key, view));
+                let chain_hit = snap.as_ref().and_then(|s| s.visible_at(&cell.key, view));
                 if let Some(entry) = chain_hit {
                     if entry.is_tombstone {
                         continue;
@@ -242,7 +244,6 @@ impl<S: BTreePageStore> BTree<S> {
                     results.push((cell.key.clone(), bytes));
                     continue;
                 }
-
                 // History fallthrough before falling back to the on-disk cell.
                 // A visible evicted entry in the history store is preferred
                 // over the cell (which reflects the latest committed baseline,
@@ -264,7 +265,6 @@ impl<S: BTreePageStore> BTree<S> {
                         continue;
                     }
                 }
-
                 // Fall back to the on-disk cell.
                 let bytes = match &cell.value {
                     CellValue::Inline(v) => v.clone(),

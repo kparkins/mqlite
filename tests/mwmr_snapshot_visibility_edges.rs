@@ -92,9 +92,7 @@ fn stale_snapshot_vs_fresh_load() {
         // Wait for reader to complete first find.
         bs_b.wait();
         for i in 1i32..=50 {
-            col_b
-                .insert_one(&doc! { "_id": i, "v": i })
-                .unwrap();
+            col_b.insert_one(&doc! { "_id": i, "v": i }).unwrap();
         }
         // Signal reader that writes are done.
         ba_b.wait();
@@ -151,7 +149,8 @@ fn namespace_published_but_empty() {
     assert_eq!(count, 0, "count on empty namespace must be 0");
 
     // Insert one doc.
-    col.insert_one(&doc! { "_id": 1i32, "hello": "world" }).unwrap();
+    col.insert_one(&doc! { "_id": 1i32, "hello": "world" })
+        .unwrap();
 
     // Next find must return exactly that doc.
     let after: Vec<_> = col
@@ -276,7 +275,8 @@ fn list_indexes_returns_ready_only() {
     // Seed enough docs so the build takes measurable time.
     let col = client.database("d").collection::<Document>("things");
     for i in 0..1000i32 {
-        col.insert_one(&doc! { "_id": i, "score": i % 100 }).unwrap();
+        col.insert_one(&doc! { "_id": i, "score": i % 100 })
+            .unwrap();
     }
 
     let barrier = Arc::new(Barrier::new(2));
@@ -289,11 +289,7 @@ fn list_indexes_returns_ready_only() {
         client_builder
             .database("d")
             .collection::<Document>("things")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "score": 1i32 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "score": 1i32 }).build())
             .unwrap();
     });
 
@@ -503,7 +499,8 @@ fn btree_split_under_writes() {
         // Also verify total count is correct.
         let count = col.count_documents(doc! {}).unwrap();
         assert_eq!(
-            count, inserted as u64,
+            count,
+            inserted as u64,
             "count after batch ending at {} must be {}; got {}",
             inserted - 1,
             inserted,

@@ -46,7 +46,9 @@ fn create_index_on_other_ns_does_not_block_writers() {
 
     // Baseline: insert 200 docs into namespace B serially (no concurrent
     // build), measure duration.
-    let col_b_baseline = client.database("d").collection::<Document>("other_baseline");
+    let col_b_baseline = client
+        .database("d")
+        .collection::<Document>("other_baseline");
     let t0 = Instant::now();
     for i in 0..200i32 {
         col_b_baseline
@@ -79,11 +81,7 @@ fn create_index_on_other_ns_does_not_block_writers() {
         ba.wait();
         let coll_a = client_a.database("d").collection::<Document>("big");
         coll_a
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "category": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "category": 1 }).build())
             .unwrap();
     });
 
@@ -140,12 +138,8 @@ fn create_index_includes_concurrent_inserts() {
     // also be in the index — `maintain_secondary_on_insert` dual-writes
     // to the Building entry.
     let coll = client.database("d").collection::<Document>("docs");
-    coll.create_index(
-        IndexModel::builder()
-            .keys(doc! { "tag": 1 })
-            .build(),
-    )
-    .unwrap();
+    coll.create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
+        .unwrap();
 
     writer.join().unwrap();
 
@@ -187,11 +181,7 @@ fn bootstrap_new_namespace_not_blocked_by_create_index_build() {
         client_build
             .database("d")
             .collection::<Document>("big")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "category": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "category": 1 }).build())
             .unwrap();
     });
 
@@ -276,11 +266,7 @@ fn drop_index_during_build_succeeds() {
         client_build
             .database("d")
             .collection::<Document>("big")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "tag": 1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
     });
 
     let client_drop = client.clone();

@@ -3,7 +3,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{options::OpenOptions, storage::{engine::StorageEngine, lock::AnyFileLock}};
+use crate::{
+    options::OpenOptions,
+    storage::{engine::StorageEngine, lock::AnyFileLock},
+};
 
 /// Internal shared state for a [`super::Client`].
 ///

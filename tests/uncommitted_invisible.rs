@@ -54,7 +54,10 @@ fn build_chain(entries: Vec<VersionEntry>) -> HashMap<Vec<u8>, Arc<VecDeque<Vers
 #[test]
 fn pending_write_is_invisible_to_concurrent_reader() {
     // Chain state mid-transaction: pending v2 at head, committed v1 below.
-    let ts100 = Ts { physical_ms: 100, logical: 0 };
+    let ts100 = Ts {
+        physical_ms: 100,
+        logical: 0,
+    };
     let source = build_chain(vec![
         pending(/* writer txn A */ 7, b"v2"),
         committed(ts100, Ts::MAX, 6, b"v1"),
@@ -63,7 +66,10 @@ fn pending_write_is_invisible_to_concurrent_reader() {
 
     // Reader B with a distinct txn_id opens BEFORE the writer commits.
     let reader_b = ReadView::new(
-        Ts { physical_ms: 150, logical: 0 },
+        Ts {
+            physical_ms: 150,
+            logical: 0,
+        },
         /* reader txn B */ 99,
     );
     let seen = snap.visible_at(KEY, &reader_b).expect("reader must see v1");
@@ -77,8 +83,14 @@ fn pending_write_is_invisible_to_concurrent_reader() {
 #[test]
 fn commit_stamps_pending_and_later_reader_sees_new_value() {
     // Simulate commit: v2 gets a real start_ts, v1's stop_ts advances.
-    let ts100 = Ts { physical_ms: 100, logical: 0 };
-    let ts200 = Ts { physical_ms: 200, logical: 0 };
+    let ts100 = Ts {
+        physical_ms: 100,
+        logical: 0,
+    };
+    let ts200 = Ts {
+        physical_ms: 200,
+        logical: 0,
+    };
     let source = build_chain(vec![
         committed(ts200, Ts::MAX, /* writer A */ 7, b"v2"),
         committed(ts100, ts200, /* old writer */ 6, b"v1"),
@@ -86,7 +98,13 @@ fn commit_stamps_pending_and_later_reader_sees_new_value() {
     let snap = ChainSnapshot::new(&source, None);
 
     // Reader C opens at a later read_ts >= commit_ts.
-    let reader_c = ReadView::new(Ts { physical_ms: 250, logical: 0 }, 100);
+    let reader_c = ReadView::new(
+        Ts {
+            physical_ms: 250,
+            logical: 0,
+        },
+        100,
+    );
     let seen = snap
         .visible_at(KEY, &reader_c)
         .expect("reader C must see v2 after commit");
@@ -94,7 +112,13 @@ fn commit_stamps_pending_and_later_reader_sees_new_value() {
     assert_eq!(seen.start_ts, ts200);
 
     // A reader opened with a read_ts BEFORE the commit still sees v1.
-    let reader_old = ReadView::new(Ts { physical_ms: 150, logical: 0 }, 101);
+    let reader_old = ReadView::new(
+        Ts {
+            physical_ms: 150,
+            logical: 0,
+        },
+        101,
+    );
     let seen_old = snap
         .visible_at(KEY, &reader_old)
         .expect("old reader must still see v1");

@@ -150,7 +150,11 @@ pub(crate) fn build_index_keys(
         // above guarantees that `fields[arr_idx].1` is `Some(Bson::Array(_))`.
         let arr = match fields[arr_idx].1 {
             Some(Bson::Array(a)) => a,
-            _ => return Err(Error::Internal("secondary_index: array_field_idx invariant broken".into())),
+            _ => {
+                return Err(Error::Internal(
+                    "secondary_index: array_field_idx invariant broken".into(),
+                ))
+            }
         };
 
         let mut keys = Vec::with_capacity(arr.len());
@@ -190,7 +194,9 @@ fn unique_range(field_values: &[(&Bson, bool)]) -> (Vec<u8>, Vec<u8>) {
     let mut start = encode_compound_key(field_values);
     start.push(COMPOUND_SEP);
     let mut end = start.clone();
-    *end.last_mut().expect("encode_compound_key always produces a non-empty byte slice") += 1; // 0x01 → 0x02, safe
+    if let Some(last) = end.last_mut() {
+        *last += 1; // COMPOUND_SEP 0x01 -> 0x02, safe
+    }
     (start, end)
 }
 
@@ -307,18 +313,15 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
                 && pending.key.as_slice() < range_end.as_slice()
             {
                 return Err(Error::DuplicateKey {
-                    detail: format!(
-                        "unique index '{}' — in-txn conflict",
-                        index_entry.name
-                    ),
+                    detail: format!("unique index '{}' — in-txn conflict", index_entry.name),
                 });
             }
         }
     }
 
     // Serialize _id once; reused for every key (multikey may have several).
-    let id_bytes = bson::to_vec(&bson::doc! { "_id": doc_id.clone() })
-        .map_err(Error::BsonSerialization)?;
+    let id_bytes =
+        bson::to_vec(&bson::doc! { "_id": doc_id.clone() }).map_err(Error::BsonSerialization)?;
 
     // Multikey arrays can emit duplicate compound keys (e.g. `["a", "a"]`);
     // the legacy direct-write path silently swallowed these via `Err(Dup)`
@@ -326,13 +329,15 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
     // commit-time install doesn't see duplicates from the same doc.
     let staged_keys: Vec<Vec<u8>> = if is_multikey {
         let mut seen = std::collections::HashSet::with_capacity(keys.len());
-        keys.into_iter().filter(|k| seen.insert(k.clone())).collect()
+        keys.into_iter()
+            .filter(|k| seen.insert(k.clone()))
+            .collect()
     } else {
         keys
     };
 
     for key in staged_keys {
-        txn.stage_sec_index_insert(index_entry.root_page, key, id_bytes.clone());
+        txn.stage_sec_index_insert(index_entry.id, index_entry.root_page, key, id_bytes.clone());
     }
 
     Ok(is_multikey)
@@ -348,11 +353,10 @@ pub(crate) fn update_index_on_delete(
     index_entry: &IndexEntry,
     txn: &mut WriteTxn,
 ) -> Result<()> {
-    let (keys, _) =
-        build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
+    let (keys, _) = build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
 
     for key in keys {
-        txn.stage_sec_index_delete(index_entry.root_page, key);
+        txn.stage_sec_index_delete(index_entry.id, index_entry.root_page, key);
     }
     Ok(())
 }
@@ -409,8 +413,8 @@ fn update_index_on_insert_direct<S: BTreePageStore>(
         check_unique_constraint(index_tree, &index_entry.key_pattern, &field_values, doc_id)?;
     }
 
-    let id_bytes = bson::to_vec(&bson::doc! { "_id": doc_id.clone() })
-        .map_err(Error::BsonSerialization)?;
+    let id_bytes =
+        bson::to_vec(&bson::doc! { "_id": doc_id.clone() }).map_err(Error::BsonSerialization)?;
 
     for key in &keys {
         match index_tree.insert(key, &id_bytes) {
@@ -468,8 +472,7 @@ where
             Error::Internal("document missing '_id' field during index build".into())
         })?;
 
-        let is_multikey =
-            update_index_on_insert_direct(&doc, doc_id, index_tree, index_entry)?;
+        let is_multikey = update_index_on_insert_direct(&doc, doc_id, index_tree, index_entry)?;
         if is_multikey {
             any_multikey = true;
         }
@@ -481,7 +484,6 @@ where
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
 
 #[cfg(test)]
 #[path = "secondary_index_tests.rs"]

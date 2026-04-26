@@ -531,9 +531,7 @@ mod tests {
 
         // Seed source.
         let client = Client::open(&src_path).expect("open source");
-        let col = client
-            .database("db")
-            .collection::<bson::Document>("col");
+        let col = client.database("db").collection::<bson::Document>("col");
         col.insert_one(&doc! { "x": 1i32 }).expect("insert");
 
         // First backup.
@@ -595,7 +593,8 @@ mod crash_recovery_public_api_tests {
         let client = Client::open_with_options(&db_path, fullsync_opts()).expect("open seed db");
         let db = client.database("test");
         let col = db.collection::<Document>("items");
-        col.insert_one(&doc! { "key": "seed", "value": 1i32 }).expect("insert seed");
+        col.insert_one(&doc! { "key": "seed", "value": 1i32 })
+            .expect("insert seed");
         drop(client);
         db_path
     }
@@ -606,7 +605,11 @@ mod crash_recovery_public_api_tests {
         let db_path = setup_seed_data(&dir);
 
         let mut pipe_fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe() failed");
+        assert_eq!(
+            unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+            0,
+            "pipe() failed"
+        );
         let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
 
         let pid = unsafe { libc::fork() };
@@ -625,7 +628,13 @@ mod crash_recovery_public_api_tests {
                 Err(_) => unsafe { libc::_exit(3) },
             }
             let signal_byte: u8 = 1;
-            unsafe { libc::write(write_fd, &signal_byte as *const u8 as *const libc::c_void, 1) };
+            unsafe {
+                libc::write(
+                    write_fd,
+                    &signal_byte as *const u8 as *const libc::c_void,
+                    1,
+                )
+            };
             unsafe { libc::sleep(60) };
             unsafe { libc::_exit(0) };
         }
@@ -644,7 +653,8 @@ mod crash_recovery_public_api_tests {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
 
-        let client = Client::open_with_options(&db_path, fullsync_opts()).expect("reopen after crash");
+        let client =
+            Client::open_with_options(&db_path, fullsync_opts()).expect("reopen after crash");
         let db = client.database("test");
         let col = db.collection::<Document>("items");
 
@@ -652,13 +662,23 @@ mod crash_recovery_public_api_tests {
             .find_one(doc! { "key": "seed" })
             .expect("find_one seed")
             .expect("seed document must survive crash");
-        assert_eq!(seed.get_i32("value").ok(), Some(1), "seed document value must be 1");
+        assert_eq!(
+            seed.get_i32("value").ok(),
+            Some(1),
+            "seed document value must be 1"
+        );
 
         let child_doc = col
             .find_one(doc! { "key": "child_insert" })
             .expect("find_one child_insert")
-            .expect("child_insert document must survive crash (FullSync fsync completed before kill)");
-        assert_eq!(child_doc.get_i32("value").ok(), Some(2), "child_insert document value must be 2");
+            .expect(
+                "child_insert document must survive crash (FullSync fsync completed before kill)",
+            );
+        assert_eq!(
+            child_doc.get_i32("value").ok(),
+            Some(2),
+            "child_insert document value must be 2"
+        );
     }
 }
 
@@ -733,7 +753,10 @@ mod compat_tests {
         assert_eq!(res.errors.len(), 1);
         assert_eq!(res.errors[0].index, 2);
         assert_eq!(res.errors[0].code, codes::DUPLICATE_KEY);
-        assert!(col.find_one(doc! { "x": "dup", "label": "doc2" }).unwrap().is_none());
+        assert!(col
+            .find_one(doc! { "x": "dup", "label": "doc2" })
+            .unwrap()
+            .is_none());
         assert!(col.find_one(doc! { "x": "a" }).unwrap().is_some());
         assert!(col.find_one(doc! { "x": "b" }).unwrap().is_some());
         assert!(col.find_one(doc! { "x": "c" }).unwrap().is_some());
@@ -753,7 +776,10 @@ mod compat_tests {
             .unwrap();
         let returned_doc = returned.expect("must return the pre-update document");
         assert_eq!(returned_doc.get_i32("a").unwrap(), 1);
-        let db_doc = col.find_one(doc! {}).unwrap().expect("document must still exist");
+        let db_doc = col
+            .find_one(doc! {})
+            .unwrap()
+            .expect("document must still exist");
         assert_eq!(db_doc.get_i32("a").unwrap(), 2);
     }
 
@@ -780,14 +806,19 @@ mod compat_tests {
         let db = client.database("test");
         let col = db.collection::<Document>("users");
         let res = col
-            .update_one(doc! { "email": "a@b.com" }, doc! { "$set": { "name": "Alice" } })
+            .update_one(
+                doc! { "email": "a@b.com" },
+                doc! { "$set": { "name": "Alice" } },
+            )
             .upsert(true)
             .run()
             .unwrap();
         assert!(res.upserted_id.is_some());
         assert_eq!(res.matched_count, 0);
         assert_eq!(res.modified_count, 0);
-        let found = col.find_one(doc! { "email": "a@b.com" }).unwrap()
+        let found = col
+            .find_one(doc! { "email": "a@b.com" })
+            .unwrap()
             .expect("upserted doc must be findable");
         assert_eq!(found.get_str("email").unwrap(), "a@b.com");
         assert_eq!(found.get_str("name").unwrap(), "Alice");
@@ -814,7 +845,10 @@ mod compat_tests {
                 .options(IndexOptions::new().unique(true).name("email_1".to_string()))
                 .build();
             col.create_index(model).expect("create email index");
-            assert!(col.find_one(doc! { "email": reference_email }).expect("find_one before close").is_some());
+            assert!(col
+                .find_one(doc! { "email": reference_email })
+                .expect("find_one before close")
+                .is_some());
             db.close().expect("close database");
         }
         {
@@ -827,7 +861,9 @@ mod compat_tests {
             let email_idx = indexes.iter().find(|idx| idx.name == "email_1");
             assert!(email_idx.is_some(), "email_1 index must survive reopen");
             assert!(email_idx.unwrap().unique);
-            let after_doc = col.find_one(doc! { "email": reference_email }).expect("find_one after reopen")
+            let after_doc = col
+                .find_one(doc! { "email": reference_email })
+                .expect("find_one after reopen")
                 .expect("reference document must be findable after reopen");
             assert_eq!(after_doc.get_str("email").unwrap(), reference_email);
             assert_eq!(after_doc.get_i32("index").unwrap(), 42);
@@ -846,16 +882,27 @@ mod compat_tests {
         let model = IndexModel::builder().keys(doc! { "score": 1i32 }).build();
         let idx_name = col.create_index(model).unwrap();
         let filter = doc! { "score": { "$ne": 5i32 } };
-        let with_index: Vec<Document> = col.find(filter.clone()).run().unwrap()
-            .collect::<crate::error::Result<_>>().unwrap();
+        let with_index: Vec<Document> = col
+            .find(filter.clone())
+            .run()
+            .unwrap()
+            .collect::<crate::error::Result<_>>()
+            .unwrap();
         col.drop_index(&idx_name).unwrap();
-        let without_index: Vec<Document> = col.find(filter).run().unwrap()
-            .collect::<crate::error::Result<_>>().unwrap();
+        let without_index: Vec<Document> = col
+            .find(filter)
+            .run()
+            .unwrap()
+            .collect::<crate::error::Result<_>>()
+            .unwrap();
         assert_eq!(with_index.len(), 9);
         assert_eq!(without_index.len(), 9);
         let ids = |docs: &[Document]| -> std::collections::HashSet<Vec<u8>> {
             use crate::keys::encode_key;
-            docs.iter().filter_map(|d| d.get("_id")).map(encode_key).collect()
+            docs.iter()
+                .filter_map(|d| d.get("_id"))
+                .map(encode_key)
+                .collect()
         };
         assert_eq!(ids(&with_index), ids(&without_index));
     }
@@ -870,8 +917,11 @@ mod compat_tests {
             .options(IndexOptions::new().unique(true))
             .build();
         col.create_index(model).unwrap();
-        col.insert_one(&doc! { "email": "alice@example.com" }).unwrap();
-        let err = col.insert_one(&doc! { "email": "alice@example.com" }).unwrap_err();
+        col.insert_one(&doc! { "email": "alice@example.com" })
+            .unwrap();
+        let err = col
+            .insert_one(&doc! { "email": "alice@example.com" })
+            .unwrap_err();
         assert!(matches!(err, Error::DuplicateKey { .. }));
         assert_eq!(err.code(), Some(codes::DUPLICATE_KEY));
     }
@@ -882,7 +932,10 @@ mod compat_tests {
         let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let col = client.database("test").collection::<Document>("u");
         col.insert_one(&doc! { "x": 1i32 }).unwrap();
-        let err = col.find(doc! { "$where": "this.x == 1" }).run().err()
+        let err = col
+            .find(doc! { "$where": "this.x == 1" })
+            .run()
+            .err()
             .expect("find with $where must return Err");
         assert!(matches!(err, Error::UnsupportedOperator { .. }));
         assert_eq!(err.code(), Some(codes::UNSUPPORTED_OPERATOR));
@@ -893,7 +946,9 @@ mod compat_tests {
         let _tempdir = TempDir::new().expect("tempdir");
         let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
         let col = client.database("test").collection::<Document>("u");
-        let model = IndexModel::builder().keys(doc! { "description": "text" }).build();
+        let model = IndexModel::builder()
+            .keys(doc! { "description": "text" })
+            .build();
         let err = col.create_index(model).unwrap_err();
         assert!(matches!(err, Error::UnsupportedIndexOption { .. }));
         assert_eq!(err.code(), Some(codes::CANNOT_CREATE_INDEX));
@@ -918,7 +973,9 @@ mod compat_tests {
         let symlink_path = dir.path().join("link.mqlite");
         std::fs::write(&real_file, b"").expect("create real file");
         std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
-        let err = Client::open(&symlink_path).err().expect("opening symlink must return Err");
+        let err = Client::open(&symlink_path)
+            .err()
+            .expect("opening symlink must return Err");
         assert!(matches!(err, Error::SymlinkRejected { .. }));
         assert_eq!(err.code(), Some(codes::BAD_VALUE));
     }
@@ -927,7 +984,9 @@ mod compat_tests {
     fn collection_not_found_returns_empty() {
         let _tempdir = TempDir::new().expect("tempdir");
         let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
-        let col = client.database("test").collection::<Document>("nonexistent");
+        let col = client
+            .database("test")
+            .collection::<Document>("nonexistent");
         assert_eq!(col.count_documents(doc! {}).unwrap(), 0);
         assert!(col.find_one(doc! {}).unwrap().is_none());
     }
@@ -937,11 +996,7 @@ mod compat_tests {
 mod journal_atomicity_tests {
     use tempfile::TempDir;
 
-    use crate::{
-        doc,
-        error::Error,
-        Client, Document, IndexModel, IndexOptions, OpenOptions,
-    };
+    use crate::{doc, error::Error, Client, Document, IndexModel, IndexOptions, OpenOptions};
 
     fn open(dir: &TempDir, name: &str) -> Client {
         Client::open_with_options(dir.path().join(name), OpenOptions::new()).expect("open client")
@@ -959,9 +1014,13 @@ mod journal_atomicity_tests {
                     .keys(doc! { "email": 1 })
                     .options(IndexOptions::new().unique(true))
                     .build(),
-            ).expect("create unique index");
-            col.insert_one(&doc! { "_id": 1i32, "email": "a@b.com" }).expect("first insert succeeds");
-            let err = col.insert_one(&doc! { "_id": 2i32, "email": "a@b.com" }).unwrap_err();
+            )
+            .expect("create unique index");
+            col.insert_one(&doc! { "_id": 1i32, "email": "a@b.com" })
+                .expect("first insert succeeds");
+            let err = col
+                .insert_one(&doc! { "_id": 2i32, "email": "a@b.com" })
+                .unwrap_err();
             assert!(matches!(err, Error::DuplicateKey { .. }));
             assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
             assert!(col.find_one(doc! { "_id": 2i32 }).unwrap().is_none());
@@ -982,14 +1041,21 @@ mod journal_atomicity_tests {
                 .keys(doc! { "email": 1 })
                 .options(IndexOptions::new().unique(true))
                 .build(),
-        ).expect("create unique index");
-        col.update_one(doc! { "_id": 1i32 }, doc! { "$set": { "email": "x@y.com" } })
-            .upsert(true)
-            .run()
-            .expect("first upsert");
+        )
+        .expect("create unique index");
+        col.update_one(
+            doc! { "_id": 1i32 },
+            doc! { "$set": { "email": "x@y.com" } },
+        )
+        .upsert(true)
+        .run()
+        .expect("first upsert");
         assert_eq!(col.count_documents(doc! {}).unwrap(), 1);
         let err = col
-            .update_one(doc! { "_id": 2i32 }, doc! { "$set": { "email": "x@y.com" } })
+            .update_one(
+                doc! { "_id": 2i32 },
+                doc! { "$set": { "email": "x@y.com" } },
+            )
             .upsert(true)
             .run()
             .unwrap_err();
@@ -1012,7 +1078,10 @@ mod journal_atomicity_tests {
         let col = client.database("t").collection::<Document>("k");
         assert_eq!(col.count_documents(doc! {}).unwrap(), 20);
         for i in 0..20i32 {
-            assert!(col.find_one(doc! { "_id": i }).unwrap().is_some(), "doc _id={i} missing after reopen");
+            assert!(
+                col.find_one(doc! { "_id": i }).unwrap().is_some(),
+                "doc _id={i} missing after reopen"
+            );
         }
     }
 }

@@ -105,6 +105,11 @@ impl<T> Cursor<T> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method currently does not fail; it returns `Result` to match the
+    /// fallible cursor API surface.
     pub fn explain(&self) -> Result<ExplainResult> {
         Ok(self.plan.clone())
     }

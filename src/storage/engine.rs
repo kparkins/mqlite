@@ -25,6 +25,8 @@
 
 use bson::{Bson, Document};
 
+#[cfg(any(test, feature = "test-hooks"))]
+use super::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
 use crate::{
     error::Result,
     index::{IndexInfo, IndexModel},
@@ -221,8 +223,87 @@ pub trait StorageEngine: Send + Sync {
     }
 
     /// Test-only accessor for the MVCC `ReadViewRegistry`.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     fn read_view_registry(&self) -> Option<std::sync::Arc<crate::mvcc::ReadViewRegistry>> {
         None
+    }
+
+    /// Test-only accessor: sample the timestamp oracle's current value.
+    ///
+    /// Returns `(physical_ms, logical)` from the oracle's last-issued timestamp.
+    /// After a commit the oracle's value is >= that commit's `commit_ts`, so
+    /// callers can use this to observe a monotone lower-bound on "the highest
+    /// commit_ts issued so far".  Used by `recovery_timestamp_floor` to verify
+    /// Contract 3.4 without reaching into `pub(crate)` internals.
+    ///
+    /// # Note
+    ///
+    /// This method is `#[doc(hidden)]` and `#[allow(unused)]` — it is intended
+    /// only for integration tests.  It must not be called from production code.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn oracle_now(&self) -> (u64, u32) {
+        (0, 0)
+    }
+
+    /// Test-only accessor: sample the current `ReadEpoch.visible_ts`
+    /// from the published `ArcSwap`, encoded as `(physical_ms, logical)`.
+    ///
+    /// Used by the §10.6 / §10.8 #23 reopen-bootstrap tests to verify
+    /// that the initial ReadEpoch carries a Ts >= the pre-crash max
+    /// commit's successor. Not intended for production code.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn published_visible_ts(&self) -> (u64, u32) {
+        (0, 0)
+    }
+
+    /// Test-only accessor: return a stable pointer-identity for the
+    /// currently-published `Arc<PublishedCatalog>`, encoded as `usize`.
+    ///
+    /// Two calls that straddle a `publish_commit` whose
+    /// `dirty.published_catalog_dirty == false` return the SAME
+    /// `usize` (same Arc allocation reused). A rebuild commit returns
+    /// a DIFFERENT `usize`. §10.8 §10.11 / US-011 and US-014 use this
+    /// in place of `Arc::ptr_eq` from integration tests that cannot
+    /// reach into `pub(crate)` internals.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn published_catalog_ptr(&self) -> usize {
+        0
+    }
+
+    /// Test-only accessor: return the highest `ChainCommit.commit_ts` recovered
+    /// from the journal on the most recent `open_or_create`, encoded as
+    /// `Some((physical_ms, logical))`, or `None` when the journal was fresh or
+    /// carried no `ChainCommit` frames.
+    ///
+    /// The US-002 crash harness uses this to verify that after a journal-tail
+    /// truncation the recovered timestamp floor drops accordingly.
+    ///
+    /// # Note
+    ///
+    /// This method is `#[doc(hidden)]` — it is intended only for integration
+    /// tests.  It must not be called from production code.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
+        None
+    }
+
+    /// Hidden Phase 0 probe for integration tests that must pin the current
+    /// write-envelope ordering without adding runtime hooks to normal CRUD.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn phase0_probe_insert(
+        &self,
+        _ns: &str,
+        _doc: Document,
+        _cut: Phase0ProbeCut,
+    ) -> Result<Phase0ProbeReport> {
+        Err(crate::error::Error::Internal(
+            "phase0 probe is unsupported by this engine".into(),
+        ))
     }
 }

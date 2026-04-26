@@ -169,7 +169,9 @@ impl ServerState {
             }
             None => return 0,
         };
-        std::fs::metadata(&journal_path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&journal_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     /// Total number of connections that have been opened since server start.
@@ -345,9 +347,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, state: ServerState) {
         }
     }
     // Drain remaining connection tasks with a 5-second grace period.
-    let drain = async {
-        while join_set.join_next().await.is_some() {}
-    };
+    let drain = async { while join_set.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
 }
 

@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::storage::buffer_pool::{PageSource, PageSize};
+use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::lock::FileLock;
 use crate::storage::page::PAGE_SIZE_LEAF;
 
@@ -206,7 +206,10 @@ mod tests {
     #[test]
     fn file_offset_is_uniform_32k_stride() {
         for n in 0u32..10 {
-            assert_eq!(FilePageSource::file_offset(n), n as u64 * PAGE_SIZE_LEAF as u64);
+            assert_eq!(
+                FilePageSource::file_offset(n),
+                n as u64 * PAGE_SIZE_LEAF as u64
+            );
         }
     }
 

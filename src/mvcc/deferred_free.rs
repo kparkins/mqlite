@@ -31,6 +31,7 @@ pub struct DeferredFreeQueue {
 
 impl DeferredFreeQueue {
     /// Construct an empty queue.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
@@ -55,6 +56,7 @@ impl DeferredFreeQueue {
     ///
     /// Returns the full snapshot. The caller should free each page under
     /// the appropriate writer-path serialization.
+    #[must_use]
     pub fn take_all(&self) -> Vec<u32> {
         #[allow(clippy::unwrap_used)]
         let mut q = self.pending.lock().unwrap();
@@ -62,6 +64,7 @@ impl DeferredFreeQueue {
     }
 
     /// Return the current queue depth (metrics / gauge).
+    #[must_use]
     pub fn depth(&self) -> usize {
         #[allow(clippy::unwrap_used)]
         let q = self.pending.lock().unwrap();
@@ -110,7 +113,7 @@ mod tests {
     fn take_all_clears_queue() {
         let q = DeferredFreeQueue::new();
         q.push(42);
-        q.take_all();
+        let _ = q.take_all();
         q.push(99);
         assert_eq!(q.take_all(), vec![99]);
     }

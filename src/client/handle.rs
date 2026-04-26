@@ -95,11 +95,19 @@ impl Client {
     /// Force a journal checkpoint.
     ///
     /// After this returns, the main database file is safe to copy as a backup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint I/O fails.
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.checkpoint()
     }
 
     /// Hot backup to a destination file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backup cannot be written.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         self.inner.backup(dest.as_ref())
     }
@@ -109,19 +117,20 @@ impl Client {
     /// Use this when you need a guarantee that all committed data is in the main
     /// file (e.g., before copying the file as a backup). `Drop` performs a
     /// non-blocking close.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the final checkpoint fails.
     pub fn close(self) -> Result<()> {
         self.inner.checkpoint()
     }
 
-    /// Test-only accessor for the MVCC `ReadViewRegistry` backing this client.
-    ///
-    /// Exposed for integration tests that need to register external `ReadView`s
-    /// and watch them get force-expired on the engine's drop path. Returns `None`
-    /// when the client has no attached buffer pool.
-    #[doc(hidden)]
-    pub fn __read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
-        self.inner.engine.read_view_registry()
-    }
+    // Test-only accessors (`__oracle_now`, `__published_visible_ts`,
+    // `__published_catalog_ptr`, `__recovered_max_commit_ts`,
+    // `__read_view_registry`) live in a dedicated module:
+    // `src/client/test_accessors.rs`. Keeping them out of this file
+    // makes the boundary between production API and test scaffolding
+    // unambiguous.
 }
 
 impl Drop for Client {

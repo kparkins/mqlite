@@ -11,9 +11,7 @@
 //! an empty snapshot) and ticks the
 //! `mvcc.read_views_force_expired_total` counter exactly once per call.
 
-use mqlite::mvcc::metrics::{
-    read_views_force_expired_snapshot, reset_read_views_force_expired,
-};
+use mqlite::mvcc::metrics::{read_views_force_expired_snapshot, reset_read_views_force_expired};
 use mqlite::mvcc::timestamp::Ts;
 use mqlite::mvcc::ReadView;
 
@@ -21,7 +19,13 @@ use mqlite::mvcc::ReadView;
 fn force_expire_ticks_counter_exactly_once_per_call() {
     reset_read_views_force_expired();
 
-    let rv = ReadView::new(Ts { physical_ms: 100, logical: 0 }, 42);
+    let rv = ReadView::new(
+        Ts {
+            physical_ms: 100,
+            logical: 0,
+        },
+        42,
+    );
     assert_eq!(read_views_force_expired_snapshot(), 0);
 
     rv.force_expire();

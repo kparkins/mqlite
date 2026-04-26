@@ -96,7 +96,11 @@ pub(crate) fn apply_update(doc: &mut Document, update: &Document, is_insert: boo
                     apply_set(doc, args_doc)?;
                 }
             }
-            _ => return Err(Error::UnsupportedOperator { operator: op.to_string() }),
+            _ => {
+                return Err(Error::UnsupportedOperator {
+                    operator: op.to_string(),
+                })
+            }
         }
     }
     Ok(())
@@ -122,7 +126,9 @@ pub(crate) fn set_nested(doc: &mut Document, path: &str, value: Bson) {
     }
 
     let mut parts = path.splitn(2, '.');
-    let head = parts.next().expect("field paths are non-empty: callers must validate before passing to set_nested/remove_nested");
+    let Some(head) = parts.next() else {
+        return;
+    };
 
     match parts.next() {
         None => {
@@ -148,7 +154,9 @@ pub(crate) fn set_nested(doc: &mut Document, path: &str, value: Bson) {
 /// Remove a (possibly dotted) field path.
 fn remove_nested(doc: &mut Document, path: &str) {
     let mut parts = path.splitn(2, '.');
-    let head = parts.next().expect("field paths are non-empty: callers must validate before passing to set_nested/remove_nested");
+    let Some(head) = parts.next() else {
+        return;
+    };
 
     match parts.next() {
         None => {
@@ -358,15 +366,12 @@ fn apply_push_modifiers(doc: &mut Document, path: &str, modifiers: &Document) ->
 
     let position: Option<i64> = modifiers
         .get("$position")
-        .and_then(|v| as_f64(v))
+        .and_then(as_f64)
         .map(|f| f as i64);
 
     let sort_spec = modifiers.get("$sort");
 
-    let slice: Option<i64> = modifiers
-        .get("$slice")
-        .and_then(|v| as_f64(v))
-        .map(|f| f as i64);
+    let slice: Option<i64> = modifiers.get("$slice").and_then(as_f64).map(|f| f as i64);
 
     let field = get_nested_field(doc, path).cloned();
     let mut arr = match field {
@@ -427,7 +432,7 @@ fn sort_bson_array(arr: &mut [Bson], spec: &Bson) -> Result<()> {
     // Scalar direction.
     if let Some(d) = as_f64(spec) {
         if d >= 0.0 {
-            arr.sort_by(|a, b| bson_cmp(a, b));
+            arr.sort_by(bson_cmp);
         } else {
             arr.sort_by(|a, b| bson_cmp(b, a));
         }

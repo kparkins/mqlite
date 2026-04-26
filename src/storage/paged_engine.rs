@@ -33,15 +33,23 @@ mod doc_helpers;
 mod doc_ops;
 mod index_build;
 mod index_maint;
+#[cfg(any(test, feature = "test-hooks"))]
+mod phase0_probe;
+pub(crate) mod publish;
 mod snapshot_ops;
 mod state;
+/// Test-only `impl PagedEngine` accessors — isolated from the
+/// production code path in a separate file so the boundary is
+/// visible at a glance.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod test_accessors;
 
 #[cfg(test)]
 mod tests;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as ParkingMutex;
 
@@ -51,6 +59,9 @@ use crate::options::BusyHandler;
 
 use bson::{Bson, Document};
 
+use super::engine::StorageEngine;
+#[cfg(any(test, feature = "test-hooks"))]
+use super::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
 use crate::error::{Error, Result};
 use crate::index::{IndexInfo, IndexModel};
 use crate::mvcc::transaction::WriteTxn;
@@ -63,13 +74,13 @@ use crate::storage::btree::BTree;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
-use super::engine::StorageEngine;
 
 use self::catalog_ops::{
-    new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,
+    catalog_lock, new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,
 };
 use self::doc_helpers::now_millis;
 use self::index_maint::{install_pending_primary, install_pending_sec_index};
+use self::publish::PublishDirty;
 use self::state::{MetadataState, OwnedLaneGuard, SharedState};
 
 // ---------------------------------------------------------------------------
@@ -115,6 +126,89 @@ pub(crate) struct PagedEngine {
     /// Cleared when the namespace is explicitly re-created via
     /// `create_namespace` (the public `create_collection` API path).
     dropped_namespaces: DashSet<String>,
+}
+
+/// RAII recorder for lane-wait timing.
+///
+/// Keeps the observational counter fetch_add OUTSIDE the lane mutex's
+/// critical section (§5 cross-boundary guardrail). The recorder is declared
+/// BEFORE the lane `MutexGuard` so Rust's LIFO drop order guarantees the
+/// guard is released first and `drop(self)` runs with no lock held.
+struct LaneWaitRecord {
+    /// Measured lane-wait duration. `None` before the guard is acquired;
+    /// populated immediately after `acquire_lane` returns.
+    elapsed: Option<Duration>,
+}
+
+impl Drop for LaneWaitRecord {
+    fn drop(&mut self) {
+        if let Some(d) = self.elapsed {
+            crate::mvcc::metrics::record_lane_wait_ns(d.as_nanos() as u64);
+        }
+    }
+}
+
+/// RAII recorder for commit_seq-wait timing.
+///
+/// Mirrors [`LaneWaitRecord`] for the commit_seq mutex: declared BEFORE the
+/// `MutexGuard`, so the atomic fetch_add runs after the mutex is released.
+struct CommitSeqWaitRecord {
+    /// Measured commit_seq-wait duration. `None` before the guard is
+    /// acquired; populated immediately after `commit_seq.lock()` returns.
+    elapsed: Option<Duration>,
+}
+
+impl Drop for CommitSeqWaitRecord {
+    fn drop(&mut self) {
+        if let Some(d) = self.elapsed {
+            crate::mvcc::metrics::record_commit_seq_wait_ns(d.as_nanos() as u64);
+        }
+    }
+}
+
+/// RAII guard that records the §7 / US-024 logical-frame-append
+/// duration sample AND recomputes the percentile gauges (p50/p95/p99)
+/// from the ring buffer.
+///
+/// AC#3 demands `Instant::now()` reads OUTSIDE the commit_seq critical
+/// section. This guard:
+///
+///   - Captures `start = Instant::now()` at construction (BEFORE
+///     the commit_seq mutex is acquired in `run_write_existing` — the
+///     guard is declared before `_commit`, and Rust evaluates RHS in
+///     order so the `Instant::now()` call here happens first).
+///   - On `drop` (which runs AFTER the commit_seq mutex is released
+///     because of LIFO drop order), samples `elapsed` and records it
+///     as one logical-frame-append duration sample, then recomputes
+///     the p50/p95/p99 gauges.
+///
+/// Both `Instant::now()` reads happen with NO commit_seq mutex held.
+/// Same pattern as `LaneWaitRecord` / `CommitSeqWaitRecord`.
+///
+/// The recorded duration spans the full commit_seq critical section
+/// rather than just the journal-file I/O. Per §7 ("approximate
+/// latest-value gauge"), this is an acceptable approximation: the
+/// critical section is dominated by the logical+legacy+ChainCommit
+/// journal writes, so the envelope duration tracks the append
+/// duration to within a few microseconds of overhead.
+struct LogicalTxnAppendPercentileRefresh {
+    start: std::time::Instant,
+}
+
+impl LogicalTxnAppendPercentileRefresh {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for LogicalTxnAppendPercentileRefresh {
+    fn drop(&mut self) {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        crate::mvcc::metrics::record_logical_txn_append_duration_ms(elapsed_ms);
+        crate::mvcc::metrics::recompute_logical_txn_append_percentiles();
+    }
 }
 
 impl PagedEngine {
@@ -167,10 +261,7 @@ impl PagedEngine {
     }
 
     /// Acquire the namespace lane with busy-timeout / busy-handler semantics.
-    fn acquire_lane(
-        &self,
-        lane: Arc<ParkingMutex<()>>,
-    ) -> Result<OwnedLaneGuard> {
+    fn acquire_lane(&self, lane: Arc<ParkingMutex<()>>) -> Result<OwnedLaneGuard> {
         state::acquire_lane(self, lane)
     }
 
@@ -192,22 +283,28 @@ impl PagedEngine {
                 name: ns.to_string(),
             });
         }
-        let md_w = self.metadata.write().map_err(|_| {
-            Error::Internal("metadata RwLock poisoned".into())
-        })?;
-        if md_w.catalog.lock().expect("catalog poisoned").get_collection(ns)?.is_some() {
+        let md_w = self
+            .metadata
+            .write()
+            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        if catalog_lock(&md_w).get_collection(ns)?.is_some() {
             return Ok(());
         }
         // Hold commit_seq for the publish so publish_ts remains monotonic.
-        let _commit = self.commit_seq.lock().map_err(|_| {
-            Error::Internal("commit_seq mutex poisoned".into())
-        })?;
+        let _commit = self
+            .commit_seq
+            .lock()
+            .map_err(|_| Error::Internal("commit_seq mutex poisoned".into()))?;
 
         // Open a journal mark + overlay so the bootstrap is atomic.
         let mark = self.shared.handle.begin_txn()?;
         let mut overlay = TxnOverlay::new();
         // Drain deferred-free into overlay reservations.
-        let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
+        let ready = self
+            .shared
+            .handle
+            .allocator()
+            .drain_deferred_free_reservations();
         for page in ready {
             overlay.push_reservation(PageReservation {
                 page,
@@ -217,11 +314,13 @@ impl PagedEngine {
         }
 
         let result: Result<()> = (|| {
-            let data_root = md_w
-                .catalog
-                .lock()
-                .expect("catalog poisoned")
-                .create_collection(ns, bson::doc! {}, now_millis())?;
+            let data_root = {
+                let mut cat = catalog_lock(&md_w);
+                // Phase 1 §10.7 — allocate durable namespace id from the
+                // header counter atomically with the catalog commit.
+                let id = cat.allocate_namespace_id();
+                cat.create_collection(ns, id, bson::doc! {}, now_millis())?
+            };
             sync_catalog_root_overlay(&self.shared, &md_w, &mut overlay)?;
             let _ = BTree::create_at(new_txn_store(&self.shared, &mut overlay), data_root)?;
             Ok(())
@@ -252,10 +351,25 @@ impl PagedEngine {
                     // journal into the main file so subsequent txns have
                     // room. Best-effort — failure here does not roll back
                     // the txn (it is already committed).
+                    crate::mvcc::metrics::record_emergency_checkpoint_trigger();
                     let _ = self.shared.handle.emergency_checkpoint();
                 }
-                let publish_ts = self.shared.oracle.now();
-                rebuild_and_publish_locked(&self.shared, &md_w, publish_ts)?;
+                // Phase 1 §6.3: bootstrap_namespace is a metadata-only
+                // DDL publish (no primary writes / no commit_ts), so use
+                // `oracle.commit()` — NEVER `oracle.now()`. Two sub-ms
+                // DDLs with `now()` can return equal Ts and break the
+                // strict-monotonicity invariant enforced by
+                // `publish_commit`'s debug_assert.
+                let publish_ts = self.shared.oracle.commit()?;
+                // Phase 1 §10.3 — bootstrap_namespace is a DDL-style
+                // publish site that creates a new reader-visible
+                // namespace: both `published_catalog_dirty` and
+                // `catalog_header_dirty` are set.
+                let dirty = PublishDirty {
+                    published_catalog_dirty: true,
+                    catalog_header_dirty: true,
+                };
+                rebuild_and_publish_locked(&self.shared, &md_w, publish_ts, dirty)?;
                 Ok(())
             }
             Err(e) => {
@@ -266,7 +380,6 @@ impl PagedEngine {
         }
     }
 
-
     /// CRUD write lifecycle.
     ///
     /// Drives: metadata.read() → bootstrap-if-missing → lane → overlay +
@@ -275,23 +388,14 @@ impl PagedEngine {
     /// rebuild_and_publish } → release lane → release metadata.
     fn run_write<F, R>(&self, ns: &str, f: F) -> Result<R>
     where
-        F: FnOnce(
-            &SharedState,
-            &MetadataState,
-            &mut TxnOverlay,
-            &mut WriteTxn,
-        ) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay, &mut WriteTxn) -> Result<R>,
     {
         // Take read guard; if namespace absent, bootstrap then retry.
-        let md_read = self.metadata.read().map_err(|_| {
-            Error::Internal("metadata RwLock poisoned".into())
-        })?;
-        let ns_missing = md_read
-            .catalog
-            .lock()
-            .expect("catalog poisoned")
-            .get_collection(ns)?
-            .is_none();
+        let md_read = self
+            .metadata
+            .read()
+            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        let ns_missing = catalog_lock(&md_read).get_collection(ns)?.is_none();
         if ns_missing {
             drop(md_read);
             self.bootstrap_namespace(ns)?;
@@ -310,23 +414,35 @@ impl PagedEngine {
     /// documented on `MetadataState`.
     fn run_write_existing<F, R>(&self, ns: &str, f: F) -> Result<R>
     where
-        F: FnOnce(
-            &SharedState,
-            &MetadataState,
-            &mut TxnOverlay,
-            &mut WriteTxn,
-        ) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay, &mut WriteTxn) -> Result<R>,
     {
-        let md_read = self.metadata.read().map_err(|_| {
-            Error::Internal("metadata RwLock poisoned".into())
-        })?;
+        let md_read = self
+            .metadata
+            .read()
+            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
         let lane = self.lane_for(ns);
+        // Observational lane-wait timing: the counter fetch_add must run
+        // AFTER the lane mutex is released (§5 cross-boundary guardrail —
+        // no atomic counter work while a lane/commit_seq mutex is held).
+        // Strategy: declare `lane_wait_record` BEFORE `_lane_guard`. Rust's
+        // LIFO drop order (last declared = first dropped) means
+        // `_lane_guard` drops first (releasing the lane mutex) and then
+        // `lane_wait_record` drops, performing the atomic fetch_add with
+        // NO mutex held. The recorded duration is captured immediately
+        // after acquire_lane returns, so it still reflects only the wait.
+        let mut lane_wait_record = LaneWaitRecord { elapsed: None };
+        let lane_wait_start = Instant::now();
         let _lane_guard = self.acquire_lane(lane)?;
+        lane_wait_record.elapsed = Some(lane_wait_start.elapsed());
 
         // Setup overlay + WriteTxn.
         let mark = self.shared.handle.begin_txn()?;
         let mut overlay = TxnOverlay::new();
-        let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
+        let ready = self
+            .shared
+            .handle
+            .allocator()
+            .drain_deferred_free_reservations();
         for page in ready {
             overlay.push_reservation(PageReservation {
                 page,
@@ -347,22 +463,65 @@ impl PagedEngine {
 
         match body_result {
             Ok(value) => {
+                // Root-neutral vs root-changing classification: if the body
+                // called `sync_catalog_root_overlay` (because a tree root moved
+                // or the catalog root changed), the overlay captured the file
+                // header pre-image. Observed OUTSIDE the commit_seq critical
+                // section — reading `overlay.has_header_pre()` takes no locks.
+                let root_changing = overlay.has_header_pre();
+
                 // Commit sequencing.
-                let _commit = self.commit_seq.lock().map_err(|_| {
-                    Error::Internal("commit_seq mutex poisoned".into())
-                })?;
+                // Observational commit_seq-wait timing: the counter fetch_add
+                // must run AFTER the commit_seq mutex is released (§5
+                // cross-boundary guardrail). Same LIFO-drop pattern as the
+                // lane-wait recorder above: `commit_seq_wait_record` is
+                // declared BEFORE `_commit`, so `_commit` drops first (end
+                // of this match-arm scope) and the fetch_add in
+                // `CommitSeqWaitRecord::drop` runs with NO mutex held.
+                let mut commit_seq_wait_record = CommitSeqWaitRecord { elapsed: None };
+                let commit_seq_wait_start = Instant::now();
+                // §7 / US-024 AC#3 — refresh the logical-txn append-duration
+                // percentiles AFTER `_commit` releases the commit_seq mutex.
+                // `LogicalTxnAppendPercentileRefresh::drop` runs the
+                // sort+store work outside the critical section. Declared
+                // BEFORE `_commit` so Rust's LIFO drop order makes
+                // `_commit` drop first (releasing the mutex) and this
+                // guard's Drop runs with NO mutex held.
+                let _logical_txn_append_pct_refresh = LogicalTxnAppendPercentileRefresh::new();
+                let _commit = self
+                    .commit_seq
+                    .lock()
+                    .map_err(|_| Error::Internal("commit_seq mutex poisoned".into()))?;
+                commit_seq_wait_record.elapsed = Some(commit_seq_wait_start.elapsed());
 
                 let sec_writes = std::mem::take(&mut txn.pending_sec_index);
-                if let Err(e) =
-                    install_pending_sec_index(&self.shared, &md_read, &mut overlay, sec_writes.to_vec())
-                {
+                if let Err(e) = install_pending_sec_index(
+                    &self.shared,
+                    &md_read,
+                    &mut overlay,
+                    sec_writes.to_vec(),
+                    &mut txn,
+                ) {
                     drop(txn);
                     let _ = self.rollback_overlay_and_wal(overlay, mark);
                     return Err(e);
                 }
 
                 let primary_writes = std::mem::take(&mut txn.pending_primary);
-                let commit_ts_opt = if !primary_writes.is_empty() {
+                // Phase 2 §3.7 commit envelope order: S4 allocate_commit_ts →
+                // S5 emit LogicalTxnFrame → S6 flush → S7 ChainCommit. The
+                // logical frame is emitted when ANY logical op (primary or
+                // secondary) was staged; metadata-only commits skip both
+                // the allocation and the emit (ChainCommit on those runs
+                // picks up its ts via `WriteTxn::commit`'s lazy allocate).
+                //
+                // The `sec_writes` + `primary_writes` locals must survive
+                // until after `emit_logical_txn_frame` has captured them —
+                // `install_pending_primary` below consumes primary_writes
+                // via `.to_vec()`, which clones into a throwaway copy, so
+                // the original still drives the emit call.
+                let has_logical_ops = !sec_writes.is_empty() || !primary_writes.is_empty();
+                let commit_ts_opt = if has_logical_ops {
                     let txn_id = txn.txn_id;
                     let commit_ts = match txn.allocate_commit_ts(&self.shared.oracle) {
                         Ok(ts) => ts,
@@ -372,17 +531,30 @@ impl PagedEngine {
                             return Err(e);
                         }
                     };
-                    if let Err(e) = install_pending_primary(
-                        &self.shared,
-                        &md_read,
-                        &mut overlay,
-                        primary_writes.to_vec(),
-                        commit_ts,
-                        txn_id,
+
+                    if let Err(e) = txn.emit_logical_txn_frame(
+                        &self.shared.handle,
+                        &primary_writes,
+                        &sec_writes,
                     ) {
                         drop(txn);
                         let _ = self.rollback_overlay_and_wal(overlay, mark);
                         return Err(e);
+                    }
+
+                    if !primary_writes.is_empty() {
+                        if let Err(e) = install_pending_primary(
+                            &self.shared,
+                            &md_read,
+                            &mut overlay,
+                            primary_writes.to_vec(),
+                            commit_ts,
+                            txn_id,
+                        ) {
+                            drop(txn);
+                            let _ = self.rollback_overlay_and_wal(overlay, mark);
+                            return Err(e);
+                        }
                     }
                     Some(commit_ts)
                 } else {
@@ -397,8 +569,24 @@ impl PagedEngine {
                     return Err(e);
                 }
                 self.shared.handle.flush()?;
-                let (_commit_ts, _installed, _sec_index) =
-                    txn.commit(&self.shared.oracle, &self.shared.handle)?;
+                // Phase 1 §10.3 — capture the txn's dirty flags before
+                // `txn.commit()` consumes the transaction. `install_*`
+                // above may have called `mark_published` / `mark_header`
+                // based on root-movement classification (§4.1 / §10.3).
+                let dirty = txn.publish_dirty();
+                // Phase 2 §3.7: the Cell was taken by `emit_logical_txn_frame`,
+                // so use `commit_with_ts(commit_ts)` when we have a
+                // pre-allocated ts. Metadata-only commits (no sec/primary
+                // writes) fall through `commit()` to the lazy-allocate
+                // path, preserving existing behavior.
+                let _installed_and_sec = match commit_ts_opt {
+                    Some(ts) => txn.commit_with_ts(ts, &self.shared.handle)?,
+                    None => {
+                        let (_ts, pending, sec) =
+                            txn.commit(&self.shared.oracle, &self.shared.handle)?;
+                        (pending, sec)
+                    }
+                };
                 let db_page_count = self
                     .shared
                     .handle
@@ -425,10 +613,35 @@ impl PagedEngine {
                     db_page_count,
                 )?;
                 if emergency {
+                    crate::mvcc::metrics::record_emergency_checkpoint_trigger();
                     let _ = self.shared.handle.emergency_checkpoint();
                 }
-                let publish_ts = commit_ts_opt.unwrap_or_else(|| self.shared.oracle.now());
-                rebuild_and_publish_locked(&self.shared, &md_read, publish_ts)?;
+                // Phase 1 §6.3: strict-monotonic visible_ts rule.
+                //   - txn had primary writes → use its allocated `commit_ts`.
+                //   - metadata-only commit (no primary writes) → use
+                //     `oracle.commit()?`, NOT `oracle.now()`. `now()` peeks
+                //     the HLC without advancing it, so two sub-ms
+                //     metadata-only commits could return equal Ts and
+                //     violate `publish_commit`'s monotonicity debug_assert.
+                let publish_ts = match commit_ts_opt {
+                    Some(ts) => ts,
+                    None => self.shared.oracle.commit()?,
+                };
+                // §10.8 #19 rendezvous: test-only hook placed AFTER
+                // commit_txn and BEFORE publish_commit so a unit test
+                // can deterministically observe the pre-publish
+                // ReadEpoch. Gated under `#[cfg(test)]` — in
+                // `cfg(not(test))` (production) builds this expands
+                // to an inlined no-op; no new `Mutex` / `Arc`
+                // appears on the commit path (§11 #10).
+                #[cfg(test)]
+                self::test_accessors::publish_pause_if_installed(&self.shared);
+                rebuild_and_publish_locked(&self.shared, &md_read, publish_ts, dirty)?;
+                if root_changing {
+                    crate::mvcc::metrics::record_crud_commit_root_changing();
+                } else {
+                    crate::mvcc::metrics::record_crud_commit_root_neutral();
+                }
                 Ok(value)
             }
             Err(e) => {
@@ -439,16 +652,11 @@ impl PagedEngine {
         }
     }
 
-    fn rollback_overlay_and_wal(
-        &self,
-        overlay: TxnOverlay,
-        mark: Option<u64>,
-    ) -> Result<()> {
+    fn rollback_overlay_and_wal(&self, overlay: TxnOverlay, mark: Option<u64>) -> Result<()> {
         overlay.rollback(&self.shared.handle)?;
         let _ = self.shared.handle.rollback_txn(mark);
         Ok(())
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -540,11 +748,14 @@ impl StorageEngine for PagedEngine {
     fn create_namespace(&self, ns: &str) -> Result<()> {
         let result = self.run_ddl(|shared, md, overlay| {
             let data_root = {
-                let mut cat = md.catalog.lock().expect("catalog poisoned");
+                let mut cat = catalog_lock(md);
                 if cat.get_collection(ns)?.is_some() {
                     return Ok(());
                 }
-                cat.create_collection(ns, bson::doc! {}, now_millis())?
+                // Phase 1 §10.7 — allocate durable namespace id from the
+                // header counter atomically with the catalog commit.
+                let id = cat.allocate_namespace_id();
+                cat.create_collection(ns, id, bson::doc! {}, now_millis())?
             };
             sync_catalog_root_overlay(shared, md, overlay)?;
             let store = new_txn_store(shared, overlay);
@@ -590,7 +801,7 @@ impl StorageEngine for PagedEngine {
 
         let result = self.run_ddl(|shared, md, overlay| {
             let (maybe_coll, index_roots, dropped) = {
-                let mut cat = md.catalog.lock().expect("catalog poisoned");
+                let mut cat = catalog_lock(md);
                 let maybe_coll = cat.get_collection(ns)?;
                 let index_roots: Vec<(u32, u8)> = if maybe_coll.is_some() {
                     cat.list_indexes(ns)?
@@ -632,8 +843,8 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_namespaces(&self) -> Result<Vec<String>> {
-        let snap = self.shared.published.load();
-        let keys = snap.namespaces.keys();
+        let snap = self.shared.load_published();
+        let keys = snap.catalog.namespace_id_by_name.keys();
         let mut out = Vec::with_capacity(keys.len());
         out.extend(keys.cloned());
         Ok(out)
@@ -643,8 +854,42 @@ impl StorageEngine for PagedEngine {
         snapshot_ops::checkpoint(self)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
         Some(Arc::clone(self.shared.handle.read_view_registry()))
+    }
+
+    // Test-only trait methods — implementations live in
+    // `src/storage/paged_engine/test_accessors.rs` so the production
+    // impl stays free of test-scaffolding logic.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn oracle_now(&self) -> (u64, u32) {
+        self.test_oracle_now()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn published_visible_ts(&self) -> (u64, u32) {
+        self.test_published_visible_ts()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn published_catalog_ptr(&self) -> usize {
+        self.test_published_catalog_ptr()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
+        self.test_recovered_max_commit_ts()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn phase0_probe_insert(
+        &self,
+        ns: &str,
+        doc: Document,
+        cut: Phase0ProbeCut,
+    ) -> Result<Phase0ProbeReport> {
+        self.phase0_probe_insert_impl(ns, doc, cut)
     }
 
     fn close(&self) -> Result<()> {
@@ -671,16 +916,22 @@ impl PagedEngine {
     where
         F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay) -> Result<R>,
     {
-        let md_w = self.metadata.write().map_err(|_| {
-            Error::Internal("metadata RwLock poisoned".into())
-        })?;
-        let _commit = self.commit_seq.lock().map_err(|_| {
-            Error::Internal("commit_seq mutex poisoned".into())
-        })?;
+        let md_w = self
+            .metadata
+            .write()
+            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        let _commit = self
+            .commit_seq
+            .lock()
+            .map_err(|_| Error::Internal("commit_seq mutex poisoned".into()))?;
 
         let mark = self.shared.handle.begin_txn()?;
         let mut overlay = TxnOverlay::new();
-        let ready = self.shared.handle.allocator().drain_deferred_free_reservations();
+        let ready = self
+            .shared
+            .handle
+            .allocator()
+            .drain_deferred_free_reservations();
         for page in ready {
             overlay.push_reservation(PageReservation {
                 page,
@@ -713,8 +964,20 @@ impl PagedEngine {
                 if emergency {
                     let _ = self.shared.handle.emergency_checkpoint();
                 }
-                let publish_ts = self.shared.oracle.now();
-                rebuild_and_publish_locked(&self.shared, &md_w, publish_ts)?;
+                // Phase 1 §6.3: DDL has no primary writes, so allocate a
+                // fresh monotonic Ts from the oracle. `oracle.commit()`
+                // advances the HLC; `oracle.now()` only peeks and can
+                // return equal Ts across two sub-ms DDLs.
+                let publish_ts = self.shared.oracle.commit()?;
+                // Phase 1 §10.3 — every DDL body that runs to completion
+                // changes the reader-visible published catalog (new /
+                // dropped namespace, Building↔Ready flip, dropped index,
+                // orphan Building cleanup). Both flags always set.
+                let dirty = PublishDirty {
+                    published_catalog_dirty: true,
+                    catalog_header_dirty: true,
+                };
+                rebuild_and_publish_locked(&self.shared, &md_w, publish_ts, dirty)?;
                 Ok(value)
             }
             Err(e) => {
@@ -723,5 +986,4 @@ impl PagedEngine {
             }
         }
     }
-
 }

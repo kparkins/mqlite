@@ -33,7 +33,10 @@
 //!  72      4    WAL salt 2: u32 LE
 //!  76      4    Catalog root backup: u32 LE (redundant copy of offset 36)
 //!  80      1    Catalog root level: u8
-//!  81     47    Reserved (zero-filled; future: encryption metadata, etc.)
+//!  81      8    Next namespace id: u64 LE (Phase 1 §10.7 durable id counter; reserved = 0)
+//!  89      8    Next index id: u64 LE (Phase 1 §10.7 durable id counter; reserved = 0)
+//!  97      4    History store root page: u32 LE (Phase 1 §10.7; persisted root of HistoryStore)
+//! 101     27    Reserved (zero-filled; future: encryption metadata, etc.)
 //! 128   3968    Unused padding to 4096 bytes
 //! ```
 //!
@@ -138,7 +141,27 @@ pub(crate) struct FileHeader {
     /// [`catalog_root_page`](Self::catalog_root_page) this allows reopening the
     /// catalog without a full tree scan.
     pub catalog_root_level: u8,
-    // offsets 81–127: reserved, zero-filled
+    // offset 81
+    /// Monotonic namespace id counter (Phase 1 §10.7). The next allocated
+    /// `NamespaceId` equals this value; on allocation the counter advances
+    /// by 1 and the new value is persisted atomically with the owning
+    /// catalog commit. Id `0` is reserved and never allocated.
+    ///
+    /// Initialized to `1` on fresh-DB creation so the first allocated id is
+    /// strictly positive. Outside the 0–63 checksum range, so updates do
+    /// not require recomputing `header_checksum`.
+    pub next_namespace_id: u64,
+    // offset 89
+    /// Monotonic index id counter (Phase 1 §10.7). Same protocol as
+    /// `next_namespace_id` but for `IndexId`.
+    pub next_index_id: u64,
+    // offset 97
+    /// Durable root page of the [`HistoryStore`](crate::storage::history_store::HistoryStore)
+    /// (Phase 1 §10.7). On fresh DB, initialized to the page id returned
+    /// by `HistoryStore::create_empty_root`. On reopen, `HistoryStore::open`
+    /// reads this value and opens the existing tree.
+    pub history_store_root_page: u32,
+    // offsets 101–127: reserved, zero-filled
     // offsets 128–4095: unused padding
 }
 
@@ -169,6 +192,14 @@ impl FileHeader {
             wal_salt2,
             catalog_root_backup: 0,
             catalog_root_level: 0,
+            // Phase 1 §10.7: durable id counters start at 1 so the first
+            // `allocate_namespace_id` / `allocate_index_id` returns 1.
+            // Id `0` is reserved and must never be allocated.
+            next_namespace_id: 1,
+            next_index_id: 1,
+            // `0` signals "no history store persisted yet"; state.rs creates
+            // the empty root on fresh-DB init and writes the id back.
+            history_store_root_page: 0,
         }
     }
 
@@ -226,9 +257,7 @@ impl FileHeader {
         if magic != FILE_MAGIC {
             return Err(Error::CorruptDatabase {
                 path: std::path::PathBuf::new(),
-                detail: format!(
-                    "invalid magic: expected {FILE_MAGIC:?} ('MQLT'), found {magic:?}"
-                ),
+                detail: format!("invalid magic: expected {FILE_MAGIC:?} ('MQLT'), found {magic:?}"),
                 recoverable: false,
             });
         }
@@ -317,6 +346,10 @@ impl FileHeader {
             wal_salt2: u32::from_le_bytes(buf[72..76].try_into().expect("4 bytes")),
             catalog_root_backup: u32::from_le_bytes(buf[76..80].try_into().expect("4 bytes")),
             catalog_root_level: buf[80],
+            // Phase 1 §10.7 — durable id counters + history-store root page.
+            next_namespace_id: u64::from_le_bytes(buf[81..89].try_into().expect("8 bytes")),
+            next_index_id: u64::from_le_bytes(buf[89..97].try_into().expect("8 bytes")),
+            history_store_root_page: u32::from_le_bytes(buf[97..101].try_into().expect("4 bytes")),
         })
     }
 
@@ -376,7 +409,11 @@ impl FileHeader {
         buf[72..76].copy_from_slice(&self.wal_salt2.to_le_bytes());
         buf[76..80].copy_from_slice(&self.catalog_root_backup.to_le_bytes());
         buf[80] = self.catalog_root_level;
-        // offsets 81–127: reserved, already zero-filled by array init
+        // Phase 1 §10.7 — durable id counters + history-store root page.
+        buf[81..89].copy_from_slice(&self.next_namespace_id.to_le_bytes());
+        buf[89..97].copy_from_slice(&self.next_index_id.to_le_bytes());
+        buf[97..101].copy_from_slice(&self.history_store_root_page.to_le_bytes());
+        // offsets 101–127: reserved, already zero-filled by array init
         // offsets 128–4095: padding, already zero-filled
     }
 }
@@ -495,12 +532,41 @@ mod tests {
     }
 
     #[test]
-    fn reserved_bytes_81_to_127_are_zero() {
+    fn reserved_bytes_101_to_127_are_zero() {
+        // Phase 1 §10.7 — offsets 81..101 now carry `next_namespace_id`,
+        // `next_index_id`, and `history_store_root_page`. The reserved
+        // zero-fill region now spans 101..128.
         let bytes = fresh_header().to_bytes();
         assert!(
-            bytes[81..128].iter().all(|&b| b == 0),
-            "reserved region must be zero-filled"
+            bytes[101..128].iter().all(|&b| b == 0),
+            "reserved region 101..128 must be zero-filled"
         );
+    }
+
+    #[test]
+    fn durable_id_counters_roundtrip() {
+        // Phase 1 §10.7 — persist and recover `next_namespace_id`,
+        // `next_index_id`, `history_store_root_page` via the header.
+        let mut h = fresh_header();
+        h.next_namespace_id = 42;
+        h.next_index_id = 99;
+        h.history_store_root_page = 314;
+
+        let bytes = h.to_bytes();
+        let decoded = FileHeader::from_bytes(&bytes).expect("parse");
+        assert_eq!(decoded.next_namespace_id, 42);
+        assert_eq!(decoded.next_index_id, 99);
+        assert_eq!(decoded.history_store_root_page, 314);
+    }
+
+    #[test]
+    fn fresh_header_initializes_durable_counters_to_one() {
+        // Phase 1 §10.7 — `0` is reserved, so the first allocation must
+        // return 1. Both counters must start at 1 on fresh-DB creation.
+        let h = fresh_header();
+        assert_eq!(h.next_namespace_id, 1);
+        assert_eq!(h.next_index_id, 1);
+        assert_eq!(h.history_store_root_page, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -673,11 +739,7 @@ mod tests {
         );
 
         // last_checkpoint_ts = Ts::PENDING (zeroes) for a fresh header — 12 bytes
-        assert_eq!(
-            &bytes[24..36],
-            &[0u8; 12],
-            "last_checkpoint_ts Ts-LE bytes"
-        );
+        assert_eq!(&bytes[24..36], &[0u8; 12], "last_checkpoint_ts Ts-LE bytes");
 
         // Checksum algorithm = 1 (CRC32C)  →  LE bytes [0x01, 0x00, 0x00, 0x00] at offset 60
         assert_eq!(bytes[60], 0x01, "checksum_algo LSB");

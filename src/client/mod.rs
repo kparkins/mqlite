@@ -37,6 +37,13 @@ mod handle;
 mod inner;
 mod open;
 mod path;
+#[cfg(any(test, feature = "test-hooks"))]
+mod phase0_probe;
+/// Test-only `impl Client` accessors — `__`-prefixed, `#[doc(hidden)]`,
+/// and strictly NOT part of the public API. Isolated here so the
+/// boundary between production code and test scaffolding is obvious.
+#[cfg(any(test, feature = "test-hooks"))]
+mod test_accessors;
 
 #[cfg(test)]
 mod tests;

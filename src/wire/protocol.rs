@@ -706,7 +706,8 @@ mod tests {
         };
         let mut docs_bytes: Vec<u8> = Vec::with_capacity(docs.len() * 128);
         for d in docs.iter() {
-            bson::to_writer(&mut docs_bytes, d).expect("BSON serialisation should not fail in test");
+            bson::to_writer(&mut docs_bytes, d)
+                .expect("BSON serialisation should not fail in test");
         }
         // size field (4) + identifier + docs
         let section_payload_size = 4 + id_bytes.len() + docs_bytes.len();
