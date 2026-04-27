@@ -1,15 +1,14 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use bson::Bson;
 
 use super::super::{catalog_ops, PagedEngine};
 use super::apply_parsed_logical_frames;
 use crate::client::Client;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::journal::log_file::{
     LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire, LOGICAL_TXN_FORMAT_VERSION,
 };
@@ -22,11 +21,12 @@ use crate::mvcc::{VersionEntry, VersionState};
 use crate::options::OpenOptions as DbOpenOptions;
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
+use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::catalog::CollectionEntry;
 use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
+use crate::storage::test_support::{ArcIo, MockIo};
 
 const NS: &str = "test.us018b";
 const COMMIT_TS: Ts = Ts {
@@ -38,40 +38,6 @@ const OPEN_FAILURE_COMMIT_TS: Ts = Ts {
     physical_ms: 9_000_000_000_001,
     logical: 0,
 };
-
-#[derive(Default)]
-struct MockIo {
-    pages: StdMutex<HashMap<u32, Vec<u8>>>,
-}
-
-struct ArcIo(Arc<MockIo>);
-
-impl PageSource for ArcIo {
-    fn read_page(&self, page: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-        let pages = self
-            .0
-            .pages
-            .lock()
-            .map_err(|_| Error::Internal("mock io pages mutex poisoned".into()))?;
-        if let Some(data) = pages.get(&page) {
-            let n = buf.len().min(data.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            buf[n..].fill(0);
-        } else {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-
-    fn write_page(&self, page: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-        self.0
-            .pages
-            .lock()
-            .map_err(|_| Error::Internal("mock io pages mutex poisoned".into()))?
-            .insert(page, buf.to_vec());
-        Ok(())
-    }
-}
 
 fn buffered_engine() -> PagedEngine {
     let io = Arc::new(MockIo::default());

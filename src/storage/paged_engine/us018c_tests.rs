@@ -1,57 +1,20 @@
 use super::*;
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
 use bson::doc;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::index::IndexModel;
 use crate::options::FindOptions;
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
+use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
+use crate::storage::test_support::{ArcIo, MockIo};
 
 const NS: &str = "test.us018c.docs";
 const TAG_INDEX: &str = "tag_1";
-
-#[derive(Default)]
-struct MockIo {
-    pages: StdMutex<HashMap<u32, Vec<u8>>>,
-}
-
-struct ArcIo(Arc<MockIo>);
-
-impl PageSource for ArcIo {
-    fn read_page(&self, page: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-        let pages = self
-            .0
-            .pages
-            .lock()
-            .map_err(|_| Error::Internal("mock io pages mutex poisoned".into()))?;
-        if let Some(data) = pages.get(&page) {
-            let n = buf.len().min(data.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            if n < buf.len() {
-                buf[n..].fill(0);
-            }
-        } else {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-
-    fn write_page(&self, page: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-        self.0
-            .pages
-            .lock()
-            .map_err(|_| Error::Internal("mock io pages mutex poisoned".into()))?
-            .insert(page, buf.to_vec());
-        Ok(())
-    }
-}
 
 fn buffered_engine() -> Result<PagedEngine> {
     let io = Arc::new(MockIo::default());

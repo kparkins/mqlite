@@ -1,42 +1,6 @@
 use super::*;
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSource};
-use std::sync::Mutex as StdMutex;
-
-#[derive(Default)]
-struct MockIo {
-    pages: StdMutex<HashMap<u32, Vec<u8>>>,
-}
-
-impl MockIo {
-    fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-}
-
-struct ArcIo(Arc<MockIo>);
-
-impl PageSource for ArcIo {
-    fn read_page(&self, page_number: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-        let pages = self.0.pages.lock().unwrap();
-        if let Some(data) = pages.get(&page_number) {
-            let len = buf.len().min(data.len());
-            buf[..len].copy_from_slice(&data[..len]);
-            buf[len..].fill(0);
-        } else {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-
-    fn write_page(&self, page_number: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-        self.0
-            .pages
-            .lock()
-            .unwrap()
-            .insert(page_number, buf.to_vec());
-        Ok(())
-    }
-}
+use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::test_support::{ArcIo, MockIo};
 
 fn handle_with_header(header: FileHeader) -> BufferPoolHandle {
     let io = MockIo::new();

@@ -690,40 +690,12 @@ mod tests {
     use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize};
     use crate::storage::handle::BufferPoolHandle;
     use crate::storage::header::FileHeader;
+    use crate::storage::test_support::{ArcIo, MockIo};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex as StdMutex};
 
     fn fresh_allocator() -> AllocatorHandle {
         AllocatorHandle::new(FileHeader::new(0, 0, 0))
-    }
-
-    /// Minimal in-memory `PageSource` for constructing a journal-less
-    /// `BufferPoolHandle` in unit tests.
-    #[derive(Default)]
-    struct MockIo {
-        pages: StdMutex<HashMap<u32, Vec<u8>>>,
-    }
-
-    struct ArcIo(Arc<MockIo>);
-
-    impl PageSource for ArcIo {
-        fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-            let pages = self.0.pages.lock().unwrap();
-            if let Some(data) = pages.get(&pn) {
-                let copy_len = buf.len().min(data.len());
-                buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                if copy_len < buf.len() {
-                    buf[copy_len..].fill(0);
-                }
-            } else {
-                buf.fill(0);
-            }
-            Ok(())
-        }
-        fn write_page(&self, pn: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-            self.0.pages.lock().unwrap().insert(pn, buf.to_vec());
-            Ok(())
-        }
     }
 
     fn fresh_handle() -> Arc<BufferPoolHandle> {
@@ -1298,33 +1270,9 @@ mod tests {
         let journal = Arc::new(StdMutex::new(mgr));
 
         // Pool wiring (mirrors `fresh_handle` but with a journal
-        // attached via `with_journal`).
-        struct MockIo {
-            pages: StdMutex<HashMap<u32, Vec<u8>>>,
-        }
-        struct ArcIo(Arc<MockIo>);
-        impl PageSource for ArcIo {
-            fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-                let pages = self.0.pages.lock().unwrap();
-                if let Some(data) = pages.get(&pn) {
-                    let n = buf.len().min(data.len());
-                    buf[..n].copy_from_slice(&data[..n]);
-                    if n < buf.len() {
-                        buf[n..].fill(0);
-                    }
-                } else {
-                    buf.fill(0);
-                }
-                Ok(())
-            }
-            fn write_page(&self, pn: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-                self.0.pages.lock().unwrap().insert(pn, buf.to_vec());
-                Ok(())
-            }
-        }
-        let io = Arc::new(MockIo {
-            pages: StdMutex::new(HashMap::new()),
-        });
+        // attached via `with_journal`). Uses the canonical test fixture
+        // imported at the module level.
+        let io = Arc::new(MockIo::default());
         let pool = Arc::new(BufferPool::new(
             default_sizes::DESKTOP,
             Box::new(ArcIo(Arc::clone(&io))),

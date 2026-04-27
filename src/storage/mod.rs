@@ -21,4 +21,6 @@ pub(crate) mod paged_engine;
 pub(crate) mod phase0_probe;
 pub(crate) mod root_snapshot;
 pub(crate) mod secondary_index;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod txn_page_store;

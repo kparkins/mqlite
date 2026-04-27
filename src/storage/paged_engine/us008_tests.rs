@@ -1,19 +1,19 @@
 use std::cell::Cell;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use bson::doc;
 
 use super::state::ReadOpScope;
 use super::visibility::WriteVisibility;
 use super::*;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::index::IndexModel;
 use crate::options::IndexOptions;
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
+use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
+use crate::storage::test_support::{ArcIo, MockIo};
 
 thread_local! {
     static WRITE_VISIBILITY_NEW_CALLS: Cell<u64> = const { Cell::new(0) };
@@ -30,34 +30,6 @@ fn reset_write_visibility_new_calls() {
 
 fn write_visibility_new_calls() -> u64 {
     WRITE_VISIBILITY_NEW_CALLS.with(Cell::get)
-}
-
-#[derive(Default)]
-struct MockIo {
-    pages: StdMutex<HashMap<u32, Vec<u8>>>,
-}
-
-struct ArcIo(Arc<MockIo>);
-
-impl PageSource for ArcIo {
-    fn read_page(&self, page: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-        let pages = self.0.pages.lock().unwrap();
-        if let Some(data) = pages.get(&page) {
-            let n = buf.len().min(data.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            if n < buf.len() {
-                buf[n..].fill(0);
-            }
-        } else {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-
-    fn write_page(&self, page: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-        self.0.pages.lock().unwrap().insert(page, buf.to_vec());
-        Ok(())
-    }
 }
 
 fn buffered_engine() -> PagedEngine {

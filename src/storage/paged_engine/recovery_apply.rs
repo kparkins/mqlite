@@ -96,7 +96,7 @@ fn apply_parsed_logical_frames_locked(
     //      make the logical+chain pair CRUD authority without requiring the
     //      legacy frame. Torn or CRC-invalid logical tails are rejected before
     //      this hand-off (`pass1_torn_logical_frame_halts_scan_at_offset`).
-    for (_offset, frame) in &parsed.frames {
+    for (_, frame) in &parsed.frames {
         for op in &frame.ops {
             replay_logical_op(shared, catalog, frame, op)?;
         }
@@ -284,7 +284,7 @@ fn estimate_recovery_replay_pool_usage(
     parsed: &ParsedLogicalFrames,
 ) -> Result<RecoveryReplayPoolEstimate> {
     let mut leaf_pages = BTreeSet::new();
-    for (_offset, frame) in &parsed.frames {
+    for (_, frame) in &parsed.frames {
         for op in &frame.ops {
             match &op.kind {
                 LogicalOpKind::PrimaryInsert { ns_id, key, .. }

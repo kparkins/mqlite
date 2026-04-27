@@ -1,8 +1,7 @@
 use super::*;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
 use bson::{doc, Bson, Document};
 
@@ -10,42 +9,15 @@ use crate::keys::{encode_compound_key, encode_key};
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
+use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedIndex};
+use crate::storage::test_support::{ArcIo, MockIo};
 
 const NS: &str = "test.us007";
 const EMAIL_INDEX: &str = "email_1";
 const TXN_ID: u64 = 7_007;
-
-#[derive(Default)]
-struct MockIo {
-    pages: StdMutex<HashMap<u32, Vec<u8>>>,
-}
-
-struct ArcIo(Arc<MockIo>);
-
-impl PageSource for ArcIo {
-    fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-        let pages = self.0.pages.lock().unwrap();
-        if let Some(data) = pages.get(&pn) {
-            let n = buf.len().min(data.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            if n < buf.len() {
-                buf[n..].fill(0);
-            }
-        } else {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-
-    fn write_page(&self, pn: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-        self.0.pages.lock().unwrap().insert(pn, buf.to_vec());
-        Ok(())
-    }
-}
 
 fn buffered_engine() -> PagedEngine {
     let io = Arc::new(MockIo::default());

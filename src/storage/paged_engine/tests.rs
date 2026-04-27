@@ -170,38 +170,9 @@ fn find_one_and_delete_returns_doc() {
 // an in-memory mock I/O layer so they remain hermetic and fast.
 // -----------------------------------------------------------------------
 
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
+use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::header::FileHeader;
-use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
-
-/// Minimal in-memory `PageSource` for buffered-mode engine tests.
-#[derive(Default)]
-struct MockIo {
-    pages: StdMutex<HashMap<u32, Vec<u8>>>,
-}
-
-struct ArcIo(Arc<MockIo>);
-
-impl PageSource for ArcIo {
-    fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-        let pages = self.0.pages.lock().unwrap();
-        if let Some(data) = pages.get(&pn) {
-            let n = buf.len().min(data.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            if n < buf.len() {
-                buf[n..].fill(0);
-            }
-        } else {
-            buf.fill(0);
-        }
-        Ok(())
-    }
-    fn write_page(&self, pn: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-        self.0.pages.lock().unwrap().insert(pn, buf.to_vec());
-        Ok(())
-    }
-}
+use crate::storage::test_support::{ArcIo, MockIo};
 
 /// Create a buffered `PagedEngine` backed by an in-memory `MockIo`.
 ///

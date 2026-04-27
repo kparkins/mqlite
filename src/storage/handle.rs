@@ -577,47 +577,7 @@ mod tests {
     use super::*;
     use crate::storage::buffer_pool::default_sizes;
     use crate::storage::header::FileHeader;
-    use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
-
-    // -----------------------------------------------------------------------
-    // Mock I/O
-    // -----------------------------------------------------------------------
-
-    /// Minimal in-memory `PageSource` used to back the `BufferPool` in tests.
-    #[derive(Default)]
-    struct MockIo {
-        pages: StdMutex<HashMap<u32, Vec<u8>>>,
-    }
-
-    impl MockIo {
-        fn new() -> Arc<Self> {
-            Arc::new(Self::default())
-        }
-    }
-
-    struct ArcIo(Arc<MockIo>);
-
-    impl PageSource for ArcIo {
-        fn read_page(&self, pn: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-            let pages = self.0.pages.lock().unwrap();
-            if let Some(data) = pages.get(&pn) {
-                let copy_len = buf.len().min(data.len());
-                buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                if copy_len < buf.len() {
-                    buf[copy_len..].fill(0);
-                }
-            } else {
-                buf.fill(0);
-            }
-            Ok(())
-        }
-
-        fn write_page(&self, pn: u32, _size: PageSize, buf: &[u8]) -> Result<()> {
-            self.0.pages.lock().unwrap().insert(pn, buf.to_vec());
-            Ok(())
-        }
-    }
+    use crate::storage::test_support::{ArcIo, MockIo};
 
     fn make_handle() -> (Arc<MockIo>, BufferPoolHandle) {
         let io = MockIo::new();
