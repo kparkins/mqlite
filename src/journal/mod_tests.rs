@@ -14,7 +14,7 @@ mod tests {
     use super::super::*;
     use crate::storage::header::FileHeader;
     use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
@@ -176,7 +176,7 @@ mod tests {
 
         let (_dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
-        let mut header = make_header();
+        let header = make_header();
 
         let page_data = make_page_4k(0x7E);
         let cursor_before_logical;
@@ -350,6 +350,71 @@ mod tests {
 
         assert_eq!(mgr.write_cursor(), cursor_before);
         assert_eq!(mgr.index().occupied_count(), index_before);
+    }
+
+    #[test]
+    fn logical_txn_encode_rejects_oversize_inline_fields() {
+        use crate::error::Error;
+        use crate::journal::log_file::{
+            LogicalOp, LogicalOpKind, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
+            LOGICAL_TXN_MAX_KEY_BYTES,
+        };
+        use crate::mvcc::timestamp::Ts;
+
+        let frame = LogicalTxnFrame {
+            salt1: 1,
+            salt2: 2,
+            commit_ts: Ts {
+                physical_ms: 1,
+                logical: 0,
+            },
+            diagnostic_txn_id: 0,
+            format_version: LOGICAL_TXN_FORMAT_VERSION,
+            flags: 0,
+            ops: vec![LogicalOp {
+                op_ordinal: 0,
+                kind: LogicalOpKind::PrimaryDelete {
+                    ns_id: 1,
+                    key: vec![0u8; LOGICAL_TXN_MAX_KEY_BYTES + 1],
+                },
+            }],
+        };
+
+        let err = frame
+            .encode()
+            .expect_err("oversize key must be rejected before encoding");
+        assert!(
+            matches!(err, Error::JournalFrameTooLarge { .. }),
+            "expected JournalFrameTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn chain_commit_decode_bounds_page_write_count_before_allocation() {
+        use crate::journal::log_file::ChainCommitFrame;
+        use crate::mvcc::timestamp::Ts;
+
+        let frame = ChainCommitFrame {
+            salt1: 1,
+            salt2: 2,
+            commit_ts: Ts {
+                physical_ms: 1,
+                logical: 0,
+            },
+            refcount_deltas: vec![],
+            page_writes: vec![],
+        };
+        let mut bytes = frame.encode().unwrap();
+        bytes[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        let checksum_at = bytes.len() - 4;
+        let checksum = crc32c::crc32c(&bytes[..checksum_at]);
+        bytes[checksum_at..].copy_from_slice(&checksum.to_le_bytes());
+
+        let decoded = ChainCommitFrame::decode(&bytes, 1, 2).unwrap();
+        assert!(
+            decoded.is_none(),
+            "untrusted page_write_count must be rejected before allocation"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1176,7 +1241,7 @@ mod tests {
         // The §3.8(b) sweep MUST log a warning. Observable proof: counter
         // ticks at least once for the orphan frame.
         assert!(
-            logical_txn_pass1_orphan_logical_dropped_snapshot() >= before + 1,
+            logical_txn_pass1_orphan_logical_dropped_snapshot() > before,
             "§3.8(b) sweep must record at least one orphan-logical drop \
              (warning observable via counter)"
         );
@@ -1232,7 +1297,7 @@ mod tests {
         // ticks for the unmatched ChainCommit (at least 1, since a pristine
         // fresh-DB open may also contribute a no-op recovery pass).
         assert!(
-            logical_txn_pass1_unmatched_chain_commit_snapshot() >= before + 1,
+            logical_txn_pass1_unmatched_chain_commit_snapshot() > before,
             "case (c) tolerance must record at least one unmatched-ChainCommit \
              (warning observable via counter)"
         );
@@ -1335,7 +1400,7 @@ mod tests {
             "surviving frame must be the post-boundary one"
         );
         assert!(
-            logical_txn_pass1_pre_boundary_dropped_snapshot() >= before + 1,
+            logical_txn_pass1_pre_boundary_dropped_snapshot() > before,
             "§3.11 pre-boundary cull must tick the counter at least once"
         );
         drop(mgr2);
@@ -2473,6 +2538,72 @@ mod tests {
         drop(dir);
     }
 
+    const PASS2_LIVE_NS_ID: i64 = 1;
+    const PASS2_ABSENT_NS_ID: i64 = 999;
+    const PASS2_RESOLVED_TS: Ts = Ts {
+        physical_ms: 1_000,
+        logical: 0,
+    };
+    const PASS2_UNRESOLVED_TS: Ts = Ts {
+        physical_ms: 2_000,
+        logical: 0,
+    };
+
+    fn setup_pass2_live_catalog(db_path: &Path) {
+        use crate::{Client, OpenOptions as DbOpts};
+
+        let client = Client::open_with_options(db_path, DbOpts::new()).expect("open client");
+        client
+            .database("us024_db")
+            .create_collection("c_resolved")
+            .expect("create resolved");
+        client.close().expect("checkpoint setup catalog");
+    }
+
+    fn append_pass2_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
+        use crate::journal::log_file::{
+            LogicalOp, LogicalOpKind, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
+        };
+        use crate::storage::header::HEADER_PAGE_SIZE;
+
+        let mut main_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(db_path)
+            .expect("open main file");
+        let header = {
+            let mut buf = [0u8; HEADER_PAGE_SIZE];
+            main_file.seek(SeekFrom::Start(0)).expect("seek header");
+            main_file.read_exact(&mut buf).expect("read header");
+            FileHeader::from_bytes(&buf).expect("decode header")
+        };
+        let mut mgr = JournalManager::open_or_create(db_path, &header, &mut main_file)
+            .expect("open journal manager");
+        let (salt1, salt2) = mgr.salts();
+        let frame = LogicalTxnFrame {
+            salt1,
+            salt2,
+            commit_ts,
+            diagnostic_txn_id: ns_id as u64,
+            format_version: LOGICAL_TXN_FORMAT_VERSION,
+            flags: 0,
+            ops: vec![LogicalOp {
+                op_ordinal: 0,
+                kind: LogicalOpKind::PrimaryInsert {
+                    ns_id,
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    overflow: None,
+                },
+            }],
+        };
+
+        mgr.append_logical_txn(frame).expect("append logical");
+        mgr.append_chain_commit(commit_ts, vec![], vec![])
+            .expect("append chain commit");
+        mgr.sync_journal().expect("sync journal");
+    }
+
     /// §7 / US-024 AC#4 — `pass2_resolved_ops_total` and
     /// `pass2_unresolved_ops_total` split correctly on a known
     /// workload. Drives both paths through the actual Pass 2 code
@@ -2501,33 +2632,15 @@ mod tests {
             record_logical_txn_pass2_unresolved_op,
         );
 
-        // Drive Pass 2 through the real engine open path. The workload
-        // produces one LogicalTxn whose ns_id IS in the live catalog
-        // post-reopen (resolvable) and one whose ns_id IS NOT
-        // (unresolvable, because the collection was dropped post-insert).
+        // Drive Pass 2 through the real engine open path. The setup checkpoints
+        // a live catalog, then appends one durable uncheckpointed logical frame
+        // whose ns_id is still live and one whose ns_id is absent.
         use crate::{Client, OpenOptions as DbOpts};
-        use bson::doc;
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("us024.mqlite");
-        {
-            let client = Client::open_with_options(&db_path, DbOpts::new()).expect("open client");
-            let db = client.database("us024_db");
-            db.create_collection("c_resolved").expect("create resolved");
-            db.collection::<bson::Document>("c_resolved")
-                .insert_one(&doc! { "_id": 1i32 })
-                .expect("insert resolved");
-            db.create_collection("c_unresolved")
-                .expect("create unresolved");
-            db.collection::<bson::Document>("c_unresolved")
-                .insert_one(&doc! { "_id": 2i32 })
-                .expect("insert unresolved");
-            // Drop the second collection. Its LogicalTxn frame (with
-            // the original ns_id) remains on disk; the catalog no
-            // longer maps that id; on reopen Pass 2 will tick the
-            // unresolved counter.
-            db.drop_collection("c_unresolved").expect("drop unresolved");
-            std::mem::forget(client);
-        }
+        setup_pass2_live_catalog(&db_path);
+        append_pass2_logical_insert(&db_path, PASS2_LIVE_NS_ID, PASS2_RESOLVED_TS);
+        append_pass2_logical_insert(&db_path, PASS2_ABSENT_NS_ID, PASS2_UNRESOLVED_TS);
         // Do NOT call reset_* here: other tests in the suite touch the
         // SAME crate-global counters concurrently, and a stale reset
         // from a parallel test could land between our pre snapshot and
@@ -2548,7 +2661,7 @@ mod tests {
         assert!(
             post_unresolved > pre_unresolved,
             "unresolved counter must increment for the LogicalTxn whose \
-             ns_id was DROPPED before reopen (pre={pre_unresolved}, \
+             ns_id is absent from the catalog (pre={pre_unresolved}, \
              post={post_unresolved})"
         );
     }

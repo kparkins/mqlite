@@ -1,8 +1,8 @@
-//! Published read-side state: `ReadEpoch` and `PublishedCatalog`.
+//! Published read-side state: `PublishedEpoch` and `PublishedCatalog`.
 //!
-//! Readers load a single `Arc<ReadEpoch>` atomically via `ArcSwap::load()`
-//! and observe both `visible_ts` (used to open a `ReadView`) and `catalog`
-//! (used to resolve namespace + index roots) through the same guard.
+//! Readers load a single `Arc<PublishedEpoch>` atomically via
+//! `ArcSwap::load()` and observe visibility metadata plus the catalog
+//! through the same guard.
 //! Writers publish a new epoch on commit by `ArcSwap::store()`.
 //!
 //! See `docs/STORAGE-UPGRADE-PHASE-01-READ-EPOCH.md` §3.1 and §10.1 for the
@@ -108,10 +108,12 @@ impl PublishedCatalog {
 }
 
 /// Atomically published read epoch. The outer object is what `ArcSwap`
-/// swaps; both fields must be observed through a single guard.
-pub(crate) struct ReadEpoch {
+/// swaps; all fields must be observed through a single guard.
+pub(crate) struct PublishedEpoch {
     pub visible_ts: Ts,
     pub catalog: Arc<PublishedCatalog>,
+    pub catalog_generation: u64,
+    pub sequencer_frontier: Ts,
 }
 
 #[cfg(test)]

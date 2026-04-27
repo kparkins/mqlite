@@ -1,14 +1,17 @@
 #![doc = "Integration test requiring the test-hooks feature."]
 #![cfg(feature = "test-hooks")]
 
-//! US-007 — Crash-cut matrix for the current two-stage commit envelope.
+//! US-021 — Phase 3 crash-cut matrix rebaseline.
 //!
-//! Covers all 6 cuts listed in
-//! docs/STORAGE-UPGRADE-PHASE-00-BASELINE-HARDENING.md §4.2 with one
-//! invariant-class predicate and one HEAD-ORDERING-class predicate per cut.
-//! The workload uses the hidden Phase 0 probe to stop inside the real write
-//! envelope at each named cut point rather than approximating cuts via a
-//! shared journal-tail truncation.
+//! Covers the post-Phase-3 cut set from
+//! docs/STORAGE-UPGRADE-PHASE-03-ORDERED-LIVE-DELTAS.md §12.5:
+//! cuts 0a, 0b, 1, 2, 2b, 3, 4, and 6. Each active test is an
+//! invariant-class predicate: preceding committed writes remain visible, and
+//! the cut write is visible after reopen only once the logical frame and
+//! ChainCommit are both durable.
+//!
+//! Pre-Phase-3 HEAD-ORDERING tests are retained below with the required
+//! ignore tag so the old ordering assertions do not silently drift.
 
 #[path = "crash_harness.rs"]
 mod crash_harness;
@@ -30,55 +33,144 @@ fn with_test_lock<R>(f: impl FnOnce() -> R) -> R {
 
 #[derive(Debug, Clone, Copy)]
 struct CrashCut {
-    cut_id: u8,
+    cut_id: &'static str,
     source_range: &'static str,
     probe_cut: Phase0ProbeCut,
     chain_commit_expected: bool,
-    commit_txn_expected: bool,
+    legacy_commit_expected: bool,
+    cut_commit_visible_expected: bool,
+    truncate_unflushed_journal_tail: bool,
 }
 
-const CUTS: [CrashCut; 6] = [
+const REBASELINE_CUTS: [CrashCut; 8] = [
     CrashCut {
-        cut_id: 1,
-        source_range: "src/storage/paged_engine.rs:437-443",
+        cut_id: "0a",
+        source_range: "§10.16 S5→S6",
+        probe_cut: Phase0ProbeCut::AfterLogicalFrameBeforeAppend,
+        chain_commit_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "0b",
+        source_range: "§10.16 S6→S7",
+        probe_cut: Phase0ProbeCut::AfterLogicalAppendBeforeChainCommit,
+        chain_commit_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "1",
+        source_range: "§10.16 S3→S4",
+        probe_cut: Phase0ProbeCut::AfterStageBeforeCommitTs,
+        chain_commit_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "2",
+        source_range: "§10.16 S4→S5",
+        probe_cut: Phase0ProbeCut::AfterCommitTsBeforeLogicalFrame,
+        chain_commit_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "2b",
+        source_range: "§10.16 S7→S8",
+        probe_cut: Phase0ProbeCut::AfterChainCommitBeforeSecondaryInstall,
+        chain_commit_expected: true,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: true,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "3",
+        source_range: "§10.16 S9→S10",
+        probe_cut: Phase0ProbeCut::AfterPrimaryInstallBeforeOverlayCommit,
+        chain_commit_expected: true,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: true,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "4",
+        source_range: "§10.16 S10→S11",
+        probe_cut: Phase0ProbeCut::AfterOverlayCommitBeforeFlush,
+        chain_commit_expected: true,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: true,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "6",
+        source_range: "§10.16 S11→S12",
+        probe_cut: Phase0ProbeCut::AfterStructuralFlushBeforePublish,
+        chain_commit_expected: true,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: true,
+        truncate_unflushed_journal_tail: false,
+    },
+];
+
+const RETIRED_HEAD_ORDERING_CUTS: [CrashCut; 6] = [
+    CrashCut {
+        cut_id: "1",
+        source_range: "pre-Phase-3 paged_engine.rs:437-443",
         probe_cut: Phase0ProbeCut::AfterAllocateCommitTs,
         chain_commit_expected: false,
-        commit_txn_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: 2,
-        source_range: "src/storage/paged_engine.rs:445-455",
+        cut_id: "2",
+        source_range: "pre-Phase-3 paged_engine.rs:445-455",
         probe_cut: Phase0ProbeCut::AfterInstallPendingPrimary,
         chain_commit_expected: false,
-        commit_txn_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: 3,
-        source_range: "src/storage/paged_engine.rs:463-464",
+        cut_id: "3",
+        source_range: "pre-Phase-3 paged_engine.rs:463-464",
         probe_cut: Phase0ProbeCut::AfterOverlayCommit,
         chain_commit_expected: false,
-        commit_txn_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: true,
     },
     CrashCut {
-        cut_id: 4,
-        source_range: "src/storage/paged_engine.rs:469-469",
+        cut_id: "4",
+        source_range: "pre-Phase-3 paged_engine.rs:469-469",
         probe_cut: Phase0ProbeCut::AfterFlushBeforeChainCommit,
         chain_commit_expected: false,
-        commit_txn_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: 5,
-        source_range: "src/storage/paged_engine.rs:470-471",
+        cut_id: "5",
+        source_range: "pre-Phase-3 paged_engine.rs:470-471",
         probe_cut: Phase0ProbeCut::AfterChainCommitBeforeCommitTxn,
         chain_commit_expected: true,
-        commit_txn_expected: false,
+        legacy_commit_expected: false,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: 6,
-        source_range: "src/storage/paged_engine.rs:491-502",
+        cut_id: "6",
+        source_range: "pre-Phase-3 paged_engine.rs:491-502",
         probe_cut: Phase0ProbeCut::AfterCommitTxnBeforePublish,
         chain_commit_expected: true,
-        commit_txn_expected: true,
+        legacy_commit_expected: true,
+        cut_commit_visible_expected: true,
+        truncate_unflushed_journal_tail: false,
     },
 ];
 
@@ -124,9 +216,9 @@ fn build_workload(cut: &CrashCut) -> (tempfile::TempDir, std::path::PathBuf, Pha
         (report, pre_probe_journal_len)
     };
 
-    if cut.probe_cut == Phase0ProbeCut::AfterOverlayCommit {
+    if cut.truncate_unflushed_journal_tail {
         crash_harness::truncate_journal_to_offset(&db_path, pre_probe_journal_len)
-            .expect("truncate unflushed cut-3 journal tail");
+            .expect("truncate unflushed journal tail");
     }
 
     (dir, db_path, report)
@@ -147,9 +239,10 @@ fn assert_preceding_visible(cut: CrashCut, ids: &BTreeSet<i32>) {
     for id in preceding_ids() {
         assert!(
             ids.contains(&id),
-            "cut {} invariant failed: preceding committed write _id={} \
+            "cut {} ({}) invariant failed: preceding committed write _id={} \
              must remain durable",
             cut.cut_id,
+            cut.source_range,
             id
         );
     }
@@ -158,8 +251,9 @@ fn assert_preceding_visible(cut: CrashCut, ids: &BTreeSet<i32>) {
 fn assert_cut_absent(cut: CrashCut, ids: &BTreeSet<i32>) {
     assert!(
         !ids.contains(&CUT_COMMIT_ID),
-        "cut {} invariant failed: cut commit _id={} must not be visible",
+        "cut {} ({}) invariant failed: cut commit _id={} must not be visible",
         cut.cut_id,
+        cut.source_range,
         CUT_COMMIT_ID
     );
 }
@@ -167,9 +261,10 @@ fn assert_cut_absent(cut: CrashCut, ids: &BTreeSet<i32>) {
 fn assert_cut_visible(cut: CrashCut, ids: &BTreeSet<i32>) {
     assert!(
         ids.contains(&CUT_COMMIT_ID),
-        "cut {} invariant failed: commit_txn completed before the cut, so \
-         cut commit _id={} must be visible after reopen",
+        "cut {} ({}) invariant failed: durable logical+ChainCommit evidence \
+         must make cut commit _id={} visible after reopen",
         cut.cut_id,
+        cut.source_range,
         CUT_COMMIT_ID
     );
 }
@@ -187,7 +282,7 @@ fn assert_frame_presence(cut: CrashCut, db_path: &std::path::Path, report: &Phas
 
     let legacy_commit_frames =
         crash_harness::scan_legacy_commit_frames(db_path).expect("scan legacy commit frames");
-    let expected_legacy_commits = BASELINE_LEGACY_COMMITS + usize::from(cut.commit_txn_expected);
+    let expected_legacy_commits = BASELINE_LEGACY_COMMITS + usize::from(cut.legacy_commit_expected);
     assert_eq!(
         legacy_commit_frames.len(),
         expected_legacy_commits,
@@ -225,7 +320,7 @@ fn run_invariant(cut: CrashCut) {
         let (client, _recovery) = crash_harness::reopen_inspect(&db_path).expect("reopen");
         let ids = visible_ids_after_reopen(&client);
         assert_preceding_visible(cut, &ids);
-        if cut.commit_txn_expected {
+        if cut.cut_commit_visible_expected {
             assert_cut_visible(cut, &ids);
         } else {
             assert_cut_absent(cut, &ids);
@@ -238,69 +333,84 @@ fn run_head_ordering(cut: CrashCut) {
         let (_dir, db_path, report) = build_workload(&cut);
         assert_frame_presence(cut, &db_path, &report);
         assert_recovered_floor(cut, &db_path, &report);
-        let _ = cut.source_range;
     });
 }
 
 #[test]
-fn cut1_invariant_reopen_preserves_committed_writes_no_damage() {
-    run_invariant(CUTS[0]);
+fn cut0a_invariant_logical_frame_not_durable_reopens_without_cut_write() {
+    run_invariant(REBASELINE_CUTS[0]);
 }
 
 #[test]
+fn cut0b_invariant_orphan_logical_frame_reopens_without_cut_write() {
+    run_invariant(REBASELINE_CUTS[1]);
+}
+
+#[test]
+fn cut1_invariant_staged_body_without_commit_ts_reopens_without_cut_write() {
+    run_invariant(REBASELINE_CUTS[2]);
+}
+
+#[test]
+fn cut2_invariant_allocated_ts_without_logical_frame_reopens_without_cut_write() {
+    run_invariant(REBASELINE_CUTS[3]);
+}
+
+#[test]
+fn cut2b_invariant_durable_commit_replays_from_logical_frame() {
+    run_invariant(REBASELINE_CUTS[4]);
+}
+
+#[test]
+fn cut3_invariant_post_primary_install_replays_from_logical_frame() {
+    run_invariant(REBASELINE_CUTS[5]);
+}
+
+#[test]
+fn cut4_invariant_post_overlay_commit_replays_from_logical_frame() {
+    run_invariant(REBASELINE_CUTS[6]);
+}
+
+#[test]
+fn cut6_invariant_pre_publish_durable_commit_replays_from_logical_frame() {
+    run_invariant(REBASELINE_CUTS[7]);
+}
+
+#[test]
+#[ignore = "HEAD-ORDERING class retired at Phase 3 exit"]
 fn cut1_head_ordering_no_chain_commit_for_allocated_only() {
-    run_head_ordering(CUTS[0]);
+    run_head_ordering(RETIRED_HEAD_ORDERING_CUTS[0]);
 }
 
 #[test]
-fn cut2_invariant_rollback_leaves_no_durable_damage() {
-    run_invariant(CUTS[1]);
-}
-
-#[test]
+#[ignore = "HEAD-ORDERING class retired at Phase 3 exit"]
 fn cut2_head_ordering_no_chain_commit_and_pre_commit_main_file() {
-    run_head_ordering(CUTS[1]);
+    run_head_ordering(RETIRED_HEAD_ORDERING_CUTS[1]);
 }
 
 #[test]
-fn cut3_invariant_rollback_leaves_no_durable_damage() {
-    run_invariant(CUTS[2]);
-}
-
-#[test]
+#[ignore = "HEAD-ORDERING class retired at Phase 3 exit"]
 fn cut3_head_ordering_journal_tail_discarded_on_reopen() {
-    run_head_ordering(CUTS[2]);
+    run_head_ordering(RETIRED_HEAD_ORDERING_CUTS[2]);
 }
 
 #[test]
-fn cut4_invariant_rollback_leaves_no_durable_damage() {
-    run_invariant(CUTS[3]);
-}
-
-#[test]
+#[ignore = "HEAD-ORDERING class retired at Phase 3 exit"]
 fn cut4_head_ordering_no_chain_commit_frame_and_hlc_excludes_cut_ts() {
-    run_head_ordering(CUTS[3]);
+    run_head_ordering(RETIRED_HEAD_ORDERING_CUTS[3]);
 }
 
 #[test]
-fn cut5_invariant_rollback_leaves_no_durable_damage() {
-    run_invariant(CUTS[4]);
-}
-
-#[test]
+#[ignore = "HEAD-ORDERING class retired at Phase 3 exit"]
 fn cut5_head_ordering_chain_commit_present_hlc_includes_cut_ts() {
-    run_head_ordering(CUTS[4]);
+    run_head_ordering(RETIRED_HEAD_ORDERING_CUTS[4]);
 }
 
 #[test]
-fn cut6_invariant_reopen_preserves_committed_writes() {
-    run_invariant(CUTS[5]);
-}
-
-#[test]
+#[ignore = "HEAD-ORDERING class retired at Phase 3 exit"]
 fn cut6_head_ordering_legacy_commit_present_and_publish_runs_on_reopen() {
     with_test_lock(|| {
-        let cut = CUTS[5];
+        let cut = RETIRED_HEAD_ORDERING_CUTS[5];
         let (_dir, db_path, report) = build_workload(&cut);
         assert_frame_presence(cut, &db_path, &report);
 
@@ -318,9 +428,6 @@ fn cut6_head_ordering_legacy_commit_present_and_publish_runs_on_reopen() {
         assert_cut_visible(cut, &ids);
 
         mqlite::mvcc::metrics::reset_published_snapshot_rebuilds();
-        // Phase 1 US-006: only publications that REBUILD the catalog Arc
-        // tick this counter (root-neutral CRUD reuses the Arc). Drive a
-        // DDL so the post-reopen publish path is guaranteed to rebuild.
         client
             .database(DB_NAME)
             .create_collection("post_reopen_ddl_probe")
@@ -333,6 +440,5 @@ fn cut6_head_ordering_legacy_commit_present_and_publish_runs_on_reopen() {
             cut.cut_id,
             rebuilds
         );
-        let _ = cut.source_range;
     });
 }

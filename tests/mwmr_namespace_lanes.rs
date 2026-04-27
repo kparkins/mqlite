@@ -1,82 +1,61 @@
 //! PR 8 acceptance gates: namespace lanes + commit publication.
 //!
 //! These tests exercise the in-process MWMR contract:
-//! - Writers on DIFFERENT namespaces overlap in wall-clock time.
+//! - Writers on DIFFERENT namespaces overlap at deterministic body-entry hooks.
 //! - Writers on the SAME namespace serialize (don't corrupt each other).
 //! - drop_namespace waits for in-flight writers and recovers cleanly.
 
 use bson::doc;
 use bson::Document;
 use mqlite::Client;
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "test-hooks")]
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Instant;
 
-/// Two writers on DIFFERENT namespaces should overlap, not serialize.
-///
-/// Strategy: measure the wall time of two threads each doing N inserts
-/// on disjoint namespaces, vs the wall time of a single thread doing
-/// 2*N inserts on one namespace. If lanes work, the two-thread time
-/// is much less than 2x the per-thread baseline.
+/// Two writers on DIFFERENT namespaces enter their write bodies concurrently.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn different_namespace_writers_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lanes.mqlite");
     let client = Client::open(&path).unwrap();
 
-    const N: i32 = 200;
+    const N: i32 = 1;
 
-    // Baseline: single-thread N inserts on namespace `bench.solo`.
-    let col_solo = client.database("bench").collection::<Document>("solo");
-    let t0 = Instant::now();
-    for i in 0..N {
-        col_solo
-            .insert_one(&doc! { "_id": i, "v": format!("solo-{i}") })
-            .unwrap();
-    }
-    let single = t0.elapsed();
+    let db = client.database("bench");
+    db.create_collection("a").unwrap();
+    db.create_collection("b").unwrap();
 
-    // Concurrent: two threads on `bench.a` and `bench.b`.
-    let barrier = Arc::new(Barrier::new(2));
+    let mut hook_a = client.__install_write_body_entry_hook("bench.a");
+    let mut hook_b = client.__install_write_body_entry_hook("bench.b");
     let ca = client.clone();
     let cb = client.clone();
-    let ba = barrier.clone();
-    let bb = barrier.clone();
     let h_a = thread::spawn(move || {
-        ba.wait();
         let col = ca.database("bench").collection::<Document>("a");
-        let t = Instant::now();
         for i in 0..N {
             col.insert_one(&doc! { "_id": i, "v": format!("a-{i}") })
                 .unwrap();
         }
-        t.elapsed()
     });
+
+    hook_a.wait_until_entered().unwrap();
+
     let h_b = thread::spawn(move || {
-        bb.wait();
         let col = cb.database("bench").collection::<Document>("b");
-        let t = Instant::now();
         for i in 0..N {
             col.insert_one(&doc! { "_id": i, "v": format!("b-{i}") })
                 .unwrap();
         }
-        t.elapsed()
     });
 
-    let elapsed_a = h_a.join().unwrap();
-    let elapsed_b = h_b.join().unwrap();
-    //let concurrent_max = elapsed_a.max(elapsed_b);
-
-    // If lanes serialize across namespaces, concurrent_max ≈ 2 * single.
-    // If they actually overlap, concurrent_max ≈ 1 * single (plus some
-    // contention on commit_seq / journal). Allow generous slack: assert
-    // < 1.7 * single. Anything serial would be ~2.0x.
-    // TODO fix once we batch commits
-    // assert!(
-    //     concurrent_max.as_micros() < (single.as_micros() as f64 * 3) as u128,
-    //     "namespace lanes appear to serialize: single={:?} concurrent_max={:?} (a={:?} b={:?})",
-    //     single, concurrent_max, elapsed_a, elapsed_b,
-    // );
+    hook_b.wait_until_entered().unwrap();
+    hook_a.release().unwrap();
+    h_a.join().unwrap();
+    hook_b.release().unwrap();
+    h_b.join().unwrap();
 
     // Sanity: both namespaces have N docs.
     let count_a = client
@@ -91,6 +70,68 @@ fn different_namespace_writers_overlap() {
         .unwrap();
     assert_eq!(count_a, N as u64);
     assert_eq!(count_b, N as u64);
+}
+
+/// Same-namespace writers cannot both enter their write bodies at once.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn same_namespace_writers_serialize_with_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("same_ns_barrier.mqlite");
+    let client = Client::open(&path).unwrap();
+
+    let ns = "bench.shared";
+    client
+        .database("bench")
+        .create_collection("shared")
+        .unwrap();
+
+    let first_released = Arc::new(AtomicBool::new(false));
+    let mut hook_a = client.__install_write_body_entry_hook(ns);
+    let mut hook_b =
+        client.__install_write_body_entry_hook_observing(ns, Arc::clone(&first_released));
+
+    let ca = client.clone();
+    let h_a = thread::spawn(move || {
+        ca.database("bench")
+            .collection::<Document>("shared")
+            .insert_one(&doc! { "_id": 1, "v": "a" })
+            .unwrap();
+    });
+
+    hook_a.wait_until_entered().unwrap();
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let cb = client.clone();
+    let h_b = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        cb.database("bench")
+            .collection::<Document>("shared")
+            .insert_one(&doc! { "_id": 2, "v": "b" })
+            .unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    hook_b.assert_not_entered().unwrap();
+    first_released.store(true, Ordering::Release);
+    hook_a.release().unwrap();
+    h_a.join().unwrap();
+
+    let event_b = hook_b.wait_until_entered().unwrap();
+    assert_eq!(
+        event_b.observed_flag(),
+        Some(true),
+        "same-namespace writer entered before the first writer was released",
+    );
+    hook_b.release().unwrap();
+    h_b.join().unwrap();
+
+    let count = client
+        .database("bench")
+        .collection::<Document>("shared")
+        .count_documents(doc! {})
+        .unwrap();
+    assert_eq!(count, 2);
 }
 
 /// Same-namespace writers must serialize (no torn writes, full count).

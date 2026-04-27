@@ -210,7 +210,7 @@ fn chain_commit_total_frame_bytes_bound_min() {
     let frame = ChainCommitFrame {
         salt1: 1,
         salt2: 2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         refcount_deltas: vec![],
         page_writes: vec![],
     };
@@ -392,7 +392,7 @@ fn chain_commit_inflated_delta_count_returns_none() {
     let frame = ChainCommitFrame {
         salt1: 1,
         salt2: 2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         refcount_deltas: vec![],
         page_writes: vec![],
     };
@@ -616,7 +616,7 @@ fn logical_txn_encode_rejects_oversize() {
     let frame = LogicalTxnFrame {
         salt1: 1,
         salt2: 2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -1077,7 +1077,7 @@ fn build_primary_delete_frame_with_bogus_key_len(bogus_key_len: u32) -> Vec<u8> 
     let frame = LogicalTxnFrame {
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -1117,7 +1117,7 @@ fn build_primary_insert_frame_with_bogus_value_len(bogus_value_len: u32) -> Vec<
     let frame = LogicalTxnFrame {
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -1161,7 +1161,7 @@ fn build_one_op_primary_delete_frame() -> (Vec<u8>, LogicalTxnFrame) {
     let frame = LogicalTxnFrame {
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -1222,7 +1222,7 @@ fn build_three_op_primary_delete_frame() -> (Vec<u8>, [usize; 3]) {
     let frame = LogicalTxnFrame {
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -1288,7 +1288,7 @@ fn build_primary_insert_with_overflow_present() -> (Vec<u8>, usize) {
     let frame = LogicalTxnFrame {
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -1400,7 +1400,7 @@ fn build_secondary_insert_frame_with_bogus_id_len(bogus_id_len: u32) -> Vec<u8> 
     let frame = LogicalTxnFrame {
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -1445,7 +1445,7 @@ fn logical_txn_secondary_insert_id_bytes_above_key_cap_round_trips() {
     let frame = LogicalTxnFrame {
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
-        commit_ts: Ts::PENDING,
+        commit_ts: Ts::default(),
         diagnostic_txn_id: 0,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,

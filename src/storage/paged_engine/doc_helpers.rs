@@ -7,8 +7,10 @@ use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
 use crate::keys::encode_key;
+use crate::mvcc::read_view::ReadView;
+use crate::mvcc::{PrimaryOp, PrimaryWrite};
 use crate::query::get_nested_field;
-use crate::storage::btree::{BTree, BTreePageStore, CellValue};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::oid::ObjectIdGenerator;
 
 /// Return current Unix milliseconds.
@@ -64,7 +66,8 @@ pub(in crate::storage::paged_engine) fn validate_index_keys(keys: &Document) -> 
 /// `unique_specs` is a list of `(index_name, fields, sparse)` for each unique index.
 /// If any existing document matches the new doc on all indexed fields, returns
 /// [`Error::DuplicateKey`].
-pub(in crate::storage::paged_engine) fn check_unique_constraints<S: BTreePageStore>(
+#[allow(dead_code)]
+pub(in crate::storage::paged_engine) fn check_unique_constraints_base_only<S: BTreePageStore>(
     tree: &BTree<S>,
     unique_specs: &[(String, Vec<String>, bool)],
     new_doc: &Document,
@@ -122,7 +125,103 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints<S: BTreePageSto
     Ok(())
 }
 
+/// Check unique index constraints against MVCC-visible rows and staged writes.
+///
+/// `unique_specs` is a list of `(index_name, fields, sparse)` for each unique
+/// index. If any visible or same-transaction document matches the new doc on
+/// all indexed fields with a different `_id`, returns [`Error::DuplicateKey`].
+pub(in crate::storage::paged_engine) fn check_unique_constraints_mvcc<S: BTreePageStore>(
+    tree: &BTree<S>,
+    unique_specs: &[(String, Vec<String>, bool)],
+    new_doc: &Document,
+    view: &ReadView,
+    history: Option<&dyn HistoryProbe>,
+    pending: &[PrimaryWrite],
+    ns: &str,
+) -> Result<()> {
+    if unique_specs.is_empty() {
+        return Ok(());
+    }
+
+    let null_encoded = encode_key(&Bson::Null);
+    let new_id = new_doc.get("_id").unwrap_or(&Bson::Null);
+
+    for (idx_name, fields, sparse) in unique_specs {
+        let mut new_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+        new_encoded.extend(
+            fields
+                .iter()
+                .map(|f| encode_key(new_doc.get(f.as_str()).unwrap_or(&Bson::Null))),
+        );
+
+        if *sparse && new_encoded.iter().all(|v| v == &null_encoded) {
+            continue;
+        }
+
+        let pairs = tree.range_scan_mvcc(None, None, view, history)?;
+        let mut existing_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+        for (_, bson_bytes) in pairs {
+            let existing: Document =
+                bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
+            existing_encoded.clear();
+            existing_encoded.extend(
+                fields
+                    .iter()
+                    .map(|f| encode_key(existing.get(f.as_str()).unwrap_or(&Bson::Null))),
+            );
+
+            if new_encoded == existing_encoded
+                && existing.get("_id").unwrap_or(&Bson::Null) != new_id
+            {
+                return Err(Error::DuplicateKey {
+                    detail: format!(
+                        "E11000 duplicate key error — unique index '{}': dup key {{{}}}",
+                        idx_name,
+                        fields
+                            .iter()
+                            .map(|f| format!("{}: {:?}", f, new_doc.get(f.as_str())))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+
+        for staged in pending.iter().filter(|staged| staged.ns.as_str() == ns) {
+            let data = match &staged.op {
+                PrimaryOp::Insert { data } | PrimaryOp::Update { data } => data,
+                PrimaryOp::Delete => continue,
+            };
+            let existing: Document = bson::from_slice(data).map_err(Error::BsonDeserialization)?;
+            existing_encoded.clear();
+            existing_encoded.extend(
+                fields
+                    .iter()
+                    .map(|f| encode_key(existing.get(f.as_str()).unwrap_or(&Bson::Null))),
+            );
+
+            if new_encoded == existing_encoded
+                && existing.get("_id").unwrap_or(&Bson::Null) != new_id
+            {
+                return Err(Error::DuplicateKey {
+                    detail: format!(
+                        "E11000 duplicate key error — unique index '{}': dup key {{{}}}",
+                        idx_name,
+                        fields
+                            .iter()
+                            .map(|f| format!("{}: {:?}", f, new_doc.get(f.as_str())))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a [`CellValue`] from a B+ tree to raw bytes.
+#[allow(dead_code)]
 pub(in crate::storage::paged_engine) fn resolve_cell<S: BTreePageStore>(
     tree: &BTree<S>,
     cv: CellValue,

@@ -1,5 +1,6 @@
 //! Snapshot-based read helpers — mutex-free read path.
 
+use std::ops::Bound;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -13,15 +14,19 @@ use crate::query::eval_filter;
 use crate::query::planner::{
     select_plan, IndexCondition, IndexMeta, PrimaryKeyCondition, ScanPlan,
 };
-use crate::storage::btree::{BTree, BTreePageStore, HistoryProbe};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::IndexState;
 use crate::storage::history_store::HistoryStore;
-use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedIndex};
+use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedEpoch, PublishedIndex};
 
 use super::btree_ops::btree_collscan;
+use super::catalog_ops::rebuild_and_publish_locked;
 use super::doc_helpers::{apply_projection_to_doc, sort_docs};
-use super::index_maint::{index_bounds_free, index_entry_id_free};
+use super::index_maint::{
+    index_bounds_free, index_entry_id_free, materialize_ready_secondary_deltas_for_checkpoint,
+};
+use super::publish::PublishDirty;
 use super::state::SharedState;
 
 type SnapshotPairs = Vec<(Vec<u8>, Document)>;
@@ -29,12 +34,12 @@ type PlannedSnapshotPairs = (ScanPlan, SnapshotPairs);
 
 pub(super) fn open_snapshot_read_view(
     shared: &SharedState,
-    publish_ts: crate::mvcc::timestamp::Ts,
+    epoch: Arc<PublishedEpoch>,
 ) -> Arc<ReadView> {
     let txn_id = shared.txn_counter.fetch_add(1, Ordering::Relaxed);
-    ReadView::open(
+    ReadView::open_for_epoch(
         Arc::clone(shared.handle.read_view_registry()),
-        publish_ts,
+        epoch,
         txn_id,
     )
 }
@@ -72,12 +77,12 @@ pub(super) fn execute_primary_key_lookup_from_snap(
     ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
-    publish_ts: crate::mvcc::timestamp::Ts,
+    epoch: Arc<PublishedEpoch>,
     condition: &PrimaryKeyCondition,
 ) -> Result<SnapshotPairs> {
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
-    let view = open_snapshot_read_view(shared, publish_ts);
+    let view = open_snapshot_read_view(shared, epoch);
     let probe = primary_history_probe(shared, ns);
 
     match condition {
@@ -175,7 +180,7 @@ pub(super) fn execute_index_scan_from_snap(
     ns_snap: &crate::storage::root_snapshot::NamespaceSnapshot,
     ready_indexes: &[&PublishedIndex],
     filter: &Document,
-    publish_ts: crate::mvcc::timestamp::Ts,
+    view: &ReadView,
     index_name: &str,
     primary_field: &str,
     condition: &IndexCondition,
@@ -203,8 +208,13 @@ pub(super) fn execute_index_scan_from_snap(
             }
             let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
             let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
-            for (_, cv) in idx_tree.range_scan(Some(&p), Some(&p_next))? {
-                let id = index_entry_id_free(&handle, cv)?;
+            for (_, cv) in idx_tree.range_scan_mvcc_bounded(
+                Bound::Included(&p),
+                Bound::Excluded(&p_next),
+                view,
+                None,
+            )? {
+                let id = index_entry_id_free(&handle, CellValue::Inline(cv))?;
                 if !matches!(id, Bson::Null) {
                     results.push(id);
                 }
@@ -215,11 +225,13 @@ pub(super) fn execute_index_scan_from_snap(
         let (start, end) = index_bounds_free(condition, ascending);
         let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
         let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
+        let start_bound = start.as_deref().map_or(Bound::Unbounded, Bound::Included);
+        let end_bound = end.as_deref().map_or(Bound::Unbounded, Bound::Included);
         idx_tree
-            .range_scan(start.as_deref(), end.as_deref())?
+            .range_scan_mvcc_bounded(start_bound, end_bound, view, None)?
             .into_iter()
             .filter_map(|(_, cv)| {
-                index_entry_id_free(&handle, cv)
+                index_entry_id_free(&handle, CellValue::Inline(cv))
                     .ok()
                     .filter(|id| !matches!(id, Bson::Null))
             })
@@ -232,12 +244,11 @@ pub(super) fn execute_index_scan_from_snap(
     if !id_bsons.is_empty() {
         let data_store = BufferPoolPageStore::new(Arc::clone(&handle));
         let data_tree = BTree::open(data_store, ns_snap.data_root_page, ns_snap.data_root_level);
-        let view = open_snapshot_read_view(shared, publish_ts);
         let probe = primary_history_probe(shared, ns);
         for id_bson in id_bsons {
             let data_key = encode_key(&id_bson);
             if let Some(pair) =
-                fetch_primary_pair(&data_tree, data_key, filter, &view, Some(&probe))?
+                fetch_primary_pair(&data_tree, data_key, filter, view, Some(&probe))?
             {
                 docs.push(pair);
             }
@@ -251,11 +262,11 @@ pub(super) fn execute_collscan_from_snap(
     ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
-    publish_ts: crate::mvcc::timestamp::Ts,
+    epoch: Arc<PublishedEpoch>,
 ) -> Result<SnapshotPairs> {
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
-    let view = open_snapshot_read_view(shared, publish_ts);
+    let view = open_snapshot_read_view(shared, epoch);
     let probe = primary_history_probe(shared, ns);
     btree_collscan(&tree, filter, &view, Some(&probe))
 }
@@ -265,7 +276,7 @@ pub(super) fn execute_snapshot_pairs_from_snap(
     ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
-    publish_ts: crate::mvcc::timestamp::Ts,
+    epoch: Arc<PublishedEpoch>,
     allow_secondary_indexes: bool,
 ) -> Result<PlannedSnapshotPairs> {
     let ready_indexes: Vec<&PublishedIndex> = if allow_secondary_indexes {
@@ -286,15 +297,7 @@ pub(super) fn execute_snapshot_pairs_from_snap(
         .collect();
 
     let plan = select_plan(filter, &index_metas);
-    let pairs = execute_plan_from_snap(
-        &plan,
-        shared,
-        ns,
-        ns_snap,
-        &ready_indexes,
-        filter,
-        publish_ts,
-    )?;
+    let pairs = execute_plan_from_snap(&plan, shared, ns, ns_snap, &ready_indexes, filter, epoch)?;
     Ok((plan, pairs))
 }
 
@@ -305,7 +308,7 @@ pub(super) fn execute_snapshot_pairs_only(
     ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
-    publish_ts: crate::mvcc::timestamp::Ts,
+    epoch: Arc<PublishedEpoch>,
     allow_secondary_indexes: bool,
 ) -> Result<SnapshotPairs> {
     let (_plan, pairs) = execute_snapshot_pairs_from_snap(
@@ -313,7 +316,7 @@ pub(super) fn execute_snapshot_pairs_only(
         ns,
         ns_snap,
         filter,
-        publish_ts,
+        epoch,
         allow_secondary_indexes,
     )?;
     Ok(pairs)
@@ -326,28 +329,31 @@ fn execute_plan_from_snap(
     ns_snap: &NamespaceSnapshot,
     ready_indexes: &[&PublishedIndex],
     filter: &Document,
-    publish_ts: crate::mvcc::timestamp::Ts,
+    epoch: Arc<PublishedEpoch>,
 ) -> Result<SnapshotPairs> {
     match plan {
         ScanPlan::PrimaryKeyLookup { condition } => {
-            execute_primary_key_lookup_from_snap(shared, ns, ns_snap, filter, publish_ts, condition)
+            execute_primary_key_lookup_from_snap(shared, ns, ns_snap, filter, epoch, condition)
         }
         ScanPlan::IndexScan {
             index_name,
             primary_field,
             condition,
-        } => execute_index_scan_from_snap(
-            shared,
-            ns,
-            ns_snap,
-            ready_indexes,
-            filter,
-            publish_ts,
-            index_name,
-            primary_field,
-            condition,
-        ),
-        ScanPlan::CollScan => execute_collscan_from_snap(shared, ns, ns_snap, filter, publish_ts),
+        } => {
+            let view = open_snapshot_read_view(shared, epoch);
+            execute_index_scan_from_snap(
+                shared,
+                ns,
+                ns_snap,
+                ready_indexes,
+                filter,
+                &view,
+                index_name,
+                primary_field,
+                condition,
+            )
+        }
+        ScanPlan::CollScan => execute_collscan_from_snap(shared, ns, ns_snap, filter, epoch),
     }
 }
 
@@ -360,6 +366,19 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         .metadata
         .write()
         .map_err(|_| crate::error::Error::Internal("metadata RwLock poisoned".into()))?;
+
+    let mut overlay = crate::storage::txn_page_store::TxnOverlay::new();
+    let published_catalog_dirty =
+        materialize_ready_secondary_deltas_for_checkpoint(&engine.shared, &md, &mut overlay)?;
+    let mut base_store = super::catalog_ops::new_store(&engine.shared);
+    overlay.commit(&mut base_store, &engine.shared.handle)?;
+    if published_catalog_dirty {
+        let mut dirty = PublishDirty::default();
+        dirty.mark_published();
+        dirty.mark_header();
+        let publish_ts = engine.shared.oracle.commit()?;
+        rebuild_and_publish_locked(&engine.shared, &md, publish_ts, dirty)?;
+    }
 
     let (root_page, root_level) = {
         let cat = super::catalog_ops::catalog_lock(&md);

@@ -2,6 +2,12 @@ use bson::Document;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::error::{Error, Result};
+use crate::storage::buffer_pool::DELTA_BEARING_FRAMES_WARN_THRESHOLD_DEFAULT;
+
+const DELTA_BEARING_FRAMES_WARN_THRESHOLD_MIN: f64 = 0.0;
+const DELTA_BEARING_FRAMES_WARN_THRESHOLD_MAX: f64 = 1.0;
+
 /// Durability mode controls when data is fsynced to disk.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DurabilityMode {
@@ -67,6 +73,9 @@ pub struct OpenOptions {
     pub(crate) create_if_missing: bool,
     /// Maximum concurrent readers. Default: 64.
     pub(crate) max_readers: u32,
+    /// Warn when delta-bearing frames reach this fraction of configured frames.
+    /// Default: 0.75.
+    pub(crate) delta_bearing_frames_warn_threshold: f64,
 }
 
 impl Default for OpenOptions {
@@ -81,6 +90,7 @@ impl Default for OpenOptions {
             read_only: false,
             create_if_missing: true,
             max_readers: 64,
+            delta_bearing_frames_warn_threshold: DELTA_BEARING_FRAMES_WARN_THRESHOLD_DEFAULT,
         }
     }
 }
@@ -156,6 +166,35 @@ impl OpenOptions {
     pub fn max_readers(mut self, count: u32) -> Self {
         self.max_readers = count;
         self
+    }
+
+    /// Set the warning threshold for delta-bearing buffer-pool frames.
+    ///
+    /// The value must be in `(0.0, 1.0]`; validation runs when the database is
+    /// opened with these options.
+    #[must_use]
+    pub fn delta_bearing_frames_warn_threshold(mut self, threshold: f64) -> Self {
+        self.delta_bearing_frames_warn_threshold = threshold;
+        self
+    }
+
+    /// Validate option values before opening the engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] when an option is outside its supported
+    /// range.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.delta_bearing_frames_warn_threshold <= DELTA_BEARING_FRAMES_WARN_THRESHOLD_MIN
+            || self.delta_bearing_frames_warn_threshold > DELTA_BEARING_FRAMES_WARN_THRESHOLD_MAX
+            || self.delta_bearing_frames_warn_threshold.is_nan()
+        {
+            return Err(Error::InvalidConfig {
+                field: "delta_bearing_frames_warn_threshold",
+                detail: "expected a finite value in (0.0, 1.0]".to_string(),
+            });
+        }
+        Ok(())
     }
 }
 

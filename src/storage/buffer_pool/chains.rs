@@ -1,6 +1,6 @@
-//! MVCC per-frame version-chain helpers on [`BufferPool`].
+//! MVCC per-frame delta-chain helpers on [`BufferPool`].
 //!
-//! The per-key version chains live on the 32 KB leaf partition's frames.
+//! The per-key delta chains live on the 32 KB leaf partition's frames.
 //! This module extends [`BufferPool`] with the take / put / snapshot /
 //! clear / drain helpers the MVCC writer and reader lanes use to manipulate
 //! those chains, plus the [`BufferPool::reconcile`] walk.
@@ -27,7 +27,7 @@ type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
 
 impl BufferPool {
     // -----------------------------------------------------------------------
-    // MVCC version-chain helpers (T3.5)
+    // MVCC delta-chain helpers (T3.5)
     //
     // Chains are stored on the 32 KB partition's frames (leaf pages). The
     // caller is responsible for having pinned the page (via `read_leaf` or
@@ -36,7 +36,7 @@ impl BufferPool {
     // read / write, so the frame has not yet been eligible for eviction.
     // -----------------------------------------------------------------------
 
-    /// Remove and return the version chain for `key` on leaf page `page`.
+    /// Remove and return the delta chain for `key` on leaf page `page`.
     pub(crate) fn take_chain(
         &self,
         page: u32,
@@ -52,10 +52,36 @@ impl BufferPool {
         let frame = guard.frames[idx].as_mut().ok_or_else(|| {
             Error::Internal("page_map invariant: frame must exist at mapped slot".into())
         })?;
-        Ok(frame.version_chains.remove(key))
+        Ok(frame.deltas.remove(key))
     }
 
-    /// Install a version chain for `key` on leaf page `page`.
+    /// Return the delta chain for `key` on leaf page `page`, creating an
+    /// empty caller-owned chain when no resident chain exists yet.
+    pub(crate) fn get_or_create_chain(
+        &self,
+        page: u32,
+        key: &[u8],
+    ) -> Result<Arc<VecDeque<VersionEntry>>> {
+        let guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let idx = guard.page_map.get(&page).copied().ok_or_else(|| {
+            Error::Internal(format!(
+                "buffer pool get_or_create_chain: page {page} is not resident"
+            ))
+        })?;
+        let frame = guard.frames[idx].as_ref().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
+        Ok(frame
+            .deltas
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(VecDeque::new())))
+    }
+
+    /// Install a delta chain for `key` on leaf page `page`.
     pub(crate) fn put_chain(
         &self,
         page: u32,
@@ -74,11 +100,11 @@ impl BufferPool {
         let frame = guard.frames[idx].as_mut().ok_or_else(|| {
             Error::Internal("page_map invariant: frame must exist at mapped slot".into())
         })?;
-        frame.version_chains.insert(key, chain);
+        frame.deltas.insert(key, chain);
         Ok(())
     }
 
-    /// Build a [`ChainSnapshot`] from the per-key MVCC version chains on
+    /// Build a [`ChainSnapshot`] from the per-key MVCC delta chains on
     /// leaf page `page`. Returns `None` if the page is not currently
     /// resident (the caller must have the frame pinned via `pin_page` for
     /// the snapshot to reflect the live chains).
@@ -104,15 +130,15 @@ impl BufferPool {
         let frame = guard.frames[idx].as_ref().ok_or_else(|| {
             Error::Internal("page_map invariant: frame must exist at mapped slot".into())
         })?;
-        Ok(Some(ChainSnapshot::new(&frame.version_chains, view)))
+        Ok(Some(ChainSnapshot::new(&frame.deltas, view)))
     }
 
-    /// Clear all version chains attached to the resident frame for `page`
+    /// Clear all delta chains attached to the resident frame for `page`
     /// in the partition selected by `size`.
     ///
     /// Used by the overflow-chain free path: overflow pages share the
     /// 32 KB leaf partition with data leaves, so a page reborn as an
-    /// overflow page may inherit stale `version_chains` entries from
+    /// overflow page may inherit stale `deltas` entries from
     /// its previous data-leaf life. Clearing them keeps the T3.5
     /// `chains_empty` guard inside `free_leaf` consumers sound.
     ///
@@ -132,11 +158,11 @@ impl BufferPool {
         let frame = guard.frames[idx].as_mut().ok_or_else(|| {
             Error::Internal("page_map invariant: frame must exist at mapped slot".into())
         })?;
-        frame.version_chains.clear();
+        frame.deltas.clear();
         Ok(())
     }
 
-    /// Drain and return every version chain currently attached to the
+    /// Drain and return every delta chain currently attached to the
     /// 32 KB leaf frame for `page`. Returns an empty vector if the page
     /// is not resident.
     ///
@@ -155,12 +181,10 @@ impl BufferPool {
         let frame = guard.frames[idx].as_mut().ok_or_else(|| {
             Error::Internal("page_map invariant: frame must exist at mapped slot".into())
         })?;
-        Ok(std::mem::take(&mut frame.version_chains)
-            .into_iter()
-            .collect())
+        Ok(std::mem::take(&mut frame.deltas).into_iter().collect())
     }
 
-    /// True if no version chains are attached to leaf page `page` (including
+    /// True if no delta chains are attached to leaf page `page` (including
     /// the case where the page is not currently resident).
     pub(crate) fn chains_empty(&self, page: u32) -> Result<bool> {
         let guard = self
@@ -173,21 +197,19 @@ impl BufferPool {
         let frame = guard.frames[idx].as_ref().ok_or_else(|| {
             Error::Internal("page_map invariant: frame must exist at mapped slot".into())
         })?;
-        Ok(frame.version_chains.is_empty())
+        Ok(frame.deltas.is_empty())
     }
 
     // -----------------------------------------------------------------------
     // Reconciliation (T6)
     // -----------------------------------------------------------------------
 
-    /// Reconcile the per-key version chains on leaf page `page`.
+    /// Reconcile the per-key delta chains on leaf page `page`.
     ///
     /// Walks every chain on the frame and drops entries whose `stop_ts`
     /// is `<= oldest_required_ts` — no live reader can see them, so they
-    /// are pure garbage. A chain that collapses to a single head entry
-    /// (`stop_ts == Ts::MAX`) is removed from the frame entirely: the
-    /// dual-write invariant guarantees the on-disk cell already reflects
-    /// that head, so the chain is redundant.
+    /// are pure garbage. Phase 3 never collapses a live non-tombstone head;
+    /// that value-equivalence rule returns with Phase 4 reconcile.
     ///
     /// `OverflowRef::Drop` RAII runs on every dropped `VersionEntry`. When
     /// a drop brings an overflow refcount to 0, the page is enqueued on
@@ -234,11 +256,11 @@ impl BufferPool {
             })?;
 
             let mut dropped_count = 0usize;
-            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.version_chains.len());
-            keys.extend(frame.version_chains.keys().cloned());
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.deltas.len());
+            keys.extend(frame.deltas.keys().cloned());
 
             for key in keys {
-                let Some(chain_arc) = frame.version_chains.get_mut(&key) else {
+                let Some(chain_arc) = frame.deltas.get_mut(&key) else {
                     continue;
                 };
                 let before = chain_arc.len();
@@ -254,20 +276,9 @@ impl BufferPool {
                 let after = chain_arc.len();
                 dropped_count += before - after;
 
-                // Collapse-if-head-only: the dual-write invariant means the
-                // on-disk cell mirrors the head. A single entry with
-                // stop_ts == Ts::MAX is therefore redundant.
-                let collapse = chain_arc.len() == 1
-                    && chain_arc
-                        .front()
-                        .map(|e| e.stop_ts == Ts::MAX && !e.is_tombstone)
-                        .unwrap_or(false);
-                if collapse {
-                    frame.version_chains.remove(&key);
-                } else if chain_arc.is_empty() {
-                    // A chain whose only entry was a tombstone that has
-                    // aged out also drops away.
-                    frame.version_chains.remove(&key);
+                if chain_arc.is_empty() {
+                    // A chain whose entries all aged out drops away.
+                    frame.deltas.remove(&key);
                 }
             }
 

@@ -445,6 +445,45 @@ impl LogicalOp {
 }
 
 impl LogicalTxnFrame {
+    fn validate_encode_limits(&self, total: usize) -> Result<()> {
+        if self.ops.len() > LOGICAL_TXN_MAX_OP_COUNT {
+            return Err(Error::JournalFrameTooLarge {
+                logical_frame_bytes: total,
+                max_bytes: LOGICAL_TXN_MAX_FRAME_SIZE,
+            });
+        }
+
+        for op in &self.ops {
+            match &op.kind {
+                LogicalOpKind::PrimaryInsert { key, value, .. }
+                | LogicalOpKind::PrimaryUpdate { key, value, .. } => {
+                    Self::validate_inline_len(key.len(), LOGICAL_TXN_MAX_KEY_BYTES)?;
+                    Self::validate_inline_len(value.len(), LOGICAL_TXN_MAX_VALUE_BYTES)?;
+                }
+                LogicalOpKind::PrimaryDelete { key, .. }
+                | LogicalOpKind::SecondaryDelete { key, .. } => {
+                    Self::validate_inline_len(key.len(), LOGICAL_TXN_MAX_KEY_BYTES)?;
+                }
+                LogicalOpKind::SecondaryInsert { key, id_bytes, .. } => {
+                    Self::validate_inline_len(key.len(), LOGICAL_TXN_MAX_KEY_BYTES)?;
+                    Self::validate_inline_len(id_bytes.len(), LOGICAL_TXN_MAX_VALUE_BYTES)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_inline_len(len: usize, max: usize) -> Result<()> {
+        if len > max {
+            return Err(Error::JournalFrameTooLarge {
+                logical_frame_bytes: len,
+                max_bytes: max,
+            });
+        }
+        Ok(())
+    }
+
     /// Compute the total encoded byte size (`total_frame_bytes`) per §4.5.
     fn total_frame_bytes(&self) -> usize {
         let ops_len: usize = self.ops.iter().map(LogicalOp::encoded_len).sum();
@@ -468,6 +507,7 @@ impl LogicalTxnFrame {
                 max_bytes: LOGICAL_TXN_MAX_FRAME_SIZE,
             });
         }
+        self.validate_encode_limits(total)?;
         // Safe: total ≤ LOGICAL_TXN_MAX_FRAME_SIZE (64 MiB) fits in u32.
         let total_u32 = total as u32;
         let op_count_u32 = self.ops.len() as u32;
@@ -1569,6 +1609,11 @@ impl ChainCommitFrame {
             u32::from_le_bytes(buf[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
         cursor += 4;
 
+        let remaining = body_end.saturating_sub(cursor);
+        let min_page_write_bytes = 8 + JournalPageSize::Small4k.bytes();
+        if page_write_count > remaining / min_page_write_bytes {
+            return Ok(None);
+        }
         let mut page_writes = Vec::with_capacity(page_write_count);
         for _ in 0..page_write_count {
             if cursor + 8 > body_end {

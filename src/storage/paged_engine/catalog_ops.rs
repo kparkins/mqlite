@@ -60,7 +60,7 @@ pub(super) fn new_txn_store<'a>(
 
 /// Update `FileHeader::catalog_root_page` and `catalog_root_level` to
 /// reflect the current catalog root, routing through the provided txn
-/// overlay so a rollback restores the pre-image.
+/// overlay so a rollback can restore only the txn's catalog-root change.
 pub(super) fn sync_catalog_root_overlay(
     shared: &SharedState,
     md: &MetadataState,
@@ -87,8 +87,8 @@ pub(super) fn sync_catalog_root_overlay(
     })
 }
 
-/// Mutate the file header, snapshotting the pre-image into the given
-/// overlay on first call.
+/// Mutate the file header, recording the txn-local catalog-root transition
+/// into the overlay on first call.
 pub(super) fn txn_update_header<F>(
     shared: &SharedState,
     overlay: &mut TxnOverlay,
@@ -97,14 +97,10 @@ pub(super) fn txn_update_header<F>(
 where
     F: FnOnce(&mut crate::storage::header::FileHeader),
 {
-    if let Some(pre) = shared.handle.allocator().with_header(|h| {
-        if overlay.has_header_pre() {
-            None
-        } else {
-            Some(h.clone())
-        }
-    })? {
-        overlay.capture_header_pre_once(&pre);
-    }
-    shared.handle.allocator().update_header(f)
+    shared.handle.allocator().update_header(|header| {
+        let before = header.clone();
+        f(header);
+        let after = header.clone();
+        overlay.capture_header_change_once(&before, &after);
+    })
 }

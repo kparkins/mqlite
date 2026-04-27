@@ -1,8 +1,8 @@
-/// Demonstrates how to verify that indexes are being used by comparing
-/// `docs_examined` counts between indexed and non-indexed queries.
-///
-/// The key idea: if an index is used, `docs_examined` should be close to the
-/// number of matching documents. Without an index, it equals the full collection size.
+//! Demonstrates how to verify that indexes are being used by comparing
+//! `docs_examined` counts between indexed and non-indexed queries.
+//!
+//! The key idea: if an index is used, `docs_examined` should be close to the
+//! number of matching documents. Without an index, it equals the full collection size.
 use mqlite::{doc, Client, ObjectId};
 use serde::{Deserialize, Serialize};
 

@@ -41,7 +41,7 @@ impl PagedEngine {
         name: &str,
     ) -> Result<ReserveOutcome> {
         // Drive through `run_ddl` so we get the standard DDL envelope:
-        // metadata.write() + commit_seq + overlay/WAL + publish.
+        // metadata.write() + commit mutex + overlay/WAL + publish.
         let outcome = std::cell::Cell::new(ReserveOutcome::Reserved);
         self.run_ddl(|shared, md, overlay| {
             let mut cat = catalog_lock(md);
@@ -103,6 +103,15 @@ impl PagedEngine {
     /// already dual-written to the Building index (via
     /// `maintain_secondary_on_*`).
     pub(super) fn create_index_build(&self, ns: &str, name: &str) -> Result<()> {
+        self.create_index_build_inner(ns, name, false)
+    }
+
+    fn create_index_build_inner(
+        &self,
+        ns: &str,
+        name: &str,
+        rebuild_derived_pages: bool,
+    ) -> Result<()> {
         // Acquire the namespace lane under a short-lived metadata.read()
         // guard — the read guard blocks drop_namespace (which needs
         // metadata.write()) from racing with lane acquisition. Once the
@@ -129,7 +138,7 @@ impl PagedEngine {
             let md_read = self
                 .metadata
                 .read()
-                .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+                .map_err(|_| Error::Internal("metadata lock poisoned".into()))?;
             let cat = catalog_lock(&md_read);
             let idx_entry = cat.get_index(ns, name)?.ok_or_else(|| {
                 Error::Internal(format!(
@@ -146,10 +155,9 @@ impl PagedEngine {
             (idx_entry, data_entry)
         };
 
-        // Open a dedicated WAL transaction for the build — it's
-        // independent of the reserve txn (already committed) and the
-        // commit txn (has not yet begun).
-        let mark = self.shared.handle.begin_txn()?;
+        // Stage the build in an overlay first. Journal rollback marks are not
+        // captured during the body because no journal frames are appended here,
+        // and other namespace lanes may commit while this long build runs.
         let mut overlay = TxnOverlay::new();
         let ready_reservations = self
             .shared
@@ -174,23 +182,34 @@ impl PagedEngine {
                 data_entry.data_root_page,
                 data_entry.data_root_level,
             );
-            let idx_store = new_txn_store(&self.shared, &mut overlay);
-            let mut idx_tree = BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level);
-            let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
+            let original_root_page = idx_entry.root_page;
+            let original_root_level = idx_entry.root_level;
+            let (root_page, root_level, any_multikey) = {
+                let idx_store = new_txn_store(&self.shared, &mut overlay);
+                let mut idx_tree = if rebuild_derived_pages {
+                    BTree::create(idx_store)?
+                } else {
+                    BTree::open(idx_store, idx_entry.root_page, idx_entry.root_level)
+                };
+                let any_multikey = build_index(&data_tree, &mut idx_tree, &idx_entry)?;
+                (idx_tree.root_page, idx_tree.root_level, any_multikey)
+            };
+            if rebuild_derived_pages {
+                let old_store = new_txn_store(&self.shared, &mut overlay);
+                BTree::open(old_store, original_root_page, original_root_level).free_all_pages()?;
+            }
 
             // Persist the possibly-updated root + multikey flag. Note:
             // we do NOT flip state to Ready here — that happens in the
             // commit step under metadata.write() so readers see a
             // consistent transition on the published snapshot.
-            let root_changed = idx_tree.root_page != idx_entry.root_page
-                || idx_tree.root_level != idx_entry.root_level;
+            let root_changed =
+                root_page != idx_entry.root_page || root_level != idx_entry.root_level;
             let multikey_changed = any_multikey && !idx_entry.multikey;
-            if root_changed || multikey_changed {
+            if rebuild_derived_pages || root_changed || multikey_changed {
                 let mut updated = idx_entry.clone();
-                if root_changed {
-                    updated.root_page = idx_tree.root_page;
-                    updated.root_level = idx_tree.root_level;
-                }
+                updated.root_page = root_page;
+                updated.root_level = root_level;
                 if multikey_changed {
                     updated.multikey = true;
                 }
@@ -211,8 +230,9 @@ impl PagedEngine {
         match body {
             Ok(()) => {
                 // Commit the build txn. We intentionally do NOT hold
-                // commit_seq here — no timestamp is allocated (the build
-                // step has no primary writes), and no publish is performed.
+                // the global commit sequencer here — no timestamp is
+                // allocated (the build step has no primary writes), and
+                // no publish is performed.
                 // The only shared mutation is catalog root/multikey
                 // metadata, which is safe under the lane.
                 let mut base = new_store(&self.shared);
@@ -239,7 +259,10 @@ impl PagedEngine {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.rollback_overlay_and_wal(overlay, mark);
+                // The build body has not appended any journal frames yet. Do
+                // not truncate to `mark`: other namespace lanes may have
+                // committed since this build transaction began.
+                let _ = self.rollback_overlay_only(overlay);
                 Err(e)
             }
         }
@@ -248,6 +271,9 @@ impl PagedEngine {
     /// Phase 3 of `create_index`: flip `state: Ready` under metadata.write
     /// and publish the final snapshot.
     pub(super) fn create_index_commit(&self, ns: &str, name: &str) -> Result<()> {
+        // US-018c: the Building -> Ready catalog rewrite flows through
+        // `run_ddl`, so it acquires commit_seq. DDL does not call
+        // allocate_commit_ts.
         self.run_ddl(|_shared, md, _overlay| {
             let mut cat = catalog_lock(md);
             let mut entry = cat.get_index(ns, name)?.ok_or_else(|| {
@@ -265,6 +291,37 @@ impl PagedEngine {
             sync_catalog_root_overlay(_shared, md, _overlay)?;
             Ok(())
         })
+    }
+
+    /// Resume every catalog-visible Building index after reopen.
+    ///
+    /// Building index pages are derived state. Recovery ignores any prior
+    /// partial build pages by bulk-loading into a fresh tree, releases the
+    /// previous derived tree, and then promotes the catalog entry to Ready via
+    /// the ordinary DDL commit envelope.
+    pub(super) fn resume_building_indexes_after_open(&self) -> Result<()> {
+        let builds = {
+            let md_read = self
+                .metadata
+                .read()
+                .map_err(|_| Error::Internal("metadata lock poisoned".into()))?;
+            let cat = catalog_lock(&md_read);
+            let mut builds = Vec::new();
+            for coll in cat.list_collections()? {
+                for idx in cat.list_indexes(&coll.name)? {
+                    if idx.state == IndexState::Building {
+                        builds.push((coll.name.clone(), idx.name.clone()));
+                    }
+                }
+            }
+            builds
+        };
+
+        for (ns, name) in builds {
+            self.create_index_build_inner(&ns, &name, true)?;
+            self.create_index_commit(&ns, &name)?;
+        }
+        Ok(())
     }
 
     /// Cleanup after a failed build step: drop the orphan Building entry.

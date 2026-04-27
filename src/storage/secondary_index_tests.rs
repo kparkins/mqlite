@@ -1,4 +1,5 @@
 use super::*;
+use crate::mvcc::{ReadView, Ts};
 use crate::storage::btree::{BTree, MemPageStore};
 use crate::storage::catalog::IndexEntry;
 use bson::{doc, oid::ObjectId, Bson};
@@ -7,8 +8,18 @@ use bson::{doc, oid::ObjectId, Bson};
 // Helpers
 // -----------------------------------------------------------------------
 
+const READ_TS: Ts = Ts {
+    physical_ms: 200,
+    logical: 0,
+};
+const READER_TXN_ID: u64 = 99;
+
 fn fresh_tree() -> BTree<MemPageStore> {
     BTree::create(MemPageStore::new()).expect("create tree")
+}
+
+fn read_view() -> ReadView {
+    ReadView::new(READ_TS, READER_TXN_ID)
 }
 
 /// Drain a `WriteTxn`'s pending sec-index writes into `tree`, mirroring
@@ -37,7 +48,8 @@ fn stage_insert<S: BTreePageStore>(
     entry: &IndexEntry,
 ) -> Result<bool> {
     let mut txn = WriteTxn::new(0);
-    let r = update_index_on_insert(doc, doc_id, tree, entry, &mut txn)?;
+    let view = read_view();
+    let r = update_index_on_insert(doc, doc_id, tree, entry, &view, None, &mut txn)?;
     install_pending(&mut txn, tree)?;
     Ok(r)
 }
@@ -64,7 +76,10 @@ fn stage_update<S: BTreePageStore>(
     entry: &IndexEntry,
 ) -> Result<bool> {
     let mut txn = WriteTxn::new(0);
-    let r = update_index_on_update(old_doc, new_doc, old_id, new_id, tree, entry, &mut txn)?;
+    let view = read_view();
+    let r = update_index_on_update(
+        old_doc, new_doc, old_id, new_id, tree, entry, &view, None, &mut txn,
+    )?;
     install_pending(&mut txn, tree)?;
     Ok(r)
 }
@@ -384,13 +399,121 @@ fn staged_unique_in_txn_conflict() {
     let doc2 = doc! { "_id": id2.clone(), "email": "dup@test.com" };
 
     let mut txn = WriteTxn::new(0);
-    update_index_on_insert(&doc1, &id1, &tree, &entry, &mut txn)
+    let view = read_view();
+    update_index_on_insert(&doc1, &id1, &tree, &entry, &view, None, &mut txn)
         .expect("first insert stages cleanly");
-    let result = update_index_on_insert(&doc2, &id2, &tree, &entry, &mut txn);
+    let result = update_index_on_insert(&doc2, &id2, &tree, &entry, &view, None, &mut txn);
     assert!(
         matches!(result, Err(Error::DuplicateKey { .. })),
         "second staged insert with same unique key must fail as in-txn conflict"
     );
+}
+
+#[test]
+fn test_same_txn_secondary_unique_conflict_before_commit() {
+    let tree = fresh_tree();
+    let entry = make_index_entry(doc! { "email": 1 }, true, false);
+    let id1 = Bson::ObjectId(ObjectId::new());
+    let id2 = Bson::ObjectId(ObjectId::new());
+    let doc1 = doc! { "_id": id1.clone(), "email": "dup@test.com" };
+    let doc2 = doc! { "_id": id2.clone(), "email": "dup@test.com" };
+    let mut txn = WriteTxn::new(0);
+    let view = read_view();
+
+    update_index_on_insert(&doc1, &id1, &tree, &entry, &view, None, &mut txn)
+        .expect("first insert stages cleanly");
+    let result = update_index_on_insert(&doc2, &id2, &tree, &entry, &view, None, &mut txn);
+
+    assert!(matches!(result, Err(Error::DuplicateKey { .. })));
+}
+
+#[test]
+fn test_same_txn_secondary_self_update_allowed() {
+    let tree = fresh_tree();
+    let entry = make_index_entry(doc! { "email": 1 }, true, false);
+    let id = Bson::ObjectId(ObjectId::new());
+    let doc = doc! { "_id": id.clone(), "email": "self@test.com" };
+    let mut txn = WriteTxn::new(0);
+    let view = read_view();
+
+    update_index_on_insert(&doc, &id, &tree, &entry, &view, None, &mut txn)
+        .expect("initial insert stages cleanly");
+    let result = update_index_on_update(&doc, &doc, &id, &id, &tree, &entry, &view, None, &mut txn);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_same_txn_secondary_reinsert_after_delete() {
+    let tree = fresh_tree();
+    let entry = make_index_entry(doc! { "email": 1 }, true, false);
+    let id = Bson::ObjectId(ObjectId::new());
+    let doc = doc! { "_id": id.clone(), "email": "again@test.com" };
+    let mut txn = WriteTxn::new(0);
+    let view = read_view();
+
+    update_index_on_insert(&doc, &id, &tree, &entry, &view, None, &mut txn)
+        .expect("initial insert stages cleanly");
+    update_index_on_delete(&doc, &id, &entry, &mut txn).expect("delete stages cleanly");
+    let result = update_index_on_insert(&doc, &id, &tree, &entry, &view, None, &mut txn);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_secondary_unique_trailing_id_suffix_distinguishes_docs() {
+    let mut tree = fresh_tree();
+    let entry = make_index_entry(doc! { "email": 1 }, true, false);
+    let id1 = Bson::ObjectId(ObjectId::new());
+    let id2 = Bson::ObjectId(ObjectId::new());
+    let id3 = Bson::ObjectId(ObjectId::new());
+    let doc1 = doc! { "_id": id1.clone(), "email": "dup@test.com" };
+    let doc2 = doc! { "_id": id2.clone(), "email": "dup@test.com" };
+    let doc3 = doc! { "_id": id3.clone(), "email": "dup@test.com" };
+    let build_entry = make_index_entry(doc! { "email": 1 }, false, false);
+
+    stage_insert(&doc1, &id1, &mut tree, &build_entry).expect("first base entry");
+    stage_insert(&doc2, &id2, &mut tree, &build_entry).expect("second base entry");
+    let email = doc3.get("email").expect("email field");
+    let field_values = [(email, true)];
+
+    let result = check_unique_constraint_mvcc(
+        &tree,
+        &entry.key_pattern,
+        &field_values,
+        &id3,
+        &read_view(),
+        None,
+        &[],
+        entry.root_page,
+    );
+
+    assert!(matches!(result, Err(Error::DuplicateKey { .. })));
+}
+
+#[test]
+fn test_secondary_unique_same_doc_update_does_not_self_conflict() {
+    let mut tree = fresh_tree();
+    let entry = make_index_entry(doc! { "email": 1 }, true, false);
+    let id = Bson::ObjectId(ObjectId::new());
+    let doc = doc! { "_id": id.clone(), "email": "same@test.com" };
+    let build_entry = make_index_entry(doc! { "email": 1 }, false, false);
+
+    stage_insert(&doc, &id, &mut tree, &build_entry).expect("base entry");
+    let email = doc.get("email").expect("email field");
+    let field_values = [(email, true)];
+
+    check_unique_constraint_mvcc(
+        &tree,
+        &entry.key_pattern,
+        &field_values,
+        &id,
+        &read_view(),
+        None,
+        &[],
+        entry.root_page,
+    )
+    .expect("same full compound key is a self-update");
 }
 
 /// Multikey dedupe happens at stage time via `HashSet`: duplicate array
@@ -405,7 +528,8 @@ fn staged_multikey_dedupe_single_pending_entry() {
 
     let mut txn = WriteTxn::new(0);
     let is_multikey =
-        update_index_on_insert(&doc, &id, &tree, &entry, &mut txn).expect("stage multikey insert");
+        update_index_on_insert(&doc, &id, &tree, &entry, &read_view(), None, &mut txn)
+            .expect("stage multikey insert");
     assert!(is_multikey);
     assert_eq!(
         txn.pending_sec_index.len(),

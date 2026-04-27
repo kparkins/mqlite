@@ -469,6 +469,24 @@ impl WriteTxn {
         primary_writes: &[PrimaryWrite],
         sec_writes: &[SecIndexWrite],
     ) -> Result<()> {
+        let frame = self.build_logical_txn_frame(journal, primary_writes, sec_writes);
+        journal.append_logical_txn(frame)?;
+        Ok(())
+    }
+
+    /// Build and consume this transaction's Phase 2 `LogicalTxnFrame`.
+    ///
+    /// This is the S5-only half of [`emit_logical_txn_frame`]: it consumes
+    /// the pre-allocated `commit_ts` Cell and returns the frame without doing
+    /// journal I/O. `run_write_existing` appends and fsyncs the returned frame
+    /// at S6 so rollback handling can distinguish frame construction from
+    /// durability.
+    pub(crate) fn build_logical_txn_frame(
+        &self,
+        journal: &BufferPoolHandle,
+        primary_writes: &[PrimaryWrite],
+        sec_writes: &[SecIndexWrite],
+    ) -> crate::journal::log_file::LogicalTxnFrame {
         #[allow(clippy::expect_used)]
         let commit_ts = self.commit_ts.get().expect(
             "§3.7 invariant violation: emit_logical_txn_frame called before \
@@ -477,16 +495,14 @@ impl WriteTxn {
         self.commit_ts.set(None);
 
         let (salt1, salt2) = journal.journal_salts().unwrap_or((0, 0));
-        let frame = build_logical_txn_frame(
+        build_logical_txn_frame(
             self.txn_id,
             commit_ts,
             salt1,
             salt2,
             primary_writes,
             sec_writes,
-        );
-        journal.append_logical_txn(frame)?;
-        Ok(())
+        )
     }
 
     /// Finalize the transaction.
@@ -538,9 +554,23 @@ impl WriteTxn {
     /// `pending` refcount ownership. Returns `(pending, pending_sec_index)`
     /// on success; flips `finalized` so `Drop` skips the refcount decref.
     pub(crate) fn commit_with_ts(
-        mut self,
+        self,
         commit_ts: Ts,
         journal: &BufferPoolHandle,
+    ) -> Result<(Vec<OverflowRef>, Vec<SecIndexWrite>)> {
+        self.commit_chain_commit(journal, commit_ts)
+    }
+
+    /// Append and fsync the S7 `ChainCommit` frame for this transaction.
+    ///
+    /// Returns the drained overflow refs and secondary-index write list after
+    /// the durable chain commit is on disk. This consumes `self`; on any
+    /// append/sync failure, `Drop` still owns the drained vectors and aborts
+    /// their refcounts normally.
+    pub(crate) fn commit_chain_commit(
+        mut self,
+        journal: &BufferPoolHandle,
+        commit_ts: Ts,
     ) -> Result<(Vec<OverflowRef>, Vec<SecIndexWrite>)> {
         let pending = std::mem::take(&mut self.pending).into_vec();
         let page_writes = std::mem::take(&mut self.page_writes).into_vec();
@@ -548,6 +578,7 @@ impl WriteTxn {
         let pending_sec_index = std::mem::take(&mut self.pending_sec_index).into_vec();
 
         journal.append_chain_commit(commit_ts, refcount_deltas, page_writes)?;
+        journal.journal_sync()?;
 
         self.finalized = true;
         Ok((pending, pending_sec_index))
@@ -824,7 +855,7 @@ mod tests {
         assert!(sec2.is_empty());
 
         assert!(ts2 > ts1, "commit_ts strictly monotone");
-        assert_ne!(ts1, Ts::PENDING);
+        assert_ne!(ts1, Ts::default());
     }
 
     #[test]

@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
-use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry};
+use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::btree::{BTree, BTreePageStore};
 
@@ -284,6 +284,7 @@ pub(crate) fn decode_version_entry_value(
         start_ts,
         stop_ts,
         txn_id,
+        state: VersionState::Committed,
         data,
         is_tombstone,
     })

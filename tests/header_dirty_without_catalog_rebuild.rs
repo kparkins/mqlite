@@ -2,12 +2,12 @@
 #![cfg(feature = "test-hooks")]
 
 //! Phase 1 US-011 / §4.4 — header-dirty commits do NOT rebuild the
-//! published catalog Arc.
+//! published catalog.
 //!
 //! §4.4 invariant: `catalog_header_dirty` and `published_catalog_dirty`
 //! are decoupled. A commit may need `sync_catalog_root_overlay`
 //! (because the on-disk catalog tree changed) while still reusing the
-//! existing `Arc<PublishedCatalog>`. The §10.3 "multikey flip on a
+//! existing published catalog. The §10.3 "multikey flip on a
 //! Ready index" row is exactly this shape:
 //!   - published_catalog_dirty = false (multikey is not published)
 //!   - catalog_header_dirty    = true  (catalog B-tree + header updated)
@@ -37,8 +37,8 @@ fn multikey_flip_sets_header_dirty_only_and_reuses_catalog_arc() {
     col.create_index(IndexModel::builder().keys(doc! { "tags": 1 }).build())
         .unwrap();
 
-    // Capture the pre-commit catalog Arc identity.
-    let pre_ptr = client.__published_catalog_ptr();
+    // Capture the pre-commit catalog generation.
+    let pre_gen = client.__published_catalog_gen();
 
     reset_read_epoch_publish_count();
     reset_published_catalog_rebuild_count();
@@ -48,17 +48,17 @@ fn multikey_flip_sets_header_dirty_only_and_reuses_catalog_arc() {
     // Ready index. §10.3: `published_catalog_dirty=false`,
     // `catalog_header_dirty=true`. Expected counter deltas:
     //   - read_epoch_publish_count: +1 (every CRUD commit publishes)
-    //   - published_catalog_rebuild_count: +0 (Arc reused)
+    //   - published_catalog_rebuild_count: +0 (generation unchanged)
     //   - catalog_header_sync_count: +1 (sync_catalog_root_overlay ran)
     col.insert_one(&doc! { "_id": 1i32, "tags": ["a", "b"] })
         .unwrap();
 
-    let post_ptr = client.__published_catalog_ptr();
+    let post_gen = client.__published_catalog_gen();
     assert_eq!(
-        pre_ptr, post_ptr,
-        "§4.4: Arc<PublishedCatalog> identity must be preserved across a \
-         header-dirty-only commit; pre={:#x} post={:#x}",
-        pre_ptr, post_ptr
+        pre_gen, post_gen,
+        "§4.4: published-catalog generation must be preserved across a \
+         header-dirty-only commit; pre={} post={}",
+        pre_gen, post_gen
     );
     assert_eq!(
         published_catalog_rebuild_count_snapshot(),

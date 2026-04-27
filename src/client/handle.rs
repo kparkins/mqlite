@@ -126,7 +126,8 @@ impl Client {
     }
 
     // Test-only accessors (`__oracle_now`, `__published_visible_ts`,
-    // `__published_catalog_ptr`, `__recovered_max_commit_ts`,
+    // `__published_catalog_gen`, `__published_sequencer_frontier`,
+    // `__recovery_open_published_store_count`, `__recovered_max_commit_ts`,
     // `__read_view_registry`) live in a dedicated module:
     // `src/client/test_accessors.rs`. Keeping them out of this file
     // makes the boundary between production API and test scaffolding

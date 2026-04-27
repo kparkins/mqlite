@@ -176,10 +176,10 @@ impl BTreePageStore for BufferPoolPageStore {
     }
 
     // -----------------------------------------------------------------------
-    // MVCC version-chain accessors (T3.5)
+    // MVCC delta-chain accessors (T3.5)
     //
     // Delegate to the buffer pool's chain helpers, which operate on the
-    // `Frame::version_chains` map for the 32 KB leaf partition.
+    // `Frame::deltas` map for the 32 KB leaf partition.
     // -----------------------------------------------------------------------
 
     fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
@@ -213,6 +213,13 @@ impl BTreePageStore for BufferPoolPageStore {
     }
 
     fn take_all_chains(
+        &mut self,
+        page: u32,
+    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
+        self.take_all_chains_on_page(page)
+    }
+
+    fn take_all_chains_on_page(
         &mut self,
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {

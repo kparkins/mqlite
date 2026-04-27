@@ -14,7 +14,7 @@
 //! - Page-byte reads and writes are overlay-routed.
 //! - Allocator calls (`alloc_internal` / `alloc_leaf` / `free_*`) record
 //!   txn-local reservations so rollback can undo allocations.
-//! - MVCC version-chain helpers (`take_chain` / `put_chain` /
+//! - MVCC delta-chain helpers (`take_chain` / `put_chain` /
 //!   `chains_empty`) go straight through to the shared frame. They are
 //!   already CoW-safe via `Arc::make_mut`: concurrent readers holding an
 //!   old `Arc<VecDeque<VersionEntry>>` observe their frozen copy while the
@@ -45,6 +45,43 @@ use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
 const INTERNAL_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 const LEAF_SIZE: usize = PAGE_SIZE_LEAF as usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CatalogRootHeaderState {
+    root_page: u32,
+    root_backup: u32,
+    root_level: u8,
+}
+
+impl CatalogRootHeaderState {
+    fn from_header(header: &FileHeader) -> Self {
+        Self {
+            root_page: header.catalog_root_page,
+            root_backup: header.catalog_root_backup,
+            root_level: header.catalog_root_level,
+        }
+    }
+
+    fn restore_into(self, header: &mut FileHeader) {
+        header.catalog_root_page = self.root_page;
+        header.catalog_root_backup = self.root_backup;
+        header.catalog_root_level = self.root_level;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeaderChange {
+    before: CatalogRootHeaderState,
+    after: CatalogRootHeaderState,
+}
+
+impl HeaderChange {
+    fn rollback_into(self, header: &mut FileHeader) {
+        if CatalogRootHeaderState::from_header(header) == self.after {
+            self.before.restore_into(header);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Reservations
@@ -109,11 +146,14 @@ pub(crate) struct TxnOverlay {
     /// prevents the page bytes from being replayed at commit, so the
     /// allocator's view ends up consistent with rollback regardless.
     reservations: Vec<PageReservation>,
-    /// Pre-txn snapshot of the file header. Captured lazily — only on the
-    /// first call to `txn_update_header` during this txn. On rollback the
-    /// header is restored to this snapshot in a single `update_header`
-    /// closure call. On commit the snapshot is discarded.
-    header_pre: Option<FileHeader>,
+    /// True after this txn updates the file header through
+    /// `txn_update_header`. Used by commit classification; rollback only
+    /// stores the catalog-root fields that are safe to restore selectively.
+    header_touched: bool,
+    /// Catalog-root header transition captured on the first header update
+    /// that moves the catalog root. Id counters and allocator fields remain
+    /// monotonic/shared and are not rolled back from a whole-header preimage.
+    header_change: Option<HeaderChange>,
 }
 
 impl TxnOverlay {
@@ -157,7 +197,7 @@ impl TxnOverlay {
         // began and were drained into the overlay (rather than directly
         // into the free list) so a rollback could return them unchanged.
         // NewAlloc reservations have no commit-time work — successful
-        // txns keep their allocations. `header_pre` is discarded.
+        // txns keep their allocations. Header rollback metadata is discarded.
         for res in &self.reservations {
             if matches!(res.origin, PageOrigin::DeferredFree) {
                 handle.free_page(res.page, res.size)?;
@@ -175,63 +215,29 @@ impl TxnOverlay {
     /// - `DeferredFree`: push back onto the `DeferredFreeQueue` so the
     ///   next writer drains-and-frees it after a refcount recheck.
     ///
-    /// If `header_pre` is `Some`, restore the header to its pre-txn
-    /// snapshot in a single `update_header` closure call.
+    /// If this txn moved the catalog root, restore the old catalog-root
+    /// fields only when no later header update has replaced them. Allocator
+    /// fields and id counters are intentionally left monotonic; rolling back
+    /// an entire `FileHeader` can clobber concurrent namespace-lane commits.
     ///
     /// Overlay page-byte entries and the `touched_*` vectors are dropped
     /// on return (consumed by `self`) — rollback never writes them to
     /// shared frames.
     pub(crate) fn rollback(self, handle: &BufferPoolHandle) -> Result<()> {
-        // Process reservations first — allocator free-list adjustments
-        // must happen BEFORE the header snapshot restore, since the
-        // allocator mutates the header on every `free_*` call and we
-        // want the final state to match `header_pre` exactly.
-        //
-        // For a NewAlloc page to be returned to the free list the
-        // allocator needs to run `free_*`, which itself writes into the
-        // free-list head of the header. If `header_pre` was taken AFTER
-        // those allocations (which is the normal ordering — allocations
-        // happen in the BTree body, header mutations sync the catalog
-        // root afterwards), then restoring `header_pre` is authoritative
-        // anyway — the free-list head in `header_pre` reflects the
-        // pre-txn state.
-        //
-        // Strategy: if `header_pre` is set, restore it FIRST (which
-        // resets free-list pointers, total_page_count, catalog_root_page
-        // etc. to pre-txn), then walk reservations to clear the
-        // buffer-pool frames / requeue deferred-free pages — skipping the
-        // allocator `free_*` calls because they would double-free pages
-        // that `header_pre` has already returned to the free list.
-        //
-        // If `header_pre` is None (no `update_header` calls happened,
-        // but the txn still allocated pages via the allocator), fall
-        // through to calling `free_*` on each NewAlloc reservation.
         let TxnOverlay {
             reservations,
-            header_pre,
+            header_touched: _,
+            header_change,
             overlay_4k: _,
             overlay_32k: _,
             touched_4k: _,
             touched_32k: _,
         } = self;
 
-        let restored_header = header_pre.is_some();
-        if let Some(pre) = header_pre {
-            handle.allocator().update_header(|h| *h = pre)?;
-        }
-
         for res in reservations {
             match res.origin {
                 PageOrigin::NewAlloc => {
-                    if !restored_header {
-                        // No header snapshot was taken; we must manually
-                        // return the page to the allocator's free list.
-                        // Safe because the txn never touched the header
-                        // directly — only the allocator's internal
-                        // free-list fields, which this `free_*` call
-                        // updates consistently.
-                        handle.free_page(res.page, res.size)?;
-                    }
+                    handle.free_page(res.page, res.size)?;
                     // Invalidate the buffer-pool frame so a subsequent
                     // allocate that reuses this page number does not see
                     // stale content cached by this txn's short-lived
@@ -247,6 +253,11 @@ impl TxnOverlay {
                 }
             }
         }
+        if let Some(change) = header_change {
+            handle
+                .allocator()
+                .update_header(|header| change.rollback_into(header))?;
+        }
         Ok(())
     }
 
@@ -257,17 +268,19 @@ impl TxnOverlay {
         self.reservations.push(res);
     }
 
-    /// Capture the pre-txn header snapshot if not already set. Called by
-    /// `BpBackend::txn_update_header` before the first header mutation.
-    pub(crate) fn capture_header_pre_once(&mut self, header: &FileHeader) {
-        if self.header_pre.is_none() {
-            self.header_pre = Some(header.clone());
+    /// Capture catalog-root header rollback metadata for this transaction.
+    pub(crate) fn capture_header_change_once(&mut self, before: &FileHeader, after: &FileHeader) {
+        self.header_touched = true;
+        let before = CatalogRootHeaderState::from_header(before);
+        let after = CatalogRootHeaderState::from_header(after);
+        if before != after && self.header_change.is_none() {
+            self.header_change = Some(HeaderChange { before, after });
         }
     }
 
-    /// True if a pre-txn header snapshot has already been captured.
-    pub(crate) fn has_header_pre(&self) -> bool {
-        self.header_pre.is_some()
+    /// True if this txn has updated the file header through the overlay.
+    pub(crate) fn has_header_update(&self) -> bool {
+        self.header_touched
     }
 }
 
@@ -447,6 +460,17 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
         &mut self,
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        self.base.take_all_chains(page)
+        self.take_all_chains_on_page(page)
+    }
+
+    fn take_all_chains_on_page(
+        &mut self,
+        page: u32,
+    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
+        self.base.take_all_chains_on_page(page)
     }
 }
+
+#[cfg(test)]
+#[path = "txn_page_store_tests.rs"]
+mod tests;

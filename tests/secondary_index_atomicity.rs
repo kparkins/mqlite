@@ -15,10 +15,10 @@
 //! writer installs at commit time (primary doc swap, sec-index old-key
 //! tombstone, sec-index new-key insert) and asserts atomic visibility.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry};
+use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry, VersionState};
 
 const PRIMARY_KEY: &[u8] = b"pk/user-1";
 const SEC_OLD_KEY: &[u8] = b"idx/status/active/user-1";
@@ -31,6 +31,7 @@ fn entry(start: Ts, stop: Ts, txn_id: u64, bytes: &[u8], tombstone: bool) -> Ver
         start_ts: start,
         stop_ts: stop,
         txn_id,
+        state: VersionState::Committed,
         data: VersionData::Inline(bytes.to_vec()),
         is_tombstone: tombstone,
     }
@@ -39,7 +40,7 @@ fn entry(start: Ts, stop: Ts, txn_id: u64, bytes: &[u8], tombstone: bool) -> Ver
 /// Build the post-commit snapshot that `install_pending_primary` and the
 /// sec-index install path would produce.
 fn snap_after_commit(commit_ts: Ts, pre_commit_ts: Ts) -> ChainSnapshot {
-    let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+    let mut source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
 
     // Primary chain: new doc as head (stop=MAX), old doc stopped at commit_ts.
     let mut primary = VecDeque::new();

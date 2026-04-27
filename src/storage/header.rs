@@ -179,7 +179,7 @@ impl FileHeader {
             page_size_internal: PAGE_SIZE_INTERNAL,
             page_size_leaf: PAGE_SIZE_LEAF,
             created_at,
-            last_checkpoint_ts: Ts::PENDING,
+            last_checkpoint_ts: Ts::default(),
             catalog_root_page: 0,
             free_list_head_4k: 0,
             free_list_head_32k: 0,
@@ -439,6 +439,48 @@ pub(crate) fn derive_wal_salts(created_at_millis: u64) -> (u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Test-hooks accessor — durable header counters via the crate-owned parser
+// ---------------------------------------------------------------------------
+//
+// Replaces ad-hoc byte-offset arithmetic in integration tests. Tests
+// asserting durable-id monotonicity across reopen go through this
+// accessor so the on-disk layout is owned in exactly one place.
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+/// Durable header id counters parsed from page 0.
+pub struct DurableHeaderCounters {
+    /// Next namespace id that will be allocated from the durable header.
+    pub next_namespace_id: u64,
+    /// Next index id that will be allocated from the durable header.
+    pub next_index_id: u64,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+/// Read durable header id counters from a database file.
+///
+/// # Errors
+///
+/// Returns any file-read error from opening or reading page 0, or
+/// [`std::io::ErrorKind::InvalidData`] when the header parser rejects page 0.
+pub fn read_durable_header_counters(
+    path: &std::path::Path,
+) -> std::io::Result<DurableHeaderCounters> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; HEADER_PAGE_SIZE];
+    file.read_exact(&mut buf)?;
+    let header = FileHeader::from_bytes(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(DurableHeaderCounters {
+        next_namespace_id: header.next_namespace_id,
+        next_index_id: header.next_index_id,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -467,7 +509,7 @@ mod tests {
         assert_eq!(decoded.page_size_internal, 4096);
         assert_eq!(decoded.page_size_leaf, 32768);
         assert_eq!(decoded.created_at, TEST_TS);
-        assert_eq!(decoded.last_checkpoint_ts, Ts::PENDING);
+        assert_eq!(decoded.last_checkpoint_ts, Ts::default());
         assert_eq!(decoded.catalog_root_page, 0);
         assert_eq!(decoded.free_list_head_4k, 0);
         assert_eq!(decoded.free_list_head_32k, 0);
@@ -738,7 +780,7 @@ mod tests {
             "created_at LE bytes"
         );
 
-        // last_checkpoint_ts = Ts::PENDING (zeroes) for a fresh header — 12 bytes
+        // last_checkpoint_ts = zero for a fresh header — 12 bytes
         assert_eq!(&bytes[24..36], &[0u8; 12], "last_checkpoint_ts Ts-LE bytes");
 
         // Checksum algorithm = 1 (CRC32C)  →  LE bytes [0x01, 0x00, 0x00, 0x00] at offset 60

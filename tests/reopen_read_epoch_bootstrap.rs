@@ -1,13 +1,13 @@
 #![doc = "Integration test requiring the test-hooks feature."]
 #![cfg(feature = "test-hooks")]
 
-//! Phase 1 US-010 / §10.6 — open-time `ReadEpoch` bootstrap.
+//! Phase 1 US-010 / §10.6 — open-time `PublishedEpoch` bootstrap.
 //!
 //! The rule: at `SharedState::new` the engine constructs the initial
-//! `ReadEpoch` by building the PublishedCatalog directly and pairing
+//! `PublishedEpoch` by building the PublishedCatalog directly and pairing
 //! it with `oracle.now()` (post-floor). On reopen the oracle has
 //! already been floored above `max_commit_ts.successor()` by journal
-//! recovery, so the post-reopen `ReadEpoch.visible_ts` must be
+//! recovery, so the post-reopen `PublishedEpoch.visible_ts` must be
 //! `>= max_commit_ts.successor()`. On a fresh database with no prior
 //! commits the initial `visible_ts` is `Ts { 0, 0 }`.
 
@@ -17,7 +17,7 @@ use mqlite::Client;
 #[path = "crash_harness.rs"]
 mod crash_harness;
 
-/// §10.6: on reopen the initial ReadEpoch.visible_ts is floored above
+/// §10.6: on reopen the initial PublishedEpoch.visible_ts is floored above
 /// the pre-close max commit ts.
 #[test]
 fn reopen_initial_read_epoch_visible_ts_is_floored_above_max_commit() {
@@ -65,7 +65,7 @@ fn reopen_initial_read_epoch_visible_ts_is_floored_above_max_commit() {
 }
 
 /// §10.6: on a fresh database with zero prior commits, the initial
-/// `ReadEpoch.visible_ts` is `Ts { physical_ms: 0, logical: 0 }` and
+/// `PublishedEpoch.visible_ts` is `Ts { physical_ms: 0, logical: 0 }` and
 /// the very first write's commit advances strictly above that.
 #[test]
 fn fresh_db_initial_visible_ts_is_zero_and_first_commit_strictly_greater() {
@@ -77,7 +77,7 @@ fn fresh_db_initial_visible_ts_is_zero_and_first_commit_strictly_greater() {
     assert_eq!(
         initial,
         (0, 0),
-        "fresh DB must bootstrap ReadEpoch.visible_ts = Ts {{ 0, 0 }}; saw {:?}",
+        "fresh DB must bootstrap PublishedEpoch.visible_ts = Ts {{ 0, 0 }}; saw {:?}",
         initial
     );
 

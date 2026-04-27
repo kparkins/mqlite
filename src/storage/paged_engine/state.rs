@@ -1,6 +1,8 @@
 //! Shared + metadata state for the PagedEngine.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,10 +19,14 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::history_store::HistoryStore;
-use crate::storage::root_snapshot::ReadEpoch;
+use crate::storage::root_snapshot::PublishedEpoch;
 
 use super::catalog_ops::catalog_lock;
 use super::publish::build_published_catalog;
+use super::recovery_apply::{
+    apply_parsed_logical_frames, check_recovery_replay_pool_bound,
+    install_recovered_published_epoch,
+};
 
 // ---------------------------------------------------------------------------
 // SharedState — fields shared by read path (no mutex) and writer (mutex held)
@@ -33,17 +39,15 @@ pub(crate) struct SharedState {
     pub history_store: std::sync::Mutex<HistoryStore<BufferPoolPageStore>>,
     pub oracle: TimestampOracle,
     /// Atomically published read epoch for the mutex-free read path.
-    /// Phase 1 §10.1: readers load a single `Arc<ReadEpoch>` and observe
-    /// both `visible_ts` and `catalog` through the same guard.
-    pub published: ArcSwap<ReadEpoch>,
+    /// Readers load one `Arc<PublishedEpoch>` and observe the full
+    /// visibility tuple through the same guard.
+    pub published: ArcSwap<PublishedEpoch>,
+    /// Engine-fatal poison flag for post-durable unrecoverable live-state
+    /// failures. Once set, new operations return [`Error::EngineFatal`]
+    /// until the database is reopened.
+    pub engine_poisoned: AtomicBool,
     /// Monotonic transaction identifier source shared by readers and writers.
     pub txn_counter: AtomicU64,
-    /// Monotonically-increasing generation counter for the published
-    /// catalog. Advanced under `metadata.write()` alongside every
-    /// `published_catalog_rebuild`; readers load with `Ordering::Acquire`
-    /// WITHOUT holding `metadata.read()`. Phase 1 §10.1 / Phase 5
-    /// §10.17.1 / §10.21 CV-5.
-    pub catalog_gen: AtomicU64,
     /// §10.8 #19 publish-pause rendezvous hook. Per-engine (NOT
     /// process-global) so parallel tests using independent engines
     /// cannot consume each other's barriers. Under `#[cfg(test)]`
@@ -51,6 +55,27 @@ pub(crate) struct SharedState {
     /// `Arc<Barrier>` (§11 #10: no new `Mutex` / `Arc` on commit path).
     #[cfg(test)]
     pub publish_pause_hook: std::sync::Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    /// Test-only counter for the post-open recovery epoch store. This is
+    /// per-engine so integration tests do not race on a global metric.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub recovery_open_published_store_count: AtomicU64,
+    /// Test-only S9 primary-install fault injector for US-019.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us019_primary_install_failures: AtomicU8,
+    /// Test-only S9 primary-install attempt counter for US-019.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us019_primary_install_attempts: AtomicU64,
+    /// Test-only namespace-keyed write-body entry rendezvous hooks.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_body_entry_hooks: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::collections::VecDeque<super::test_accessors::WriteBodyEntryHook>,
+        >,
+    >,
+    /// Monotonic ids for test-only write-body entry hooks.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub write_body_entry_hook_next_id: AtomicU64,
 }
 
 impl SharedState {
@@ -65,12 +90,25 @@ impl SharedState {
     /// through `load_published` and does NOT increment the read-path
     /// counter — Phase 1 §10.5 explicitly scopes the single-load gate
     /// to the read path.
-    pub(crate) fn load_published(&self) -> arc_swap::Guard<Arc<ReadEpoch>> {
+    pub(crate) fn load_published(&self) -> Arc<PublishedEpoch> {
         #[cfg(test)]
         {
             EPOCH_LOAD_COUNT.with(|c| c.set(c.get() + 1));
         }
-        self.published.load()
+        self.published.load_full()
+    }
+
+    /// Return [`Error::EngineFatal`] if this live engine has been poisoned.
+    pub(crate) fn check_engine_not_poisoned(&self) -> Result<()> {
+        if self.engine_poisoned.load(Ordering::Acquire) {
+            return Err(Error::EngineFatal);
+        }
+        Ok(())
+    }
+
+    /// Poison the live engine after a post-durable unrecoverable failure.
+    pub(crate) fn poison_engine(&self) {
+        self.engine_poisoned.store(true, Ordering::Release);
     }
 }
 
@@ -132,7 +170,7 @@ impl Drop for ReadOpScope {
 /// guard (shared with other CRUD writers) and mutate the catalog via
 /// the interior `Mutex<Catalog>`.
 ///
-/// Lock order: `metadata` RwLock -> `ns_lanes` mutex -> `commit_seq`
+/// CRUD lock order: `ns_lanes` mutex -> `metadata.read()` -> `commit_seq`
 /// mutex -> `catalog` Mutex. DO NOT grab `metadata.write()` while
 /// holding the catalog mutex — that would invert the order relative to
 /// a reader that already holds `metadata.read()` and is waiting for the
@@ -147,6 +185,11 @@ pub(crate) struct MetadataState {
     /// uncontended while no CRUD writer holds `metadata.read()`.
     pub catalog: std::sync::Mutex<Catalog<BufferPoolPageStore>>,
 }
+
+/// Read guard over [`MetadataState`] used by future writer-visibility plumbing.
+#[allow(dead_code)]
+pub(in crate::storage::paged_engine) type MetadataReadGuard<'a> =
+    std::sync::RwLockReadGuard<'a, MetadataState>;
 
 /// Phase 2 §5.2 Pass 2 — validate `ParsedLogicalFrames` against the live
 /// catalog without mutating any durable state.
@@ -279,17 +322,17 @@ impl MetadataState {
         // Phase 2 §5.2 — Pass 2 post-open validation of logical frames.
         // Runs exactly once immediately after `catalog_open_with_fallback`
         // and before any user-visible state is published. Phase 2
-        // tolerance: unresolved ids are log-and-proceed. Must not mutate
-        // the catalog, buffer pool, journal, HLC floor, or any tree —
-        // the `&Catalog` signature alone pins the no-mutation contract
-        // (see `validate_parsed_logical_frames_against_catalog`).
+        // tolerance: unresolved ids are log-and-proceed. The validation
+        // pass itself does not mutate durable state.
         let parsed_logical = handle.take_parsed_logical_frames();
         validate_parsed_logical_frames_against_catalog(&catalog, &parsed_logical)?;
+        check_recovery_replay_pool_bound(&handle, &catalog, &parsed_logical)?;
         // T7 — journal-tail HLC oracle recovery: floor the oracle above
         // every durable ChainCommit from the previous lifetime. Missing
         // `successor()` (saturated `Ts::MAX`) is a hard error per plan.
         let oracle = TimestampOracle::new();
-        if let Some(max_ts) = handle.recovered_max_commit_ts()? {
+        let recovered_max_commit_ts = handle.recovered_max_commit_ts()?;
+        if let Some(max_ts) = recovered_max_commit_ts {
             match max_ts.successor() {
                 Some(next) => oracle.set_min(next),
                 None => return Err(Error::TimestampExhausted),
@@ -306,14 +349,15 @@ impl MetadataState {
         let (history_store_inner, persisted_history_root) =
             HistoryStore::create_empty_root(BufferPoolPageStore::new_history(Arc::clone(&handle)))?;
 
-        // Phase 1 §10.6 — build the initial `ReadEpoch` from the live
-        // catalog at `oracle.now()`. Fresh DB: `oracle.now()` is
-        // `Ts { 0, 0 }`. Reopen: oracle is already floored above
-        // `max_commit_ts.successor()`.
+        // Pre-replay epoch. Readers cannot reach this engine until open
+        // returns; keeping both timestamps at Ts::MIN ensures a failed replay
+        // does not publish partially-applied committed deltas.
         let initial_catalog = Arc::new(build_published_catalog(&catalog)?);
-        let initial_epoch = ReadEpoch {
-            visible_ts: oracle.now(),
+        let initial_epoch = PublishedEpoch {
+            visible_ts: crate::mvcc::Ts::default(),
             catalog: initial_catalog,
+            catalog_generation: 1,
+            sequencer_frontier: crate::mvcc::Ts::default(),
         };
 
         let shared = Arc::new(SharedState {
@@ -321,15 +365,26 @@ impl MetadataState {
             history_store: std::sync::Mutex::new(history_store_inner),
             oracle,
             published: ArcSwap::from_pointee(initial_epoch),
+            engine_poisoned: AtomicBool::new(false),
             txn_counter: AtomicU64::new(1),
-            catalog_gen: AtomicU64::new(0),
             #[cfg(test)]
             publish_pause_hook: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-hooks"))]
+            recovery_open_published_store_count: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us019_primary_install_failures: AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us019_primary_install_attempts: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            write_body_entry_hooks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            write_body_entry_hook_next_id: AtomicU64::new(1),
         });
 
         let md = Self {
             catalog: std::sync::Mutex::new(catalog),
         };
+        apply_parsed_logical_frames(&shared, &md, &parsed_logical)?;
         // For a new database, persist the freshly-allocated catalog root
         // AND the history-store root page to the file header immediately
         // (will be written to disk on flush). Reopen case: header values
@@ -351,10 +406,7 @@ impl MetadataState {
                 }
             })?;
         }
-        // Seed `catalog_gen` with 1 so every subsequent rebuild sees a
-        // monotonically strictly greater value — readers can distinguish
-        // "not yet published" (0) from "fresh epoch" (>= 1).
-        shared.catalog_gen.store(1, Ordering::Release);
+        install_recovered_published_epoch(&shared, &md, recovered_max_commit_ts)?;
         Ok((md, shared))
     }
 }

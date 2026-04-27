@@ -42,7 +42,10 @@
 mod chains;
 mod partition;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use crate::error::{Error, Result};
 use crate::mvcc::metrics;
@@ -50,6 +53,9 @@ use crate::mvcc::read_view::ReadViewRegistry;
 use crate::storage::allocator::AllocatorHandle;
 
 use partition::Partition;
+
+/// Default warning threshold for delta-bearing frame density.
+pub(crate) const DELTA_BEARING_FRAMES_WARN_THRESHOLD_DEFAULT: f64 = 0.75;
 
 // ---------------------------------------------------------------------------
 // Main buffer-pool sharding
@@ -192,6 +198,29 @@ pub(crate) struct BufferPool {
     inner_4k: Mutex<Partition>,
     inner_32k: Mutex<Partition>,
     io: Box<dyn PageSource>,
+    max_pool_bytes: usize,
+    #[allow(dead_code)]
+    total_pool_frames: usize,
+    #[allow(dead_code)]
+    delta_bearing_frames_warn_threshold: f64,
+    #[allow(dead_code)]
+    delta_bearing_frames_warn_above_threshold: AtomicBool,
+}
+
+/// Point-in-time buffer-pool occupancy metrics.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BufferPoolOccupancySnapshot {
+    /// Configured number of frames across both buffer-pool partitions.
+    pub(crate) total_pool_frames: usize,
+    /// Number of currently resident frames across both partitions.
+    pub(crate) resident_frames: usize,
+    /// Number of resident frames with at least one active pin.
+    pub(crate) pinned_frames: usize,
+    /// Number of resident frames carrying a live committed delta head.
+    pub(crate) delta_bearing_frames_count: u64,
+    /// Delta-bearing frame count divided by configured total frames.
+    pub(crate) delta_bearing_frames_ratio: f64,
 }
 
 impl BufferPool {
@@ -200,17 +229,122 @@ impl BufferPool {
     /// `buffer_pool_size` is the total byte budget.  Both partitions receive
     /// at least one frame even when the budget is very small.
     pub(crate) fn new(buffer_pool_size: usize, io: Box<dyn PageSource>) -> Self {
+        Self::new_with_delta_bearing_frames_warn_threshold(
+            buffer_pool_size,
+            io,
+            DELTA_BEARING_FRAMES_WARN_THRESHOLD_DEFAULT,
+        )
+    }
+
+    /// Create a buffer pool with a custom delta-bearing warning threshold.
+    ///
+    /// # Panics
+    ///
+    /// This constructor assumes its caller already validated that `threshold`
+    /// is in `(0.0, 1.0]`; invalid values trip a debug assertion.
+    pub(crate) fn new_with_delta_bearing_frames_warn_threshold(
+        buffer_pool_size: usize,
+        io: Box<dyn PageSource>,
+        threshold: f64,
+    ) -> Self {
+        debug_assert!(threshold > 0.0 && threshold <= 1.0);
+
         let size_4k = buffer_pool_size / 4;
         let size_32k = buffer_pool_size - size_4k;
 
         let capacity_4k = (size_4k / PageSize::Small4k.bytes()).max(1);
         let capacity_32k = (size_32k / PageSize::Large32k.bytes()).max(1);
+        let total_pool_frames = capacity_4k + capacity_32k;
 
         Self {
             inner_4k: Mutex::new(Partition::new(capacity_4k, PageSize::Small4k.bytes())),
             inner_32k: Mutex::new(Partition::new(capacity_32k, PageSize::Large32k.bytes())),
             io,
+            max_pool_bytes: buffer_pool_size,
+            total_pool_frames,
+            delta_bearing_frames_warn_threshold: threshold,
+            delta_bearing_frames_warn_above_threshold: AtomicBool::new(false),
         }
+    }
+
+    /// Return the caller-configured byte budget for this pool.
+    #[allow(dead_code)]
+    pub(crate) fn max_pool_bytes(&self) -> usize {
+        self.max_pool_bytes
+    }
+
+    /// Return a point-in-time occupancy snapshot and publish its metrics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either buffer-pool partition mutex is poisoned.
+    #[allow(dead_code)]
+    pub(crate) fn occupancy_snapshot(&self) -> Result<BufferPoolOccupancySnapshot> {
+        let (resident_frames, pinned_frames, delta_bearing_frames_count) = {
+            // Lock order is 32 KB (position 3) before 4 KB (position 4).
+            let large = self
+                .inner_32k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            let small = self
+                .inner_4k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+
+            let large_occupancy = large.occupancy_snapshot();
+            let small_occupancy = small.occupancy_snapshot();
+            (
+                large_occupancy.resident_frames + small_occupancy.resident_frames,
+                large_occupancy.pinned_frames + small_occupancy.pinned_frames,
+                large_occupancy.delta_bearing_frames + small_occupancy.delta_bearing_frames,
+            )
+        };
+
+        let delta_bearing_frames_count = delta_bearing_frames_count as u64;
+        let delta_bearing_frames_ratio =
+            delta_bearing_frames_count as f64 / self.total_pool_frames as f64;
+
+        metrics::reset_delta_bearing_frames_count();
+        for _ in 0..delta_bearing_frames_count {
+            metrics::record_delta_bearing_frame();
+        }
+        metrics::set_delta_bearing_frames_ratio(delta_bearing_frames_ratio);
+
+        let snapshot = BufferPoolOccupancySnapshot {
+            total_pool_frames: self.total_pool_frames,
+            resident_frames,
+            pinned_frames,
+            delta_bearing_frames_count,
+            delta_bearing_frames_ratio,
+        };
+        self.warn_on_delta_bearing_threshold_crossing(&snapshot);
+        Ok(snapshot)
+    }
+
+    #[allow(dead_code)]
+    fn warn_on_delta_bearing_threshold_crossing(&self, snapshot: &BufferPoolOccupancySnapshot) {
+        let above_threshold =
+            snapshot.delta_bearing_frames_ratio >= self.delta_bearing_frames_warn_threshold;
+        let was_above = self
+            .delta_bearing_frames_warn_above_threshold
+            .swap(above_threshold, Ordering::Relaxed);
+        if above_threshold && !was_above {
+            Self::emit_delta_bearing_frames_warn(snapshot);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn emit_delta_bearing_frames_warn(snapshot: &BufferPoolOccupancySnapshot) {
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            target: "mqlite",
+            delta_bearing_frames_count = snapshot.delta_bearing_frames_count,
+            total_pool_frames = snapshot.total_pool_frames as u64,
+            delta_bearing_frames_ratio = snapshot.delta_bearing_frames_ratio,
+            "mqlite::delta_bearing_frames_threshold_crossed"
+        );
+        #[cfg(not(feature = "tracing"))]
+        let _ = snapshot;
     }
 
     /// Pin `page_number` in the appropriate partition and return a
@@ -291,8 +425,32 @@ impl BufferPool {
             let mut guard = lock
                 .lock()
                 .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-            let (idx, dropped) =
-                guard.pin_page_reconciling(page_number, ort, self.io.as_ref(), size_enum)?;
+            let mut blocked = 0usize;
+            let (idx, dropped) = loop {
+                match guard.pin_page_reconciling(page_number, ort, self.io.as_ref(), size_enum) {
+                    Ok(result) => break result,
+                    Err(Error::BufferPoolEvictionBlocked { page, reason }) => {
+                        blocked += 1;
+                        let _ = (page, reason);
+                        #[cfg(feature = "tracing")]
+                        tracing::trace!(
+                            target: "mqlite",
+                            page,
+                            reason,
+                            "mqlite::eviction_candidate_blocked"
+                        );
+                        if blocked >= guard.capacity {
+                            return Err(Error::Internal(
+                                "buffer pool exhausted: all frames are pinned or \
+                                 delta-bearing; unpin unused pages, wait for \
+                                 Phase 4 reconcile, or increase buffer_pool_size"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            };
             (guard.data_snapshot(idx), dropped)
         };
 
@@ -436,4 +594,12 @@ pub(crate) mod default_sizes {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod delta_order_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod us013_tests;
+#[cfg(test)]
+mod us014_tests;
+#[cfg(test)]
+mod us015_tests;

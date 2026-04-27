@@ -17,11 +17,13 @@
 //! allocator handle are reachable. This integration test locks in the
 //! *externally observable* RAII guarantees.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
-use mqlite::mvcc::{ChainSnapshot, ReadView, ReadViewRegistry, Ts, VersionData, VersionEntry};
+use mqlite::mvcc::{
+    ChainSnapshot, ReadView, ReadViewRegistry, Ts, VersionData, VersionEntry, VersionState,
+};
 
 #[test]
 fn read_view_unregisters_across_panic() {
@@ -67,13 +69,14 @@ fn chain_snapshot_releases_arcs_across_panic() {
         },
         stop_ts: Ts::MAX,
         txn_id: 1,
+        state: VersionState::Committed,
         data: VersionData::Inline(b"payload".to_vec()),
         is_tombstone: false,
     };
     let mut chain = VecDeque::new();
     chain.push_back(entry);
     let chain_arc = Arc::new(chain);
-    let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+    let mut source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
     source.insert(b"k".to_vec(), chain_arc.clone());
 
     // Baseline: one strong ref (source map) + one held locally.

@@ -575,6 +575,10 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod crash_recovery_public_api_tests {
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
     use tempfile::TempDir;
 
     use crate::{
@@ -584,74 +588,92 @@ mod crash_recovery_public_api_tests {
     };
     use bson::Document;
 
+    const SUPERVISOR_DIR_ENV: &str = "MQLITE_CRASH_PUBLIC_SUPERVISOR_DIR";
+    const CHILD_DB_PATH_ENV: &str = "MQLITE_CRASH_PUBLIC_CHILD_DB_PATH";
+    const CHILD_READY_PATH_ENV: &str = "MQLITE_CRASH_PUBLIC_CHILD_READY_PATH";
+    const SUPERVISOR_PROCESS_TEST: &str =
+        "client::tests::crash_recovery_public_api_tests::crash_recovery_fullsync_supervisor_process";
+    const CHILD_PROCESS_TEST: &str =
+        "client::tests::crash_recovery_public_api_tests::crash_recovery_fullsync_child_process";
+    const CHILD_READY_TIMEOUT: Duration = Duration::from_secs(10);
+    const CHILD_READY_POLL: Duration = Duration::from_millis(10);
+    const CHILD_SLEEP_AFTER_READY: Duration = Duration::from_secs(60);
+
     fn fullsync_opts() -> OpenOptions {
         OpenOptions::new().durability(DurabilityMode::FullSync)
     }
 
-    fn setup_seed_data(dir: &TempDir) -> std::path::PathBuf {
-        let db_path = dir.path().join("crash_public.mqlite");
-        let client = Client::open_with_options(&db_path, fullsync_opts()).expect("open seed db");
-        let db = client.database("test");
-        let col = db.collection::<Document>("items");
-        col.insert_one(&doc! { "key": "seed", "value": 1i32 })
-            .expect("insert seed");
-        drop(client);
+    fn setup_seed_data(dir: &Path) -> PathBuf {
+        let db_path = dir.join("crash_public.mqlite");
+        {
+            let client =
+                Client::open_with_options(&db_path, fullsync_opts()).expect("open seed db");
+            let db = client.database("test");
+            let col = db.collection::<Document>("items");
+            col.insert_one(&doc! { "key": "seed", "value": 1i32 })
+                .expect("insert seed");
+        }
         db_path
     }
 
-    #[test]
-    fn crash_recovery_fullsync_via_public_api() {
-        let dir = TempDir::new().expect("tempdir");
-        let db_path = setup_seed_data(&dir);
-
-        let mut pipe_fds = [0i32; 2];
-        assert_eq!(
-            unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
-            0,
-            "pipe() failed"
-        );
-        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork() failed");
-
-        if pid == 0 {
-            unsafe { libc::close(read_fd) };
-            let client = match Client::open_with_options(&db_path, fullsync_opts()) {
-                Ok(c) => c,
-                Err(_) => unsafe { libc::_exit(2) },
-            };
-            let db = client.database("test");
-            let col = db.collection::<Document>("items");
-            match col.insert_one(&doc! { "key": "child_insert", "value": 2i32 }) {
-                Ok(_) => {}
-                Err(_) => unsafe { libc::_exit(3) },
+    fn wait_for_child_ready(child: &mut Child, ready_path: &Path) {
+        let deadline = Instant::now() + CHILD_READY_TIMEOUT;
+        loop {
+            if ready_path.exists() {
+                return;
             }
-            let signal_byte: u8 = 1;
-            unsafe {
-                libc::write(
-                    write_fd,
-                    &signal_byte as *const u8 as *const libc::c_void,
-                    1,
-                )
-            };
-            unsafe { libc::sleep(60) };
-            unsafe { libc::_exit(0) };
+            if let Some(status) = child.try_wait().expect("poll child status") {
+                panic!("child exited before signalling fsync completion: {status}");
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill unresponsive child");
+                child.wait().expect("wait for killed child");
+                panic!("timed out waiting for child fsync completion signal");
+            }
+            std::thread::sleep(CHILD_READY_POLL);
         }
+    }
 
-        unsafe { libc::close(write_fd) };
-        let mut buf = 0u8;
-        let n = unsafe { libc::read(read_fd, &mut buf as *mut u8 as *mut libc::c_void, 1) };
-        unsafe { libc::close(read_fd) };
+    #[test]
+    fn crash_recovery_fullsync_child_process() {
+        let Some(db_path) = std::env::var_os(CHILD_DB_PATH_ENV) else {
+            return;
+        };
+        let ready_path = std::env::var_os(CHILD_READY_PATH_ENV)
+            .map(PathBuf::from)
+            .expect("child ready path env");
+        let client = Client::open_with_options(PathBuf::from(db_path), fullsync_opts())
+            .expect("child open client");
+        let db = client.database("test");
+        let col = db.collection::<Document>("items");
+        col.insert_one(&doc! { "key": "child_insert", "value": 2i32 })
+            .expect("child insert");
+        std::fs::write(ready_path, b"1").expect("write child ready marker");
+        std::thread::sleep(CHILD_SLEEP_AFTER_READY);
+    }
 
-        if n != 1 {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-            panic!("child exited before signalling fsync completion");
-        }
+    #[test]
+    fn crash_recovery_fullsync_supervisor_process() {
+        let Some(dir) = std::env::var_os(SUPERVISOR_DIR_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let db_path = setup_seed_data(&dir);
+        let ready_path = dir.join("child-ready");
+        let current_exe = std::env::current_exe().expect("current test binary");
+        let mut child = Command::new(current_exe)
+            .arg("--exact")
+            .arg(CHILD_PROCESS_TEST)
+            .arg("--test-threads=1")
+            .env_remove(SUPERVISOR_DIR_ENV)
+            .env(CHILD_DB_PATH_ENV, &db_path)
+            .env(CHILD_READY_PATH_ENV, &ready_path)
+            .spawn()
+            .expect("spawn crash child test process");
 
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        wait_for_child_ready(&mut child, &ready_path);
+        child.kill().expect("kill child after fsync completion");
+        child.wait().expect("wait for killed child");
 
         let client =
             Client::open_with_options(&db_path, fullsync_opts()).expect("reopen after crash");
@@ -678,6 +700,26 @@ mod crash_recovery_public_api_tests {
             child_doc.get_i32("value").ok(),
             Some(2),
             "child_insert document value must be 2"
+        );
+    }
+
+    #[test]
+    fn crash_recovery_fullsync_via_public_api() {
+        let dir = TempDir::new().expect("tempdir");
+        let current_exe = std::env::current_exe().expect("current test binary");
+        let output = Command::new(current_exe)
+            .arg("--exact")
+            .arg(SUPERVISOR_PROCESS_TEST)
+            .arg("--test-threads=1")
+            .env(SUPERVISOR_DIR_ENV, dir.path())
+            .output()
+            .expect("spawn crash supervisor test process");
+        assert!(
+            output.status.success(),
+            "crash supervisor failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

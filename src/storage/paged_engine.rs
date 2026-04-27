@@ -36,6 +36,7 @@ mod index_maint;
 #[cfg(any(test, feature = "test-hooks"))]
 mod phase0_probe;
 pub(crate) mod publish;
+mod recovery_apply;
 mod snapshot_ops;
 mod state;
 /// Test-only `impl PagedEngine` accessors — isolated from the
@@ -43,14 +44,32 @@ mod state;
 /// visible at a glance.
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod test_accessors;
+mod visibility;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod us007_tests;
+#[cfg(test)]
+mod us008_tests;
+#[cfg(test)]
+mod us009_tests;
+#[cfg(test)]
+mod us011_tests;
+#[cfg(test)]
+mod us012_tests;
+#[cfg(test)]
+mod us018c_tests;
+#[cfg(test)]
+mod us020_tests;
 
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, feature = "test-hooks"))]
+use self::test_accessors::Phase3CommitFailpoint;
 use parking_lot::Mutex as ParkingMutex;
 
 use dashmap::{DashMap, DashSet};
@@ -79,9 +98,13 @@ use self::catalog_ops::{
     catalog_lock, new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,
 };
 use self::doc_helpers::now_millis;
-use self::index_maint::{install_pending_primary, install_pending_sec_index};
+use self::index_maint::{
+    commit_pending_primary_states, commit_pending_primary_states_with_overlay,
+    commit_pending_sec_index_states, install_pending_primary, install_pending_sec_index,
+};
 use self::publish::PublishDirty;
 use self::state::{MetadataState, OwnedLaneGuard, SharedState};
+use self::visibility::WriteVisibility;
 
 // ---------------------------------------------------------------------------
 // PagedEngine — public struct
@@ -93,9 +116,9 @@ use self::state::{MetadataState, OwnedLaneGuard, SharedState};
 ///
 /// - **Reads**: mutex-free — load `shared.published` (`ArcSwap`) and open
 ///   B-trees at the snapshot's root pages. No engine-level lock taken.
-/// - **Writes on CRUD paths**: acquire `metadata.read()` (shared), then the
-///   per-namespace lane from `ns_lanes`. Two writers on different namespaces
-///   progress concurrently. Commit sequencing (ts allocation + publish) is
+/// - **Writes on CRUD paths**: acquire the per-namespace lane from
+///   `ns_lanes`, then `metadata.read()` (shared). Two writers on different
+///   namespaces progress concurrently. Commit sequencing (S4-S12) is
 ///   serialized under `commit_seq`.
 /// - **DDL** (`create_namespace`, `drop_namespace`, `create_index`,
 ///   `drop_index`, `checkpoint`, `close`, `backup`): takes `metadata.write()`
@@ -109,10 +132,10 @@ pub(crate) struct PagedEngine {
     /// in parallel; two writers on the same namespace serialize on the
     /// lane mutex.
     ns_lanes: DashMap<String, Arc<ParkingMutex<()>>>,
-    /// Commit-sequencing mutex. All successful writes acquire it around
-    /// the `commit_ts = oracle.commit()` → install_primary → flush →
-    /// append_chain_commit → commit_txn → publish sequence, so
-    /// `commit_ts`, journal append order, and `publish_ts` all agree.
+    /// Commit-sequencing mutex. Ordinary CRUD writes acquire it at S4 and
+    /// hold it through S12: allocate `commit_ts`, append/fsync logical
+    /// transaction, append/fsync ChainCommit, install Pending heads, flush
+    /// structural bytes, then publish one `PublishedEpoch`.
     commit_seq: Mutex<()>,
     /// Writer busy-timeout applied on lane contention.
     busy_timeout: Duration,
@@ -212,6 +235,11 @@ impl Drop for LogicalTxnAppendPercentileRefresh {
 }
 
 impl PagedEngine {
+    fn engine_fatal(&self) -> Error {
+        self.shared.poison_engine();
+        Error::EngineFatal
+    }
+
     /// Create a file-backed engine using `handle` as the page store.
     ///
     /// If `catalog_root_page == 0` the database is new and an empty catalog
@@ -240,7 +268,7 @@ impl PagedEngine {
         busy_handler: Option<BusyHandler>,
     ) -> Result<Self> {
         let (md, shared) = MetadataState::new(handle, catalog_root_page, catalog_root_level)?;
-        Ok(PagedEngine {
+        let engine = PagedEngine {
             shared,
             metadata: RwLock::new(md),
             ns_lanes: DashMap::new(),
@@ -248,7 +276,9 @@ impl PagedEngine {
             busy_timeout,
             busy_handler,
             dropped_namespaces: DashSet::new(),
-        })
+        };
+        engine.resume_building_indexes_after_open()?;
+        Ok(engine)
     }
 
     // -----------------------------------------------------------------------
@@ -388,8 +418,15 @@ impl PagedEngine {
     /// rebuild_and_publish } → release lane → release metadata.
     fn run_write<F, R>(&self, ns: &str, f: F) -> Result<R>
     where
-        F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay, &mut WriteTxn) -> Result<R>,
+        F: FnOnce(
+            &SharedState,
+            &MetadataState,
+            &mut TxnOverlay,
+            &mut WriteTxn,
+            &WriteVisibility<'_>,
+        ) -> Result<R>,
     {
+        self.shared.check_engine_not_poisoned()?;
         // Take read guard; if namespace absent, bootstrap then retry.
         let md_read = self
             .metadata
@@ -414,12 +451,18 @@ impl PagedEngine {
     /// documented on `MetadataState`.
     fn run_write_existing<F, R>(&self, ns: &str, f: F) -> Result<R>
     where
-        F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay, &mut WriteTxn) -> Result<R>,
+        F: FnOnce(
+            &SharedState,
+            &MetadataState,
+            &mut TxnOverlay,
+            &mut WriteTxn,
+            &WriteVisibility<'_>,
+        ) -> Result<R>,
     {
-        let md_read = self
-            .metadata
-            .read()
-            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        self.shared.check_engine_not_poisoned()?;
+        // COMMIT-ENVELOPE-RESIDUE: A (pre-logical; no current transaction bytes).
+        // S0: acquire the namespace write lane before taking the CRUD
+        // metadata read guard.
         let lane = self.lane_for(ns);
         // Observational lane-wait timing: the counter fetch_add must run
         // AFTER the lane mutex is released (§5 cross-boundary guardrail —
@@ -432,11 +475,25 @@ impl PagedEngine {
         // after acquire_lane returns, so it still reflects only the wait.
         let mut lane_wait_record = LaneWaitRecord { elapsed: None };
         let lane_wait_start = Instant::now();
+        // COMMIT-ENVELOPE-RESIDUE: A (lane acquisition fails before journal append).
         let _lane_guard = self.acquire_lane(lane)?;
         lane_wait_record.elapsed = Some(lane_wait_start.elapsed());
+        // S1: read metadata/catalog under the namespace lane.
+        // COMMIT-ENVELOPE-RESIDUE: A (metadata read fails before journal append).
+        let md_read = self
+            .metadata
+            .read()
+            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        // S2: create the writer visibility context held through S12.
+        // COMMIT-ENVELOPE-RESIDUE: A (visibility setup fails before journal append).
+        let vis = WriteVisibility::new(&self.shared, ns)?;
 
-        // Setup overlay + WriteTxn.
-        let mark = self.shared.handle.begin_txn()?;
+        // Setup overlay + WriteTxn. Journal rollback marks are captured later,
+        // inside `commit_seq`, immediately before this transaction can append
+        // journal frames. Capturing a mark here is unsafe with independent
+        // namespace lanes: another writer may commit after the mark and before
+        // this body fails, and truncating to the old mark would erase that
+        // committed writer's frames.
         let mut overlay = TxnOverlay::new();
         let ready = self
             .shared
@@ -450,16 +507,18 @@ impl PagedEngine {
                 origin: PageOrigin::DeferredFree,
             });
         }
-        let txn_id = self.shared.txn_counter.fetch_add(1, Ordering::Relaxed);
+        let txn_id = vis.read_view.txn_id;
         let mut txn = WriteTxn::new(txn_id);
 
-        // Body — pass `&md_read` directly. The catalog itself is
+        // S3: execute the write body. Pass `&md_read` directly. The catalog itself is
         // behind `Mutex<Catalog>`, so mutations happen inside the
         // closure under the catalog mutex without needing a RwLock
         // upgrade. Other CRUD writers on different namespaces hold
         // their own `metadata.read()` concurrently and their own
         // lanes; only `commit_seq` serializes the publish step.
-        let body_result = f(&self.shared, &md_read, &mut overlay, &mut txn);
+        #[cfg(any(test, feature = "test-hooks"))]
+        self::test_accessors::write_body_entry_if_installed(&self.shared, ns);
+        let body_result = f(&self.shared, &md_read, &mut overlay, &mut txn, &vis);
 
         match body_result {
             Ok(value) => {
@@ -467,27 +526,23 @@ impl PagedEngine {
                 // called `sync_catalog_root_overlay` (because a tree root moved
                 // or the catalog root changed), the overlay captured the file
                 // header pre-image. Observed OUTSIDE the commit_seq critical
-                // section — reading `overlay.has_header_pre()` takes no locks.
-                let root_changing = overlay.has_header_pre();
+                // section — reading `overlay.has_header_update()` takes no locks.
+                let root_changing = overlay.has_header_update();
 
-                // Commit sequencing.
+                // S4-S12: commit sequencing.
                 // Observational commit_seq-wait timing: the counter fetch_add
                 // must run AFTER the commit_seq mutex is released (§5
-                // cross-boundary guardrail). Same LIFO-drop pattern as the
-                // lane-wait recorder above: `commit_seq_wait_record` is
-                // declared BEFORE `_commit`, so `_commit` drops first (end
-                // of this match-arm scope) and the fetch_add in
-                // `CommitSeqWaitRecord::drop` runs with NO mutex held.
+                // cross-boundary guardrail). `_commit` is dropped explicitly
+                // at S13 before this recorder runs.
                 let mut commit_seq_wait_record = CommitSeqWaitRecord { elapsed: None };
                 let commit_seq_wait_start = Instant::now();
                 // §7 / US-024 AC#3 — refresh the logical-txn append-duration
                 // percentiles AFTER `_commit` releases the commit_seq mutex.
                 // `LogicalTxnAppendPercentileRefresh::drop` runs the
-                // sort+store work outside the critical section. Declared
-                // BEFORE `_commit` so Rust's LIFO drop order makes
-                // `_commit` drop first (releasing the mutex) and this
-                // guard's Drop runs with NO mutex held.
+                // sort+store work outside the critical section after `_commit`
+                // is explicitly dropped at S13.
                 let _logical_txn_append_pct_refresh = LogicalTxnAppendPercentileRefresh::new();
+                // COMMIT-ENVELOPE-RESIDUE: A (commit_seq acquisition fails before S4).
                 let _commit = self
                     .commit_seq
                     .lock()
@@ -495,148 +550,223 @@ impl PagedEngine {
                 commit_seq_wait_record.elapsed = Some(commit_seq_wait_start.elapsed());
 
                 let sec_writes = std::mem::take(&mut txn.pending_sec_index);
-                if let Err(e) = install_pending_sec_index(
-                    &self.shared,
-                    &md_read,
-                    &mut overlay,
-                    sec_writes.to_vec(),
-                    &mut txn,
-                ) {
-                    drop(txn);
-                    let _ = self.rollback_overlay_and_wal(overlay, mark);
-                    return Err(e);
+                let primary_writes = std::mem::take(&mut txn.pending_primary);
+                let has_logical_ops = !sec_writes.is_empty() || !primary_writes.is_empty();
+
+                if !has_logical_ops {
+                    // COMMIT-ENVELOPE-RESIDUE: A (legacy-only branch begins before append).
+                    let commit_mark = self.shared.handle.begin_txn()?;
+                    let mut base_store = new_store(&self.shared);
+                    if let Err(e) = overlay.commit(&mut base_store, &self.shared.handle) {
+                        // COMMIT-ENVELOPE-RESIDUE: A (legacy-only overlay rolled back).
+                        drop(txn);
+                        let _ = self.shared.handle.rollback_txn(commit_mark);
+                        return Err(e);
+                    }
+                    // COMMIT-ENVELOPE-RESIDUE: A (legacy-only flush can still roll back).
+                    self.shared.handle.flush()?;
+                    let dirty = txn.publish_dirty();
+                    // COMMIT-ENVELOPE-RESIDUE: D (legacy-only commit before publish).
+                    let (publish_ts, _pending, _sec) =
+                        txn.commit(&self.shared.oracle, &self.shared.handle)?;
+                    // COMMIT-ENVELOPE-RESIDUE: D (legacy header commit before publish).
+                    self.commit_legacy_header_frame()?;
+                    #[cfg(test)]
+                    self::test_accessors::publish_pause_if_installed(&self.shared);
+                    // COMMIT-ENVELOPE-RESIDUE: D (legacy committed, publish absent on Err).
+                    rebuild_and_publish_locked(&self.shared, &md_read, publish_ts, dirty)?;
+                    if root_changing {
+                        crate::mvcc::metrics::record_crud_commit_root_changing();
+                    } else {
+                        crate::mvcc::metrics::record_crud_commit_root_neutral();
+                    }
+                    return Ok(value);
                 }
 
-                let primary_writes = std::mem::take(&mut txn.pending_primary);
-                // Phase 2 §3.7 commit envelope order: S4 allocate_commit_ts →
-                // S5 emit LogicalTxnFrame → S6 flush → S7 ChainCommit. The
-                // logical frame is emitted when ANY logical op (primary or
-                // secondary) was staged; metadata-only commits skip both
-                // the allocation and the emit (ChainCommit on those runs
-                // picks up its ts via `WriteTxn::commit`'s lazy allocate).
-                //
-                // The `sec_writes` + `primary_writes` locals must survive
-                // until after `emit_logical_txn_frame` has captured them —
-                // `install_pending_primary` below consumes primary_writes
-                // via `.to_vec()`, which clones into a throwaway copy, so
-                // the original still drives the emit call.
-                let has_logical_ops = !sec_writes.is_empty() || !primary_writes.is_empty();
-                let commit_ts_opt = if has_logical_ops {
-                    let txn_id = txn.txn_id;
-                    let commit_ts = match txn.allocate_commit_ts(&self.shared.oracle) {
-                        Ok(ts) => ts,
+                // COMMIT-ENVELOPE-RESIDUE: A (begin_txn fails before logical append).
+                let commit_mark = self.shared.handle.begin_txn()?;
+                let txn_id = txn.txn_id;
+
+                // S4: allocate commit_ts and prove it advances the current
+                // published epoch before any resident install.
+                let commit_ts = match txn.allocate_commit_ts(&self.shared.oracle) {
+                    Ok(ts) => ts,
+                    Err(e) => {
+                        // COMMIT-ENVELOPE-RESIDUE: A (S4 failure, no logical frame).
+                        drop(txn);
+                        let _ = self.rollback_overlay_and_wal(overlay, commit_mark);
+                        return Err(e);
+                    }
+                };
+                let prev_published = self.shared.published.load_full();
+                assert!(
+                    commit_ts > prev_published.visible_ts,
+                    "S4 commit_ts must advance beyond previous PublishedEpoch"
+                );
+                drop(prev_published);
+
+                // S5: build LogicalTxnFrame from staged primary and
+                // secondary writes using stage-time ns_id/index_id.
+                let frame =
+                    txn.build_logical_txn_frame(&self.shared.handle, &primary_writes, &sec_writes);
+
+                #[cfg(any(test, feature = "test-hooks"))]
+                self::test_accessors::phase3_abort_if_armed(
+                    Phase3CommitFailpoint::BeforeLogicalTxnAppend,
+                );
+
+                // S6: append logical transaction and fsync the logical tail.
+                if let Err(e) = self.shared.handle.append_logical_txn(frame) {
+                    // COMMIT-ENVELOPE-RESIDUE: A (S6 failure rolls back to mark).
+                    drop(txn);
+                    let _ = self.rollback_overlay_and_wal(overlay, commit_mark);
+                    return Err(e);
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                self::test_accessors::phase3_abort_if_armed(
+                    Phase3CommitFailpoint::AfterLogicalTxnAppendBeforeFsync,
+                );
+                if let Err(e) = self.shared.handle.fsync_logical_tail() {
+                    // COMMIT-ENVELOPE-RESIDUE: A (S6 failure rolls back to mark).
+                    drop(txn);
+                    let _ = self.rollback_overlay_and_wal(overlay, commit_mark);
+                    return Err(e);
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                self::test_accessors::phase3_abort_if_armed(
+                    Phase3CommitFailpoint::AfterLogicalTxnFsyncBeforeChainCommit,
+                );
+
+                let dirty = txn.publish_dirty();
+
+                // S7: append ChainCommit and fsync. Durable from here.
+                let _installed_and_sec =
+                    match txn.commit_chain_commit(&self.shared.handle, commit_ts) {
+                        Ok(installed) => installed,
                         Err(e) => {
-                            drop(txn);
-                            let _ = self.rollback_overlay_and_wal(overlay, mark);
+                            // COMMIT-ENVELOPE-RESIDUE: A (S7 failure rolls back to mark).
+                            let _ = self.rollback_overlay_and_wal(overlay, commit_mark);
                             return Err(e);
                         }
                     };
+                #[cfg(any(test, feature = "test-hooks"))]
+                self::test_accessors::phase3_abort_if_armed(
+                    Phase3CommitFailpoint::AfterChainCommitBeforeLegacyCommit,
+                );
 
-                    if let Err(e) = txn.emit_logical_txn_frame(
-                        &self.shared.handle,
-                        &primary_writes,
-                        &sec_writes,
-                    ) {
-                        drop(txn);
-                        let _ = self.rollback_overlay_and_wal(overlay, mark);
-                        return Err(e);
-                    }
-
-                    if !primary_writes.is_empty() {
-                        if let Err(e) = install_pending_primary(
-                            &self.shared,
-                            &md_read,
-                            &mut overlay,
-                            primary_writes.to_vec(),
-                            commit_ts,
-                            txn_id,
-                        ) {
-                            drop(txn);
-                            let _ = self.rollback_overlay_and_wal(overlay, mark);
-                            return Err(e);
-                        }
-                    }
-                    Some(commit_ts)
-                } else {
-                    None
-                };
-
-                // Commit overlay bytes onto shared frames.
-                let mut base_store = new_store(&self.shared);
-                if let Err(e) = overlay.commit(&mut base_store, &self.shared.handle) {
-                    drop(txn);
-                    let _ = self.shared.handle.rollback_txn(mark);
-                    return Err(e);
-                }
-                self.shared.handle.flush()?;
-                // Phase 1 §10.3 — capture the txn's dirty flags before
-                // `txn.commit()` consumes the transaction. `install_*`
-                // above may have called `mark_published` / `mark_header`
-                // based on root-movement classification (§4.1 / §10.3).
-                let dirty = txn.publish_dirty();
-                // Phase 2 §3.7: the Cell was taken by `emit_logical_txn_frame`,
-                // so use `commit_with_ts(commit_ts)` when we have a
-                // pre-allocated ts. Metadata-only commits (no sec/primary
-                // writes) fall through `commit()` to the lazy-allocate
-                // path, preserving existing behavior.
-                let _installed_and_sec = match commit_ts_opt {
-                    Some(ts) => txn.commit_with_ts(ts, &self.shared.handle)?,
-                    None => {
-                        let (_ts, pending, sec) =
-                            txn.commit(&self.shared.oracle, &self.shared.handle)?;
-                        (pending, sec)
-                    }
-                };
-                let db_page_count = self
-                    .shared
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.total_page_count)?;
-                // Build the commit-frame page-0 bytes from the allocator's
-                // authoritative header rather than the buffer pool.  The
-                // overlay commit above (overlay_inner.commit) may have written
-                // a stale catalog_root_page to the pool if a concurrent DDL
-                // (e.g. drop_namespace) committed AFTER this txn's body ran
-                // but BEFORE we reached the commit-seq lock.  Reading from the
-                // allocator — which is always updated atomically under
-                // update_header — guarantees we persist the latest
-                // catalog_root_page even if a concurrent DDL beat us here.
-                let header_data = self
-                    .shared
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.to_bytes())?;
-                let emergency = self.shared.handle.commit_txn(
-                    0,
-                    PageSize::Small4k,
-                    &header_data,
-                    db_page_count,
+                // S8: install secondary delta heads as Pending.
+                // COMMIT-ENVELOPE-RESIDUE: C (S8 repeated failure; durable ChainCommit).
+                self.install_pending_sec_index_or_fatal(
+                    &md_read,
+                    &mut overlay,
+                    &sec_writes,
+                    &vis,
+                    commit_ts,
+                    txn_id,
                 )?;
-                if emergency {
-                    crate::mvcc::metrics::record_emergency_checkpoint_trigger();
-                    let _ = self.shared.handle.emergency_checkpoint();
-                }
-                // Phase 1 §6.3: strict-monotonic visible_ts rule.
-                //   - txn had primary writes → use its allocated `commit_ts`.
-                //   - metadata-only commit (no primary writes) → use
-                //     `oracle.commit()?`, NOT `oracle.now()`. `now()` peeks
-                //     the HLC without advancing it, so two sub-ms
-                //     metadata-only commits could return equal Ts and
-                //     violate `publish_commit`'s monotonicity debug_assert.
-                let publish_ts = match commit_ts_opt {
-                    Some(ts) => ts,
-                    None => self.shared.oracle.commit()?,
+
+                // S9: install primary delta heads as Pending.
+                // COMMIT-ENVELOPE-RESIDUE: C (S9 repeated failure; durable ChainCommit).
+                self.install_pending_primary_or_fatal(
+                    &md_read,
+                    &mut overlay,
+                    &primary_writes,
+                    &vis,
+                    commit_ts,
+                    txn_id,
+                )?;
+
+                // S10: commit structural overlay bytes only. Root-neutral
+                // ordinary CRUD defers its page-image commit out of the
+                // pre-publish window so readers cannot fall through to
+                // speculative primary base cells while the resident head is
+                // Pending.
+                let mut root_neutral_overlay = if root_changing {
+                    let mut base_store = new_store(&self.shared);
+                    // COMMIT-ENVELOPE-RESIDUE: C (S10 failure; durable ChainCommit).
+                    overlay
+                        .commit(&mut base_store, &self.shared.handle)
+                        .map_err(|_| self.engine_fatal())?;
+                    None
+                } else {
+                    Some(overlay)
                 };
-                // §10.8 #19 rendezvous: test-only hook placed AFTER
-                // commit_txn and BEFORE publish_commit so a unit test
-                // can deterministically observe the pre-publish
-                // ReadEpoch. Gated under `#[cfg(test)]` — in
-                // `cfg(not(test))` (production) builds this expands
-                // to an inlined no-op; no new `Mutex` / `Arc`
-                // appears on the commit path (§11 #10).
+
+                // S11: flush structural effects and persist the legacy header
+                // commit frame without changing ChainCommit authority.
+                // COMMIT-ENVELOPE-RESIDUE: C (S11 flush failure before legacy commit frame).
+                self.shared
+                    .handle
+                    .flush()
+                    .map_err(|_| self.engine_fatal())?;
+                if root_changing {
+                    // COMMIT-ENVELOPE-RESIDUE: C (legacy header frame failure before publish).
+                    self.commit_legacy_header_frame()
+                        .map_err(|_| self.engine_fatal())?;
+                }
+
+                #[cfg(any(test, feature = "test-hooks"))]
+                self::test_accessors::phase3_abort_if_armed(
+                    Phase3CommitFailpoint::AfterLegacyCommitBeforePublish,
+                );
+
+                // S12: publish exactly one PublishedEpoch swap.
                 #[cfg(test)]
                 self::test_accessors::publish_pause_if_installed(&self.shared);
-                rebuild_and_publish_locked(&self.shared, &md_read, publish_ts, dirty)?;
+                // COMMIT-ENVELOPE-RESIDUE: D (legacy committed, publish absent on Err).
+                rebuild_and_publish_locked(&self.shared, &md_read, commit_ts, dirty)
+                    .map_err(|_| self.engine_fatal())?;
+                // COMMIT-ENVELOPE-RESIDUE: E (publish complete; local secondary flip failed).
+                commit_pending_sec_index_states(
+                    &self.shared,
+                    &md_read,
+                    &sec_writes,
+                    commit_ts,
+                    txn_id,
+                )
+                .map_err(|_| self.engine_fatal())?;
+                // COMMIT-ENVELOPE-RESIDUE: E (publish complete; local primary flip failed).
+                if let Some(overlay) = root_neutral_overlay.as_mut() {
+                    commit_pending_primary_states_with_overlay(
+                        &self.shared,
+                        &md_read,
+                        overlay,
+                        &primary_writes,
+                        commit_ts,
+                        txn_id,
+                    )
+                } else {
+                    commit_pending_primary_states(
+                        &self.shared,
+                        &md_read,
+                        &primary_writes,
+                        commit_ts,
+                        txn_id,
+                    )
+                }
+                .map_err(|_| self.engine_fatal())?;
+
+                // S13: release commit_seq after the S12 publish and local
+                // Pending-to-Committed diagnostic flip. The namespace lane
+                // releases when its guard drops at the end of this call.
+                drop(_commit);
+
+                if let Some(overlay) = root_neutral_overlay {
+                    let mut base_store = new_store(&self.shared);
+                    // COMMIT-ENVELOPE-RESIDUE: E (publish complete; delayed overlay commit failed).
+                    overlay
+                        .commit(&mut base_store, &self.shared.handle)
+                        .map_err(|_| self.engine_fatal())?;
+                    // COMMIT-ENVELOPE-RESIDUE: E (publish complete; delayed overlay flush failed).
+                    self.shared
+                        .handle
+                        .flush()
+                        .map_err(|_| self.engine_fatal())?;
+                    // COMMIT-ENVELOPE-RESIDUE: E (publish complete; delayed header frame failed).
+                    self.commit_legacy_header_frame()
+                        .map_err(|_| self.engine_fatal())?;
+                }
+
                 if root_changing {
                     crate::mvcc::metrics::record_crud_commit_root_changing();
                 } else {
@@ -645,11 +775,143 @@ impl PagedEngine {
                 Ok(value)
             }
             Err(e) => {
+                // COMMIT-ENVELOPE-RESIDUE: A (S3 body failure before journal append).
                 drop(txn);
-                let _ = self.rollback_overlay_and_wal(overlay, mark);
+                let _ = self.rollback_overlay_only(overlay);
                 Err(e)
             }
         }
+    }
+
+    fn commit_legacy_header_frame(&self) -> Result<()> {
+        let db_page_count = self
+            .shared
+            .handle
+            .allocator()
+            .with_header(|h| h.total_page_count)?;
+        // Build the commit-frame page-0 bytes from the allocator's
+        // authoritative header rather than the buffer pool. The overlay
+        // commit may have written stale header bytes if concurrent catalog
+        // work advanced the allocator header before this writer sequenced.
+        let header_data = self
+            .shared
+            .handle
+            .allocator()
+            .with_header(|h| h.to_bytes())?;
+        let emergency =
+            self.shared
+                .handle
+                .commit_txn(0, PageSize::Small4k, &header_data, db_page_count)?;
+        if emergency {
+            crate::mvcc::metrics::record_emergency_checkpoint_trigger();
+            let _ = self.shared.handle.emergency_checkpoint();
+        }
+        Ok(())
+    }
+
+    fn install_pending_sec_index_or_fatal(
+        &self,
+        md: &MetadataState,
+        overlay: &mut TxnOverlay,
+        writes: &[crate::mvcc::SecIndexWrite],
+        vis: &WriteVisibility<'_>,
+        commit_ts: crate::mvcc::Ts,
+        txn_id: u64,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        if install_pending_sec_index(
+            &self.shared,
+            md,
+            overlay,
+            writes.to_vec(),
+            vis,
+            commit_ts,
+            txn_id,
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        install_pending_sec_index(
+            &self.shared,
+            md,
+            overlay,
+            writes.to_vec(),
+            vis,
+            commit_ts,
+            txn_id,
+        )
+        .map_err(|_| self.engine_fatal())
+    }
+
+    fn install_pending_primary_or_fatal(
+        &self,
+        md: &MetadataState,
+        overlay: &mut TxnOverlay,
+        writes: &[crate::mvcc::PrimaryWrite],
+        vis: &WriteVisibility<'_>,
+        commit_ts: crate::mvcc::Ts,
+        txn_id: u64,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        let first_attempt = self::test_accessors::us019_maybe_fail_primary_install(&self.shared)
+            .and_then(|()| {
+                install_pending_primary(
+                    &self.shared,
+                    md,
+                    overlay,
+                    writes.to_vec(),
+                    vis,
+                    commit_ts,
+                    txn_id,
+                )
+            });
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let first_attempt = install_pending_primary(
+            &self.shared,
+            md,
+            overlay,
+            writes.to_vec(),
+            vis,
+            commit_ts,
+            txn_id,
+        );
+        if first_attempt.is_ok() {
+            return Ok(());
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        let second_attempt = self::test_accessors::us019_maybe_fail_primary_install(&self.shared)
+            .and_then(|()| {
+                install_pending_primary(
+                    &self.shared,
+                    md,
+                    overlay,
+                    writes.to_vec(),
+                    vis,
+                    commit_ts,
+                    txn_id,
+                )
+            });
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let second_attempt = install_pending_primary(
+            &self.shared,
+            md,
+            overlay,
+            writes.to_vec(),
+            vis,
+            commit_ts,
+            txn_id,
+        );
+        second_attempt.map_err(|_| self.engine_fatal())
+    }
+
+    fn rollback_overlay_only(&self, overlay: TxnOverlay) -> Result<()> {
+        overlay.rollback(&self.shared.handle)
     }
 
     fn rollback_overlay_and_wal(&self, overlay: TxnOverlay, mark: Option<u64>) -> Result<()> {
@@ -665,6 +927,7 @@ impl PagedEngine {
 
 impl StorageEngine for PagedEngine {
     fn insert(&self, ns: &str, doc: Document) -> Result<Bson> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::insert(self, ns, doc)
     }
 
@@ -674,10 +937,12 @@ impl StorageEngine for PagedEngine {
         filter: &Document,
         opts: &FindOptions,
     ) -> Result<(Vec<Document>, crate::query::explain::ExplainResult)> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::find(self, ns, filter, opts)
     }
 
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::find_one(self, ns, filter)
     }
 
@@ -689,14 +954,17 @@ impl StorageEngine for PagedEngine {
         opts: &UpdateOptions,
         many: bool,
     ) -> Result<UpdateResult> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::update(self, ns, filter, update, opts, many)
     }
 
     fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::delete(self, ns, filter, many)
     }
 
     fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::count(self, ns, filter)
     }
 
@@ -707,6 +975,7 @@ impl StorageEngine for PagedEngine {
         update: &Document,
         opts: &FindOneAndUpdateOptions,
     ) -> Result<Option<Document>> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::find_one_and_update_doc(self, ns, filter, update, opts)
     }
 
@@ -716,6 +985,7 @@ impl StorageEngine for PagedEngine {
         filter: &Document,
         opts: &FindOneAndDeleteOptions,
     ) -> Result<Option<Document>> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::find_one_and_delete_doc(self, ns, filter, opts)
     }
 
@@ -726,18 +996,22 @@ impl StorageEngine for PagedEngine {
         replacement: &Document,
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
+        self.shared.check_engine_not_poisoned()?;
         doc_ops::find_one_and_replace_doc(self, ns, filter, replacement, opts)
     }
 
     fn create_index(&self, ns: &str, model: &IndexModel) -> Result<String> {
+        self.shared.check_engine_not_poisoned()?;
         index_maint::create_index(self, ns, model)
     }
 
     fn drop_index(&self, ns: &str, name: &str) -> Result<()> {
+        self.shared.check_engine_not_poisoned()?;
         index_maint::drop_index(self, ns, name)
     }
 
     fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
+        self.shared.check_engine_not_poisoned()?;
         index_maint::list_indexes(self, ns)
     }
 
@@ -746,6 +1020,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn create_namespace(&self, ns: &str) -> Result<()> {
+        self.shared.check_engine_not_poisoned()?;
         let result = self.run_ddl(|shared, md, overlay| {
             let data_root = {
                 let mut cat = catalog_lock(md);
@@ -775,6 +1050,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn drop_namespace(&self, ns: &str) -> Result<()> {
+        self.shared.check_engine_not_poisoned()?;
         // Force-expire ALL active ReadViews globally before freeing pages.
         // Done BEFORE taking the metadata write guard so concurrent readers
         // that just loaded the published snapshot can finish their pin walks.
@@ -843,6 +1119,7 @@ impl StorageEngine for PagedEngine {
     // -----------------------------------------------------------------------
 
     fn list_namespaces(&self) -> Result<Vec<String>> {
+        self.shared.check_engine_not_poisoned()?;
         let snap = self.shared.load_published();
         let keys = snap.catalog.namespace_id_by_name.keys();
         let mut out = Vec::with_capacity(keys.len());
@@ -851,6 +1128,7 @@ impl StorageEngine for PagedEngine {
     }
 
     fn checkpoint(&self) -> Result<()> {
+        self.shared.check_engine_not_poisoned()?;
         snapshot_ops::checkpoint(self)
     }
 
@@ -873,13 +1151,42 @@ impl StorageEngine for PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn published_catalog_ptr(&self) -> usize {
-        self.test_published_catalog_ptr()
+    fn published_catalog_gen(&self) -> u64 {
+        self.test_published_catalog_gen()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn published_sequencer_frontier(&self) -> (u64, u32) {
+        self.test_published_sequencer_frontier()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn recovery_open_published_store_count(&self) -> u64 {
+        self.test_recovery_open_published_store_count()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
         self.test_recovered_max_commit_ts()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn us019_set_primary_install_failures(&self, failures: u8) {
+        self.test_us019_set_primary_install_failures(failures);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn us019_primary_install_attempts(&self) -> u64 {
+        self.test_us019_primary_install_attempts()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn install_write_body_entry_hook(
+        &self,
+        ns: &str,
+        observe_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> self::test_accessors::WriteBodyEntryHookGuard {
+        self.test_install_write_body_entry_hook(ns, observe_flag)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -893,14 +1200,17 @@ impl StorageEngine for PagedEngine {
     }
 
     fn close(&self) -> Result<()> {
+        self.shared.check_engine_not_poisoned()?;
         snapshot_ops::close(self)
     }
 
     fn journal_sync(&self) -> Result<()> {
+        self.shared.check_engine_not_poisoned()?;
         snapshot_ops::journal_sync(self)
     }
 
     fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.shared.check_engine_not_poisoned()?;
         snapshot_ops::snapshot_bytes(self)
     }
 }
@@ -916,6 +1226,7 @@ impl PagedEngine {
     where
         F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay) -> Result<R>,
     {
+        self.shared.check_engine_not_poisoned()?;
         let md_w = self
             .metadata
             .write()

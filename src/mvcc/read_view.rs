@@ -47,6 +47,7 @@
 // reconciliation path.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::Bound;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
@@ -60,7 +61,8 @@ use loom::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::mvcc::timestamp::Ts;
-use crate::mvcc::version::VersionEntry;
+use crate::mvcc::version::{VersionEntry, VersionState};
+use crate::storage::root_snapshot::{PublishedCatalog, PublishedEpoch};
 
 /// A snapshot handle for an active reader.
 ///
@@ -68,12 +70,12 @@ use crate::mvcc::version::VersionEntry;
 /// the timestamp oracle. The visibility rule:
 ///
 /// - Committed entry `E` is visible iff `E.start_ts <= read_ts < E.stop_ts`.
-/// - Pending entry is visible only to its own `txn_id`.
+/// - Pending entry is visible to its own `txn_id`; foreign pending entries
+///   are gated by the pinned sequencer frontier and timestamp window.
 ///
 /// `poisoned` is set by force-expiry before touching any owned pins;
 /// `pin_ops_in_flight` lets the force-expiry path wait for concurrent
 /// pin walks to complete before releasing pages.
-#[derive(Debug)]
 pub struct ReadView {
     /// Snapshot timestamp for visibility checks.
     pub read_ts: Ts,
@@ -95,6 +97,24 @@ pub struct ReadView {
     /// view. `None` for standalone `ReadView::new(..)` callers — primarily
     /// tests that exercise snapshot visibility without a registry.
     registry: Option<Arc<ReadViewRegistry>>,
+    /// Published visibility tuple pinned for this view's lifetime.
+    epoch: Arc<PublishedEpoch>,
+}
+
+impl std::fmt::Debug for ReadView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadView")
+            .field("read_ts", &self.read_ts)
+            .field("txn_id", &self.txn_id)
+            .field("poisoned", &self.poisoned.load(Ordering::Acquire))
+            .field(
+                "pin_ops_in_flight",
+                &self.pin_ops_in_flight.load(Ordering::Acquire),
+            )
+            .field("catalog_generation", &self.epoch.catalog_generation)
+            .field("sequencer_frontier", &self.epoch.sequencer_frontier)
+            .finish()
+    }
 }
 
 impl ReadView {
@@ -103,12 +123,23 @@ impl ReadView {
     /// exists for tests and internal snapshot fixtures.
     #[must_use]
     pub fn new(read_ts: Ts, txn_id: u64) -> Self {
+        Self::new_for_epoch(standalone_epoch(read_ts), txn_id)
+    }
+
+    /// Construct a `ReadView` over an already-loaded published epoch.
+    ///
+    /// Reader paths load `SharedState.published` once, clone that epoch
+    /// into the view, and read all visibility metadata from this pinned
+    /// value for the rest of the snapshot lifetime.
+    #[must_use]
+    pub(crate) fn new_for_epoch(epoch: Arc<PublishedEpoch>, txn_id: u64) -> Self {
         Self {
-            read_ts,
+            read_ts: epoch.visible_ts,
             txn_id,
             poisoned: AtomicBool::new(false),
             pin_ops_in_flight: AtomicU32::new(0),
             registry: None,
+            epoch,
         }
     }
 
@@ -119,15 +150,51 @@ impl ReadView {
     /// `Weak<ReadView>` so `force_expire_all` can iterate live views.
     #[must_use]
     pub fn open(registry: Arc<ReadViewRegistry>, read_ts: Ts, txn_id: u64) -> Arc<Self> {
+        Self::open_for_epoch(registry, standalone_epoch(read_ts), txn_id)
+    }
+
+    /// Open a registry-tracked view over an already-loaded published epoch.
+    #[must_use]
+    pub(crate) fn open_for_epoch(
+        registry: Arc<ReadViewRegistry>,
+        epoch: Arc<PublishedEpoch>,
+        txn_id: u64,
+    ) -> Arc<Self> {
+        let read_ts = epoch.visible_ts;
         let view = Arc::new(Self {
             read_ts,
             txn_id,
             poisoned: AtomicBool::new(false),
             pin_ops_in_flight: AtomicU32::new(0),
             registry: Some(Arc::clone(&registry)),
+            epoch,
         });
         registry.register(txn_id, read_ts, Arc::downgrade(&view));
         view
+    }
+
+    /// Snapshot timestamp pinned by the published epoch.
+    #[must_use]
+    pub(crate) fn visible_ts(&self) -> Ts {
+        self.epoch.visible_ts
+    }
+
+    /// Published catalog pinned by the view.
+    #[must_use]
+    pub(crate) fn catalog(&self) -> &PublishedCatalog {
+        &self.epoch.catalog
+    }
+
+    /// Published catalog generation pinned by the view.
+    #[must_use]
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.epoch.catalog_generation
+    }
+
+    /// Published sequencer frontier pinned by the view.
+    #[must_use]
+    pub(crate) fn sequencer_frontier(&self) -> Ts {
+        self.epoch.sequencer_frontier
     }
 
     /// True iff this view has been force-expired. Readers MUST check this
@@ -212,6 +279,18 @@ impl ReadView {
             std::thread::yield_now();
         }
     }
+}
+
+fn standalone_epoch(read_ts: Ts) -> Arc<PublishedEpoch> {
+    Arc::new(PublishedEpoch {
+        visible_ts: read_ts,
+        catalog: Arc::new(PublishedCatalog {
+            namespaces: HashMap::new(),
+            namespace_id_by_name: HashMap::new(),
+        }),
+        catalog_generation: 0,
+        sequencer_frontier: Ts::default(),
+    })
 }
 
 impl Drop for ReadView {
@@ -349,7 +428,7 @@ impl ReadViewRegistry {
 /// Every entry observed through the snapshot is therefore pinned — its
 /// backing overflow chain cannot be freed while the snapshot is live.
 ///
-/// Drop follows the default Rust drop-glue: the outer `HashMap` drops each
+/// Drop follows the default Rust drop-glue: the outer map drops each
 /// `VecDeque<VersionEntry>`, which drops every contained `VersionEntry`,
 /// which in turn runs `OverflowRef::Drop` (atomic decref + deferred-free
 /// enqueue on 0).
@@ -372,7 +451,7 @@ pub struct ChainSnapshot {
     /// exclusively by this snapshot; the `VersionEntry` values inside each
     /// `VecDeque` were cloned from the source (running `OverflowRef::Clone`
     /// for `VersionData::Overflow` entries).
-    chains: HashMap<Vec<u8>, VecDeque<VersionEntry>>,
+    chains: BTreeMap<Vec<u8>, VecDeque<VersionEntry>>,
     /// Back-reference to the owning reader's `ReadView`, used for the
     /// poison check during `new`. `None` for standalone callers (primarily
     /// tests that exercise snapshot visibility without a registry).
@@ -397,7 +476,7 @@ impl ChainSnapshot {
     /// type-level docs for the poison contract.
     #[must_use]
     pub fn new(
-        source: &HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+        source: &BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
         view: Option<Arc<ReadView>>,
     ) -> Self {
         // Pre-check: if the owning view is already poisoned, refuse to
@@ -406,7 +485,7 @@ impl ChainSnapshot {
         if let Some(v) = &view {
             if v.poisoned.load(Ordering::Acquire) {
                 return ChainSnapshot {
-                    chains: HashMap::new(),
+                    chains: BTreeMap::new(),
                     view,
                 };
             }
@@ -415,7 +494,7 @@ impl ChainSnapshot {
 
         // Deep clone: each inner `VersionEntry::clone()` runs
         // `OverflowRef::clone()` which is the CAS-loop incref.
-        let mut chains = HashMap::with_capacity(source.len());
+        let mut chains = BTreeMap::new();
         for (k, chain) in source {
             let cloned: VecDeque<VersionEntry> = chain.iter().cloned().collect();
             chains.insert(k.clone(), cloned);
@@ -429,7 +508,7 @@ impl ChainSnapshot {
             v.pin_ops_in_flight.fetch_sub(1, Ordering::Release);
             if poisoned_after {
                 return ChainSnapshot {
-                    chains: HashMap::new(),
+                    chains: BTreeMap::new(),
                     view,
                 };
             }
@@ -441,17 +520,43 @@ impl ChainSnapshot {
     /// Find the entry in the chain for `key` visible at `view.read_ts`.
     ///
     /// Visibility rule:
-    /// - Pending entry (`start_ts == Ts::PENDING`): visible only to its own `txn_id`.
+    /// - Own pending entry: visible by matching `txn_id`.
+    /// - Foreign pending entry: same timestamp window and
+    ///   `start_ts <= view.sequencer_frontier()`.
     /// - Committed entry: `start_ts <= read_ts < stop_ts`.
+    /// - Aborted entry: skipped.
     #[must_use]
     pub fn visible_at(&self, key: &[u8], view: &ReadView) -> Option<&VersionEntry> {
-        self.chains.get(key).and_then(|chain| {
-            chain.iter().find(|e| {
-                if e.start_ts == Ts::PENDING {
-                    e.txn_id == view.txn_id
-                } else {
-                    e.start_ts <= view.read_ts && view.read_ts < e.stop_ts
-                }
+        self.chains
+            .get(key)
+            .and_then(|chain| chain.iter().find(|entry| version_visible_to(entry, view)))
+    }
+
+    /// Iterate visible `(key, entry)` pairs within the supplied byte bounds.
+    ///
+    /// Uses the same visibility predicate as [`Self::visible_at`].
+    pub fn visible_range<'a>(
+        &'a self,
+        start: Bound<&'a [u8]>,
+        end: Bound<&'a [u8]>,
+        view: &'a ReadView,
+    ) -> impl Iterator<Item = (&'a [u8], &'a VersionEntry)> + 'a {
+        self.chains
+            .range::<[u8], _>((start, end))
+            .filter_map(move |(key, chain)| {
+                chain
+                    .iter()
+                    .find(|entry| version_visible_to(entry, view))
+                    .map(|entry| (key.as_slice(), entry))
+            })
+    }
+
+    /// True when history can contain a useful version for `key` at `read_ts`.
+    #[must_use]
+    pub fn history_is_candidate(&self, key: &[u8], read_ts: Ts) -> bool {
+        self.chains.get(key).map_or(true, |chain| {
+            chain.iter().all(|entry| {
+                entry.start_ts > read_ts || matches!(entry.state, VersionState::Pending { .. })
             })
         })
     }
@@ -472,6 +577,23 @@ impl ChainSnapshot {
     #[must_use]
     pub fn chain_len(&self, key: &[u8]) -> usize {
         self.chains.get(key).map_or(0, |c| c.len())
+    }
+}
+
+fn version_visible_to(entry: &VersionEntry, view: &ReadView) -> bool {
+    let read_ts = view.visible_ts();
+    match entry.state {
+        VersionState::Pending { txn_id } => {
+            if txn_id == view.txn_id {
+                true
+            } else {
+                entry.start_ts <= read_ts
+                    && read_ts < entry.stop_ts
+                    && entry.start_ts <= view.sequencer_frontier()
+            }
+        }
+        VersionState::Committed => entry.start_ts <= read_ts && read_ts < entry.stop_ts,
+        VersionState::Aborted => false,
     }
 }
 
@@ -497,6 +619,7 @@ mod tests {
             start_ts: ts,
             stop_ts: Ts::MAX,
             txn_id: 1,
+            state: VersionState::Committed,
             data: VersionData::Overflow(r),
             is_tombstone: false,
         }
@@ -520,7 +643,7 @@ mod tests {
 
     #[test]
     fn poisoned_flag_transitions() {
-        let rv = ReadView::new(Ts::PENDING, 0);
+        let rv = ReadView::new(Ts::default(), 0);
         assert!(!rv.poisoned.load(Ordering::Acquire));
         rv.poisoned.store(true, Ordering::Release);
         assert!(rv.poisoned.load(Ordering::Acquire));
@@ -528,7 +651,7 @@ mod tests {
 
     #[test]
     fn pin_ops_counter_tracks_in_flight() {
-        let rv = ReadView::new(Ts::PENDING, 0);
+        let rv = ReadView::new(Ts::default(), 0);
         rv.pin_ops_in_flight.fetch_add(1, Ordering::Release);
         rv.pin_ops_in_flight.fetch_add(1, Ordering::Release);
         assert_eq!(rv.pin_ops_in_flight.load(Ordering::Acquire), 2);
@@ -543,7 +666,7 @@ mod tests {
     #[test]
     fn chain_snapshot_new_bumps_each_overflow_refcount() {
         let alloc = fresh_allocator();
-        let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+        let mut source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
 
         // Key A: chain of 3 overflow entries on pages 10, 11, 12.
         let mut chain_a = VecDeque::new();
@@ -620,7 +743,7 @@ mod tests {
 
     #[test]
     fn chain_snapshot_is_empty_on_empty_source() {
-        let source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+        let source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
         let snap = ChainSnapshot::new(&source, None);
         assert!(snap.is_empty());
         assert_eq!(snap.key_count(), 0);
@@ -633,7 +756,7 @@ mod tests {
     #[test]
     fn chain_snapshot_poisoned_before_new_takes_no_pins() {
         let alloc = fresh_allocator();
-        let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+        let mut source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
         let mut chain = VecDeque::new();
         chain.push_back(overflow_entry(
             &alloc,
@@ -679,7 +802,7 @@ mod tests {
         // the invariant and then cover the real path with the loom test
         // in tests/force_expiry_pin_race.rs.
         let alloc = fresh_allocator();
-        let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+        let mut source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
         let mut chain = VecDeque::new();
         chain.push_back(overflow_entry(
             &alloc,
@@ -758,7 +881,7 @@ mod tests {
 
     #[test]
     fn force_expire_returns_immediately_when_pin_ops_is_zero() {
-        let rv = ReadView::new(Ts::PENDING, 0);
+        let rv = ReadView::new(Ts::default(), 0);
         assert_eq!(rv.pin_ops_in_flight.load(Ordering::Acquire), 0);
         let start = std::time::Instant::now();
         rv.force_expire();
@@ -840,7 +963,7 @@ mod tests {
         // Mirrors the MemPageStore acceptance bullet: chains inserted,
         // `visible_at` returns the correct entry.
         let alloc = fresh_allocator();
-        let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+        let mut source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
 
         // Chain for key K: head is committed at ts=200, stop_ts=MAX; older
         // entry committed at ts=100, stopped at ts=200.
@@ -851,6 +974,7 @@ mod tests {
             },
             stop_ts: Ts::MAX,
             txn_id: 7,
+            state: VersionState::Committed,
             data: VersionData::Inline(b"v2".to_vec()),
             is_tombstone: false,
         };
@@ -864,6 +988,7 @@ mod tests {
                 logical: 0,
             },
             txn_id: 6,
+            state: VersionState::Committed,
             data: VersionData::Overflow(OverflowRef::new_owned(42, 256, alloc.clone()).unwrap()),
             is_tombstone: false,
         };
@@ -917,3 +1042,13 @@ mod tests {
         assert!(snap.visible_at(b"missing", &reader_new).is_none());
     }
 }
+
+#[cfg(test)]
+#[cfg(not(loom))]
+#[path = "read_view_us001_tests.rs"]
+mod read_view_us001_tests;
+
+#[cfg(test)]
+#[cfg(not(loom))]
+#[path = "read_view_us004_tests.rs"]
+mod read_view_us004_tests;

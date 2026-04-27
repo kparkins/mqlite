@@ -191,6 +191,8 @@ impl<S: BTreePageStore> BTree<S> {
     }
 
     fn move_all_leaf_chains(&mut self, from_page: u32, to_page: u32) -> Result<()> {
+        // Phase 3 Section 10.6: merge drains every chain from the source leaf,
+        // including delta-only chains, and keeps the existing transport shape.
         for (key, chain) in self.store.take_all_chains(from_page)? {
             self.store.put_chain(to_page, key, chain)?;
         }
@@ -203,6 +205,9 @@ impl<S: BTreePageStore> BTree<S> {
         right_page: u32,
         separator_key: &[u8],
     ) -> Result<()> {
+        // Phase 3 Section 10.6: redistribution remains a separator-key
+        // partition, so delta-only chains route by the same raw key bytes as
+        // base-backed chains.
         let mut chains = self.store.take_all_chains(left_page)?;
         chains.extend(self.store.take_all_chains(right_page)?);
 

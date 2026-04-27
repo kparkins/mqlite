@@ -31,7 +31,7 @@ fn new_client(name: &str) -> (Client, tempfile::TempDir) {
 }
 
 /// §10.8 #17: an update operation plans against the catalog AND
-/// installs the new version using observations from ONE ReadEpoch
+/// installs the new version using observations from ONE PublishedEpoch
 /// load. The public API goes through `run_write` (write path), which
 /// consumes the catalog via `metadata.read()` — it does NOT
 /// re-load the published epoch during the write. Observable: a

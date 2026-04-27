@@ -12,13 +12,13 @@
 //! diagnostic counters. This test exercises the public primitives
 //! exposed on the `mqlite::mvcc` module.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use mqlite::mvcc::{
     record_secondary_index_tombstone_hit, reset_secondary_index_tombstone_hits,
     secondary_index_tombstone_hits_snapshot, ChainSnapshot, ReadView, Ts, VersionData,
-    VersionEntry,
+    VersionEntry, VersionState,
 };
 
 // The tombstone counter is a process-global atomic. Tests in this file
@@ -38,6 +38,7 @@ fn entry(start: Ts, stop: Ts, txn_id: u64, bytes: &[u8], tombstone: bool) -> Ver
         start_ts: start,
         stop_ts: stop,
         txn_id,
+        state: VersionState::Committed,
         data: VersionData::Inline(bytes.to_vec()),
         is_tombstone: tombstone,
     }
@@ -48,7 +49,7 @@ fn snap_with(chain_entries: Vec<VersionEntry>) -> ChainSnapshot {
     for e in chain_entries {
         chain.push_back(e);
     }
-    let mut source = HashMap::new();
+    let mut source = BTreeMap::new();
     source.insert(SEC_KEY.to_vec(), Arc::new(chain));
     ChainSnapshot::new(&source, None)
 }

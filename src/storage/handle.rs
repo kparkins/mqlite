@@ -240,7 +240,7 @@ impl BufferPoolHandle {
         } // unpin — dirty bit persists in the pool
 
         // Bug B (T3.5): a page reborn from the free list inherits the
-        // version_chains map from its previous occupant. Those entries are
+        // deltas map from its previous occupant. Those entries are
         // stale (they reference cells that no longer exist on this page)
         // and must not leak into the new occupant's MVCC bookkeeping —
         // they would trip the `chains_empty` guard at the next leaf
@@ -486,6 +486,13 @@ impl BufferPoolHandle {
             .lock()
             .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
         guard.sync_journal()
+    }
+
+    /// Fsync the logical-transaction journal tail after appending a
+    /// `LogicalTxnFrame`. This names the S6 durability point while reusing
+    /// the same journal sync primitive as the rest of the handle.
+    pub(crate) fn fsync_logical_tail(&self) -> Result<()> {
+        self.journal_sync()
     }
 
     /// Append an MVCC `ChainCommit` frame (Format Lock §A.2).

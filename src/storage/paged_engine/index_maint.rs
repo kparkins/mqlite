@@ -8,17 +8,18 @@ use crate::error::{Error, Result};
 use crate::keys::{encode_compound_key, COMPOUND_SEP};
 use crate::mvcc::transaction::WriteTxn;
 use crate::query::planner::IndexCondition;
-use crate::storage::btree::{BTree, CellValue};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::catalog::{IndexEntry, IndexState};
+use crate::storage::catalog::{CollectionEntry, IndexEntry, IndexState};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::secondary_index::{
     update_index_on_delete, update_index_on_insert, update_index_on_update,
 };
 use crate::storage::txn_page_store::TxnOverlay;
 
-use super::catalog_ops::{catalog_lock, new_txn_store, sync_catalog_root_overlay};
+use super::catalog_ops::{catalog_lock, new_store, new_txn_store, sync_catalog_root_overlay};
 use super::state::{MetadataState, SharedState};
+use super::visibility::WriteVisibility;
 
 /// Retrieve the serialised `_id` value stored in an index tree entry.
 pub(super) fn index_entry_id_free(handle: &Arc<BufferPoolHandle>, cv: CellValue) -> Result<Bson> {
@@ -146,6 +147,10 @@ pub(super) fn sync_index_entry(
 }
 
 /// Maintain all secondary indexes after a document insert.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "US-010 threads writer visibility into the existing insert maintenance API"
+)]
 pub(super) fn maintain_secondary_on_insert(
     shared: &SharedState,
     md: &MetadataState,
@@ -153,13 +158,26 @@ pub(super) fn maintain_secondary_on_insert(
     ns: &str,
     doc: &Document,
     doc_id: &Bson,
+    vis: &WriteVisibility<'_>,
     txn: &mut WriteTxn,
 ) -> Result<()> {
     let entries = catalog_lock(md).list_indexes(ns)?;
     for entry in entries {
         let store = new_txn_store(shared, overlay);
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-        let is_multikey = update_index_on_insert(doc, doc_id, &idx_tree, &entry, txn)?;
+        let history = vis
+            .secondary_history
+            .as_ref()
+            .map(|probe| probe as &dyn HistoryProbe);
+        let is_multikey = update_index_on_insert(
+            doc,
+            doc_id,
+            &idx_tree,
+            &entry,
+            vis.read_view.as_ref(),
+            history,
+            txn,
+        )?;
         // Extract root values before dropping idx_tree so the &mut overlay
         // borrow from its store is released before sync_index_entry borrows
         // overlay again.
@@ -220,14 +238,28 @@ pub(super) fn maintain_secondary_on_update(
     new_doc: &Document,
     old_id: &Bson,
     new_id: &Bson,
+    vis: &WriteVisibility<'_>,
     txn: &mut WriteTxn,
 ) -> Result<()> {
     let entries = catalog_lock(md).list_indexes(ns)?;
     for entry in entries {
         let store = new_txn_store(shared, overlay);
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-        let is_multikey =
-            update_index_on_update(old_doc, new_doc, old_id, new_id, &idx_tree, &entry, txn)?;
+        let history = vis
+            .secondary_history
+            .as_ref()
+            .map(|probe| probe as &dyn HistoryProbe);
+        let is_multikey = update_index_on_update(
+            old_doc,
+            new_doc,
+            old_id,
+            new_id,
+            &idx_tree,
+            &entry,
+            vis.read_view.as_ref(),
+            history,
+            txn,
+        )?;
         let (new_root, new_level) = (idx_tree.root_page, idx_tree.root_level);
         drop(idx_tree);
         sync_index_entry(
@@ -244,85 +276,71 @@ pub(super) fn maintain_secondary_on_update(
     Ok(())
 }
 
-/// Drain the given `SecIndexWrite` batch and perform the actual
-/// `BTree::insert` / `delete` into each target index tree.
+/// Drain the given `SecIndexWrite` batch into resident secondary-index
+/// delta heads.
 pub(super) fn install_pending_sec_index(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &mut TxnOverlay,
+    _overlay: &mut TxnOverlay,
     writes: Vec<crate::mvcc::SecIndexWrite>,
-    txn: &mut WriteTxn,
+    _vis: &WriteVisibility<'_>,
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
 ) -> Result<()> {
     if writes.is_empty() {
         return Ok(());
     }
-    use crate::mvcc::SecIndexOp;
+    use crate::mvcc::{SecIndexOp, Ts, VersionData, VersionEntry, VersionState};
+    use crate::storage::buffer_pool::PageSize;
     use std::collections::HashMap as StdHashMap;
 
-    let mut entry_by_root: StdHashMap<u32, IndexEntry> = StdHashMap::new();
+    let mut entry_by_id: StdHashMap<i64, IndexEntry> = StdHashMap::new();
     {
         let cat = catalog_lock(md);
         let collections = cat.list_collections()?;
         for coll in &collections {
             for entry in cat.list_indexes(&coll.name)? {
-                entry_by_root.insert(entry.root_page, entry);
+                entry_by_id.insert(entry.id, entry);
             }
         }
     }
-
-    struct TreeState {
-        current_root: u32,
-        current_level: u8,
-        entry: IndexEntry,
-    }
-    let mut states: StdHashMap<u32, TreeState> = StdHashMap::new();
 
     for write in writes {
-        let state = match states.entry(write.index_root_page) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let entry = entry_by_root
-                    .get(&write.index_root_page)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::Internal(format!(
-                            "pending sec-index write references unknown root_page {}",
-                            write.index_root_page
-                        ))
-                    })?;
-                slot.insert(TreeState {
-                    current_root: entry.root_page,
-                    current_level: entry.root_level,
-                    entry,
-                })
+        let entry = entry_by_id.get(&write.index_id).ok_or_else(|| {
+            Error::Internal(format!(
+                "pending sec-index write references unknown index_id {}",
+                write.index_id
+            ))
+        })?;
+        let idx_tree = BTree::open(new_store(shared), write.index_root_page, entry.root_level);
+        let leaf_page = idx_tree.find_leaf(&write.key)?;
+        let _pin = shared.handle.fetch_page(leaf_page, PageSize::Large32k)?;
+        let mut chain_arc = shared
+            .handle
+            .pool()
+            .get_or_create_chain(leaf_page, &write.key)?;
+        {
+            let chain_mut = Arc::make_mut(&mut chain_arc);
+            if let Some(prev_head) = chain_mut.front_mut() {
+                prev_head.stop_ts = commit_ts;
             }
-        };
-
-        let store = new_txn_store(shared, overlay);
-        let mut idx_tree = BTree::open(store, state.current_root, state.current_level);
-        match write.op {
-            SecIndexOp::Insert { id_bytes } => {
-                idx_tree.insert(&write.key, &id_bytes)?;
-            }
-            SecIndexOp::Delete => {
-                let _ = idx_tree.delete(&write.key)?;
-            }
+            let (data, is_tombstone) = match write.op {
+                SecIndexOp::Insert { id_bytes } => (VersionData::Inline(id_bytes), false),
+                SecIndexOp::Delete => (VersionData::Inline(Vec::new()), true),
+            };
+            chain_mut.push_front(VersionEntry {
+                start_ts: commit_ts,
+                stop_ts: Ts::MAX,
+                txn_id,
+                state: VersionState::Pending { txn_id },
+                data,
+                is_tombstone,
+            });
         }
-        state.current_root = idx_tree.root_page;
-        state.current_level = idx_tree.root_level;
-    }
-
-    for (_, state) in states {
-        sync_index_entry(
-            shared,
-            md,
-            overlay,
-            &state.entry,
-            state.current_root,
-            state.current_level,
-            state.entry.multikey,
-            txn,
-        )?;
+        shared
+            .handle
+            .pool()
+            .put_chain(leaf_page, write.key, chain_arc)?;
     }
 
     Ok(())
@@ -335,13 +353,17 @@ pub(super) fn install_pending_primary(
     md: &MetadataState,
     overlay: &mut TxnOverlay,
     writes: Vec<crate::mvcc::PrimaryWrite>,
+    _vis: &WriteVisibility<'_>,
     commit_ts: crate::mvcc::Ts,
     txn_id: u64,
 ) -> Result<()> {
+    #[cfg(test)]
+    super::us009_tests::record_install_pending_primary_call();
+
     if writes.is_empty() {
         return Ok(());
     }
-    use crate::mvcc::{PrimaryOp, Ts, VersionData, VersionEntry};
+    use crate::mvcc::{PrimaryOp, Ts, VersionData, VersionEntry, VersionState};
     use crate::storage::buffer_pool::PageSize;
 
     for write in writes {
@@ -371,6 +393,7 @@ pub(super) fn install_pending_primary(
                 start_ts: commit_ts,
                 stop_ts: Ts::MAX,
                 txn_id,
+                state: VersionState::Pending { txn_id },
                 data,
                 is_tombstone,
             });
@@ -379,6 +402,268 @@ pub(super) fn install_pending_primary(
             .handle
             .pool()
             .put_chain(leaf_page, write.key, chain_arc)?;
+    }
+    Ok(())
+}
+
+/// Flip secondary-index heads installed by this transaction from Pending to
+/// Committed after the S12 published-epoch swap.
+pub(super) fn commit_pending_sec_index_states(
+    shared: &SharedState,
+    md: &MetadataState,
+    writes: &[crate::mvcc::SecIndexWrite],
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
+) -> Result<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    use std::collections::HashMap as StdHashMap;
+
+    let mut entry_by_id: StdHashMap<i64, IndexEntry> = StdHashMap::new();
+    {
+        let cat = catalog_lock(md);
+        let collections = cat.list_collections()?;
+        for coll in &collections {
+            for entry in cat.list_indexes(&coll.name)? {
+                entry_by_id.insert(entry.id, entry);
+            }
+        }
+    }
+
+    for write in writes {
+        let entry = entry_by_id.get(&write.index_id).ok_or_else(|| {
+            Error::Internal(format!(
+                "pending sec-index flip references unknown index_id {}",
+                write.index_id
+            ))
+        })?;
+        commit_pending_chain_head(
+            shared,
+            entry.root_page,
+            entry.root_level,
+            &write.key,
+            commit_ts,
+            txn_id,
+        )?;
+    }
+    Ok(())
+}
+
+/// Flip primary heads installed by this transaction from Pending to
+/// Committed after the S12 published-epoch swap.
+pub(super) fn commit_pending_primary_states(
+    shared: &SharedState,
+    md: &MetadataState,
+    writes: &[crate::mvcc::PrimaryWrite],
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
+) -> Result<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+
+    for write in writes {
+        let coll = match catalog_lock(md).get_collection(&write.ns)? {
+            Some(coll) => coll,
+            None => continue,
+        };
+        commit_pending_primary_head(shared, &coll, &write.key, commit_ts, txn_id)?;
+    }
+    Ok(())
+}
+
+/// Flip primary heads using an uncommitted overlay for leaf routing.
+///
+/// This is used after S12 when root-neutral compatibility page images are
+/// intentionally delayed until after publish; the resident chain already lives
+/// on the leaf selected through that overlay.
+pub(super) fn commit_pending_primary_states_with_overlay(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &mut TxnOverlay,
+    writes: &[crate::mvcc::PrimaryWrite],
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
+) -> Result<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+
+    for write in writes {
+        let coll = match catalog_lock(md).get_collection(&write.ns)? {
+            Some(coll) => coll,
+            None => continue,
+        };
+        let tree = BTree::open(
+            new_txn_store(shared, overlay),
+            coll.data_root_page,
+            coll.data_root_level,
+        );
+        let leaf_page = tree.find_leaf(&write.key)?;
+        drop(tree);
+        commit_pending_chain_head_on_leaf(shared, leaf_page, &write.key, commit_ts, txn_id)?;
+    }
+    Ok(())
+}
+
+pub(super) fn commit_pending_primary_head(
+    shared: &SharedState,
+    coll: &CollectionEntry,
+    key: &[u8],
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
+) -> Result<()> {
+    commit_pending_chain_head(
+        shared,
+        coll.data_root_page,
+        coll.data_root_level,
+        key,
+        commit_ts,
+        txn_id,
+    )
+}
+
+fn commit_pending_chain_head(
+    shared: &SharedState,
+    root_page: u32,
+    root_level: u8,
+    key: &[u8],
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
+) -> Result<()> {
+    let tree = BTree::open(new_store(shared), root_page, root_level);
+    let leaf_page = tree.find_leaf(key)?;
+    commit_pending_chain_head_on_leaf(shared, leaf_page, key, commit_ts, txn_id)
+}
+
+fn commit_pending_chain_head_on_leaf(
+    shared: &SharedState,
+    leaf_page: u32,
+    key: &[u8],
+    commit_ts: crate::mvcc::Ts,
+    txn_id: u64,
+) -> Result<()> {
+    use crate::mvcc::VersionState;
+    use crate::storage::buffer_pool::PageSize;
+
+    let _pin = shared.handle.fetch_page(leaf_page, PageSize::Large32k)?;
+    let mut chain_arc = shared
+        .handle
+        .pool()
+        .take_chain(leaf_page, key)?
+        .ok_or_else(|| Error::Internal("pending version chain missing".into()))?;
+    {
+        let chain_mut = Arc::make_mut(&mut chain_arc);
+        let entry = chain_mut
+            .iter_mut()
+            .find(|entry| entry.start_ts == commit_ts && entry.txn_id == txn_id)
+            .ok_or_else(|| Error::Internal("pending version head missing".into()))?;
+        match entry.state {
+            VersionState::Pending { txn_id: id } if id == txn_id => {
+                entry.state = VersionState::Committed;
+            }
+            VersionState::Committed => {}
+            _ => {
+                return Err(Error::Internal(
+                    "pending version head state mismatch".into(),
+                ))
+            }
+        }
+    }
+    shared
+        .handle
+        .pool()
+        .put_chain(leaf_page, key.to_vec(), chain_arc)?;
+    Ok(())
+}
+
+/// Fold visible secondary delta heads into base pages during checkpoint.
+///
+/// Live commits keep secondary writes as resident deltas. A checkpoint is the
+/// point where those committed heads may be materialized into base cells so a
+/// clean reopen does not need still-resident memory or uncheckpointed logical
+/// frames to recover `Ready` index contents.
+///
+/// Returns `true` when any Ready index root changes and the published catalog
+/// must be rebuilt after the overlay is committed.
+pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
+    shared: &SharedState,
+    md: &MetadataState,
+    overlay: &mut TxnOverlay,
+) -> Result<bool> {
+    let entries = {
+        let cat = catalog_lock(md);
+        let collections = cat.list_collections()?;
+        let mut entries = Vec::new();
+        for coll in &collections {
+            for entry in cat.list_indexes(&coll.name)? {
+                if matches!(entry.state, IndexState::Ready) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries
+    };
+
+    if entries.is_empty() {
+        return Ok(false);
+    }
+
+    let mut published_catalog_dirty = false;
+    let epoch = shared.published.load_full();
+    let view = crate::mvcc::read_view::ReadView::new_for_epoch(epoch, 0);
+    for entry in entries {
+        let read_tree = BTree::open(new_store(shared), entry.root_page, entry.root_level);
+        let deltas = read_tree.visible_delta_entries(&view)?;
+        if deltas.is_empty() {
+            continue;
+        }
+
+        let mut tree = BTree::open(
+            new_txn_store(shared, overlay),
+            entry.root_page,
+            entry.root_level,
+        );
+        for (key, value) in deltas {
+            apply_secondary_checkpoint_delta(&mut tree, &key, value.as_deref())?;
+        }
+        let new_root = tree.root_page;
+        let new_level = tree.root_level;
+        drop(tree);
+
+        if new_root != entry.root_page || new_level != entry.root_level {
+            let mut updated = entry;
+            updated.root_page = new_root;
+            updated.root_level = new_level;
+            if !catalog_lock(md).update_index(&updated)? {
+                return Err(Error::Internal(
+                    "checkpoint secondary materialization lost index metadata".into(),
+                ));
+            }
+            published_catalog_dirty = true;
+        }
+    }
+
+    Ok(published_catalog_dirty)
+}
+
+fn apply_secondary_checkpoint_delta<S: BTreePageStore>(
+    tree: &mut BTree<S>,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> Result<()> {
+    match value {
+        Some(bytes) => {
+            if let Err(e) = tree.insert(key, bytes) {
+                if !matches!(e, Error::DuplicateKey { .. }) {
+                    return Err(e);
+                }
+            }
+        }
+        None => {
+            let _ = tree.delete(key)?;
+        }
     }
     Ok(())
 }

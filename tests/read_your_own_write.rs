@@ -3,26 +3,32 @@
 //! Contract:
 //! - Within a single WriteTxn, staging an insert then reading the same
 //!   key MUST return the just-written value.
-//! - Visibility hinge: a PENDING entry (`start_ts == Ts::PENDING`) is
-//!   visible iff the caller's `ReadView::txn_id` matches the entry's
-//!   `txn_id`.
-//! - A reader with a different `txn_id` must NOT see the pending entry.
+//! - Visibility hinge: a `VersionState::Pending` entry is visible to the
+//!   writer by txn id, and to other readers only after its start timestamp
+//!   is within the pinned sequencer frontier.
 //! - A committed entry is always visible once `read_ts >= start_ts`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry};
+use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry, VersionState};
 
 const KEY: &[u8] = b"order/42";
 const WRITER_TXN_ID: u64 = 128;
 const OTHER_READER_TXN_ID: u64 = 129;
+const PENDING_START_TS: Ts = Ts {
+    physical_ms: 125,
+    logical: 0,
+};
 
 fn pending_entry(bytes: &[u8]) -> VersionEntry {
     VersionEntry {
-        start_ts: Ts::PENDING,
+        start_ts: PENDING_START_TS,
         stop_ts: Ts::MAX,
         txn_id: WRITER_TXN_ID,
+        state: VersionState::Pending {
+            txn_id: WRITER_TXN_ID,
+        },
         data: VersionData::Inline(bytes.to_vec()),
         is_tombstone: false,
     }
@@ -33,7 +39,7 @@ fn snap_with(entries: Vec<VersionEntry>) -> ChainSnapshot {
     for e in entries {
         chain.push_back(e);
     }
-    let mut source = HashMap::new();
+    let mut source = BTreeMap::new();
     source.insert(KEY.to_vec(), Arc::new(chain));
     ChainSnapshot::new(&source, None)
 }
@@ -87,6 +93,7 @@ fn writer_sees_own_pending_over_older_committed() {
         start_ts: ts100,
         stop_ts: Ts::MAX,
         txn_id: 1,
+        state: VersionState::Committed,
         data: VersionData::Inline(b"old".to_vec()),
         is_tombstone: false,
     };

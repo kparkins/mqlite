@@ -1,3 +1,5 @@
+//! CLI-style demo for basic mqlite document operations.
+
 use mqlite::{doc, Client, ObjectId};
 use serde::{Deserialize, Serialize};
 

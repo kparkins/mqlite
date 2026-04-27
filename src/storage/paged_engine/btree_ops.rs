@@ -5,11 +5,13 @@ use bson::{Bson, Document};
 use crate::error::{Error, Result};
 use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
+use crate::mvcc::PrimaryWrite;
 use crate::query::eval_filter;
-use crate::storage::btree::{BTree, BTreePageStore};
+use crate::storage::btree::{BTree, BTreePageStore, HistoryProbe};
 use crate::validation::validate_document;
 
-use super::doc_helpers::{check_unique_constraints, ensure_id};
+use super::doc_helpers::{check_unique_constraints_mvcc, ensure_id};
+use super::visibility::WriteVisibility;
 
 /// Insert `doc` into `tree`, auto-assigning `_id` if absent.
 ///
@@ -25,11 +27,23 @@ pub(super) fn btree_insert_doc<S: BTreePageStore>(
     tree: &mut BTree<S>,
     doc: &mut Document,
     unique_specs: &[(String, Vec<String>, bool)],
+    vis: &WriteVisibility<'_>,
+    pending: &[PrimaryWrite],
+    ns: &str,
 ) -> Result<(Bson, Vec<u8>, Vec<u8>, u32)> {
     validate_document(doc)?;
     let id_bson = ensure_id(doc);
-    // Check secondary unique constraints before touching the tree.
-    check_unique_constraints(tree, unique_specs, doc)?;
+    // Check declared unique constraints before touching the tree.
+    let history: Option<&dyn HistoryProbe> = Some(&vis.primary_history);
+    check_unique_constraints_mvcc(
+        tree,
+        unique_specs,
+        doc,
+        vis.read_view.as_ref(),
+        history,
+        pending,
+        ns,
+    )?;
     let key = encode_key(&id_bson);
     let bson_bytes = bson::to_vec(doc).map_err(Error::BsonSerialization)?;
     tree.insert(&key, &bson_bytes).map_err(|e| match e {

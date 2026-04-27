@@ -22,6 +22,18 @@ use crate::mvcc::metrics::{
 use crate::mvcc::timestamp::Ts;
 use crate::storage::btree::MemPageStore;
 use crate::storage::catalog::Catalog;
+use std::path::Path;
+
+const LIVE_NS_ID: i64 = 1;
+const ABSENT_NS_ID: i64 = 999;
+const RESOLVED_COMMIT_TS: Ts = Ts {
+    physical_ms: 1_000,
+    logical: 0,
+};
+const UNRESOLVED_COMMIT_TS: Ts = Ts {
+    physical_ms: 2_000,
+    logical: 0,
+};
 
 /// Build a fresh in-memory catalog with one collection (id=1) and one
 /// index (id=10) attached to that collection.
@@ -72,6 +84,48 @@ fn frame_sec_insert(commit_ts: Ts, index_id: i64) -> LogicalTxnFrame {
             },
         }],
     }
+}
+
+fn setup_checkpointed_collection(db_path: &Path) {
+    use crate::client::Client;
+    use crate::options::OpenOptions as DbOpts;
+
+    let client = Client::open_with_options(db_path, DbOpts::new()).expect("open setup client");
+    client
+        .database("d")
+        .create_collection("c")
+        .expect("create live collection");
+    client.close().expect("checkpoint setup catalog");
+}
+
+fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
+    use crate::journal::JournalManager;
+    use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut main_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(db_path)
+        .expect("open main file");
+    let header = {
+        let mut buf = [0u8; HEADER_PAGE_SIZE];
+        main_file.seek(SeekFrom::Start(0)).expect("seek header");
+        main_file.read_exact(&mut buf).expect("read header");
+        FileHeader::from_bytes(&buf).expect("decode header")
+    };
+    let mut mgr = JournalManager::open_or_create(db_path, &header, &mut main_file)
+        .expect("open journal manager");
+    let (salt1, salt2) = mgr.salts();
+    let mut frame = frame_primary_insert(commit_ts, ns_id);
+    frame.salt1 = salt1;
+    frame.salt2 = salt2;
+
+    mgr.append_logical_txn(frame).expect("append logical");
+    mgr.append_chain_commit(commit_ts, vec![], vec![])
+        .expect("append chain commit");
+    mgr.sync_journal().expect("sync journal");
 }
 
 /// Pass 2 increments the resolved counter once per op that matches a
@@ -254,11 +308,11 @@ fn pass2_rejects_out_of_range_op_ordinal() {
 /// US-015 AC#5 integration: drive the full engine open path
 /// (`Client::open` → `PagedEngine::open` → `MetadataState::new` → Pass 2)
 /// and assert Pass 2 resolves the live frame's ns_id and increments the
-/// resolved counter. The Client first writes one CRUD commit (which
-/// emits a real LogicalTxnFrame for ns_id=1) and is forgotten so the
-/// journal survives to disk; the second Client::open triggers recovery,
-/// catalog rebuild, and Pass 2 — proving Pass 2 runs inside
-/// `SharedState::new` (not just inside the unit-tested helper).
+/// resolved counter. The test checkpoints a real catalog, appends a durable
+/// uncheckpointed LogicalTxnFrame + ChainCommit pair, then reopens through
+/// Client::open. That triggers recovery, catalog rebuild, and Pass 2 —
+/// proving Pass 2 runs inside `SharedState::new` (not just inside the
+/// unit-tested helper).
 ///
 /// The unresolved-id Phase 4 promotion path is covered by
 /// `pass2_logs_unresolved_ids_without_failing_open` above (synthetic
@@ -271,8 +325,7 @@ fn pass2_rejects_out_of_range_op_ordinal() {
 #[serial_test::serial(logical_txn_pass2_metrics)]
 fn pass2_through_engine_resolves_real_ns_id_after_reopen() {
     use crate::client::Client;
-    use crate::options::{DurabilityMode, OpenOptions as DbOpts};
-    use bson::Document;
+    use crate::options::OpenOptions as DbOpts;
 
     reset_logical_txn_pass2_resolved_ops();
     reset_logical_txn_pass2_unresolved_ops();
@@ -280,20 +333,12 @@ fn pass2_through_engine_resolves_real_ns_id_after_reopen() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("p2_engine.mqlite");
 
-    // Step 1: write one CRUD commit so the journal carries a real
-    // LogicalTxnFrame + matching ChainCommit + legacy commit frame.
-    {
-        let client =
-            Client::open_with_options(&db_path, DbOpts::new().durability(DurabilityMode::FullSync))
-                .expect("open client #1");
-        client
-            .database("d")
-            .collection::<Document>("c")
-            .insert_one(&doc! { "_id": 1i32 })
-            .expect("insert");
-        // Forget so the journal stays on disk past the Drop checkpoint.
-        std::mem::forget(client);
-    }
+    // Step 1: checkpoint a real catalog, then append an uncheckpointed
+    // LogicalTxnFrame + ChainCommit pair to the journal. This models the
+    // post-crash Pass 1 hand-off deterministically without relying on a
+    // process-leaking test writer.
+    setup_checkpointed_collection(&db_path);
+    append_durable_logical_insert(&db_path, LIVE_NS_ID, RESOLVED_COMMIT_TS);
 
     // Step 2: reopen — Pass 2 runs inside `SharedState::new`. The logical
     // frame's ns_id (=1, the first allocated namespace id) MUST resolve
@@ -308,7 +353,7 @@ fn pass2_through_engine_resolves_real_ns_id_after_reopen() {
     let unresolved_after = logical_txn_pass2_unresolved_ops_snapshot();
 
     assert!(
-        resolved_after >= resolved_before + 1,
+        resolved_after > resolved_before,
         "Pass 2 should resolve ≥1 op for the recovered logical frame; \
          resolved before={resolved_before}, after={resolved_after}"
     );
@@ -333,15 +378,7 @@ fn pass2_through_engine_resolves_real_ns_id_after_reopen() {
 #[serial_test::serial(logical_txn_pass2_metrics)]
 fn pass2_through_engine_ticks_unresolved_on_recovered_absent_ns_id() {
     use crate::client::Client;
-    use crate::journal::log_file::{
-        LogicalOp, LogicalOpKind, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
-    };
-    use crate::journal::JournalManager;
-    use crate::mvcc::timestamp::Ts;
-    use crate::options::{DurabilityMode, OpenOptions as DbOpts};
-    use crate::storage::header::FileHeader;
-    use bson::Document;
-    use std::fs::OpenOptions;
+    use crate::options::OpenOptions as DbOpts;
 
     reset_logical_txn_pass2_resolved_ops();
     reset_logical_txn_pass2_unresolved_ops();
@@ -349,71 +386,14 @@ fn pass2_through_engine_ticks_unresolved_on_recovered_absent_ns_id() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("p2_unresolved.mqlite");
 
-    // Step 1: establish a real DB + journal with one CRUD commit.
-    {
-        let client =
-            Client::open_with_options(&db_path, DbOpts::new().durability(DurabilityMode::FullSync))
-                .expect("open client #1");
-        client
-            .database("d")
-            .collection::<Document>("c")
-            .insert_one(&doc! { "_id": 1i32 })
-            .expect("insert");
-        std::mem::forget(client);
-    }
+    // Step 1: establish a live catalog, then append one resolvable and one
+    // unresolvable logical commit. Both frames are durable and uncheckpointed,
+    // so Pass 1 must hand them to Pass 2 on the next open.
+    setup_checkpointed_collection(&db_path);
+    append_durable_logical_insert(&db_path, LIVE_NS_ID, RESOLVED_COMMIT_TS);
+    append_durable_logical_insert(&db_path, ABSENT_NS_ID, UNRESOLVED_COMMIT_TS);
 
-    // Step 2: inject a synthetic logical frame for an unresolvable ns_id.
-    // Directly open the JournalManager on the existing db file and append
-    // a LogicalTxnFrame(ns_id=999) + matching ChainCommit. Uses the
-    // pub(crate) encoder, so no CRC byte surgery — the frame bytes are
-    // produced by the same code path `emit_logical_txn_frame` uses.
-    {
-        let mut main_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&db_path)
-            .expect("open main file");
-        let header = {
-            let mut buf = [0u8; crate::storage::header::HEADER_PAGE_SIZE];
-            use std::io::{Read, Seek, SeekFrom};
-            main_file.seek(SeekFrom::Start(0)).expect("seek header");
-            main_file.read_exact(&mut buf).expect("read header");
-            FileHeader::from_bytes(&buf).expect("decode header")
-        };
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file)
-            .expect("open journal manager");
-        let (salt1, salt2) = mgr.salts();
-
-        let injected_ts = Ts {
-            physical_ms: 9_999_999_999,
-            logical: 7,
-        };
-        let frame = LogicalTxnFrame {
-            salt1,
-            salt2,
-            commit_ts: injected_ts,
-            diagnostic_txn_id: 42,
-            format_version: LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![LogicalOp {
-                op_ordinal: 0,
-                kind: LogicalOpKind::PrimaryInsert {
-                    ns_id: 999, // NOT in catalog
-                    key: b"k".to_vec(),
-                    value: b"v".to_vec(),
-                    overflow: None,
-                },
-            }],
-        };
-        mgr.append_logical_txn(frame).expect("append logical");
-        mgr.append_chain_commit(injected_ts, vec![], vec![])
-            .expect("append chain commit");
-
-        std::mem::forget(mgr);
-        drop(main_file);
-    }
-
-    // Step 3: reopen through the full Client path. Recovery sees the
+    // Step 2: reopen through the full Client path. Recovery sees the
     // original resolved frame (ns_id=1) AND the injected unresolved
     // frame (ns_id=999). Pass 2 runs inside `SharedState::new` and must
     // NOT fail open.
@@ -427,12 +407,12 @@ fn pass2_through_engine_ticks_unresolved_on_recovered_absent_ns_id() {
     let unresolved_after = logical_txn_pass2_unresolved_ops_snapshot();
 
     assert!(
-        unresolved_after >= unresolved_before + 1,
+        unresolved_after > unresolved_before,
         "Pass 2 MUST tick logical_txn_pass2_unresolved_ops_total for \
          the injected ns_id=999 frame; before={unresolved_before}, after={unresolved_after}"
     );
     assert!(
-        resolved_after >= resolved_before + 1,
+        resolved_after > resolved_before,
         "Pass 2 should also resolve the original ns_id=1 frame; \
          resolved before={resolved_before}, after={resolved_after}"
     );

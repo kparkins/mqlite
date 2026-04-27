@@ -145,9 +145,10 @@ pub(crate) trait BTreePageStore {
     // -----------------------------------------------------------------------
 
     /// Remove and return the version chain for `key` on leaf `page`.
+    #[allow(dead_code)]
     fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>>;
 
-    /// Install a version chain for `key` on leaf `page`. Overwrites any
+    /// Install a delta chain for `key` on leaf `page`. Overwrites any
     /// existing chain for that key.
     fn put_chain(
         &mut self,
@@ -156,14 +157,14 @@ pub(crate) trait BTreePageStore {
         chain: Arc<VecDeque<VersionEntry>>,
     ) -> Result<()>;
 
-    /// True iff no version chains are attached to leaf `page`.
+    /// True iff no delta chains are attached to leaf `page`.
     fn chains_empty(&self, page: u32) -> Result<bool>;
 
-    /// Clear ALL version chains attached to leaf `page`.
+    /// Clear ALL delta chains attached to leaf `page`.
     ///
     /// Used by the overflow-chain free path: overflow pages are allocated
     /// from the same 32 KB leaf pool as data leaves, so a page that was
-    /// previously a data leaf may carry stale `version_chains` entries
+    /// previously a data leaf may carry stale `deltas` entries
     /// when reborn as an overflow page. Clearing those entries before
     /// `free_leaf` keeps the T3.5 guard sound.
     ///
@@ -171,7 +172,7 @@ pub(crate) trait BTreePageStore {
     /// chains to clear in that case.
     fn clear_chains(&mut self, page: u32) -> Result<()>;
 
-    /// Remove and return every version chain currently attached to leaf
+    /// Remove and return every delta chain currently attached to leaf
     /// `page`. Used by the leaf-merge path to migrate the residual chains
     /// for keys whose cells were already removed earlier in the same txn
     /// (e.g. by `delete_from_leaf`) onto the merged-into sibling — those
@@ -180,24 +181,32 @@ pub(crate) trait BTreePageStore {
     ///
     /// Returns an empty vector if the frame is not resident.
     fn take_all_chains(&mut self, page: u32) -> Result<VersionChainDrain>;
+
+    /// Drain every delta chain attached to one resident leaf page.
+    ///
+    /// This names the pool helper used by Phase 3 split routing. The existing
+    /// `take_all_chains` method remains the merge/redistribute abstraction.
+    fn take_all_chains_on_page(&mut self, page: u32) -> Result<VersionChainDrain> {
+        self.take_all_chains(page)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // In-memory page store (for tests)
 // ---------------------------------------------------------------------------
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-/// A simple in-memory [`BTreePageStore`] backed by hash maps.
+/// A simple in-memory [`BTreePageStore`] backed by maps.
 ///
 /// Reads of pages that were never written return zero-filled buffers.
 /// Designed for unit tests; not intended for production use.
 pub(crate) struct MemPageStore {
     internal_pages: HashMap<u32, Box<[u8; PAGE_SIZE_INTERNAL as usize]>>,
     leaf_pages: HashMap<u32, Box<[u8; PAGE_SIZE_LEAF as usize]>>,
-    /// Per-leaf-page MVCC version chains (T3.5). Outer key is page number,
+    /// Per-leaf-page MVCC delta chains (T3.5). Outer key is page number,
     /// inner key is the B+ tree cell key.
-    leaf_chains: HashMap<u32, HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>>,
+    leaf_chains: HashMap<u32, BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>>,
     next_page: u32,
 }
 
@@ -298,6 +307,13 @@ impl BTreePageStore for MemPageStore {
     }
 
     fn take_all_chains(
+        &mut self,
+        page: u32,
+    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
+        self.take_all_chains_on_page(page)
+    }
+
+    fn take_all_chains_on_page(
         &mut self,
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
@@ -455,3 +471,23 @@ mod scan;
 #[cfg(test)]
 #[path = "../btree_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../btree_us004_tests.rs"]
+mod btree_us004_tests;
+
+#[cfg(test)]
+#[path = "../btree_us005_tests.rs"]
+mod btree_us005_tests;
+
+#[cfg(test)]
+#[path = "../btree_us006_tests.rs"]
+mod btree_us006_tests;
+
+#[cfg(test)]
+#[path = "../btree_us016_tests.rs"]
+mod btree_us016_tests;
+
+#[cfg(test)]
+#[path = "../btree_us017_tests.rs"]
+mod btree_us017_tests;

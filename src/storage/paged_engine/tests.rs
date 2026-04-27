@@ -739,6 +739,39 @@ fn buffered_index_survives_reopen() {
     );
 }
 
+#[test]
+fn buffered_index_checkpoint_persists_materialized_split_root() {
+    const DOC_COUNT: i32 = 240;
+    const TARGET_INDEX: i32 = DOC_COUNT - 1;
+    const KEY_PAD_LEN: usize = 256;
+
+    let (e, io) = buffered_engine();
+    let idx = IndexModel::builder().keys(doc! { "username": 1 }).build();
+    e.create_index("test.accounts", &idx).unwrap();
+
+    let padding = "x".repeat(KEY_PAD_LEN);
+    for i in 0..DOC_COUNT {
+        e.insert(
+            "test.accounts",
+            doc! { "username": format!("user-{i:04}-{padding}") },
+        )
+        .unwrap();
+    }
+
+    e.checkpoint().unwrap();
+    drop(e);
+
+    let e2 = reopen_engine(&io);
+    let target = format!("user-{TARGET_INDEX:04}-{padding}");
+    let found = e2
+        .find_one("test.accounts", &doc! { "username": target })
+        .unwrap();
+    assert!(
+        found.is_some(),
+        "right-side secondary index entry must survive checkpoint root split"
+    );
+}
+
 // -----------------------------------------------------------------------
 // SWMR concurrency tests
 //
@@ -784,7 +817,7 @@ fn swmr_concurrent_readers_do_not_block() {
 /// Verify that a reader can observe a consistent snapshot while a
 /// concurrent writer is modifying the collection.
 ///
-/// Readers load a `ReadEpoch` without taking the engine mutex.
+/// Readers load a `PublishedEpoch` without taking the engine mutex.
 /// A reader that loaded the snapshot before the writer commits will still
 /// see the pre-write state because `publish_ts` pins the `ReadView` at
 /// that timestamp.
@@ -1073,7 +1106,7 @@ fn consecutive_reads_each_within_scope() {
 ///
 /// The test installs a 2-party `Barrier` that the writer waits on
 /// between `commit_txn` and `publish_commit`. The reader observes
-/// the pre-publish `ReadEpoch` while the writer is pinned at the
+/// the pre-publish `PublishedEpoch` while the writer is pinned at the
 /// barrier, then releases it and observes the new epoch.
 #[test]
 fn publish_happens_strictly_after_commit_txn() {
@@ -1124,18 +1157,17 @@ fn publish_happens_strictly_after_commit_txn() {
 // US-009 — additional ReadOpScope coverage for compound read ops
 // ---------------------------------------------------------------------------
 
-/// `update`'s read phase (filter planning via execute_snapshot_pairs_only)
-/// performs exactly one published load before the write phase takes
-/// over (the write phase does not re-load — it uses `metadata.read()`).
+/// `update` performs one published load for filter planning and one for the
+/// US-008 writer visibility context.
 #[test]
-fn update_read_phase_performs_one_epoch_load() {
+fn update_read_phase_plus_write_visibility_performs_two_epoch_loads() {
     use super::state::ReadOpScope;
     let (e, _io) = buffered_engine();
     e.create_namespace("test.u_scope").unwrap();
     e.insert("test.u_scope", bson::doc! { "_id": 1, "v": 0 })
         .unwrap();
 
-    let _scope = ReadOpScope::new(1);
+    let _scope = ReadOpScope::new(2);
     let _ = e
         .update(
             "test.u_scope",
@@ -1147,31 +1179,33 @@ fn update_read_phase_performs_one_epoch_load() {
         .unwrap();
 }
 
-/// `delete`'s read phase performs exactly one published load.
+/// `delete` performs one published load for target selection and one for the
+/// US-008 writer visibility context.
 #[test]
-fn delete_read_phase_performs_one_epoch_load() {
+fn delete_read_phase_plus_write_visibility_performs_two_epoch_loads() {
     use super::state::ReadOpScope;
     let (e, _io) = buffered_engine();
     e.create_namespace("test.d_scope").unwrap();
     e.insert("test.d_scope", bson::doc! { "_id": 1 }).unwrap();
     e.insert("test.d_scope", bson::doc! { "_id": 2 }).unwrap();
 
-    let _scope = ReadOpScope::new(1);
+    let _scope = ReadOpScope::new(2);
     let _ = e
         .delete("test.d_scope", &bson::doc! { "_id": 1 }, false)
         .unwrap();
 }
 
-/// `find_one_and_delete`'s read phase performs exactly one published load.
+/// `find_one_and_delete` performs one published load for target selection and
+/// one for the US-008 writer visibility context.
 #[test]
-fn find_one_and_delete_read_phase_performs_one_epoch_load() {
+fn find_one_and_delete_read_phase_plus_write_visibility_performs_two_loads() {
     use super::state::ReadOpScope;
     let (e, _io) = buffered_engine();
     e.create_namespace("test.foad_scope").unwrap();
     e.insert("test.foad_scope", bson::doc! { "_id": 1 })
         .unwrap();
 
-    let _scope = ReadOpScope::new(1);
+    let _scope = ReadOpScope::new(2);
     let _ = e
         .find_one_and_delete(
             "test.foad_scope",
@@ -1212,26 +1246,25 @@ fn list_namespaces_performs_one_epoch_load() {
 /// path in the sequencer depends on this contract.
 #[test]
 fn catalog_gen_advances_on_rebuild_and_holds_on_reuse() {
-    use std::sync::atomic::Ordering;
     let (e, _io) = buffered_engine();
 
     // Two DDL commits → each advances catalog_gen.
-    let g0 = e.shared.catalog_gen.load(Ordering::Acquire);
+    let g0 = e.shared.load_published().catalog_generation;
     e.create_namespace("test.cg1").unwrap();
-    let g1 = e.shared.catalog_gen.load(Ordering::Acquire);
+    let g1 = e.shared.load_published().catalog_generation;
     e.create_namespace("test.cg2").unwrap();
-    let g2 = e.shared.catalog_gen.load(Ordering::Acquire);
+    let g2 = e.shared.load_published().catalog_generation;
     assert!(g1 > g0, "first DDL publish must advance catalog_gen");
     assert!(g2 > g1, "second DDL publish must advance catalog_gen");
 
     // Prime namespace so the next inserts are root-neutral CRUD.
     e.insert("test.cg1", bson::doc! { "_id": 0 }).unwrap();
-    let g3 = e.shared.catalog_gen.load(Ordering::Acquire);
+    let g3 = e.shared.load_published().catalog_generation;
     // Root-neutral CRUD does NOT rebuild, so catalog_gen holds.
     for i in 1..=5 {
         e.insert("test.cg1", bson::doc! { "_id": i }).unwrap();
     }
-    let g4 = e.shared.catalog_gen.load(Ordering::Acquire);
+    let g4 = e.shared.load_published().catalog_generation;
     assert_eq!(
         g4, g3,
         "5 root-neutral CRUD publishes must NOT advance catalog_gen"

@@ -39,12 +39,16 @@
 //! existing entry with a different `_id` constitutes a violation and returns
 //! [`Error::DuplicateKey`] (code 11000).
 
+use std::collections::{BTreeMap, HashSet};
+use std::ops::Bound;
+
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
 use crate::keys::{encode_compound_key, COMPOUND_SEP};
-use crate::mvcc::transaction::{SecIndexOp, WriteTxn};
-use crate::storage::btree::{BTree, BTreePageStore, CellValue};
+use crate::mvcc::read_view::ReadView;
+use crate::mvcc::transaction::{SecIndexOp, SecIndexWrite, WriteTxn};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::catalog::IndexEntry;
 
 // ---------------------------------------------------------------------------
@@ -217,7 +221,7 @@ fn unique_range(field_values: &[(&Bson, bool)]) -> (Vec<u8>, Vec<u8>) {
 /// - `key_pattern`: original key-pattern document (used in the error message).
 /// - `field_values`: the encoded secondary field values (before appending `_id`).
 /// - `doc_id`: the `_id` of the document being inserted.
-pub(crate) fn check_unique_constraint<S: BTreePageStore>(
+pub(crate) fn check_unique_constraint_base_only<S: BTreePageStore>(
     index_tree: &BTree<S>,
     key_pattern: &Document,
     field_values: &[(&Bson, bool)],
@@ -250,6 +254,92 @@ pub(crate) fn check_unique_constraint<S: BTreePageStore>(
     Ok(())
 }
 
+/// Verify that inserting `doc_id` with the given secondary field values would
+/// not violate a unique constraint at this writer's MVCC snapshot.
+///
+/// Scans the committed secondary-index state through the MVCC merge path and
+/// compacts this transaction's staged secondary writes before checking pending
+/// inserts. A staged delete masks both an earlier staged insert for the same
+/// key and a committed entry found by the scan.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "US-010 pins the Phase 3 helper signature for caller verification"
+)]
+pub(crate) fn check_unique_constraint_mvcc<S: BTreePageStore>(
+    index_tree: &BTree<S>,
+    key_pattern: &Document,
+    field_values: &[(&Bson, bool)],
+    doc_id: &Bson,
+    view: &ReadView,
+    history: Option<&dyn HistoryProbe>,
+    pending: &[SecIndexWrite],
+    index_root_page: u32,
+) -> Result<()> {
+    let (start, end) = unique_range(field_values);
+    let existing = index_tree.range_scan_mvcc_bounded(
+        Bound::Included(start.as_slice()),
+        Bound::Excluded(end.as_slice()),
+        view,
+        history,
+    )?;
+    let my_key = {
+        let mut entry = field_values.to_vec();
+        entry.push((doc_id, true));
+        encode_compound_key(&entry)
+    };
+
+    let mut pending_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut pending_inserts: BTreeMap<Vec<u8>, Bson> = BTreeMap::new();
+    for write in pending
+        .iter()
+        .filter(|write| write.index_root_page == index_root_page)
+    {
+        if write.key.as_slice() < start.as_slice() || write.key.as_slice() >= end.as_slice() {
+            continue;
+        }
+        match &write.op {
+            SecIndexOp::Insert { id_bytes } => {
+                pending_deletes.remove(&write.key);
+                pending_inserts.insert(write.key.clone(), index_payload_id(id_bytes)?);
+            }
+            SecIndexOp::Delete => {
+                pending_inserts.remove(&write.key);
+                pending_deletes.insert(write.key.clone());
+            }
+        }
+    }
+
+    for (existing_key, _) in &existing {
+        if pending_deletes.contains(existing_key) {
+            continue;
+        }
+        if existing_key != &my_key {
+            return Err(Error::DuplicateKey {
+                detail: format!(
+                    "E11000 duplicate key error — unique index violation on key pattern {key_pattern:?}"
+                ),
+            });
+        }
+    }
+
+    for pending_key in pending_inserts.keys() {
+        if pending_key != &my_key {
+            return Err(Error::DuplicateKey {
+                detail: format!(
+                    "E11000 duplicate key error — unique index violation on key pattern {key_pattern:?}"
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn index_payload_id(id_bytes: &[u8]) -> Result<Bson> {
+    let doc: Document = bson::from_slice(id_bytes).map_err(Error::BsonDeserialization)?;
+    Ok(doc.get("_id").cloned().unwrap_or(Bson::Null))
+}
+
 // ---------------------------------------------------------------------------
 // Core index maintenance operations
 // ---------------------------------------------------------------------------
@@ -275,6 +365,8 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
     doc_id: &Bson,
     index_tree: &BTree<S>,
     index_entry: &IndexEntry,
+    view: &ReadView,
+    history: Option<&dyn HistoryProbe>,
     txn: &mut WriteTxn,
 ) -> Result<bool> {
     let (keys, is_multikey) =
@@ -298,25 +390,16 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
                 (val, ascending)
             })
             .collect();
-        check_unique_constraint(index_tree, &index_entry.key_pattern, &field_values, doc_id)?;
-        // In-txn conflict: a prior `stage_sec_index_insert` on the same
-        // index whose key falls within this doc's unique prefix range
-        // claims the same unique slot. Secondary keys are
-        // `compound_field_vals | COMPOUND_SEP | _id`, so compare by
-        // prefix (field values only), not full key equality — the `_id`
-        // suffix differs when two distinct docs collide on a unique field.
-        let (range_start, range_end) = unique_range(&field_values);
-        for pending in &txn.pending_sec_index {
-            if pending.index_root_page == index_entry.root_page
-                && matches!(pending.op, SecIndexOp::Insert { .. })
-                && pending.key.as_slice() >= range_start.as_slice()
-                && pending.key.as_slice() < range_end.as_slice()
-            {
-                return Err(Error::DuplicateKey {
-                    detail: format!("unique index '{}' — in-txn conflict", index_entry.name),
-                });
-            }
-        }
+        check_unique_constraint_mvcc(
+            index_tree,
+            &index_entry.key_pattern,
+            &field_values,
+            doc_id,
+            view,
+            history,
+            txn.pending_sec_index.as_slice(),
+            index_entry.root_page,
+        )?;
     }
 
     // Serialize _id once; reused for every key (multikey may have several).
@@ -367,6 +450,10 @@ pub(crate) fn update_index_on_delete(
 /// keys for insertion. The commit-time install pass runs them in order so
 /// the net effect is an overwrite; when `old_key == new_key` the delete +
 /// insert pair reduces to the new value.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "US-010 threads MVCC uniqueness visibility through the existing update API"
+)]
 pub(crate) fn update_index_on_update<S: BTreePageStore>(
     old_doc: &Document,
     new_doc: &Document,
@@ -374,10 +461,12 @@ pub(crate) fn update_index_on_update<S: BTreePageStore>(
     new_id: &Bson,
     index_tree: &BTree<S>,
     index_entry: &IndexEntry,
+    view: &ReadView,
+    history: Option<&dyn HistoryProbe>,
     txn: &mut WriteTxn,
 ) -> Result<bool> {
     update_index_on_delete(old_doc, old_id, index_entry, txn)?;
-    update_index_on_insert(new_doc, new_id, index_tree, index_entry, txn)
+    update_index_on_insert(new_doc, new_id, index_tree, index_entry, view, history, txn)
 }
 
 /// Direct-insert variant used by `build_index` (one-shot index build during
@@ -410,7 +499,12 @@ fn update_index_on_insert_direct<S: BTreePageStore>(
                 (val, ascending)
             })
             .collect();
-        check_unique_constraint(index_tree, &index_entry.key_pattern, &field_values, doc_id)?;
+        check_unique_constraint_base_only(
+            index_tree,
+            &index_entry.key_pattern,
+            &field_values,
+            doc_id,
+        )?;
     }
 
     let id_bytes =

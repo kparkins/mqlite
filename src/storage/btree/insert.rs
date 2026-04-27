@@ -141,13 +141,18 @@ impl<S: BTreePageStore> BTree<S> {
         let right_cells: Vec<LeafCell> = left_node.cells.drain(split_at..).collect();
         let promoted_key = right_cells[0].key.clone();
 
-        // T3.5: Migrate version chains for the keys that are moving to the
-        // right sibling. Chains stay pinned (refcount invariant preserved)
-        // because Arc ownership transfers without touching the inner data.
-        for cell in &right_cells {
-            if let Some(chain) = self.store.take_chain(left_page, &cell.key)? {
-                self.store.put_chain(right_page, cell.key.clone(), chain)?;
-            }
+        // PHASE-5-REAUDIT: §10.5 PASS-3 drain-and-partition window.
+        // When Phase 5 removes the per-namespace lane, this window needs an
+        // atomic primitive analogous to Phase 4 §8.7 replace_leaf_and_chains.
+        let all_chains = self.store.take_all_chains_on_page(left_page)?;
+        let (left_chains, right_chains): (Vec<_>, Vec<_>) = all_chains
+            .into_iter()
+            .partition(|(key, _)| key.as_slice() < promoted_key.as_slice());
+        for (key, chain) in left_chains {
+            self.store.put_chain(left_page, key, chain)?;
+        }
+        for (key, chain) in right_chains {
+            self.store.put_chain(right_page, key, chain)?;
         }
 
         let right_node = LeafNode {

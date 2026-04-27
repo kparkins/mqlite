@@ -15,10 +15,10 @@
 //! to `tags: ["red","blue"]`. The sec-index chain for key `tags=green`
 //! gains a tombstone head; `tags=red` and `tags=blue` remain untouched.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry};
+use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry, VersionState};
 
 const PRIMARY_KEY: &[u8] = b"pk/item-1";
 const IDX_RED: &[u8] = b"idx/tags/red/item-1";
@@ -32,13 +32,14 @@ fn entry(start: Ts, stop: Ts, txn_id: u64, bytes: &[u8], tombstone: bool) -> Ver
         start_ts: start,
         stop_ts: stop,
         txn_id,
+        state: VersionState::Committed,
         data: VersionData::Inline(bytes.to_vec()),
         is_tombstone: tombstone,
     }
 }
 
 fn snap_after_multikey_update(commit_ts: Ts, pre_commit: Ts) -> ChainSnapshot {
-    let mut source: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = HashMap::new();
+    let mut source: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
 
     // Primary chain: new bytes at commit_ts, prior stopped at commit_ts.
     let mut pri = VecDeque::new();

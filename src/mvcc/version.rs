@@ -158,15 +158,26 @@ impl Clone for VersionData {
     }
 }
 
+/// Commit-state marker for a resident MVCC version.
+#[derive(Clone, Copy, Debug)]
+pub enum VersionState {
+    /// Installed by `txn_id` but not yet published by the commit sequencer.
+    Pending { txn_id: u64 },
+    /// Durable commit record exists and the version is ordinarily visible
+    /// according to its timestamp window.
+    Committed,
+    /// Writer rolled back or conflict-aborted; readers skip this version.
+    Aborted,
+}
+
 /// One entry in a per-key version chain.
 ///
 /// `stop_ts == Ts::MAX` means this entry is the current head (still
-/// visible to new readers). `start_ts == Ts::PENDING` identifies an
-/// uncommitted entry whose visibility is restricted to `txn_id`.
+/// visible to new readers). `state` identifies pending, committed, and
+/// aborted entries for visibility checks.
 #[derive(Debug, Clone)]
 pub struct VersionEntry {
-    /// Timestamp at which this version becomes visible. `Ts::PENDING` on
-    /// an uncommitted entry; stamped with the commit timestamp on commit.
+    /// Timestamp at which this version becomes visible.
     pub start_ts: Ts,
     /// Timestamp at which this version is replaced. `Ts::MAX` for the
     /// current head.
@@ -174,6 +185,8 @@ pub struct VersionEntry {
     /// Transaction identifier that wrote this version. Used to resolve
     /// self-visibility for pending entries.
     pub txn_id: u64,
+    /// Published state for this version.
+    pub state: VersionState,
     /// Payload — inline bytes or refcounted overflow chain.
     pub data: VersionData,
     /// `true` if this entry represents a deletion.
@@ -274,6 +287,7 @@ mod tests {
             },
             stop_ts: Ts::MAX,
             txn_id: 1,
+            state: VersionState::Committed,
             data: VersionData::Overflow(r),
             is_tombstone: false,
         };

@@ -4,7 +4,7 @@
 //! Phase 1 US-016 / §10.8 #23, #25-27 — crash/recovery +
 //! durable-id tests.
 //!
-//! #23: reopen-bootstrapped ReadEpoch.visible_ts floors above the
+//! #23: reopen-bootstrapped PublishedEpoch.visible_ts floors above the
 //!      pre-crash max commit (also asserted by
 //!      tests/reopen_read_epoch_bootstrap.rs).
 //! #25: durable ids are monotonic across crashes.
@@ -17,7 +17,7 @@
 mod crash_harness;
 
 use bson::{doc, Document};
-use mqlite::{Client, DurabilityMode, OpenOptions, Phase0ProbeCut};
+use mqlite::{read_durable_header_counters, Client, DurabilityMode, OpenOptions, Phase0ProbeCut};
 use std::sync::Mutex;
 
 /// Shared lock serializing tests that rely on `reopen_inspect`'s
@@ -25,7 +25,7 @@ use std::sync::Mutex;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// §10.8 #23: after a durable commit + close + reopen, the initial
-/// ReadEpoch.visible_ts is >= the pre-close oracle sample AND
+/// PublishedEpoch.visible_ts is >= the pre-close oracle sample AND
 /// >= max_commit_ts from recovery.
 #[test]
 fn reopen_rebuilds_read_epoch_from_oracle_now() {
@@ -125,6 +125,63 @@ fn durable_ids_are_monotonic_across_crashes() {
         .expect("count B");
     assert_eq!(a_count, 1, "A must retain its pre-crash doc");
     assert_eq!(b_count, 1, "B must retain its post-reopen doc");
+}
+
+/// US-001 / Phase 1 §10.7: the header id counters themselves survive
+/// crash-style reopen and keep advancing after the reopened client
+/// allocates more catalog ids.
+#[test]
+fn header_id_counters_do_not_regress_across_reopen() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rec25_header_counters.mqlite");
+
+    let client = Client::open_with_options(
+        &path,
+        OpenOptions::new().durability(DurabilityMode::FullSync),
+    )
+    .unwrap();
+    let db = client.database("db");
+    db.create_collection("A").unwrap();
+    db.collection::<Document>("A")
+        .create_index(mqlite::IndexModel::builder().keys(doc! { "x": 1 }).build())
+        .unwrap();
+    std::mem::forget(client);
+
+    let (client, _) = crash_harness::reopen_inspect(&path).expect("first reopen");
+    let first = read_durable_header_counters(&path).expect("read first counters");
+    assert!(
+        first.next_namespace_id >= 2,
+        "next_namespace_id must persist beyond the allocated A id, got {}",
+        first.next_namespace_id
+    );
+    assert!(
+        first.next_index_id >= 2,
+        "next_index_id must persist beyond the allocated x_1 id, got {}",
+        first.next_index_id
+    );
+
+    let db = client.database("db");
+    db.create_collection("B").unwrap();
+    db.collection::<Document>("B")
+        .create_index(mqlite::IndexModel::builder().keys(doc! { "y": 1 }).build())
+        .unwrap();
+    std::mem::forget(client);
+
+    let (_client, _) = crash_harness::reopen_inspect(&path).expect("second reopen");
+    let second = read_durable_header_counters(&path).expect("read second counters");
+    assert!(
+        second.next_namespace_id > first.next_namespace_id,
+        "next_namespace_id regressed or failed to advance: first={}, second={}",
+        first.next_namespace_id,
+        second.next_namespace_id
+    );
+    assert!(
+        second.next_index_id > first.next_index_id,
+        "next_index_id regressed or failed to advance: first={}, second={}",
+        first.next_index_id,
+        second.next_index_id
+    );
 }
 
 /// §10.8 #27: a Cut-6 probe (after `commit_txn`, before publish) is

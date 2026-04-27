@@ -23,6 +23,8 @@ pub use metrics::{
     crud_commits_root_changing_snapshot,
     crud_commits_root_neutral_snapshot,
     deferred_free_queue_depth_snapshot,
+    delta_bearing_frames_count_snapshot,
+    delta_bearing_frames_ratio_snapshot,
     emergency_checkpoint_triggers_snapshot,
     force_expire_spin_stalls_snapshot,
     history_store_bytes_snapshot,
@@ -60,6 +62,7 @@ pub use metrics::{
     record_commit_seq_wait_ns,
     record_crud_commit_root_changing,
     record_crud_commit_root_neutral,
+    record_delta_bearing_frame,
     record_emergency_checkpoint_trigger,
     record_force_expire_spin_stall,
     record_history_store_gc_pass,
@@ -96,6 +99,8 @@ pub use metrics::{
     reset_crud_commits_root_changing,
     reset_crud_commits_root_neutral,
     reset_deferred_free_queue_depth,
+    reset_delta_bearing_frames_count,
+    reset_delta_bearing_frames_ratio,
     reset_emergency_checkpoint_triggers,
     reset_force_expire_spin_stalls,
     reset_history_store_bytes,
@@ -133,6 +138,7 @@ pub use metrics::{
     secondary_index_tombstone_hits_snapshot,
     set_active_read_views,
     set_deferred_free_queue_depth,
+    set_delta_bearing_frames_ratio,
     set_history_store_bytes,
     set_oldest_required_ts_lag_ms,
     set_overflow_pages_in_use,
@@ -148,4 +154,4 @@ pub use timestamp::{HlcState, TimestampOracle, Ts};
 #[allow(unused_imports)]
 pub(crate) use transaction::{PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite, WriteTxn};
 #[allow(unused_imports)]
-pub use version::{OverflowRef, VersionData, VersionEntry};
+pub use version::{OverflowRef, VersionData, VersionEntry, VersionState};

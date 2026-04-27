@@ -11,12 +11,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::Catalog;
 use crate::storage::root_snapshot::{
-    NamespaceSnapshot, PublishedCatalog, PublishedIndex, ReadEpoch,
+    NamespaceSnapshot, PublishedCatalog, PublishedEpoch, PublishedIndex,
 };
 
 use super::state::SharedState;
@@ -120,8 +120,9 @@ pub(crate) fn build_published_catalog(
 
 /// Canonical publish helper. Either builds a fresh `Arc<PublishedCatalog>`
 /// (when `dirty.published_catalog_dirty`) or clones the previous Arc
-/// (root-neutral), wraps it in a new `ReadEpoch` with the caller-provided
-/// `visible_ts`, and atomically stores it on `shared.published`.
+/// (root-neutral), wraps it in a new `PublishedEpoch` with the
+/// caller-provided `visible_ts`, and atomically stores it on
+/// `shared.published`.
 ///
 /// `visible_ts` selection rule (§6.3), enforced at every call site:
 ///   - if the txn had primary writes: pass the allocated `commit_ts`
@@ -133,34 +134,32 @@ pub(crate) fn publish_commit(
     catalog: &Catalog<BufferPoolPageStore>,
     visible_ts: Ts,
     dirty: PublishDirty,
-) -> Result<Arc<ReadEpoch>> {
+) -> Result<Arc<PublishedEpoch>> {
     let prev = shared.published.load_full();
     debug_assert!(
         visible_ts > prev.visible_ts,
         "visible_ts must be strictly monotonic; caller must use commit_ts or oracle.commit()"
     );
-    let catalog_arc = if dirty.published_catalog_dirty {
-        Arc::new(build_published_catalog(catalog)?)
+    let (catalog_arc, catalog_generation) = if dirty.published_catalog_dirty {
+        let next_generation = prev
+            .catalog_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Internal("published catalog generation overflow".into()))?;
+        (Arc::new(build_published_catalog(catalog)?), next_generation)
     } else {
-        Arc::clone(&prev.catalog)
+        (Arc::clone(&prev.catalog), prev.catalog_generation)
     };
-    let new_epoch = Arc::new(ReadEpoch {
+    let new_epoch = Arc::new(PublishedEpoch {
         visible_ts,
         catalog: catalog_arc,
+        catalog_generation,
+        sequencer_frontier: visible_ts,
     });
+    #[cfg(any(test, feature = "test-hooks"))]
+    super::test_accessors::phase3_abort_if_armed(
+        super::test_accessors::Phase3CommitFailpoint::DuringPublishBeforeStore,
+    );
     shared.published.store(Arc::clone(&new_epoch));
-    // Phase 1 §10.1: advance `catalog_gen` on every rebuild publish.
-    // Callers run under the commit_seq envelope (which serializes
-    // publishes) — a plain `fetch_add(1, Release)` is sufficient.
-    // Readers load with `Acquire` without holding `metadata.read()`;
-    // the Phase 5 §10.17.1 / §10.21 sequencer's catalog-revalidation
-    // path depends on this counter being strictly monotonic across
-    // rebuilds and unchanged across epoch-only (root-neutral) publishes.
-    if dirty.published_catalog_dirty {
-        shared
-            .catalog_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
     // Phase 1 §10.10 counters (US-012). Ticked after the atomic
     // publish so readers observing them cannot see a state where a
     // publish "has happened" according to the counter but not the

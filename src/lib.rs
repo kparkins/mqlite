@@ -156,6 +156,17 @@ pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
 #[doc(hidden)]
 pub use storage::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::header::{read_durable_header_counters, DurableHeaderCounters};
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::paged_engine::test_accessors::{
+    arm_phase3_commit_failpoint, Phase3CommitFailpoint, Phase3CommitFailpointGuard,
+    WriteBodyEntryEvent, WriteBodyEntryHookGuard,
+};
+
 // Collection action types (returned by Collection methods; users chain options onto them)
 pub use client::{Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update};
 

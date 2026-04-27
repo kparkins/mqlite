@@ -532,7 +532,7 @@ fn invariants_after_delete_and_merge() {
 // -----------------------------------------------------------------------
 
 use crate::mvcc::timestamp::Ts;
-use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry};
+use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::header::FileHeader;
 use std::collections::VecDeque;
@@ -546,6 +546,7 @@ fn dummy_entry(marker: u8) -> VersionEntry {
         },
         stop_ts: Ts::MAX,
         txn_id: marker as u64,
+        state: VersionState::Committed,
         data: VersionData::Inline(vec![marker; 16]),
         is_tombstone: false,
     }
@@ -682,6 +683,7 @@ fn t3_5_merge_preserves_overflow_refcount_invariant() {
             },
             stop_ts: Ts::MAX,
             txn_id: 1,
+            state: VersionState::Committed,
             data: VersionData::Overflow(r),
             is_tombstone: false,
         });
@@ -697,6 +699,7 @@ fn t3_5_merge_preserves_overflow_refcount_invariant() {
             },
             stop_ts: Ts::MAX,
             txn_id: 2,
+            state: VersionState::Committed,
             data: VersionData::Overflow(r),
             is_tombstone: false,
         });

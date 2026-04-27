@@ -13,20 +13,7 @@
 //! - TC7:  Concurrent readers during failing writes (no partial-row observation)
 //! - TC8:  Allocator drain safety (deferred-free reused after failing inserts)
 //!
-//! NOTE: TC4 triggers a known engine bug (`free_leaf called with non-empty
-//! version chain` returned as `Error::Internal` from `delete_one`).  The
-//! `.expect()` call inside TC4's `catch_unwind` closure turns that into a
-//! panic, which is caught cleanly.  However, running TC4 concurrently with
-//! other tests (default `--test-threads=N`) causes heavy file I/O that can
-//! trigger a checkpoint durability race visible in TC6 (`_id=N not found
-//! after checkpoint+reopen`).  Run with `-- --test-threads=1` for clean
-//! per-test isolation:
-//!
-//! ```text
-//! cargo test --test mwmr_txn_rollback_allocator_edges -- --test-threads=1
-//! ```
-//!
-//! Expected result: 7 PASS, 1 FAIL (TC4 — engine bug).
+//! Expected result: all tests pass under the default parallel test harness.
 
 use bson::doc;
 use bson::Document;
@@ -252,16 +239,8 @@ fn tc3_alloc_then_free_in_same_txn() {
 // times. File size must remain bounded (PR 7 ensures deferred-freed overflow
 // pages are returned to the free list and reused, not grown linearly).
 //
-// BUG FOUND: the engine panics with `free_leaf called with non-empty version
-// chain` during the churn phase.  This is a PR 7 regression: deleting a doc
-// whose leaf page still has a live MVCC version chain (held by a concurrent
-// or just-committed reader's ReadView) is not handled — the allocator assumes
-// the chain is empty before freeing the leaf.
-//
-// The test uses `std::panic::catch_unwind` so that this expected engine panic
-// does not poison the global `GC_PASSES_TEST_LOCK` mutex and destabilise
-// sibling tests running in the same process.  The caught panic is then
-// re-raised as a test failure so the CI result clearly shows TC4 FAIL.
+// Regression coverage for overflow churn after the allocator learned to
+// defer pages whose MVCC version chains are still visible to readers.
 
 #[test]
 fn tc4_overflow_page_alloc_under_churn() {
@@ -590,9 +569,10 @@ fn tc7_concurrent_readers_during_failing_writes() {
                 .expect("cursor collect must not fail");
 
             // Count must always be exactly the seeded amount (no partial rows).
-            assert!(
-                rows.len() == 5 || rows.len() == 0,
-                "TC7: reader saw unexpected row count {} (expected 5 or 0)",
+            assert_eq!(
+                rows.len(),
+                5,
+                "TC7: reader saw unexpected row count {} (expected 5)",
                 rows.len(),
             );
 

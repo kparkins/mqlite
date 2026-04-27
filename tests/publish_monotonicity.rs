@@ -5,7 +5,7 @@
 //! site (§6.3).
 //!
 //! The rule: every `publish_commit` call must supply a `visible_ts`
-//! that is strictly greater than the previous `ReadEpoch.visible_ts`.
+//! that is strictly greater than the previous `PublishedEpoch.visible_ts`.
 //! For txns with primary writes, the allocated `commit_ts` meets that
 //! (commit_seq + oracle.commit() are serialized). For metadata-only
 //! DDL / bootstrap commits the caller MUST use `oracle.commit()` — not

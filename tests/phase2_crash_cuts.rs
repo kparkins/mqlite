@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
+use std::sync::{Mutex, MutexGuard};
 
 use bson::{doc, Document};
 use mqlite::{Client, DurabilityMode, OpenOptions as DbOpts};
@@ -24,6 +25,13 @@ mod crash_harness;
 
 const DB_NAME: &str = "phase2cuts";
 const COL_NAME: &str = "docs";
+static CRASH_CUT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn crash_cut_test_guard() -> MutexGuard<'static, ()> {
+    CRASH_CUT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn open_client(db_path: &std::path::Path) -> Client {
     Client::open_with_options(db_path, DbOpts::new().durability(DurabilityMode::FullSync))
@@ -67,6 +75,7 @@ fn visible_ids(client: &Client) -> BTreeSet<i32> {
 /// `pre_journal_len` byte-for-byte.
 #[test]
 fn crash_between_flush_and_logical_emit_discards_txn() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c1.mqlite");
     let pre_journal_len = {
@@ -135,6 +144,7 @@ fn crash_between_flush_and_logical_emit_discards_txn() {
 /// frame is appended. The two cuts target different on-disk states.
 #[test]
 fn crash_between_logical_emit_and_chain_commit_discards_txn() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c2.mqlite");
     let pre_journal_len = {
@@ -224,6 +234,7 @@ fn crash_between_logical_emit_and_chain_commit_discards_txn() {
 /// the cut commit_ts.
 #[test]
 fn crash_between_chain_commit_and_legacy_commit_preserves_txn_ts() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c3.mqlite");
     {
@@ -254,6 +265,7 @@ fn crash_between_chain_commit_and_legacy_commit_preserves_txn_ts() {
 /// (commit_ts, op_ordinal) tuple is the durable identity.
 #[test]
 fn restart_identity_does_not_rely_on_txn_id() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c4.mqlite");
     {
@@ -286,6 +298,7 @@ fn restart_identity_does_not_rely_on_txn_id() {
 /// survive; frames after are dropped.
 #[test]
 fn mixed_tail_truncation_stops_at_first_bad_frame() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c5.mqlite");
 
@@ -327,6 +340,7 @@ fn mixed_tail_truncation_stops_at_first_bad_frame() {
 /// document.
 #[test]
 fn emergency_checkpoint_survives_logical_frames() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c6.mqlite");
     {
@@ -364,6 +378,7 @@ fn emergency_checkpoint_survives_logical_frames() {
 /// ticks the unresolved counter.
 #[test]
 fn pass2_logs_unresolved_ids_without_failing_open() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c7.mqlite");
     {
@@ -454,6 +469,7 @@ fn pass2_logs_unresolved_ids_without_failing_open() {
 /// i.e. exactly when stage-time-id capture is in effect.
 #[test]
 fn rename_safe_logical_frame_uses_stage_time_id() {
+    let _guard = crash_cut_test_guard();
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("c8.mqlite");
     {
@@ -576,6 +592,7 @@ fn rename_safe_logical_frame_uses_stage_time_id() {
 #[test]
 #[ignore = "Phase 4 exit criterion §8.13.3"]
 fn test_phase4_case_c_is_hard_error() {
+    let _guard = crash_cut_test_guard();
     panic!("Phase 4 not yet implemented — see §8.13.3 / US-014 AC#6 / US-015 AC#6");
 }
 

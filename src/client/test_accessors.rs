@@ -12,7 +12,7 @@
 //! (tests/crash_harness.rs) and extends it to in-crate accessors that
 //! integration tests need.
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use super::handle::Client;
 
@@ -45,10 +45,10 @@ impl Client {
     }
 
     /// Test-only accessor: sample the current published
-    /// `ReadEpoch.visible_ts`.
+    /// `PublishedEpoch.visible_ts`.
     ///
     /// Used by §10.6 / US-010 open-time bootstrap tests to verify
-    /// that the initial ReadEpoch carries a Ts >= the pre-crash
+    /// that the initial PublishedEpoch carries a Ts >= the pre-crash
     /// oracle floor.
     #[doc(hidden)]
     #[must_use]
@@ -56,14 +56,33 @@ impl Client {
         self.inner.engine.published_visible_ts()
     }
 
-    /// Test-only accessor: pointer-identity of the currently-published
-    /// `Arc<PublishedCatalog>` as `usize`. Used as an `Arc::ptr_eq`
-    /// surrogate from integration tests that cannot reach `pub(crate)`
-    /// internals (§10.8 / US-011 / US-014).
+    /// Test-only accessor: sample the published-catalog rebuild generation.
+    ///
+    /// This does not depend on allocator address reuse behavior. It advances
+    /// only when a commit publishes a new `Arc<PublishedCatalog>`.
     #[doc(hidden)]
     #[must_use]
-    pub fn __published_catalog_ptr(&self) -> usize {
-        self.inner.engine.published_catalog_ptr()
+    pub fn __published_catalog_gen(&self) -> u64 {
+        self.inner.engine.published_catalog_gen()
+    }
+
+    /// Test-only accessor: sample the current published sequencer frontier.
+    ///
+    /// Phase 3 recovery tests use this to verify the post-open published
+    /// epoch binds visibility and sequencer frontier to the same durable
+    /// recovery timestamp.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __published_sequencer_frontier(&self) -> (u64, u32) {
+        self.inner.engine.published_sequencer_frontier()
+    }
+
+    /// Test-only accessor: number of post-open recovery epoch stores for
+    /// this client engine.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __recovery_open_published_store_count(&self) -> u64 {
+        self.inner.engine.recovery_open_published_store_count()
     }
 
     /// Test-only accessor: return the highest `ChainCommit.commit_ts`
@@ -78,6 +97,42 @@ impl Client {
     #[must_use]
     pub fn __recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
         self.inner.engine.recovered_max_commit_ts()
+    }
+
+    /// Test-only US-019 fault injector: fail the next `failures`
+    /// primary-install attempts inside the post-S7 commit window.
+    #[doc(hidden)]
+    pub fn __us019_set_primary_install_failures(&self, failures: u8) {
+        self.inner
+            .engine
+            .us019_set_primary_install_failures(failures);
+    }
+
+    /// Test-only US-019 counter for primary-install attempts.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __us019_primary_install_attempts(&self) -> u64 {
+        self.inner.engine.us019_primary_install_attempts()
+    }
+
+    /// Test-only US-021c hook: pause the next write body for `ns`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __install_write_body_entry_hook(&self, ns: &str) -> crate::WriteBodyEntryHookGuard {
+        self.inner.engine.install_write_body_entry_hook(ns, None)
+    }
+
+    /// Test-only US-021c hook: pause the next write body and capture `flag`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __install_write_body_entry_hook_observing(
+        &self,
+        ns: &str,
+        flag: Arc<AtomicBool>,
+    ) -> crate::WriteBodyEntryHookGuard {
+        self.inner
+            .engine
+            .install_write_body_entry_hook(ns, Some(flag))
     }
 
     // §10.8 #19 publish-pause hook is `#[cfg(test)]`-gated inside

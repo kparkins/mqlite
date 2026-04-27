@@ -2,8 +2,6 @@
 //!
 //! Kept out of `paged_engine.rs` so the production CRUD path stays readable.
 
-use std::sync::atomic::Ordering;
-
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
@@ -14,7 +12,11 @@ use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
 
 use super::catalog_ops::{catalog_lock, new_store, rebuild_and_publish_locked};
 use super::doc_ops;
-use super::index_maint::{install_pending_primary, install_pending_sec_index};
+use super::index_maint::{
+    commit_pending_primary_states, commit_pending_primary_states_with_overlay,
+    commit_pending_sec_index_states, install_pending_primary, install_pending_sec_index,
+};
+use super::visibility::WriteVisibility;
 use super::PagedEngine;
 
 impl PagedEngine {
@@ -30,14 +32,6 @@ impl PagedEngine {
     ) -> Result<Phase0ProbeReport> {
         std::mem::forget(txn);
         std::mem::forget(overlay);
-        Ok(report)
-    }
-
-    fn phase0_stop_after_overlay_commit(
-        report: Phase0ProbeReport,
-        txn: WriteTxn,
-    ) -> Result<Phase0ProbeReport> {
-        std::mem::forget(txn);
         Ok(report)
     }
 
@@ -60,6 +54,7 @@ impl PagedEngine {
 
         let lane = self.lane_for(ns);
         let _lane_guard = self.acquire_lane(lane)?;
+        let vis = WriteVisibility::new(&self.shared, ns)?;
         let mark = self.shared.handle.begin_txn()?;
         let mut overlay = TxnOverlay::new();
         let ready = self
@@ -74,11 +69,18 @@ impl PagedEngine {
                 origin: PageOrigin::DeferredFree,
             });
         }
-        let txn_id = self.shared.txn_counter.fetch_add(1, Ordering::Relaxed);
+        let txn_id = vis.read_view.txn_id;
         let mut txn = WriteTxn::new(txn_id);
 
-        let body_result =
-            doc_ops::stage_insert_body(&self.shared, &md_read, &mut overlay, &mut txn, ns, doc);
+        let body_result = doc_ops::stage_insert_body(
+            &self.shared,
+            &md_read,
+            &mut overlay,
+            &mut txn,
+            &vis,
+            ns,
+            doc,
+        );
         let inserted_id = match body_result {
             Ok(id) => id,
             Err(e) => {
@@ -87,7 +89,7 @@ impl PagedEngine {
                 return Err(e);
             }
         };
-        let root_changing = overlay.has_header_pre();
+        let root_changing = overlay.has_header_update();
 
         let _commit = self
             .commit_seq
@@ -95,18 +97,6 @@ impl PagedEngine {
             .map_err(|_| Error::Internal("commit_seq mutex poisoned".into()))?;
 
         let sec_writes = std::mem::take(&mut txn.pending_sec_index);
-        if let Err(e) = install_pending_sec_index(
-            &self.shared,
-            &md_read,
-            &mut overlay,
-            sec_writes.to_vec(),
-            &mut txn,
-        ) {
-            drop(txn);
-            let _ = self.rollback_overlay_and_wal(overlay, mark);
-            return Err(e);
-        }
-
         let primary_writes = std::mem::take(&mut txn.pending_primary);
         if primary_writes.is_empty() {
             drop(txn);
@@ -114,6 +104,15 @@ impl PagedEngine {
             return Err(Error::Internal(
                 "phase0 probe insert produced no primary write".into(),
             ));
+        }
+        let mut report = Phase0ProbeReport {
+            commit_ts: None,
+            publish_ts: None,
+            pre_publish_visible: None,
+            post_publish_visible: None,
+        };
+        if cut == Phase0ProbeCut::AfterStageBeforeCommitTs {
+            return Self::phase0_stop_before_recovery(report, txn, overlay);
         }
 
         let commit_ts = match txn.allocate_commit_ts(&self.shared.oracle) {
@@ -124,14 +123,54 @@ impl PagedEngine {
                 return Err(e);
             }
         };
-        let mut report = Phase0ProbeReport {
-            commit_ts: Some((commit_ts.physical_ms, commit_ts.logical)),
-            publish_ts: None,
-            pre_publish_visible: None,
-            post_publish_visible: None,
-        };
-        if cut == Phase0ProbeCut::AfterAllocateCommitTs {
+        report.commit_ts = Some((commit_ts.physical_ms, commit_ts.logical));
+        if matches!(
+            cut,
+            Phase0ProbeCut::AfterCommitTsBeforeLogicalFrame | Phase0ProbeCut::AfterAllocateCommitTs
+        ) {
             return Self::phase0_stop_before_recovery(report, txn, overlay);
+        }
+
+        let frame = txn.build_logical_txn_frame(&self.shared.handle, &primary_writes, &sec_writes);
+        if cut == Phase0ProbeCut::AfterLogicalFrameBeforeAppend {
+            return Self::phase0_stop_before_recovery(report, txn, overlay);
+        }
+
+        if let Err(e) = self
+            .shared
+            .handle
+            .append_logical_txn(frame)
+            .and_then(|_| self.shared.handle.fsync_logical_tail())
+        {
+            drop(txn);
+            let _ = self.rollback_overlay_and_wal(overlay, mark);
+            return Err(e);
+        }
+        if cut == Phase0ProbeCut::AfterLogicalAppendBeforeChainCommit {
+            return Self::phase0_stop_before_recovery(report, txn, overlay);
+        }
+
+        let dirty = txn.publish_dirty();
+        let txn_id = txn.txn_id;
+        txn.commit_chain_commit(&self.shared.handle, commit_ts)?;
+        if matches!(
+            cut,
+            Phase0ProbeCut::AfterChainCommitBeforeSecondaryInstall
+                | Phase0ProbeCut::AfterChainCommitBeforeCommitTxn
+        ) {
+            return Ok(report);
+        }
+
+        if let Err(e) = install_pending_sec_index(
+            &self.shared,
+            &md_read,
+            &mut overlay,
+            sec_writes.to_vec(),
+            &vis,
+            commit_ts,
+            txn_id,
+        ) {
+            return Err(e);
         }
 
         if let Err(e) = install_pending_primary(
@@ -139,60 +178,47 @@ impl PagedEngine {
             &md_read,
             &mut overlay,
             primary_writes.to_vec(),
+            &vis,
             commit_ts,
-            txn.txn_id,
+            txn_id,
         ) {
-            drop(txn);
-            let _ = self.rollback_overlay_and_wal(overlay, mark);
             return Err(e);
         }
-        if cut == Phase0ProbeCut::AfterInstallPendingPrimary {
-            return Self::phase0_stop_before_recovery(report, txn, overlay);
-        }
-
-        let mut base_store = new_store(&self.shared);
-        if let Err(e) = overlay.commit(&mut base_store, &self.shared.handle) {
-            drop(txn);
-            let _ = self.shared.handle.rollback_txn(mark);
-            return Err(e);
-        }
-        if cut == Phase0ProbeCut::AfterOverlayCommit {
-            return Self::phase0_stop_after_overlay_commit(report, txn);
-        }
-
-        self.shared.handle.flush()?;
-        if cut == Phase0ProbeCut::AfterFlushBeforeChainCommit {
-            return Self::phase0_stop_after_overlay_commit(report, txn);
-        }
-
-        // Capture the dirty flags before `txn.commit()` consumes the txn;
-        // the publish step below needs them to choose rebuild vs reuse.
-        let dirty = txn.publish_dirty();
-        let (_commit_ts, _installed, _sec_index) =
-            txn.commit(&self.shared.oracle, &self.shared.handle)?;
-        if cut == Phase0ProbeCut::AfterChainCommitBeforeCommitTxn {
+        if matches!(
+            cut,
+            Phase0ProbeCut::AfterPrimaryInstallBeforeOverlayCommit
+                | Phase0ProbeCut::AfterInstallPendingPrimary
+        ) {
             return Ok(report);
         }
 
-        let db_page_count = self
-            .shared
-            .handle
-            .allocator()
-            .with_header(|h| h.total_page_count)?;
-        let header_data = self
-            .shared
-            .handle
-            .allocator()
-            .with_header(|h| h.to_bytes())?;
-        let emergency =
-            self.shared
-                .handle
-                .commit_txn(0, PageSize::Small4k, &header_data, db_page_count)?;
-        if emergency {
-            crate::mvcc::metrics::record_emergency_checkpoint_trigger();
-            let _ = self.shared.handle.emergency_checkpoint();
+        let mut root_neutral_overlay = if root_changing {
+            let mut base_store = new_store(&self.shared);
+            if let Err(e) = overlay.commit(&mut base_store, &self.shared.handle) {
+                let _ = self.shared.handle.rollback_txn(mark);
+                return Err(e);
+            }
+            None
+        } else {
+            Some(overlay)
+        };
+        if matches!(
+            cut,
+            Phase0ProbeCut::AfterOverlayCommitBeforeFlush | Phase0ProbeCut::AfterOverlayCommit
+        ) {
+            return Ok(report);
         }
-        if cut == Phase0ProbeCut::AfterCommitTxnBeforePublish {
+
+        self.shared.handle.flush()?;
+        if root_changing {
+            self.commit_legacy_header_frame()?;
+        }
+        if matches!(
+            cut,
+            Phase0ProbeCut::AfterStructuralFlushBeforePublish
+                | Phase0ProbeCut::AfterFlushBeforeChainCommit
+                | Phase0ProbeCut::AfterCommitTxnBeforePublish
+        ) {
             return Ok(report);
         }
 
@@ -200,10 +226,35 @@ impl PagedEngine {
         // Phase 1 §10.3 — mirror the CRUD commit path: pass the txn's
         // dirty flags into the publish helper. A root-neutral probe
         // insert will reuse the existing Arc<PublishedCatalog>. `dirty`
-        // was captured above before `txn.commit()` consumed the txn.
+        // was captured above before `commit_chain_commit()` consumed the txn.
         rebuild_and_publish_locked(&self.shared, &md_read, commit_ts, dirty)?;
+        commit_pending_sec_index_states(&self.shared, &md_read, &sec_writes, commit_ts, txn_id)?;
+        if let Some(overlay) = root_neutral_overlay.as_mut() {
+            commit_pending_primary_states_with_overlay(
+                &self.shared,
+                &md_read,
+                overlay,
+                &primary_writes,
+                commit_ts,
+                txn_id,
+            )?;
+        } else {
+            commit_pending_primary_states(
+                &self.shared,
+                &md_read,
+                &primary_writes,
+                commit_ts,
+                txn_id,
+            )?;
+        }
         report.publish_ts = Some((commit_ts.physical_ms, commit_ts.logical));
         report.post_publish_visible = Some(self.phase0_probe_visible(ns, &inserted_id)?);
+        if let Some(overlay) = root_neutral_overlay {
+            let mut base_store = new_store(&self.shared);
+            overlay.commit(&mut base_store, &self.shared.handle)?;
+            self.shared.handle.flush()?;
+            self.commit_legacy_header_frame()?;
+        }
         if root_changing {
             crate::mvcc::metrics::record_crud_commit_root_changing();
         } else {

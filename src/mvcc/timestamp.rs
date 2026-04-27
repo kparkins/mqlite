@@ -49,12 +49,6 @@ pub struct Ts {
 }
 
 impl Ts {
-    /// Sentinel "not yet committed" timestamp stored inline on pending version entries.
-    pub const PENDING: Ts = Ts {
-        physical_ms: 0,
-        logical: 0,
-    };
-
     /// Logical "infinity" timestamp — greater than any real commit.
     pub const MAX: Ts = Ts {
         physical_ms: u64::MAX,
@@ -372,7 +366,7 @@ mod tests {
     #[test]
     fn ts_le_round_trip_identity() {
         let samples = [
-            Ts::PENDING,
+            Ts::default(),
             Ts::MAX,
             Ts {
                 physical_ms: 42,
@@ -395,7 +389,7 @@ mod tests {
     #[test]
     fn ts_be_round_trip_identity() {
         let samples = [
-            Ts::PENDING,
+            Ts::default(),
             Ts::MAX,
             Ts {
                 physical_ms: 42,

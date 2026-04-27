@@ -193,6 +193,15 @@ pub enum Error {
         suggestion: String,
     },
 
+    /// A caller supplied an invalid engine configuration value.
+    #[error("invalid config {field}: {detail}")]
+    InvalidConfig {
+        /// Configuration field that failed validation.
+        field: &'static str,
+        /// Human-readable validation failure.
+        detail: String,
+    },
+
     /// The journal file's magic bytes or format version does not match what this build supports.
     /// Produced when the journal sidecar on disk was created by an incompatible mqlite version.
     #[error(
@@ -289,6 +298,33 @@ pub enum Error {
         /// Hard byte cap imposed by the journal format.
         max_bytes: usize,
     },
+
+    /// Internal-only eviction refusal for a delta-bearing frame.
+    ///
+    /// Not produced by public engine APIs; those still surface
+    /// `Error::PoolExhausted` when every eviction candidate is blocked.
+    #[error("buffer-pool eviction blocked for page {page}: {reason}")]
+    BufferPoolEvictionBlocked {
+        /// Page number for the rejected eviction candidate.
+        page: u32,
+        /// Stable reason the frame must remain resident.
+        reason: &'static str,
+    },
+
+    /// Reopen logical replay would exceed the configured buffer-pool size.
+    #[error(
+        "recovery pool exhausted: logical replay would exceed \
+         BufferPool::config.max_pool_bytes; increase max_pool_bytes or perform \
+         a forced reconcile on the previous open before closing"
+    )]
+    RecoveryPoolExhausted,
+
+    /// The engine reached a post-durable state that requires reopening.
+    #[error(
+        "engine fatal: post-durable in-memory state could not be repaired; \
+         the engine is poisoned, refuses new operations, and must be reopened"
+    )]
+    EngineFatal,
 }
 
 impl Error {
@@ -306,6 +342,7 @@ impl Error {
             Error::InvalidWireMessage { .. } => Some(codes::ILLEGAL_OP),
             Error::UnsupportedOperator { .. } => Some(codes::UNSUPPORTED_OPERATOR),
             Error::UnsupportedIndexOption { .. } => Some(codes::CANNOT_CREATE_INDEX),
+            Error::InvalidConfig { .. } => Some(codes::BAD_VALUE),
             _ => None,
         }
     }

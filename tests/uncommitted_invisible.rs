@@ -3,7 +3,8 @@
 //!
 //! Contract:
 //! - A version chain holds a committed entry v1 at ts=100.
-//! - A second writer stages v2 as a PENDING entry (txn_id=A).
+//! - A second writer stages v2 as a `VersionState::Pending` entry
+//!   (txn_id=A).
 //! - A reader with a different txn_id (B), opened before commit, must
 //!   observe v1 (never v2).
 //! - Once the writer "commits" by stamping start_ts with a real ts, a
@@ -11,21 +12,27 @@
 //!
 //! This exercises the visibility rule in
 //! [`mqlite::mvcc::ChainSnapshot::visible_at`]:
-//! - PENDING → visible only to its own `txn_id`.
-//! - Committed → `start_ts <= read_ts < stop_ts`.
+//! - Pending: visible to its own `txn_id`, or to other readers once its
+//!   start timestamp is within the pinned sequencer frontier.
+//! - Committed: `start_ts <= read_ts < stop_ts`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry};
+use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry, VersionState};
 
 const KEY: &[u8] = b"doc/1";
+const PENDING_START_TS: Ts = Ts {
+    physical_ms: 125,
+    logical: 0,
+};
 
 fn committed(ts: Ts, stop_ts: Ts, txn_id: u64, bytes: &[u8]) -> VersionEntry {
     VersionEntry {
         start_ts: ts,
         stop_ts,
         txn_id,
+        state: VersionState::Committed,
         data: VersionData::Inline(bytes.to_vec()),
         is_tombstone: false,
     }
@@ -33,20 +40,21 @@ fn committed(ts: Ts, stop_ts: Ts, txn_id: u64, bytes: &[u8]) -> VersionEntry {
 
 fn pending(txn_id: u64, bytes: &[u8]) -> VersionEntry {
     VersionEntry {
-        start_ts: Ts::PENDING,
+        start_ts: PENDING_START_TS,
         stop_ts: Ts::MAX,
         txn_id,
+        state: VersionState::Pending { txn_id },
         data: VersionData::Inline(bytes.to_vec()),
         is_tombstone: false,
     }
 }
 
-fn build_chain(entries: Vec<VersionEntry>) -> HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> {
+fn build_chain(entries: Vec<VersionEntry>) -> BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> {
     let mut chain = VecDeque::new();
     for e in entries {
         chain.push_back(e);
     }
-    let mut source = HashMap::new();
+    let mut source = BTreeMap::new();
     source.insert(KEY.to_vec(), Arc::new(chain));
     source
 }

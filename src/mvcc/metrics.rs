@@ -177,7 +177,7 @@ pub fn reset_active_read_views() {
 // 3 — mvcc.version_chain_depth_p99  (gauge)
 // ===========================================================================
 
-/// Latest observed p99 of per-frame `version_chains[key].len()`. Caller
+/// Latest observed p99 of per-frame `deltas[key].len()`. Caller
 /// samples a histogram and publishes the p99 here.
 pub static VERSION_CHAIN_DEPTH_P99: AtomicU64 = AtomicU64::new(0);
 
@@ -798,6 +798,46 @@ pub fn root_neutral_commit_count_snapshot() -> u64 {
 /// Reset the root-neutral counter.
 pub fn reset_root_neutral_commit_count() {
     ROOT_NEUTRAL_COMMIT_COUNT.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// delta_bearing_frames_count / ratio (occupancy gauges)
+// ---------------------------------------------------------------------------
+
+/// Latest observed number of frames carrying a live committed delta head.
+pub static DELTA_BEARING_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Latest observed delta-bearing frame ratio encoded with `f64::to_bits`.
+pub static DELTA_BEARING_FRAMES_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one delta-bearing frame during a buffer-pool occupancy scan.
+pub fn record_delta_bearing_frame() {
+    DELTA_BEARING_FRAMES_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the latest delta-bearing frame count.
+pub fn delta_bearing_frames_count_snapshot() -> u64 {
+    DELTA_BEARING_FRAMES_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the delta-bearing frame count gauge.
+pub fn reset_delta_bearing_frames_count() {
+    DELTA_BEARING_FRAMES_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Set the latest delta-bearing frame ratio.
+pub fn set_delta_bearing_frames_ratio(value: f64) {
+    DELTA_BEARING_FRAMES_RATIO_BITS.store(value.to_bits(), Ordering::Relaxed);
+}
+
+/// Snapshot the latest delta-bearing frame ratio.
+pub fn delta_bearing_frames_ratio_snapshot() -> f64 {
+    f64::from_bits(DELTA_BEARING_FRAMES_RATIO_BITS.load(Ordering::Relaxed))
+}
+
+/// Reset the delta-bearing frame ratio gauge.
+pub fn reset_delta_bearing_frames_ratio() {
+    DELTA_BEARING_FRAMES_RATIO_BITS.store(0, Ordering::Relaxed);
 }
 
 // ===========================================================================

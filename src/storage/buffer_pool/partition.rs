@@ -5,14 +5,14 @@
 //! walks all live here; the public [`BufferPool`](super::BufferPool) just
 //! routes calls to the appropriate partition.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
 use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
-use crate::mvcc::version::VersionEntry;
+use crate::mvcc::version::{VersionEntry, VersionState};
 
 use super::{PageSize, PageSource};
 
@@ -31,10 +31,33 @@ pub(super) struct Frame {
     pub(super) pin_count: u32,
     pub(super) dirty: bool,
     pub(super) ref_bit: bool,
-    /// Per-frame MVCC version chains, keyed by B+ tree key. Migrates with
-    /// the frame's cells on split / merge (see T3.5). Empty for non-leaf
-    /// frames and for leaf frames written by the pre-MVCC writer path.
-    pub(super) version_chains: HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+    /// Ordered per-key MVCC version chains keyed by B+ tree cell key bytes.
+    /// Ordering is lexicographic on the raw key bytes — identical to the
+    /// on-disk leaf cell ordering produced by `encode_key` /
+    /// `encode_compound_key`.
+    ///
+    /// A chain is present when there is at least one staged or committed
+    /// resident version for that key on this frame. A chain may exist without
+    /// a matching base cell (delta-only key), and a base cell may exist
+    /// without a matching chain. Both cases are legal; see Phase 3 §10.4 for
+    /// the decision table.
+    pub(super) deltas: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+}
+
+fn has_live_committed_head(frame: &Frame) -> bool {
+    frame.deltas.values().any(|chain| {
+        chain.iter().any(|entry| {
+            !matches!(entry.state, VersionState::Pending { .. }) && entry.stop_ts == Ts::MAX
+        })
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) struct PartitionOccupancySnapshot {
+    pub(super) resident_frames: usize,
+    pub(super) pinned_frames: usize,
+    pub(super) delta_bearing_frames: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +191,7 @@ impl Partition {
             pin_count: 1,
             dirty: false,
             ref_bit: true,
-            version_chains: HashMap::new(),
+            deltas: BTreeMap::new(),
         });
         self.page_map.insert(page_number, idx);
 
@@ -206,6 +229,15 @@ impl Partition {
             )
         })?;
 
+        if let Some(frame_ref) = self.frames[idx].as_ref() {
+            if has_live_committed_head(frame_ref) {
+                return Err(Error::BufferPoolEvictionBlocked {
+                    page: frame_ref.page_number,
+                    reason: "delta-bearing frame; Phase 4 reconcile not yet available",
+                });
+            }
+        }
+
         // Prune the victim's chains against the snapshotted horizon before
         // it is evicted. Entries with `stop_ts <= ort && stop_ts < Ts::MAX`
         // are invisible to every live reader; retain only the live head
@@ -225,7 +257,7 @@ impl Partition {
             pin_count: 1,
             dirty: false,
             ref_bit: true,
-            version_chains: HashMap::new(),
+            deltas: BTreeMap::new(),
         });
         self.page_map.insert(page_number, idx);
 
@@ -240,10 +272,10 @@ impl Partition {
             return 0;
         };
         let mut dropped = 0usize;
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.version_chains.len());
-        keys.extend(frame.version_chains.keys().cloned());
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.deltas.len());
+        keys.extend(frame.deltas.keys().cloned());
         for key in keys {
-            let Some(chain_arc) = frame.version_chains.get_mut(&key) else {
+            let Some(chain_arc) = frame.deltas.get_mut(&key) else {
                 continue;
             };
             let before = chain_arc.len();
@@ -252,13 +284,8 @@ impl Partition {
             let after = chain_arc.len();
             dropped += before - after;
 
-            let collapse = chain_arc.len() == 1
-                && chain_arc
-                    .front()
-                    .map(|e| e.stop_ts == Ts::MAX && !e.is_tombstone)
-                    .unwrap_or(false);
-            if collapse || chain_arc.is_empty() {
-                frame.version_chains.remove(&key);
+            if chain_arc.is_empty() {
+                frame.deltas.remove(&key);
             }
         }
         dropped
@@ -313,6 +340,22 @@ impl Partition {
             }
         }
         Ok(())
+    }
+
+    /// Return occupancy counts for resident frames in this partition.
+    #[allow(dead_code)]
+    pub(super) fn occupancy_snapshot(&self) -> PartitionOccupancySnapshot {
+        let mut snapshot = PartitionOccupancySnapshot::default();
+        for frame in self.frames.iter().flatten() {
+            snapshot.resident_frames += 1;
+            if frame.pin_count > 0 {
+                snapshot.pinned_frames += 1;
+            }
+            if has_live_committed_head(frame) {
+                snapshot.delta_bearing_frames += 1;
+            }
+        }
+        snapshot
     }
 
     /// Discard all dirty, unpinned frames without writing them to disk.

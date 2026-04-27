@@ -13,17 +13,33 @@
 pub enum Phase0ProbeCut {
     /// Complete the write, but sample visibility immediately before publish.
     CompleteWithPrePublishProbe,
-    /// Stop after `allocate_commit_ts`, before primary-chain installation.
+    /// Stop after S3 body staging, before S4 `allocate_commit_ts`.
+    AfterStageBeforeCommitTs,
+    /// Stop after S4 `allocate_commit_ts`, before S5 logical-frame build.
+    AfterCommitTsBeforeLogicalFrame,
+    /// Stop after S5 logical-frame build, before S6 logical append/fsync.
+    AfterLogicalFrameBeforeAppend,
+    /// Stop after S6 logical append/fsync, before S7 `ChainCommit`.
+    AfterLogicalAppendBeforeChainCommit,
+    /// Stop after S7 `ChainCommit`, before S8 secondary-index install.
+    AfterChainCommitBeforeSecondaryInstall,
+    /// Stop after S9 primary install, before S10 structural overlay commit.
+    AfterPrimaryInstallBeforeOverlayCommit,
+    /// Stop after S10 structural overlay commit, before S11 flush.
+    AfterOverlayCommitBeforeFlush,
+    /// Stop after S11 flush, before S12 publish.
+    AfterStructuralFlushBeforePublish,
+    /// Pre-Phase-3 cut: after `allocate_commit_ts`, before primary install.
     AfterAllocateCommitTs,
-    /// Stop after primary-chain installation, before `overlay.commit`.
+    /// Pre-Phase-3 cut: after primary install, before `overlay.commit`.
     AfterInstallPendingPrimary,
-    /// Stop after `overlay.commit`, before flushing the journal.
+    /// Pre-Phase-3 cut: after `overlay.commit`, before journal flush.
     AfterOverlayCommit,
-    /// Stop after flushing overlay bytes, before appending `ChainCommit`.
+    /// Pre-Phase-3 cut: after journal flush, before `ChainCommit`.
     AfterFlushBeforeChainCommit,
-    /// Stop after appending `ChainCommit`, before `commit_txn`.
+    /// Pre-Phase-3 cut: after `ChainCommit`, before `commit_txn`.
     AfterChainCommitBeforeCommitTxn,
-    /// Stop after `commit_txn`, before `rebuild_and_publish_locked`.
+    /// Pre-Phase-3 cut: after `commit_txn`, before publish.
     AfterCommitTxnBeforePublish,
 }
 

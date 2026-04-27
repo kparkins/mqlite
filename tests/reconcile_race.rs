@@ -1,7 +1,7 @@
 //! T6 / S1 race criterion — 4 reader threads + 1 reconciler, 60 s soak.
 //!
-//! The real `BufferPool::reconcile` keeps per-frame version chains in a
-//! `HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>` and retains entries
+//! The real `BufferPool::reconcile` keeps per-frame delta chains in a
+//! map of `Vec<u8>` to `Arc<VecDeque<VersionEntry>>` and retains entries
 //! with `stop_ts > oldest_required_ts` (plus the live head) while readers
 //! concurrently construct `ChainSnapshot`s. Because `BufferPool` is
 //! crate-private, this integration test exercises the same invariant at
@@ -13,16 +13,18 @@
 //! Default duration 3s for CI; override via `MQLITE_RECONCILE_SOAK_SECS`
 //! for a longer soak.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use mqlite::mvcc::{ChainSnapshot, ReadView, ReadViewRegistry, Ts, VersionData, VersionEntry};
+use mqlite::mvcc::{
+    ChainSnapshot, ReadView, ReadViewRegistry, Ts, VersionData, VersionEntry, VersionState,
+};
 
-/// Shared shape mimicking a buffer-pool frame's `version_chains` field.
-type ChainMap = HashMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>;
+/// Shared shape mimicking a buffer-pool frame's delta-chain map.
+type ChainMap = BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>;
 
 /// Fixture keys — small enough that readers can exercise all of them.
 const KEYS: &[&[u8]] = &[b"a", b"b", b"c", b"d"];
@@ -46,6 +48,7 @@ fn build_chain(head_ts: Ts, aged: usize, aged_start: u64) -> Arc<VecDeque<Versio
         start_ts: head_ts,
         stop_ts: Ts::MAX,
         txn_id: 1,
+        state: VersionState::Committed,
         data: VersionData::Inline(b"HEAD".to_vec()),
         is_tombstone: false,
     });
@@ -54,6 +57,7 @@ fn build_chain(head_ts: Ts, aged: usize, aged_start: u64) -> Arc<VecDeque<Versio
             start_ts: ts(aged_start + i as u64),
             stop_ts: ts(aged_start + i as u64 + 10),
             txn_id: 2 + i as u64,
+            state: VersionState::Committed,
             data: VersionData::Inline(format!("v{i}").into_bytes()),
             is_tombstone: false,
         });
@@ -62,7 +66,7 @@ fn build_chain(head_ts: Ts, aged: usize, aged_start: u64) -> Arc<VecDeque<Versio
 }
 
 fn seeded_chain_map(head_ts: Ts) -> ChainMap {
-    let mut m = HashMap::new();
+    let mut m = BTreeMap::new();
     for k in KEYS {
         m.insert(k.to_vec(), build_chain(head_ts, INITIAL_AGED_ENTRIES, 100));
     }
@@ -92,7 +96,7 @@ fn reader_step(
         let guard = chains.lock().unwrap();
         let read_ts = ts(oracle.load(Ordering::Acquire));
         let view = ReadView::open(Arc::clone(registry), read_ts, txn_id);
-        let snap = ChainSnapshot::new(&guard, Some(Arc::clone(&view)));
+        let snap = ChainSnapshot::new(&*guard, Some(Arc::clone(&view)));
         (view, snap)
     };
     for k in KEYS {
@@ -130,6 +134,7 @@ fn writer_step(chains: &Mutex<ChainMap>, now: Ts) {
             start_ts: now,
             stop_ts: Ts::MAX,
             txn_id: now.physical_ms,
+            state: VersionState::Committed,
             data: VersionData::Inline(b"HEAD".to_vec()),
             is_tombstone: false,
         });

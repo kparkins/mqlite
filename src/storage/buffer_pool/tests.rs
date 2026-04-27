@@ -580,7 +580,7 @@ mod reconcile {
     use crate::mvcc::metrics;
     use crate::mvcc::read_view::{ReadView, ReadViewRegistry};
     use crate::mvcc::timestamp::Ts;
-    use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry};
+    use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
     use crate::storage::allocator::AllocatorHandle;
     use crate::storage::header::FileHeader;
 
@@ -628,6 +628,7 @@ mod reconcile {
             start_ts: start,
             stop_ts: stop,
             txn_id: txn,
+            state: VersionState::Committed,
             data: VersionData::Inline(payload.to_vec()),
             is_tombstone: false,
         }
@@ -638,6 +639,7 @@ mod reconcile {
             start_ts: start,
             stop_ts: stop,
             txn_id: txn,
+            state: VersionState::Committed,
             data: VersionData::Inline(Vec::new()),
             is_tombstone: true,
         }
@@ -648,10 +650,8 @@ mod reconcile {
         let (pool, alloc, _io) = pool_with_resident_leaf(1);
         let registry = ReadViewRegistry::new();
         // No live readers → ort = Ts::MAX. Retain rule: keep the live
-        // head and anything with stop_ts > ort; drop the rest. A
-        // 10-entry chain (1 head + 9 aged) collapses entirely because
-        // the lone survivor (head, stop_ts == Ts::MAX) matches the
-        // on-disk cell.
+        // head and anything with stop_ts > ort; drop the rest. Phase 3
+        // keeps the remaining head as resident delta authority.
         let mut chain = VecDeque::new();
         // Head — most recent
         chain.push_back(entry_inline(ts(100), Ts::MAX, 1, b"head"));
@@ -669,9 +669,7 @@ mod reconcile {
         let dropped = pool.reconcile(1, &registry, &alloc).unwrap();
         assert_eq!(dropped, 9, "nine aged entries must drop");
 
-        // Only the head (Ts::MAX) survived — and because it's the only
-        // entry and non-tombstone, the chain was collapsed entirely.
-        assert!(pool.chains_empty(1).unwrap());
+        assert!(!pool.chains_empty(1).unwrap());
     }
 
     #[test]
@@ -697,7 +695,7 @@ mod reconcile {
     }
 
     #[test]
-    fn collapse_when_only_head_entry_remains() {
+    fn retains_live_head_when_only_entry_remains() {
         let (pool, alloc, _io) = pool_with_resident_leaf(3);
         let registry = ReadViewRegistry::new();
 
@@ -708,8 +706,7 @@ mod reconcile {
 
         let dropped = pool.reconcile(3, &registry, &alloc).unwrap();
         assert_eq!(dropped, 1);
-        // Single head collapsed.
-        assert!(pool.chains_empty(3).unwrap());
+        assert!(!pool.chains_empty(3).unwrap());
     }
 
     #[test]
@@ -746,9 +743,9 @@ mod reconcile {
         install_chain(&pool, 5, b"B", c_b);
 
         let dropped = pool.reconcile(5, &registry, &alloc).unwrap();
-        // 1 + 2 = 3 older entries dropped; both chains collapse.
+        // 1 + 2 = 3 older entries dropped; both live heads remain.
         assert_eq!(dropped, 3);
-        assert!(pool.chains_empty(5).unwrap());
+        assert!(!pool.chains_empty(5).unwrap());
     }
 
     #[test]
@@ -772,6 +769,7 @@ mod reconcile {
             start_ts: ts(10),
             stop_ts: ts(20),
             txn_id: 11,
+            state: VersionState::Committed,
             data: VersionData::Overflow(oref),
             is_tombstone: false,
         });

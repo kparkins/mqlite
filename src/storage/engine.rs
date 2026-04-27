@@ -26,6 +26,8 @@
 use bson::{Bson, Document};
 
 #[cfg(any(test, feature = "test-hooks"))]
+use super::paged_engine::test_accessors::WriteBodyEntryHookGuard;
+#[cfg(any(test, feature = "test-hooks"))]
 use super::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
 use crate::{
     error::Result,
@@ -36,6 +38,8 @@ use crate::{
     },
     results::{DeleteResult, UpdateResult},
 };
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::{atomic::AtomicBool, Arc};
 
 /// The stable interface between the mqlite public API and storage.
 ///
@@ -247,11 +251,11 @@ pub trait StorageEngine: Send + Sync {
         (0, 0)
     }
 
-    /// Test-only accessor: sample the current `ReadEpoch.visible_ts`
+    /// Test-only accessor: sample the current `PublishedEpoch.visible_ts`
     /// from the published `ArcSwap`, encoded as `(physical_ms, logical)`.
     ///
     /// Used by the §10.6 / §10.8 #23 reopen-bootstrap tests to verify
-    /// that the initial ReadEpoch carries a Ts >= the pre-crash max
+    /// that the initial PublishedEpoch carries a Ts >= the pre-crash max
     /// commit's successor. Not intended for production code.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
@@ -259,18 +263,32 @@ pub trait StorageEngine: Send + Sync {
         (0, 0)
     }
 
-    /// Test-only accessor: return a stable pointer-identity for the
-    /// currently-published `Arc<PublishedCatalog>`, encoded as `usize`.
+    /// Test-only accessor: return the published-catalog rebuild generation.
     ///
-    /// Two calls that straddle a `publish_commit` whose
-    /// `dirty.published_catalog_dirty == false` return the SAME
-    /// `usize` (same Arc allocation reused). A rebuild commit returns
-    /// a DIFFERENT `usize`. §10.8 §10.11 / US-011 and US-014 use this
-    /// in place of `Arc::ptr_eq` from integration tests that cannot
-    /// reach into `pub(crate)` internals.
+    /// The generation advances on every fresh `Arc<PublishedCatalog>` publish
+    /// and stays unchanged when a commit reuses the prior catalog Arc. This is
+    /// safer than comparing raw allocation addresses from integration tests.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    fn published_catalog_ptr(&self) -> usize {
+    fn published_catalog_gen(&self) -> u64 {
+        0
+    }
+
+    /// Test-only accessor: sample the current `PublishedEpoch.sequencer_frontier`.
+    ///
+    /// Used by Phase 3 recovery tests to verify the open-time published epoch
+    /// binds `visible_ts` and `sequencer_frontier` coherently.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn published_sequencer_frontier(&self) -> (u64, u32) {
+        (0, 0)
+    }
+
+    /// Test-only accessor: return how many post-open recovery epoch stores
+    /// this engine performed.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn recovery_open_published_store_count(&self) -> u64 {
         0
     }
 
@@ -291,6 +309,27 @@ pub trait StorageEngine: Send + Sync {
     fn recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
         None
     }
+
+    /// Hidden US-019 test hook: fail the next N primary install attempts.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us019_set_primary_install_failures(&self, _failures: u8) {}
+
+    /// Hidden US-019 test hook: count primary install attempts.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us019_primary_install_attempts(&self) -> u64 {
+        0
+    }
+
+    /// Hidden US-021c test hook: pause the next write body for `ns`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn install_write_body_entry_hook(
+        &self,
+        ns: &str,
+        observe_flag: Option<Arc<AtomicBool>>,
+    ) -> WriteBodyEntryHookGuard;
 
     /// Hidden Phase 0 probe for integration tests that must pin the current
     /// write-envelope ordering without adding runtime hooks to normal CRUD.

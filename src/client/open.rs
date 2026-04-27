@@ -65,6 +65,7 @@ impl Client {
     /// Returns an error if the path is invalid, the file cannot be opened or
     /// locked, the database header is corrupt, or journal recovery fails.
     pub fn open_with_options(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Client> {
+        opts.validate()?;
         let path = path.as_ref().to_owned();
 
         // Security: reject symlinks before touching the file.
@@ -218,7 +219,11 @@ impl Client {
                 Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,
                 Arc::clone(&journal),
             ));
-        let pool = Arc::new(BufferPool::new(opts.buffer_pool_size, layered_source));
+        let pool = Arc::new(BufferPool::new_with_delta_bearing_frames_warn_threshold(
+            opts.buffer_pool_size,
+            layered_source,
+            opts.delta_bearing_frames_warn_threshold,
+        ));
         // Dedicated history-store buffer pool.
         // Sized conservatively; routes through the same journal-layered source so
         // recovered history pages are visible after checkpoint.
