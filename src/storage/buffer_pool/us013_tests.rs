@@ -7,12 +7,14 @@ use crate::mvcc::read_view::ReadViewRegistry;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::header::FileHeader;
+use crate::storage::page::PAGE_TYPE_LEAF;
 
 struct ZeroIo;
 
 impl PageSource for ZeroIo {
     fn read_page(&self, _page_number: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
         buf.fill(0);
+        buf[0] = PAGE_TYPE_LEAF;
         Ok(())
     }
 

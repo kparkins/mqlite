@@ -13,6 +13,15 @@
 //! Default duration 3s for CI; override via `MQLITE_RECONCILE_SOAK_SECS`
 //! for a longer soak.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -96,7 +105,7 @@ fn reader_step(
         let guard = chains.lock().unwrap();
         let read_ts = ts(oracle.load(Ordering::Acquire));
         let view = ReadView::open(Arc::clone(registry), read_ts, txn_id);
-        let snap = ChainSnapshot::new(&*guard, Some(Arc::clone(&view)));
+        let snap = ChainSnapshot::new(&guard, Some(Arc::clone(&view)));
         (view, snap)
     };
     for k in KEYS {

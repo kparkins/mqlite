@@ -15,6 +15,15 @@
 //! to `tags: ["red","blue"]`. The sec-index chain for key `tags=green`
 //! gains a tombstone head; `tags=red` and `tags=blue` remain untouched.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 

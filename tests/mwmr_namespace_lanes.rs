@@ -5,6 +5,15 @@
 //! - Writers on the SAME namespace serialize (don't corrupt each other).
 //! - drop_namespace waits for in-flight writers and recovers cleanly.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use bson::Document;
 use mqlite::Client;

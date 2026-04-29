@@ -562,6 +562,10 @@ mod tests {
         const THREADS: usize = 8;
         const PER_THREAD: usize = 100_000;
 
+        #[allow(
+            clippy::needless_collect,
+            reason = "spawn all timestamp workers before joining them"
+        )]
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let oracle = oracle.clone();

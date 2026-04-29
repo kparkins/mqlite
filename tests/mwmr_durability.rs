@@ -14,6 +14,15 @@
 //! does NOT isolate the "journal alone is sufficient" scenario (that would
 //! require a fork+SIGKILL or a separate process). Still a valid regression gate.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use bson::Document;
 use mqlite::{Client, DurabilityMode, OpenOptions};

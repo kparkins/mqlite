@@ -11,6 +11,14 @@
 //! * `overflow_pages_stable_under_mixed_load` — 4W/4R/ReadView-churn for a
 //!   short soak; `mvcc.overflow.pages_in_use` stays bounded (no leak).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
 #![cfg(feature = "test-hooks")]
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,7 +1,7 @@
 //! File header — Page 0 of every `.mqlite` database file.
 //!
 //! Page 0 is always exactly 4 096 bytes (one internal-node page). The first
-//! 132 bytes hold structured header fields; the remaining bytes are
+//! 128 bytes hold structured header fields; the remaining bytes are
 //! zero-filled padding reserved for future use.
 
 // All expect() calls in this module operate on fixed-size slice conversions
@@ -28,7 +28,7 @@
 //!  52      4    Free page count 4 KB: u32 LE
 //!  56      4    Free page count 32 KB: u32 LE
 //!  60      4    Checksum algorithm: u32 LE (1 = CRC32C)
-//!  64      4    Header checksum: CRC32C of bytes 0–63
+//!  64      4    Header checksum: CRC32C of bytes 0–63 and 76–101
 //!  68      4    WAL salt 1: u32 LE
 //!  72      4    WAL salt 2: u32 LE
 //!  76      4    Catalog root backup: u32 LE (redundant copy of offset 36)
@@ -36,13 +36,13 @@
 //!  81      8    Next namespace id: u64 LE (Phase 1 §10.7 durable id counter; reserved = 0)
 //!  89      8    Next index id: u64 LE (Phase 1 §10.7 durable id counter; reserved = 0)
 //!  97      4    History store root page: u32 LE (Phase 1 §10.7; persisted root of HistoryStore)
-//! 101     27    Reserved (zero-filled; future: encryption metadata, etc.)
+//! 101      1    History store root level: u8
+//! 102     26    Reserved (zero-filled; future: encryption metadata, etc.)
 //! 128   3968    Unused padding to 4096 bytes
 //! ```
 //!
-//! The **header checksum** at offset 64 is a CRC32C over bytes 0–63 **only**.
-//! Fields at offsets 68 and beyond (WAL salts, catalog root backup) are not
-//! included and may be updated without recomputing the checksum.
+//! The **header checksum** at offset 64 is a CRC32C over bytes 0–63 and
+//! 76–101. The checksum field itself and WAL salts at 68–75 are excluded.
 //!
 //! ## WAL stale detection
 //!
@@ -69,8 +69,18 @@ pub(crate) const CHECKSUM_ALGO_CRC32C: u32 = 1;
 /// Size of the file header page in bytes (equal to one internal page = 4 KiB).
 pub(crate) const HEADER_PAGE_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 
-/// Number of bytes covered by the header checksum (offsets 0–63 inclusive).
-const CHECKSUM_RANGE_END: usize = 64;
+/// End offset of the first header checksum segment.
+const CHECKSUM_FIRST_RANGE_END: usize = 64;
+
+/// Start offset of the second header checksum segment.
+const CHECKSUM_SECOND_RANGE_START: usize = 76;
+
+/// End offset of the second header checksum segment.
+const CHECKSUM_SECOND_RANGE_END: usize = 102;
+
+/// Number of header bytes fed into the checksum.
+const CHECKSUM_COVERED_LEN: usize =
+    CHECKSUM_FIRST_RANGE_END + CHECKSUM_SECOND_RANGE_END - CHECKSUM_SECOND_RANGE_START;
 
 /// Byte offset of the header checksum field.
 const CHECKSUM_OFFSET: usize = 64;
@@ -148,8 +158,8 @@ pub(crate) struct FileHeader {
     /// catalog commit. Id `0` is reserved and never allocated.
     ///
     /// Initialized to `1` on fresh-DB creation so the first allocated id is
-    /// strictly positive. Outside the 0–63 checksum range, so updates do
-    /// not require recomputing `header_checksum`.
+    /// strictly positive. Included in the US-011 header checksum range, so
+    /// durable counter updates require a recomputed `header_checksum`.
     pub next_namespace_id: u64,
     // offset 89
     /// Monotonic index id counter (Phase 1 §10.7). Same protocol as
@@ -161,7 +171,14 @@ pub(crate) struct FileHeader {
     /// by `HistoryStore::create_empty_root`. On reopen, `HistoryStore::open`
     /// reads this value and opens the existing tree.
     pub history_store_root_page: u32,
-    // offsets 101–127: reserved, zero-filled
+    // offset 101
+    /// Root-level byte of the history-store B+ tree.
+    ///
+    /// Stored beside [`history_store_root_page`](Self::history_store_root_page)
+    /// so reopen can locate an existing non-leaf history tree without
+    /// rebuilding it.
+    pub history_store_root_level: u8,
+    // offsets 102–127: reserved, zero-filled
     // offsets 128–4095: unused padding
 }
 
@@ -200,6 +217,7 @@ impl FileHeader {
             // `0` signals "no history store persisted yet"; state.rs creates
             // the empty root on fresh-DB init and writes the id back.
             history_store_root_page: 0,
+            history_store_root_level: 0,
         }
     }
 
@@ -218,25 +236,28 @@ impl FileHeader {
         Self::new(created_at, salt1, salt2)
     }
 
-    /// Compute the header checksum: CRC32C of the first 64 bytes of the
-    /// serialized header.
+    /// Compute the header checksum: CRC32C of bytes `[0, 64)` and
+    /// `[76, 102)` of the serialized header.
     ///
-    /// The checksum field at offset 64–67 is **not** included.
-    pub(crate) fn compute_checksum(header_prefix: &[u8; CHECKSUM_RANGE_END]) -> u32 {
-        crc32c::crc32c(header_prefix)
+    /// The checksum field at offset 64–67 and WAL salts at 68–75 are not
+    /// included.
+    pub(crate) fn compute_checksum(buf: &[u8; HEADER_PAGE_SIZE]) -> u32 {
+        let mut covered = [0u8; CHECKSUM_COVERED_LEN];
+        covered[..CHECKSUM_FIRST_RANGE_END].copy_from_slice(&buf[..CHECKSUM_FIRST_RANGE_END]);
+        covered[CHECKSUM_FIRST_RANGE_END..]
+            .copy_from_slice(&buf[CHECKSUM_SECOND_RANGE_START..CHECKSUM_SECOND_RANGE_END]);
+        crc32c::crc32c(&covered)
     }
 
     /// Serialize the header to a full [`HEADER_PAGE_SIZE`]-byte buffer.
     ///
     /// The checksum at offset 64 is computed and written during serialization.
-    /// All reserved bytes (81–127) and padding (128–4095) are zero-filled.
+    /// All reserved bytes (102–127) and padding (128–4095) are zero-filled.
     pub(crate) fn to_bytes(&self) -> [u8; HEADER_PAGE_SIZE] {
         let mut buf = [0u8; HEADER_PAGE_SIZE];
         self.write_fields(&mut buf);
 
-        let prefix: [u8; CHECKSUM_RANGE_END] =
-            buf[..CHECKSUM_RANGE_END].try_into().expect("64-byte slice");
-        let checksum = Self::compute_checksum(&prefix);
+        let checksum = Self::compute_checksum(&buf);
         buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
 
         buf
@@ -248,7 +269,8 @@ impl FileHeader {
     /// 1. Magic bytes equal `"MQLT"`.
     /// 2. Format version is `1` (the only version this build supports).
     /// 3. Page sizes match the compile-time constants.
-    /// 4. Header checksum (CRC32C over bytes 0–63) matches stored value.
+    /// 4. Header checksum (CRC32C over bytes `[0, 64)` and `[76, 102)`)
+    ///    matches stored value.
     ///
     /// Returns [`Error::CorruptDatabase`] on any validation failure.
     pub(crate) fn from_bytes(buf: &[u8; HEADER_PAGE_SIZE]) -> Result<Self> {
@@ -300,10 +322,8 @@ impl FileHeader {
             });
         }
 
-        // 4. Header checksum: CRC32C of bytes 0–63
-        let prefix: [u8; CHECKSUM_RANGE_END] =
-            buf[..CHECKSUM_RANGE_END].try_into().expect("64 bytes");
-        let computed = Self::compute_checksum(&prefix);
+        // 4. Header checksum: CRC32C of bytes [0,64) and [76,102).
+        let computed = Self::compute_checksum(buf);
         let stored = u32::from_le_bytes(
             buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
                 .try_into()
@@ -350,6 +370,7 @@ impl FileHeader {
             next_namespace_id: u64::from_le_bytes(buf[81..89].try_into().expect("8 bytes")),
             next_index_id: u64::from_le_bytes(buf[89..97].try_into().expect("8 bytes")),
             history_store_root_page: u32::from_le_bytes(buf[97..101].try_into().expect("4 bytes")),
+            history_store_root_level: buf[101],
         })
     }
 
@@ -413,7 +434,8 @@ impl FileHeader {
         buf[81..89].copy_from_slice(&self.next_namespace_id.to_le_bytes());
         buf[89..97].copy_from_slice(&self.next_index_id.to_le_bytes());
         buf[97..101].copy_from_slice(&self.history_store_root_page.to_le_bytes());
-        // offsets 101–127: reserved, already zero-filled by array init
+        buf[101] = self.history_store_root_level;
+        // offsets 102–127: reserved, already zero-filled by array init
         // offsets 128–4095: padding, already zero-filled
     }
 }
@@ -574,31 +596,35 @@ mod tests {
     }
 
     #[test]
-    fn reserved_bytes_101_to_127_are_zero() {
-        // Phase 1 §10.7 — offsets 81..101 now carry `next_namespace_id`,
-        // `next_index_id`, and `history_store_root_page`. The reserved
-        // zero-fill region now spans 101..128.
+    fn reserved_bytes_102_to_127_are_zero() {
+        // Phase 4 US-011 — offsets 81..102 now carry `next_namespace_id`,
+        // `next_index_id`, `history_store_root_page`, and
+        // `history_store_root_level`. The reserved zero-fill region now
+        // spans 102..128.
         let bytes = fresh_header().to_bytes();
         assert!(
-            bytes[101..128].iter().all(|&b| b == 0),
-            "reserved region 101..128 must be zero-filled"
+            bytes[102..128].iter().all(|&b| b == 0),
+            "reserved region 102..128 must be zero-filled"
         );
     }
 
     #[test]
     fn durable_id_counters_roundtrip() {
         // Phase 1 §10.7 — persist and recover `next_namespace_id`,
-        // `next_index_id`, `history_store_root_page` via the header.
+        // `next_index_id`, `history_store_root_page`, and
+        // `history_store_root_level` via the header.
         let mut h = fresh_header();
         h.next_namespace_id = 42;
         h.next_index_id = 99;
         h.history_store_root_page = 314;
+        h.history_store_root_level = 2;
 
         let bytes = h.to_bytes();
         let decoded = FileHeader::from_bytes(&bytes).expect("parse");
         assert_eq!(decoded.next_namespace_id, 42);
         assert_eq!(decoded.next_index_id, 99);
         assert_eq!(decoded.history_store_root_page, 314);
+        assert_eq!(decoded.history_store_root_level, 2);
     }
 
     #[test]
@@ -609,6 +635,7 @@ mod tests {
         assert_eq!(h.next_namespace_id, 1);
         assert_eq!(h.next_index_id, 1);
         assert_eq!(h.history_store_root_page, 0);
+        assert_eq!(h.history_store_root_level, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -621,7 +648,7 @@ mod tests {
         let bytes = h.to_bytes();
         // Checksum at offset 64
         let stored = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
-        let computed = FileHeader::compute_checksum(bytes[..64].try_into().unwrap());
+        let computed = FileHeader::compute_checksum(&bytes);
         assert_eq!(stored, computed);
     }
 
@@ -634,18 +661,17 @@ mod tests {
     #[test]
     fn checksum_verification_fails_on_body_corruption() {
         let mut bytes = fresh_header().to_bytes();
-        bytes[10] ^= 0xFF; // corrupt within checksum range (0–63)
+        bytes[10] ^= 0xFF; // corrupt within checksum range [0,64)
         assert!(FileHeader::from_bytes(&bytes).is_err());
     }
 
     #[test]
     fn checksum_does_not_cover_wal_salts() {
-        // The checksum covers only bytes 0–63. WAL salts are at 68+.
-        // Corrupting them AFTER re-writing the checksum should still parse.
+        // The checksum excludes WAL salts at 68..76. Corrupting them after
+        // serialization should still parse.
         let original = fresh_header();
         let mut bytes = original.to_bytes();
         bytes[68] ^= 0xFF; // corrupt wal_salt1 LSB
-                           // from_bytes should succeed (checksum still valid; corruption is outside range)
         let decoded = FileHeader::from_bytes(&bytes).expect("should parse");
         // The decoded salt reflects the corruption
         assert_ne!(decoded.wal_salt1, original.wal_salt1);
@@ -661,7 +687,7 @@ mod tests {
         let mut bytes = original.to_bytes();
         // Overwrite magic + recompute checksum so only the magic is wrong
         bytes[0] = b'X';
-        let new_checksum = FileHeader::compute_checksum(bytes[..64].try_into().unwrap());
+        let new_checksum = FileHeader::compute_checksum(&bytes);
         bytes[64..68].copy_from_slice(&new_checksum.to_le_bytes());
         assert!(FileHeader::from_bytes(&bytes).is_err());
     }
@@ -672,7 +698,7 @@ mod tests {
         let mut bytes = original.to_bytes();
         // Overwrite format_version with 99
         bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
-        let new_checksum = FileHeader::compute_checksum(bytes[..64].try_into().unwrap());
+        let new_checksum = FileHeader::compute_checksum(&bytes);
         bytes[64..68].copy_from_slice(&new_checksum.to_le_bytes());
         assert!(FileHeader::from_bytes(&bytes).is_err());
     }
@@ -802,3 +828,7 @@ mod tests {
         assert_eq!(bytes[75], 0xCA, "wal_salt2 byte 3 (MSB)");
     }
 }
+
+#[cfg(test)]
+#[path = "header_us011_tests.rs"]
+mod us011_tests;

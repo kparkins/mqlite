@@ -501,11 +501,11 @@ fn logical_op_kind_variants_match_opcodes() {
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
         ops: vec![
-            secondary_insert.clone(),
-            secondary_delete.clone(),
+            secondary_insert,
+            secondary_delete,
             primary_insert.clone(),
-            primary_update.clone(),
-            primary_delete.clone(),
+            primary_update,
+            primary_delete,
         ],
     };
     assert_eq!(frame, frame.clone());
@@ -1832,7 +1832,7 @@ mod prop_tests {
                     overflow: None,
                 },
             }),
-            (key.clone(), value.clone(), ns_id).prop_map(|(key, value, ns_id)| LogicalOp {
+            (key.clone(), value, ns_id).prop_map(|(key, value, ns_id)| LogicalOp {
                 op_ordinal: 0,
                 kind: LogicalOpKind::PrimaryUpdate {
                     ns_id,
@@ -2114,7 +2114,7 @@ mod prop_tests {
                     recompute_logical_txn_crc(&mut bytes);
                     "gap_ordinal"
                 }
-                _ => unreachable!(),
+                _ => panic!("unexpected mutation case"),
             };
             let res = LogicalTxnFrame::decode(
                 &bytes,

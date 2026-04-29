@@ -289,13 +289,15 @@ impl BufferPoolHandle {
     /// Write all dirty pages to disk and persist the file header if modified.
     ///
     /// Call order:
-    /// 1. Flush all dirty data pages from the pool → `FilePageSource`.
-    /// 2. Write the updated file header (page 0) through the pool if it is
+    /// 1. Flush all dirty main-data pages from the pool → `FilePageSource`.
+    /// 2. Flush all dirty history-store pages from the history pool.
+    /// 3. Write the updated file header (page 0) through the pool if it is
     ///    dirty (this re-marks page 0 as dirty in the pool).
-    /// 3. Flush the pool again to write the freshly dirtied header page.
+    /// 4. Flush the pool again to write the freshly dirtied header page.
     pub(crate) fn flush(&self) -> Result<()> {
         // Pass 1 — flush dirty data pages.
         self.pool.flush()?;
+        self.history_pool.flush()?;
         // Persist the updated header (page 0) if any allocs / frees changed it.
         self.allocator.flush_header(&self.pool_io)?;
         // Pass 2 — flush the header page that flush_header may have dirtied.
@@ -411,9 +413,17 @@ impl BufferPoolHandle {
                 let new_count = header.total_page_count;
                 self.allocator.update_header(|h| {
                     h.total_page_count = new_count;
-                })
+                })?;
+                self.advance_page_lifetime_checkpoint()?;
+                Ok(())
             }
         }
+    }
+
+    /// Advance the page-lifetime checkpoint fence and drain newly eligible pages.
+    pub(crate) fn advance_page_lifetime_checkpoint(&self) -> Result<usize> {
+        self.allocator.advance_page_lifetime_checkpoint_fence();
+        self.allocator.drain_free_queue(&self.pool_io)
     }
 
     // -----------------------------------------------------------------------

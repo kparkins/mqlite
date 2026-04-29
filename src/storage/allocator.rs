@@ -39,11 +39,11 @@
 //! [`Error::DiskFull`] is returned with `available_bytes: 0`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::mvcc::deferred_free::DeferredFreeQueue;
+use crate::mvcc::deferred_free::{PageLifetimeKind, PageLifetimeQueue};
 use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 
@@ -272,7 +272,9 @@ struct AllocatorInner {
     /// Refcount-to-zero queue drained by the writer path.
     ///
     /// Lock-order position 1.5 (before `state` at position 2).
-    deferred_free_queue: DeferredFreeQueue,
+    page_lifetime_queue: PageLifetimeQueue,
+    /// Monotonic in-memory checkpoint fence for page-lifetime drains.
+    page_lifetime_checkpoint_fence: AtomicU64,
 }
 
 /// A `Clone`-able, `Arc`-wrapped allocator handle that owns the
@@ -304,15 +306,29 @@ impl AllocatorHandle {
                     header_dirty: false,
                 }),
                 overflow_refcounts: Mutex::new(HashMap::new()),
-                deferred_free_queue: DeferredFreeQueue::new(),
+                page_lifetime_queue: PageLifetimeQueue::new(),
+                page_lifetime_checkpoint_fence: AtomicU64::new(0),
             }),
         }
     }
 
-    /// Borrow the deferred-free queue (used by `OverflowRef::drop` and the
-    /// writer-path drain).
-    pub(crate) fn deferred_free_queue(&self) -> &DeferredFreeQueue {
-        &self.inner.deferred_free_queue
+    /// Borrow the page-lifetime queue used by `OverflowRef::drop` and drain paths.
+    pub(crate) fn page_lifetime_queue(&self) -> &PageLifetimeQueue {
+        &self.inner.page_lifetime_queue
+    }
+
+    /// Advance the checkpoint fence used by page-lifetime drains.
+    pub(crate) fn advance_page_lifetime_checkpoint_fence(&self) -> u64 {
+        self.inner
+            .page_lifetime_checkpoint_fence
+            .fetch_add(1, Ordering::AcqRel)
+            + 1
+    }
+
+    fn page_lifetime_checkpoint_fence(&self) -> u64 {
+        self.inner
+            .page_lifetime_checkpoint_fence
+            .load(Ordering::Acquire)
     }
 
     // -----------------------------------------------------------------------
@@ -376,6 +392,38 @@ impl AllocatorHandle {
         }
     }
 
+    /// CAS-loop incref only when an overflow-chain refcount is still live.
+    ///
+    /// Returns `Ok(None)` when the refcount handle is absent or the observed
+    /// refcount is 0. Unlike [`Self::incref_overflow`], this method never
+    /// creates a refcount slot and never resurrects a dropped overflow chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RefcountOverflow`] if the observed pre-bump value is
+    /// `u32::MAX`; the atomic value is left unchanged.
+    pub(crate) fn try_incref_live_overflow(&self, first_page: u32) -> Result<Option<u32>> {
+        let Some(atomic) = self.refcount_handle_opt(first_page) else {
+            return Ok(None);
+        };
+        let mut cur = atomic.load(Ordering::Acquire);
+        loop {
+            if cur == 0 {
+                return Ok(None);
+            }
+            if cur == u32::MAX {
+                return Err(Error::RefcountOverflow);
+            }
+            match atomic.compare_exchange_weak(cur, cur + 1, Ordering::Release, Ordering::Acquire) {
+                Ok(_) => return Ok(Some(cur + 1)),
+                Err(observed) => {
+                    crate::mvcc::metrics::record_overflow_refcount_cas_retry();
+                    cur = observed;
+                }
+            }
+        }
+    }
+
     /// Decref. Returns the post-decrement refcount.
     ///
     /// Ordering: Release on `fetch_sub`, synchronizing with subsequent
@@ -422,8 +470,11 @@ impl AllocatorHandle {
 
     /// Enqueue a page for deferred free. Called by `OverflowRef::drop`
     /// when the decrement brings refcount to 0.
-    pub(crate) fn enqueue_deferred_free(&self, first_page: u32) {
-        self.inner.deferred_free_queue.push(first_page);
+    pub(crate) fn enqueue_overflow_deferred_free(&self, first_page: u32) {
+        let fence = self.page_lifetime_checkpoint_fence();
+        self.inner
+            .page_lifetime_queue
+            .push_overflow_deferred_free(first_page, fence);
     }
 
     /// Writer-serialized drain of the deferred-free queue.
@@ -443,9 +494,14 @@ impl AllocatorHandle {
     ///
     /// Returns the number of pages actually freed.
     pub(crate) fn drain_free_queue(&self, io: &dyn PageSource) -> Result<usize> {
-        let pages = self.inner.deferred_free_queue.take_all();
-        if pages.is_empty() {
-            crate::mvcc::metrics::set_deferred_free_queue_depth(0);
+        let entries = self
+            .inner
+            .page_lifetime_queue
+            .take_eligible(self.page_lifetime_checkpoint_fence());
+        if entries.is_empty() {
+            crate::mvcc::metrics::set_deferred_free_queue_depth(
+                self.inner.page_lifetime_queue.depth() as u64,
+            );
             return Ok(0);
         }
 
@@ -455,9 +511,14 @@ impl AllocatorHandle {
             .lock()
             .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
         let mut freed = 0usize;
-        let mut requeue: Vec<u32> = Vec::new();
+        let mut requeue = Vec::new();
 
-        for page in pages {
+        for entry in entries {
+            if entry.kind() != PageLifetimeKind::OverflowDeferredFree {
+                requeue.push(entry);
+                continue;
+            }
+            let page = entry.page();
             let cnt = self.overflow_refcount(page);
             if cnt == 0 {
                 let mut alloc = PageAllocator::new(&mut state.header, io);
@@ -469,18 +530,20 @@ impl AllocatorHandle {
                 freed += 1;
                 crate::mvcc::metrics::record_overflow_page_freed();
             } else {
-                requeue.push(page);
+                requeue.push(entry);
             }
         }
 
-        state.header_dirty = true;
+        if freed > 0 {
+            state.header_dirty = true;
+        }
         drop(state);
 
-        if !requeue.is_empty() {
-            self.inner.deferred_free_queue.push_many(requeue);
+        for entry in requeue {
+            self.inner.page_lifetime_queue.push_entry(entry);
         }
         crate::mvcc::metrics::set_deferred_free_queue_depth(
-            self.inner.deferred_free_queue.depth() as u64
+            self.inner.page_lifetime_queue.depth() as u64
         );
         Ok(freed)
     }
@@ -501,14 +564,24 @@ impl AllocatorHandle {
     /// Precondition: caller holds writer serialization (same as
     /// `drain_free_queue`).
     pub(crate) fn drain_deferred_free_reservations(&self) -> Vec<u32> {
-        let pages = self.inner.deferred_free_queue.take_all();
-        if pages.is_empty() {
-            crate::mvcc::metrics::set_deferred_free_queue_depth(0);
+        let entries = self
+            .inner
+            .page_lifetime_queue
+            .take_eligible(self.page_lifetime_checkpoint_fence());
+        if entries.is_empty() {
+            crate::mvcc::metrics::set_deferred_free_queue_depth(
+                self.inner.page_lifetime_queue.depth() as u64,
+            );
             return Vec::new();
         }
         let mut ready = Vec::new();
-        let mut requeue: Vec<u32> = Vec::new();
-        for page in pages {
+        let mut requeue = Vec::new();
+        for entry in entries {
+            if entry.kind() != PageLifetimeKind::OverflowDeferredFree {
+                requeue.push(entry);
+                continue;
+            }
+            let page = entry.page();
             let cnt = self.overflow_refcount(page);
             if cnt == 0 {
                 // Drop the refcount entry — the page is no longer live.
@@ -517,14 +590,14 @@ impl AllocatorHandle {
                 table.remove(&page);
                 ready.push(page);
             } else {
-                requeue.push(page);
+                requeue.push(entry);
             }
         }
-        if !requeue.is_empty() {
-            self.inner.deferred_free_queue.push_many(requeue);
+        for entry in requeue {
+            self.inner.page_lifetime_queue.push_entry(entry);
         }
         crate::mvcc::metrics::set_deferred_free_queue_depth(
-            self.inner.deferred_free_queue.depth() as u64
+            self.inner.page_lifetime_queue.depth() as u64
         );
         ready
     }

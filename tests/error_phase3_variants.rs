@@ -1,5 +1,14 @@
 //! Regression coverage for Phase 3 error variants from US-002.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use mqlite::Error;
 
 #[test]

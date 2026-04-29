@@ -7,6 +7,14 @@
 //! Run:
 //!   cargo bench --bench writers_diff_ns -- --save-baseline phase0
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
 #![allow(missing_docs)]
 
 use std::sync::{Arc, Barrier};

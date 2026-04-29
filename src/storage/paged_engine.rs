@@ -49,6 +49,8 @@ mod visibility;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod us002_tests;
+#[cfg(test)]
 mod us007_tests;
 #[cfg(test)]
 mod us008_tests;
@@ -58,6 +60,8 @@ mod us009_tests;
 mod us011_tests;
 #[cfg(test)]
 mod us012_tests;
+#[cfg(test)]
+mod us015_tests;
 #[cfg(test)]
 mod us018c_tests;
 #[cfg(test)]
@@ -1092,6 +1096,9 @@ impl StorageEngine for PagedEngine {
             };
             if dropped {
                 sync_catalog_root_overlay(shared, md, overlay)?;
+                if let Some(coll) = &maybe_coll {
+                    shared.clear_dirty_collection(coll.id);
+                }
             }
             if let Some(coll) = maybe_coll {
                 let store = new_txn_store(shared, overlay);

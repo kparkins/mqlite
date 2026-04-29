@@ -1,5 +1,5 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
@@ -23,19 +23,21 @@ const VERSION_START_TS: Ts = Ts {
     logical: 0,
 };
 
-static INSTALL_PENDING_PRIMARY_CALLS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static INSTALL_PENDING_PRIMARY_CALLS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Record an `install_pending_primary` call on the current test build.
 pub(super) fn record_install_pending_primary_call() {
-    INSTALL_PENDING_PRIMARY_CALLS.fetch_add(1, Ordering::Relaxed);
+    INSTALL_PENDING_PRIMARY_CALLS.with(|calls| calls.set(calls.get() + 1));
 }
 
 fn reset_install_pending_primary_calls() {
-    INSTALL_PENDING_PRIMARY_CALLS.store(0, Ordering::Relaxed);
+    INSTALL_PENDING_PRIMARY_CALLS.with(|calls| calls.set(0));
 }
 
 fn install_pending_primary_calls() -> u64 {
-    INSTALL_PENDING_PRIMARY_CALLS.load(Ordering::Relaxed)
+    INSTALL_PENDING_PRIMARY_CALLS.with(Cell::get)
 }
 
 fn unique_specs() -> Vec<(String, Vec<String>, bool)> {

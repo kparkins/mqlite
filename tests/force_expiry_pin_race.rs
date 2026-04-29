@@ -30,6 +30,14 @@
 //! Release `fetch_add` before clones → Release `fetch_sub` before the
 //! re-check load.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
 #![cfg(feature = "loom-tests")]
 
 #[cfg(loom)]

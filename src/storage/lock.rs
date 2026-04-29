@@ -773,6 +773,10 @@ mod tests {
 
         /// Verify the lock region constants are within the reserved header area.
         #[test]
+        #[allow(
+            clippy::assertions_on_constants,
+            reason = "this test documents and checks the reserved header lock layout"
+        )]
         fn lock_region_is_within_reserved_header_area() {
             // Header reserved area: offsets 76–127 (see storage/header.rs).
             assert!(

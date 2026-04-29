@@ -82,6 +82,9 @@ pub(crate) struct PublishedCatalog {
     /// Name → id sidecar map. Name-based lookups resolve through
     /// `namespace_id_by_name` → `namespaces`.
     pub namespace_id_by_name: HashMap<String, NamespaceId>,
+    /// Index id → owning namespace id sidecar for lock-free secondary
+    /// reconcile dirty marking.
+    pub index_owner_by_id: HashMap<IndexId, NamespaceId>,
 }
 
 impl PublishedCatalog {
@@ -104,6 +107,11 @@ impl PublishedCatalog {
     #[allow(dead_code)]
     pub(crate) fn id_for_name(&self, name: &str) -> Option<NamespaceId> {
         self.namespace_id_by_name.get(name).copied()
+    }
+
+    /// Resolve a secondary index id to its owning collection id.
+    pub(crate) fn index_owner_by_id(&self, index_id: IndexId) -> Option<NamespaceId> {
+        self.index_owner_by_id.get(&index_id).copied()
     }
 }
 
@@ -139,6 +147,7 @@ mod tests {
         PublishedCatalog {
             namespaces,
             namespace_id_by_name: by_name,
+            index_owner_by_id: HashMap::new(),
         }
     }
 

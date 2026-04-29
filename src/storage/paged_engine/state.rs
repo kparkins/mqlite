@@ -1,5 +1,6 @@
 //! Shared + metadata state for the PagedEngine.
 
+use std::collections::HashMap;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 
 use crate::error::{Error, Result};
 use crate::journal::log_file::{LogicalOpKind, LogicalTxnFrame};
@@ -19,6 +21,7 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::history_store::HistoryStore;
+use crate::storage::reconcile::plan::{DirtyReason, LeafState, TreeIdent};
 use crate::storage::root_snapshot::PublishedEpoch;
 
 use super::catalog_ops::catalog_lock;
@@ -37,6 +40,8 @@ use super::recovery_apply::{
 pub(crate) struct SharedState {
     pub handle: Arc<BufferPoolHandle>,
     pub history_store: std::sync::Mutex<HistoryStore<BufferPoolPageStore>>,
+    /// Phase 4 dirty-leaf index keyed by stable tree identity.
+    pub dirty_leaves: DashMap<TreeIdent, HashMap<u32, LeafState>>,
     pub oracle: TimestampOracle,
     /// Atomically published read epoch for the mutex-free read path.
     /// Readers load one `Arc<PublishedEpoch>` and observe the full
@@ -96,6 +101,37 @@ impl SharedState {
             EPOCH_LOAD_COUNT.with(|c| c.set(c.get() + 1));
         }
         self.published.load_full()
+    }
+
+    /// Record that a leaf has resident versions eligible for checkpoint
+    /// reconciliation.
+    pub(crate) fn mark_leaf_dirty(&self, ident: TreeIdent, page_id: u32, reason: DirtyReason) {
+        let leaf_state = LeafState {
+            dirty_reason: reason,
+        };
+        self.dirty_leaves
+            .entry(ident)
+            .or_default()
+            .insert(page_id, leaf_state);
+    }
+
+    /// Remove dirty-leaf state for one tree that is leaving the catalog.
+    pub(crate) fn clear_dirty_tree(&self, ident: &TreeIdent) {
+        self.dirty_leaves.remove(ident);
+    }
+
+    /// Remove dirty-leaf state for every tree owned by a dropped collection.
+    pub(crate) fn clear_dirty_collection(&self, collection_id: i64) {
+        let idents: Vec<TreeIdent> = self
+            .dirty_leaves
+            .iter()
+            .filter_map(|entry| {
+                (entry.key().collection_id == collection_id).then(|| entry.key().clone())
+            })
+            .collect();
+        for ident in idents {
+            self.clear_dirty_tree(&ident);
+        }
     }
 
     /// Return [`Error::EngineFatal`] if this live engine has been poisoned.
@@ -187,7 +223,10 @@ pub(crate) struct MetadataState {
 }
 
 /// Read guard over [`MetadataState`] used by future writer-visibility plumbing.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Phase 5 writer visibility will hold metadata.read() across identity resolution"
+)]
 pub(in crate::storage::paged_engine) type MetadataReadGuard<'a> =
     std::sync::RwLockReadGuard<'a, MetadataState>;
 
@@ -295,15 +334,21 @@ impl MetadataState {
         catalog_root_level: u8,
     ) -> Result<(Self, Arc<SharedState>)> {
         let store = BufferPoolPageStore::new(Arc::clone(&handle));
-        let (backup_root, header_next_namespace_id, header_next_index_id, history_root_page) =
-            handle.allocator().with_header(|h| {
-                (
-                    h.catalog_root_backup,
-                    h.next_namespace_id as i64,
-                    h.next_index_id as i64,
-                    h.history_store_root_page,
-                )
-            })?;
+        let (
+            backup_root,
+            header_next_namespace_id,
+            header_next_index_id,
+            history_root_page,
+            history_root_level,
+        ) = handle.allocator().with_header(|h| {
+            (
+                h.catalog_root_backup,
+                h.next_namespace_id as i64,
+                h.next_index_id as i64,
+                h.history_store_root_page,
+                h.history_store_root_level,
+            )
+        })?;
         // Phase 1 §10.7 — propagate the persisted `next_*` counters to the
         // in-memory catalog. Fresh DB uses the defaults (1) from
         // `Catalog::create`.
@@ -338,16 +383,32 @@ impl MetadataState {
                 None => return Err(Error::TimestampExhausted),
             }
         }
-        // Phase 1 §10.7 — on fresh DB, allocate an empty root via
-        // `HistoryStore::create_empty_root` and persist the page id to
-        // the header. On reopen, the persisted root page is recorded
-        // but the tree itself is rebuilt fresh each lifetime (Phase 4's
-        // §8.11 is what introduces durable history-store contents; Phase 1
-        // only pins the root-page field in the header so Phase 4 does
-        // not need a format bump). This matches the pre-Phase-1 semantic:
-        // reconciliation repopulates the history tree lazily after open.
-        let (history_store_inner, persisted_history_root) =
-            HistoryStore::create_empty_root(BufferPoolPageStore::new_history(Arc::clone(&handle)))?;
+        // Phase 4 US-011 — on fresh DB, allocate an empty root and persist
+        // both the root page and level. On reopen, use the header-persisted
+        // `(root_page, root_level)` so history entries survive a restart.
+        let history_allocator = Arc::new(handle.allocator().clone());
+        let (history_store_inner, persisted_history_root, persisted_history_level) =
+            if history_root_page == 0 {
+                let (history, root_page) = HistoryStore::create_empty_root(
+                    BufferPoolPageStore::new_history(Arc::clone(&handle)),
+                )?;
+                (
+                    history.with_overflow_allocator(Arc::clone(&history_allocator)),
+                    root_page,
+                    0,
+                )
+            } else {
+                (
+                    HistoryStore::open(
+                        BufferPoolPageStore::new_history(Arc::clone(&handle)),
+                        history_root_page,
+                        history_root_level,
+                    )
+                    .with_overflow_allocator(Arc::clone(&history_allocator)),
+                    history_root_page,
+                    history_root_level,
+                )
+            };
 
         // Pre-replay epoch. Readers cannot reach this engine until open
         // returns; keeping both timestamps at Ts::MIN ensures a failed replay
@@ -363,6 +424,7 @@ impl MetadataState {
         let shared = Arc::new(SharedState {
             handle,
             history_store: std::sync::Mutex::new(history_store_inner),
+            dirty_leaves: DashMap::new(),
             oracle,
             published: ArcSwap::from_pointee(initial_epoch),
             engine_poisoned: AtomicBool::new(false),
@@ -403,6 +465,7 @@ impl MetadataState {
                 }
                 if history_root_page == 0 {
                     h.history_store_root_page = persisted_history_root;
+                    h.history_store_root_level = persisted_history_level;
                 }
             })?;
         }
@@ -477,3 +540,11 @@ pub(super) fn acquire_lane(
 #[cfg(test)]
 #[path = "state_tests.rs"]
 mod state_tests;
+
+#[cfg(test)]
+#[path = "state_us001_tests.rs"]
+mod state_us001_tests;
+
+#[cfg(test)]
+#[path = "state_us002_tests.rs"]
+mod state_us002_tests;

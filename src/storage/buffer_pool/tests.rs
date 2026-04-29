@@ -583,6 +583,7 @@ mod reconcile {
     use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
     use crate::storage::allocator::AllocatorHandle;
     use crate::storage::header::FileHeader;
+    use crate::storage::page::PAGE_TYPE_LEAF;
 
     fn ts(ms: u64) -> Ts {
         Ts {
@@ -606,10 +607,17 @@ mod reconcile {
         alloc
     }
 
+    fn leaf_page() -> Vec<u8> {
+        let mut page = vec![0u8; PageSize::Large32k.bytes()];
+        page[0] = PAGE_TYPE_LEAF;
+        page
+    }
+
     /// Build a fresh pool + allocator pair and pin leaf page `page`
     /// so a version chain can be attached to the resident frame.
     fn pool_with_resident_leaf(page: u32) -> (BufferPool, AllocatorHandle, Arc<MockIo>) {
         let io = MockIo::new();
+        io.seed(page, leaf_page());
         let pool = desktop_pool(Arc::clone(&io));
         // Force the frame resident (PinnedPage dropped immediately; the
         // frame stays in the pool because the pool is large).
@@ -660,7 +668,7 @@ mod reconcile {
             chain.push_back(entry_inline(
                 ts(10 + i),
                 ts(20 + i),
-                1 + i as u64,
+                1 + i,
                 format!("v{i}").as_bytes(),
             ));
         }
@@ -751,6 +759,7 @@ mod reconcile {
     #[test]
     fn overflow_refs_drop_and_enqueue_when_no_readers() {
         let io = MockIo::new();
+        io.seed(6, leaf_page());
         let pool = desktop_pool(Arc::clone(&io));
         let _p = pool.pin(6, PageSize::Large32k).unwrap();
         drop(_p);
@@ -776,19 +785,25 @@ mod reconcile {
         install_chain(&pool, 6, b"K", chain);
         assert_eq!(alloc.overflow_refcount(777), 1);
 
-        // No live readers → ort = Ts::MAX → older entry drops, its
-        // OverflowRef decrefs to 0, page 777 lands on the deferred-free
-        // queue, and drain_free_queue releases it to the allocator's
-        // free list.
+        // No live readers -> ort = Ts::MAX -> older entry drops, its
+        // OverflowRef decrefs to 0, and page 777 lands on the page-lifetime
+        // queue. It cannot be released to the allocator until a later
+        // checkpoint advances the fence.
         let depth_before = metrics::overflow_pages_freed_snapshot();
         let dropped = pool.reconcile(6, &registry, &alloc).unwrap();
         assert_eq!(dropped, 1);
         assert_eq!(alloc.overflow_refcount(777), 0);
-        assert!(
-            metrics::overflow_pages_freed_snapshot() > depth_before,
-            "drain must record at least one freed page"
+        assert_eq!(
+            metrics::overflow_pages_freed_snapshot(),
+            depth_before,
+            "drain before checkpoint fence must not release the page"
         );
-        assert_eq!(alloc.deferred_free_queue().depth(), 0, "queue drained");
+        assert_eq!(alloc.page_lifetime_queue().depth(), 1, "queue retained");
+
+        alloc.advance_page_lifetime_checkpoint_fence();
+        let freed = alloc.drain_free_queue(io.as_ref()).unwrap();
+        assert_eq!(freed, 1);
+        assert_eq!(alloc.page_lifetime_queue().depth(), 0, "queue drained");
     }
 
     #[test]

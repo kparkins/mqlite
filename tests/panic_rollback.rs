@@ -12,10 +12,19 @@
 //!
 //! The engine-level panic_rollback invariants (no torn chain mismatch
 //! between primary and sec-index, overflow refcount atomics restored,
-//! DeferredFreeQueue drains) are unit-tested at the
+//! page-lifetime queue drains) are unit-tested at the
 //! `src/storage/paged_engine.rs` layer where `WriteTxn` and the
 //! allocator handle are reachable. This integration test locks in the
 //! *externally observable* RAII guarantees.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
 
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};

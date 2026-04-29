@@ -362,7 +362,13 @@ pub(crate) fn us019_maybe_fail_primary_install(shared: &SharedState) -> Result<(
     let decremented = shared.us019_primary_install_failures.fetch_update(
         Ordering::AcqRel,
         Ordering::Acquire,
-        |remaining| (remaining > 0).then_some(remaining - 1),
+        |remaining| {
+            if remaining == 0 {
+                None
+            } else {
+                Some(remaining - 1)
+            }
+        },
     );
     if decremented.is_ok() {
         return Err(Error::Internal(

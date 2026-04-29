@@ -10,6 +10,15 @@
 //! Also covers §10.8 #21 (root-neutral workload does not rebuild) and
 //! §10.8 #22 (building-index iteration does not publish).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::{doc, Document};
 use mqlite::mvcc::metrics::{
     catalog_header_sync_count_snapshot, published_catalog_rebuild_count_snapshot,

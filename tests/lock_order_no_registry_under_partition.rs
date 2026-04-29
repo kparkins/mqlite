@@ -16,6 +16,15 @@
 //!    `inner_32k.lock()` — any refactor that inverts those two lines
 //!    will fail the audit.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;

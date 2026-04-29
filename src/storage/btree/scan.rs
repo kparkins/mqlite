@@ -13,6 +13,10 @@ use super::chain::read_overflow_chain;
 use super::node::{InternalNode, LeafNode};
 use super::{BTree, BTreePageStore, CellValue, HistoryProbe};
 
+/// A visible delta key paired with `Some(value)` for live versions or `None`
+/// for tombstones.
+pub(crate) type VisibleDeltaEntry = (Vec<u8>, Option<Vec<u8>>);
+
 impl<S: BTreePageStore> BTree<S> {
     // -----------------------------------------------------------------------
     // Search
@@ -60,12 +64,7 @@ impl<S: BTreePageStore> BTree<S> {
     /// Consults the owning leaf frame's version chain via `ChainSnapshot`
     /// first; if a [`VersionEntry`] visible to `view` exists for `key`,
     /// its payload is returned (respecting `is_tombstone`). Otherwise the
-    /// on-disk cell is used — pre-MVCC keys that never got a staged write
-    /// flow through the on-disk fallback.
-    ///
-    /// Not yet called from the engine's reader paths — those route through
-    /// `range_scan_mvcc` via `btree_collscan`.
-    #[allow(dead_code)]
+    /// on-disk cell is used for pre-MVCC keys that never got a staged write.
     pub(crate) fn get_mvcc(
         &self,
         key: &[u8],
@@ -111,7 +110,6 @@ impl<S: BTreePageStore> BTree<S> {
                 }
             }
         }
-        // Fall back to the on-disk cell (dual-write intermediate).
         let node = LeafNode::parse(&buf[..])?;
         match node.binary_search(key) {
             Ok(i) => match &node.cells[i].value {
@@ -329,10 +327,7 @@ impl<S: BTreePageStore> BTree<S> {
     ///
     /// Checkpoint uses this to fold committed delta heads into durable page
     /// images without treating the base page as visibility authority.
-    pub(crate) fn visible_delta_entries(
-        &self,
-        view: &ReadView,
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    pub(crate) fn visible_delta_entries(&self, view: &ReadView) -> Result<Vec<VisibleDeltaEntry>> {
         let mut results = Vec::new();
         let mut cur_page = self.leftmost_leaf()?;
 

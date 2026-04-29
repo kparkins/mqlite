@@ -11,6 +11,15 @@
 //!
 //! Run with: `cargo test --test registry_stress`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};

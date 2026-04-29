@@ -4,6 +4,15 @@
 //! correctly. They mirror the examples verbatim (with minor adaptations for
 //! in-memory mode) so that any future API breakage is immediately caught in CI.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use mqlite::{doc, Client};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;

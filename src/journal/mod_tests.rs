@@ -28,6 +28,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&db_path)
             .unwrap();
         (dir, db_path, file)
@@ -450,8 +451,7 @@ mod tests {
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
 
         let mut header = make_header();
-        let mut mgr =
-            JournalManager::open_or_create(&db_path, &mut header, &mut main_file).unwrap();
+        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
         let page_data = make_page_4k(0x42);
         mgr.append_non_commit(2, JournalPageSize::Small4k, &page_data)
@@ -478,8 +478,7 @@ mod tests {
         let (_dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let mut header = make_header();
-        let mut mgr =
-            JournalManager::open_or_create(&db_path, &mut header, &mut main_file).unwrap();
+        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
         assert_eq!(mgr.checkpoint_seq, 0);
 
         let page_data = make_page_4k(0x01);
@@ -525,7 +524,7 @@ mod tests {
         // Both pages should have been replayed into main file at 32 KB slots.
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
         main_file2
-            .seek(SeekFrom::Start(1 * PAGE_SIZE_LEAF as u64))
+            .seek(SeekFrom::Start(PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 0xAA, "page 1 should be replayed");
@@ -568,7 +567,7 @@ mod tests {
         // Page 1 (committed) should be in main file at the 32 KB slot offset.
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
         main_file2
-            .seek(SeekFrom::Start(1 * PAGE_SIZE_LEAF as u64))
+            .seek(SeekFrom::Start(PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 0xCC, "committed page must be present");
@@ -610,8 +609,7 @@ mod tests {
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let mut header = make_header();
 
-        let mut mgr =
-            JournalManager::open_or_create(&db_path, &mut header, &mut main_file).unwrap();
+        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
         let page_data = make_page_4k(0xFF);
         mgr.commit(1, JournalPageSize::Small4k, &page_data, 2)
             .unwrap();
@@ -831,7 +829,7 @@ mod tests {
         layered.write_page(13, PageSize::Small4k, &payload).unwrap();
 
         let journal_bytes = journal.lock().unwrap().read_page(13).unwrap();
-        assert_eq!(journal_bytes, Some(payload.clone()));
+        assert_eq!(journal_bytes, Some(payload));
 
         let pages = file_src.pages.lock().unwrap();
         assert!(
@@ -1703,12 +1701,13 @@ mod tests {
 
         // pre + ChainCommit, boundary hi1, mid + ChainCommit, boundary hi2,
         // post + ChainCommit.
-        for ts in [pre_ts] {
+        {
+            let ts = pre_ts;
             mgr.append_logical_txn(LogicalTxnFrame {
                 salt1: mgr.salt1,
                 salt2: mgr.salt2,
                 commit_ts: ts,
-                diagnostic_txn_id: ts.physical_ms as u64,
+                diagnostic_txn_id: ts.physical_ms,
                 format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
                 flags: 0,
                 ops: vec![],
@@ -1719,12 +1718,13 @@ mod tests {
         mgr.append_checkpoint_commit_boundary(CheckpointEpoch(1), pre_ts, hi1, PageId(0))
             .unwrap();
 
-        for ts in [mid_ts] {
+        {
+            let ts = mid_ts;
             mgr.append_logical_txn(LogicalTxnFrame {
                 salt1: mgr.salt1,
                 salt2: mgr.salt2,
                 commit_ts: ts,
-                diagnostic_txn_id: ts.physical_ms as u64,
+                diagnostic_txn_id: ts.physical_ms,
                 format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
                 flags: 0,
                 ops: vec![],
@@ -1739,7 +1739,7 @@ mod tests {
             salt1: mgr.salt1,
             salt2: mgr.salt2,
             commit_ts: post_ts,
-            diagnostic_txn_id: post_ts.physical_ms as u64,
+            diagnostic_txn_id: post_ts.physical_ms,
             format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
             flags: 0,
             ops: vec![],
@@ -2282,7 +2282,7 @@ mod tests {
             observed.as_ref().unwrap()[0],
             0xA5,
             "legacy-frame payload must survive recovery; got {:?}",
-            observed.as_ref().unwrap().get(0)
+            observed.as_ref().unwrap().first()
         );
         drop(mgr2);
         drop(main_file_reopen);
@@ -2792,6 +2792,7 @@ mod crash_recovery_tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(db_path)
             .map_err(Error::Io)?;
         main_file

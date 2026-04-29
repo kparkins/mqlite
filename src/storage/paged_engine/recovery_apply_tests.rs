@@ -8,7 +8,6 @@ use bson::Bson;
 use super::super::{catalog_ops, PagedEngine};
 use super::apply_parsed_logical_frames;
 use crate::client::Client;
-use crate::error::Result;
 use crate::journal::log_file::{
     LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire, LOGICAL_TXN_FORMAT_VERSION,
 };

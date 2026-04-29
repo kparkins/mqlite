@@ -23,6 +23,15 @@
 //!   functional correctness; post-PR 8 it will have actual concurrency
 //!   teeth.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use mqlite::Client;
 
@@ -55,7 +64,7 @@ fn rollback_leaves_no_dirty_frames() {
         .unwrap();
     assert_eq!(post.len(), 1, "exactly one doc survives");
     assert_eq!(post[0].get_i32("_id").unwrap(), 1);
-    assert_eq!(post[0].get_bool("ok").unwrap(), true);
+    assert!(post[0].get_bool("ok").unwrap());
     assert!(
         post[0].get("clash").is_none(),
         "rolled-back insert must not land",

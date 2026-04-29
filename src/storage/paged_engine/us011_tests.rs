@@ -15,7 +15,9 @@ use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
-use crate::storage::header::FileHeader;
+use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
+use crate::storage::history_store::{HistorySpillTxn, HistoryStore};
+use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
 use crate::storage::test_support::{ArcIo, MockIo};
 
 const READY_NS: &str = "test.us011.ready";
@@ -25,6 +27,15 @@ const EMAIL_INDEX: &str = "email_1";
 
 fn buffered_engine() -> Result<PagedEngine> {
     let io = Arc::new(MockIo::default());
+    buffered_engine_from_io(io, FileHeader::new_now(), 0, 0)
+}
+
+fn buffered_engine_from_io(
+    io: Arc<MockIo>,
+    header: FileHeader,
+    catalog_root_page: u32,
+    catalog_root_level: u8,
+) -> Result<PagedEngine> {
     let pool = Arc::new(BufferPool::new(
         default_sizes::DESKTOP,
         Box::new(ArcIo(Arc::clone(&io))),
@@ -33,9 +44,8 @@ fn buffered_engine() -> Result<PagedEngine> {
         default_sizes::IOT,
         Box::new(ArcIo(Arc::clone(&io))),
     ));
-    let header = FileHeader::new_now();
     let handle = Arc::new(BufferPoolHandle::new(pool, history_pool, header));
-    PagedEngine::new_buffered(handle, 0, 0)
+    PagedEngine::new_buffered(handle, catalog_root_page, catalog_root_level)
 }
 
 fn email_index_model(unique: bool) -> IndexModel {
@@ -139,6 +149,19 @@ fn assert_inline(entry: &VersionEntry, expected: &[u8]) -> Result<()> {
         }
         VersionData::Overflow(_) => Err(Error::Internal("expected inline version data".into())),
     }
+}
+
+fn persisted_header(io: &Arc<MockIo>) -> Result<FileHeader> {
+    let pages = io
+        .pages
+        .lock()
+        .map_err(|_| Error::Internal("mock io pages mutex poisoned".into()))?;
+    let page = pages
+        .get(&0)
+        .ok_or_else(|| Error::Internal("page 0 was not flushed".into()))?;
+    let mut buf = [0u8; HEADER_PAGE_SIZE];
+    buf.copy_from_slice(&page[..HEADER_PAGE_SIZE]);
+    FileHeader::from_bytes(&buf)
 }
 
 #[test]
@@ -245,5 +268,77 @@ fn test_primary_and_secondary_share_single_commit_ts() -> Result<()> {
     assert_eq!(primary_chain.len(), 1);
     assert_eq!(secondary_chain.len(), 1);
     assert_eq!(primary_chain[0].start_ts, secondary_chain[0].start_ts);
+    Ok(())
+}
+
+#[test]
+fn test_history_store_reopens_from_header_persisted_root() -> Result<()> {
+    let io = Arc::new(MockIo::default());
+    let engine = buffered_engine_from_io(Arc::clone(&io), FileHeader::new_now(), 0, 0)?;
+    let ident = TreeIdent {
+        collection_id: 99,
+        kind: TreeKind::Primary,
+    };
+    let entry = VersionEntry {
+        start_ts: Ts {
+            physical_ms: 10,
+            logical: 0,
+        },
+        stop_ts: Ts {
+            physical_ms: 40,
+            logical: 0,
+        },
+        txn_id: 7,
+        state: VersionState::Committed,
+        data: VersionData::Inline(b"reopened-history".to_vec()),
+        is_tombstone: false,
+    };
+    let mut spill_txn = HistorySpillTxn::new();
+    HistoryStore::<BufferPoolPageStore>::spill_primary(
+        &mut spill_txn,
+        ident,
+        b"doc-99",
+        &entry,
+        0,
+    )?;
+    {
+        let mut history = engine
+            .shared
+            .history_store
+            .lock()
+            .map_err(|_| Error::Internal("history_store mutex poisoned".into()))?;
+        history.commit_spill_txn_durable(spill_txn)?;
+    }
+    engine.shared.handle.flush()?;
+
+    let persisted = persisted_header(&io)?;
+    assert_ne!(persisted.history_store_root_page, 0);
+    assert_eq!(persisted.history_store_root_level, 0);
+    let catalog_root_page = persisted.catalog_root_page;
+    let catalog_root_level = persisted.catalog_root_level;
+    drop(engine);
+
+    let reopened = buffered_engine_from_io(
+        Arc::clone(&io),
+        persisted,
+        catalog_root_page,
+        catalog_root_level,
+    )?;
+    let visible = reopened
+        .shared
+        .history_store
+        .lock()
+        .map_err(|_| Error::Internal("history_store mutex poisoned".into()))?
+        .probe_primary(
+            99,
+            b"doc-99",
+            Ts {
+                physical_ms: 20,
+                logical: 0,
+            },
+        )?
+        .ok_or_else(|| Error::Internal("history entry did not survive reopen".into()))?;
+
+    assert_inline(&visible, b"reopened-history")?;
     Ok(())
 }

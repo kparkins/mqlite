@@ -18,7 +18,7 @@
 // these mutexes MUST acquire them in this order, and release in reverse:
 //
 // 1.   history-store partition mutex (outermost)
-// 1.5. DeferredFreeQueue::pending mutex
+// 1.5. PageLifetimeQueue::pending mutex
 //      — brief; acquired by OverflowRef::Drop on 0-refcount transition to push
 //      a u32 first_page, by drain_free_queue on writer path to drain.
 //      OverflowRef::Drop acquires 1.5 and releases immediately (no downstream
@@ -36,11 +36,11 @@
 //
 // Readers DO NOT acquire `AllocatorHandle::state` for pure reads (refcount
 // atomics live on the page header and are lock-free). The reader-path
-// `OverflowRef::Drop` DOES acquire `DeferredFreeQueue::pending` briefly
+// `OverflowRef::Drop` DOES acquire `PageLifetimeQueue::pending` briefly
 // (push a u32) when decref brings count to 0 — this is the ONLY lock any
 // reader path acquires; it is strictly above the allocator mutex in the
 // order and closed before any other acquisition. Free-side
-// `drain_free_queue` acquires `DeferredFreeQueue::pending` first, then
+// `drain_free_queue` acquires `PageLifetimeQueue::pending` first, then
 // `AllocatorHandle::state`, and is called only from writer-serialized
 // context (writer mutex held). `ReadViewRegistry::oldest_required_ts()`
 // MUST be snapshotted **before** any partition mutex is acquired in a
@@ -287,6 +287,7 @@ fn standalone_epoch(read_ts: Ts) -> Arc<PublishedEpoch> {
         catalog: Arc::new(PublishedCatalog {
             namespaces: HashMap::new(),
             namespace_id_by_name: HashMap::new(),
+            index_owner_by_id: HashMap::new(),
         }),
         catalog_generation: 0,
         sequencer_frontier: Ts::default(),
@@ -830,7 +831,7 @@ mod tests {
         // sequential test we arrange: poison, then construct with Some(v).
         // The pre-check wins and returns empty; refcount stays at baseline.
         view.poisoned.store(true, Ordering::Release);
-        let snap = ChainSnapshot::new(&source, Some(view.clone()));
+        let snap = ChainSnapshot::new(&source, Some(view));
         drop(snap);
         assert_eq!(
             alloc.overflow_refcount(9),
@@ -989,7 +990,7 @@ mod tests {
             },
             txn_id: 6,
             state: VersionState::Committed,
-            data: VersionData::Overflow(OverflowRef::new_owned(42, 256, alloc.clone()).unwrap()),
+            data: VersionData::Overflow(OverflowRef::new_owned(42, 256, alloc).unwrap()),
             is_tombstone: false,
         };
         let mut chain = VecDeque::new();

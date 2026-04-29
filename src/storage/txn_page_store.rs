@@ -96,14 +96,14 @@ pub(crate) enum PageOrigin {
     /// `free_*` and invalidate the buffer-pool frame so a subsequent
     /// reallocation does not see stale cached content.
     NewAlloc,
-    /// Page came from the `DeferredFreeQueue` drained at `WriteTxn::begin`
-    /// time. On rollback: push back onto `DeferredFreeQueue` (NOT the
+    /// Page came from the page-lifetime queue drained at `WriteTxn::begin`
+    /// time. On rollback: push back onto the page-lifetime queue (NOT the
     /// allocator free list, because a concurrent reader with a live
     /// `OverflowRef` could still observe the page via refcount decrement).
     DeferredFree,
 }
 
-/// One page allocated (or drained from the deferred-free queue) during a
+/// One page allocated (or drained from the page-lifetime queue) during a
 /// writer txn. Recorded into [`TxnOverlay::reservations`] so rollback can
 /// undo the allocation and restore the pre-txn free-list state.
 #[derive(Clone, Copy, Debug)]
@@ -212,7 +212,7 @@ impl TxnOverlay {
     /// - `NewAlloc`: return the page to the allocator free list and
     ///   invalidate any cached frame so the next allocator user does not
     ///   see stale content cached from this txn.
-    /// - `DeferredFree`: push back onto the `DeferredFreeQueue` so the
+    /// - `DeferredFree`: push back onto the page-lifetime queue so the
     ///   next writer drains-and-frees it after a refcount recheck.
     ///
     /// If this txn moved the catalog root, restore the old catalog-root
@@ -249,7 +249,7 @@ impl TxnOverlay {
                     // still be holding an `OverflowRef` for this page;
                     // the next writer's drain re-checks the refcount
                     // before actually freeing.
-                    handle.allocator().enqueue_deferred_free(res.page);
+                    handle.allocator().enqueue_overflow_deferred_free(res.page);
                 }
             }
         }

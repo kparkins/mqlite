@@ -12,8 +12,6 @@ pub mod transaction;
 pub mod version;
 
 #[allow(unused_imports)]
-pub use deferred_free::DeferredFreeQueue;
-#[allow(unused_imports)]
 pub use metrics::{
     active_read_views_snapshot,
     // Phase 1 §10.10 counters (US-012)

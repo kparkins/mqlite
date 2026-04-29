@@ -1,5 +1,14 @@
 //! Phase 3 US-015 public configuration validation tests.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use mqlite::{Client, OpenOptions};
 
 const VALID_THRESHOLD: f64 = 1.0;

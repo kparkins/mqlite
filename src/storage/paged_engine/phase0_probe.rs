@@ -161,7 +161,7 @@ impl PagedEngine {
             return Ok(report);
         }
 
-        if let Err(e) = install_pending_sec_index(
+        install_pending_sec_index(
             &self.shared,
             &md_read,
             &mut overlay,
@@ -169,11 +169,9 @@ impl PagedEngine {
             &vis,
             commit_ts,
             txn_id,
-        ) {
-            return Err(e);
-        }
+        )?;
 
-        if let Err(e) = install_pending_primary(
+        install_pending_primary(
             &self.shared,
             &md_read,
             &mut overlay,
@@ -181,9 +179,7 @@ impl PagedEngine {
             &vis,
             commit_ts,
             txn_id,
-        ) {
-            return Err(e);
-        }
+        )?;
         if matches!(
             cut,
             Phase0ProbeCut::AfterPrimaryInstallBeforeOverlayCommit

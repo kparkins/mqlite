@@ -7,6 +7,15 @@
 //! dual-write during build, building-index invisibility, drop_collection races,
 //! and reserved-name protection.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use bson::Document;
 use mqlite::{Client, IndexModel, IndexOptions};
@@ -143,7 +152,7 @@ fn tc03_concurrent_create_index_different_fields() {
             .unwrap()
     });
 
-    let c2 = client.clone();
+    let c2 = client;
     let b2 = Arc::clone(&barrier);
     let h2 = thread::spawn(move || {
         b2.wait();
@@ -250,7 +259,7 @@ fn tc05_drop_wins_race_during_build() {
         // Either Ok (build finished before drop) or Err (drop won). Both allowed.
     });
 
-    let c_drop = client.clone();
+    let c_drop = client;
     let b_drop = Arc::clone(&barrier);
     let drop_handle = thread::spawn(move || {
         b_drop.wait();
@@ -474,7 +483,7 @@ fn tc10_dual_write_during_build_all_docs_indexed() {
     });
 
     // Thread B: insert 500 more docs (tag "c" or "d").
-    let c_ins = client.clone();
+    let c_ins = client;
     let b_ins = Arc::clone(&barrier);
     let ins_thread = thread::spawn(move || {
         b_ins.wait();
@@ -539,7 +548,7 @@ fn tc11_building_index_invisible_to_queries() {
     });
 
     // Thread B: while build is in progress, run queries.
-    let c_query = client.clone();
+    let c_query = client;
     let b_query = Arc::clone(&barrier);
     let query_thread = thread::spawn(move || {
         b_query.wait();
@@ -547,8 +556,8 @@ fn tc11_building_index_invisible_to_queries() {
         thread::sleep(std::time::Duration::from_millis(10));
         let col_q = c_query.database("d").collection::<Document>("bigcol");
         // Must succeed and return correct count (falls back to collscan).
-        let cnt = col_q.count_documents(doc! { "status": "active" }).unwrap();
-        cnt
+
+        col_q.count_documents(doc! { "status": "active" }).unwrap()
     });
 
     let query_count = query_thread.join().unwrap();

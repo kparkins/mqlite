@@ -739,12 +739,12 @@ fn t3_5_merge_preserves_overflow_refcount_invariant() {
         .expect("chain B survived merge");
 
     // Drop the chains — refcounts should fall to 0 and the pages should
-    // land on the deferred-free queue exactly once each.
+    // land on the page-lifetime queue exactly once each.
     drop(a);
     drop(b);
     assert_eq!(alloc.overflow_refcount(OVF_A), 0);
     assert_eq!(alloc.overflow_refcount(OVF_B), 0);
-    assert_eq!(alloc.deferred_free_queue().depth(), 2);
+    assert_eq!(alloc.page_lifetime_queue().depth(), 2);
 }
 
 // --- T3.5 merge: orphan chains migrate with merge-into-left ------------

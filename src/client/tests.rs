@@ -225,9 +225,9 @@ mod tests {
         let good_header = FileHeader::new_now();
         let mut bytes = good_header.to_bytes();
         bytes[0] = b'X';
-        let checksum = FileHeader::compute_checksum(bytes[..64].try_into().expect("64 bytes"));
+        let checksum = FileHeader::compute_checksum(&bytes);
         bytes[64..68].copy_from_slice(&checksum.to_le_bytes());
-        fs::write(&db_path, &bytes).expect("write bad-magic file");
+        fs::write(&db_path, bytes).expect("write bad-magic file");
 
         let result = Client::open(&db_path);
         match result.err().expect("expected an error") {
@@ -394,13 +394,13 @@ mod tests {
                 thread::spawn(move || {
                     let db = c.database("test");
                     let col = db.collection::<bson::Document>("data");
-                    let docs: Vec<_> = col
+                    let doc_count = col
                         .find(doc! {})
                         .run()
                         .expect("find")
                         .filter_map(|r| r.ok())
-                        .collect();
-                    assert_eq!(docs.len(), 50, "all 50 docs must be visible");
+                        .count();
+                    assert_eq!(doc_count, 50, "all 50 docs must be visible");
                 })
             })
             .collect();

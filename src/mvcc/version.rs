@@ -6,7 +6,7 @@
 //! The explicit `Clone` impl bumps the refcount via the allocator's
 //! saturating CAS loop; the `Drop` impl atomically decrefs and, if the
 //! post-decrement count is 0, enqueues the page to the allocator's
-//! deferred-free queue. Actual free is deferred to the writer path.
+//! page-lifetime queue. Actual free is deferred to the writer path.
 //!
 //! This module never calls the allocator's state mutex directly — atomic
 //! refcount ops happen lock-free on the shared `AtomicU32` handles. See
@@ -95,6 +95,24 @@ impl OverflowRef {
     pub fn total_length(&self) -> u64 {
         self.total_length
     }
+
+    /// Clone this overflow reference only if the underlying record is live.
+    ///
+    /// Returns `None` when the allocator no longer has a refcount slot for the
+    /// record, or when the slot has already reached zero. In that case the
+    /// method leaves the refcount unchanged so a dropped overflow chain cannot
+    /// be resurrected during ownership transfer.
+    #[must_use]
+    pub fn try_clone(&self) -> Option<Self> {
+        match self.allocator.try_incref_live_overflow(self.first_page) {
+            Ok(Some(_)) => Some(Self {
+                first_page: self.first_page,
+                total_length: self.total_length,
+                allocator: self.allocator.clone(),
+            }),
+            Ok(None) | Err(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for OverflowRef {
@@ -107,19 +125,18 @@ impl std::fmt::Debug for OverflowRef {
 }
 
 impl Clone for OverflowRef {
+    #[allow(
+        clippy::panic,
+        reason = "Clone is infallible; cloning a dropped overflow ref is an invariant breach"
+    )]
     fn clone(&self) -> Self {
         // A live `OverflowRef` holds ≥ 1 refcount, so this incref can only
-        // saturate if something else has pushed the count up to u32::MAX —
-        // which requires > 4 billion concurrent pins on one chain. That's
-        // a bug, and `Clone` is infallible by trait contract, so we panic.
-        #[allow(clippy::expect_used)]
-        self.allocator
-            .incref_overflow(self.first_page)
-            .expect("refcount is bounded by CAS saturation at u32::MAX - 1; overflow means > 4B concurrent pins (pin leak)");
-        Self {
-            first_page: self.first_page,
-            total_length: self.total_length,
-            allocator: self.allocator.clone(),
+        // fail if another bug has already dropped the underlying record.
+        // `Clone` is infallible by trait contract, so retain the live-path
+        // behavior and panic instead of resurrecting a zero-refcount record.
+        match self.try_clone() {
+            Some(cloned) => cloned,
+            None => panic!("OverflowRef::clone called after the underlying record was dropped"),
         }
     }
 }
@@ -128,7 +145,8 @@ impl Drop for OverflowRef {
     fn drop(&mut self) {
         let post = self.allocator.decref_overflow(self.first_page);
         if post == 0 {
-            self.allocator.enqueue_deferred_free(self.first_page);
+            self.allocator
+                .enqueue_overflow_deferred_free(self.first_page);
         }
     }
 }
@@ -154,6 +172,15 @@ impl Clone for VersionData {
         match self {
             VersionData::Inline(v) => VersionData::Inline(v.clone()),
             VersionData::Overflow(r) => VersionData::Overflow(r.clone()),
+        }
+    }
+}
+
+impl VersionData {
+    pub(crate) fn try_clone(&self) -> Option<Self> {
+        match self {
+            VersionData::Inline(v) => Some(VersionData::Inline(v.clone())),
+            VersionData::Overflow(r) => r.try_clone().map(VersionData::Overflow),
         }
     }
 }
@@ -193,6 +220,19 @@ pub struct VersionEntry {
     pub is_tombstone: bool,
 }
 
+impl VersionEntry {
+    pub(crate) fn try_clone(&self) -> Option<Self> {
+        Some(Self {
+            start_ts: self.start_ts,
+            stop_ts: self.stop_ts,
+            txn_id: self.txn_id,
+            state: self.state,
+            data: self.data.try_clone()?,
+            is_tombstone: self.is_tombstone,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -222,6 +262,10 @@ mod tests {
         let r = OverflowRef::new_owned(42, 100, alloc.clone()).unwrap();
         assert_eq!(alloc.overflow_refcount(42), 1);
 
+        #[allow(
+            clippy::redundant_clone,
+            reason = "test asserts Clone bumps the overflow refcount"
+        )]
         let r2 = r.clone();
         assert_eq!(alloc.overflow_refcount(42), 2);
         assert_eq!(r2.first_page(), 42);
@@ -234,7 +278,7 @@ mod tests {
         drop(r);
         assert_eq!(alloc.overflow_refcount(42), 0);
         assert_eq!(
-            alloc.deferred_free_queue().depth(),
+            alloc.page_lifetime_queue().depth(),
             1,
             "refcount 0 drop must enqueue for deferred free"
         );
@@ -250,14 +294,14 @@ mod tests {
         drop(r);
         assert_eq!(alloc.overflow_refcount(42), 1);
         assert_eq!(
-            alloc.deferred_free_queue().depth(),
+            alloc.page_lifetime_queue().depth(),
             0,
             "must not enqueue while a live OverflowRef remains"
         );
 
         drop(r2);
         assert_eq!(alloc.overflow_refcount(42), 0);
-        assert_eq!(alloc.deferred_free_queue().depth(), 1);
+        assert_eq!(alloc.page_lifetime_queue().depth(), 1);
     }
 
     #[test]
@@ -293,8 +337,17 @@ mod tests {
         };
         assert_eq!(alloc.overflow_refcount(100), 1);
 
+        #[allow(
+            clippy::redundant_clone,
+            reason = "test asserts VersionEntry::clone bumps the overflow refcount"
+        )]
         let clone = entry.clone();
         assert_eq!(alloc.overflow_refcount(100), 2);
         assert_eq!(clone.txn_id, 1);
     }
 }
+
+#[cfg(test)]
+#[cfg(not(loom))]
+#[path = "version_us013_tests.rs"]
+mod us013_tests;

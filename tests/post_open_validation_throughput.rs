@@ -13,6 +13,15 @@
 //! (default 1). CI should keep it at 1; a developer rerunning
 //! locally can set it to 2-3 while tuning.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::env;
 use std::time::{Duration, Instant};
 

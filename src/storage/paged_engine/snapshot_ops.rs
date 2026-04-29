@@ -18,6 +18,7 @@ use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::IndexState;
 use crate::storage::history_store::HistoryStore;
+use crate::storage::reconcile::driver::reconcile_tree_dirty_set;
 use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedEpoch, PublishedIndex};
 
 use super::btree_ops::btree_collscan;
@@ -46,11 +47,11 @@ pub(super) fn open_snapshot_read_view(
 
 pub(super) fn primary_history_probe<'a>(
     shared: &'a SharedState,
-    ns: &str,
+    collection_id: i64,
 ) -> PrimaryHistoryProbe<'a, BufferPoolPageStore> {
     PrimaryHistoryProbe {
         store: &shared.history_store,
-        ns_id: ns_id_for(ns),
+        collection_id,
     }
 }
 
@@ -74,7 +75,7 @@ pub(super) fn fetch_primary_pair(
 
 pub(super) fn execute_primary_key_lookup_from_snap(
     shared: &SharedState,
-    ns: &str,
+    _ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
@@ -83,7 +84,7 @@ pub(super) fn execute_primary_key_lookup_from_snap(
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
     let view = open_snapshot_read_view(shared, epoch);
-    let probe = primary_history_probe(shared, ns);
+    let probe = primary_history_probe(shared, ns_snap.id);
 
     match condition {
         PrimaryKeyCondition::Eq(id) => {
@@ -107,26 +108,11 @@ pub(super) fn execute_primary_key_lookup_from_snap(
     }
 }
 
-/// Derive a stable `ns_id: u32` from a collection / namespace name.
-///
-/// FNV-1a 32-bit. Used purely as a key-space partitioning hint for the
-/// history store; collisions just mean two collections share a key
-/// prefix in the history B-tree, which is harmless because the
-/// remaining key material (kind-tag + user key) already disambiguates.
-pub(super) fn ns_id_for(ns: &str) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &b in ns.as_bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    h
-}
-
 /// Bind the primary-key probe path of a [`HistoryStore`] to a fixed
-/// `(ns_id, KIND_PRIMARY)` so the BTree layer sees a key-only probe.
+/// `(collection_id, primary tree)` so the BTree layer sees a key-only probe.
 pub(super) struct PrimaryHistoryProbe<'a, S: BTreePageStore> {
     store: &'a std::sync::Mutex<HistoryStore<S>>,
-    ns_id: u32,
+    collection_id: i64,
 }
 
 impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryProbe<'_, S> {
@@ -139,7 +125,7 @@ impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryPr
             .store
             .lock()
             .map_err(|_| Error::Internal("history_store mutex poisoned".into()))?;
-        guard.probe_primary(self.ns_id, key, read_ts)
+        guard.probe_primary(self.collection_id, key, read_ts)
     }
 }
 
@@ -176,7 +162,7 @@ pub(super) fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Ve
 )]
 pub(super) fn execute_index_scan_from_snap(
     shared: &SharedState,
-    ns: &str,
+    _ns: &str,
     ns_snap: &crate::storage::root_snapshot::NamespaceSnapshot,
     ready_indexes: &[&PublishedIndex],
     filter: &Document,
@@ -244,7 +230,7 @@ pub(super) fn execute_index_scan_from_snap(
     if !id_bsons.is_empty() {
         let data_store = BufferPoolPageStore::new(Arc::clone(&handle));
         let data_tree = BTree::open(data_store, ns_snap.data_root_page, ns_snap.data_root_level);
-        let probe = primary_history_probe(shared, ns);
+        let probe = primary_history_probe(shared, ns_snap.id);
         for id_bson in id_bsons {
             let data_key = encode_key(&id_bson);
             if let Some(pair) =
@@ -259,7 +245,7 @@ pub(super) fn execute_index_scan_from_snap(
 
 pub(super) fn execute_collscan_from_snap(
     shared: &SharedState,
-    ns: &str,
+    _ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
@@ -267,7 +253,7 @@ pub(super) fn execute_collscan_from_snap(
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
     let view = open_snapshot_read_view(shared, epoch);
-    let probe = primary_history_probe(shared, ns);
+    let probe = primary_history_probe(shared, ns_snap.id);
     btree_collscan(&tree, filter, &view, Some(&probe))
 }
 
@@ -366,6 +352,12 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         .metadata
         .write()
         .map_err(|_| crate::error::Error::Internal("metadata RwLock poisoned".into()))?;
+    let checkpoint_ts = engine.shared.published.load_full().visible_ts;
+    let ort = engine
+        .shared
+        .handle
+        .read_view_registry()
+        .oldest_required_ts();
 
     let mut overlay = crate::storage::txn_page_store::TxnOverlay::new();
     let published_catalog_dirty =
@@ -390,11 +382,16 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         h.catalog_root_backup = root_page;
     })?;
 
-    let ort = engine
+    let dirty_idents = engine
         .shared
-        .handle
-        .read_view_registry()
-        .oldest_required_ts();
+        .dirty_leaves
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    for ident in dirty_idents {
+        let _ = reconcile_tree_dirty_set(engine, &md, ident, checkpoint_ts, ort)?;
+    }
+
     {
         let mut hs =
             engine
@@ -425,11 +422,14 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
             .shared
             .handle
             .allocator()
-            .deferred_free_queue()
+            .page_lifetime_queue()
             .depth() as u64,
     );
     engine.shared.handle.flush()?;
-    engine.shared.handle.emergency_checkpoint()?;
+    let checkpointed_journal = engine.shared.handle.emergency_checkpoint()?;
+    if !checkpointed_journal {
+        engine.shared.handle.advance_page_lifetime_checkpoint()?;
+    }
     Ok(())
 }
 

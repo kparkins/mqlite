@@ -22,6 +22,15 @@
 //! panic if the invariant were violated — the test asserts the loop
 //! completes cleanly and every document is returned.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use mqlite::{doc, Client};
 use tempfile::TempDir;
 

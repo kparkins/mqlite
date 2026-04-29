@@ -19,6 +19,7 @@ pub(crate) mod page;
 pub(crate) mod paged_engine;
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod phase0_probe;
+pub(crate) mod reconcile;
 pub(crate) mod root_snapshot;
 pub(crate) mod secondary_index;
 #[cfg(test)]

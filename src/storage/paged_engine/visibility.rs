@@ -7,7 +7,7 @@ use crate::mvcc::read_view::ReadView;
 use crate::mvcc::transaction::WriteTxn;
 use crate::storage::btree::{BTreePageStore, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::history_store::{HistoryStore, KIND_SEC_INDEX_BASE};
+use crate::storage::history_store::HistoryStore;
 use crate::storage::root_snapshot::NamespaceId;
 
 use super::snapshot_ops::{primary_history_probe, PrimaryHistoryProbe};
@@ -18,14 +18,12 @@ use super::state::{MetadataReadGuard, SharedState};
 /// The context pins one published epoch for the full Phase 3 write lifetime.
 /// Downstream uniqueness and install helpers receive shared references to this
 /// value instead of constructing their own read views.
-#[allow(dead_code)]
 pub(crate) struct WriteVisibility<'a> {
     pub(in crate::storage::paged_engine) read_view: Arc<ReadView>,
     pub(in crate::storage::paged_engine) ns_id: NamespaceId,
     pub(in crate::storage::paged_engine) primary_history:
         PrimaryHistoryProbe<'a, BufferPoolPageStore>,
-    pub(in crate::storage::paged_engine) secondary_history:
-        Option<SecondaryHistoryProbe<'a, BufferPoolPageStore>>,
+    history_store: &'a std::sync::Mutex<HistoryStore<BufferPoolPageStore>>,
 }
 
 impl<'a> WriteVisibility<'a> {
@@ -68,13 +66,22 @@ impl<'a> WriteVisibility<'a> {
             Arc::clone(&epoch),
             txn_id,
         );
-        let primary_history = primary_history_probe(shared, ns);
+        let primary_history = primary_history_probe(shared, snapshot.id);
         Ok(Self {
             read_view,
             ns_id: snapshot.id,
             primary_history,
-            secondary_history: None,
+            history_store: &shared.history_store,
         })
+    }
+
+    /// Build a secondary-index history probe for one index in this namespace.
+    #[must_use]
+    pub(in crate::storage::paged_engine) fn secondary_history_probe(
+        &self,
+        index_id: i64,
+    ) -> SecondaryHistoryProbe<'a, BufferPoolPageStore> {
+        SecondaryHistoryProbe::new(self.history_store, self.ns_id, index_id)
     }
 
     /// Construct the Phase 5 writer visibility context.
@@ -107,7 +114,11 @@ impl<'a> WriteVisibility<'a> {
     /// Always panics in Phase 3 because the metadata-guard protocol belongs to
     /// Phase 5.
     #[must_use]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        clippy::panic,
+        reason = "Phase 5 placeholder; current writer path must use WriteVisibility::new"
+    )]
     pub(crate) fn for_writer(
         shared: &'a SharedState,
         md_read: MetadataReadGuard<'a>,
@@ -122,25 +133,20 @@ impl<'a> WriteVisibility<'a> {
 }
 
 /// Secondary-index history probe placeholder for Phase 4 spill support.
-#[allow(dead_code)]
 pub(in crate::storage::paged_engine) struct SecondaryHistoryProbe<'a, S: BTreePageStore> {
     store: &'a std::sync::Mutex<HistoryStore<S>>,
-    ns_id: u32,
-    kind_tag: u8,
+    collection_id: i64,
+    index_id: i64,
 }
 
-#[allow(dead_code)]
 impl<'a, S: BTreePageStore> SecondaryHistoryProbe<'a, S> {
     /// Create a secondary history probe for one secondary-index kind tag.
-    ///
-    /// Phase 3 keeps [`WriteVisibility::secondary_history`] as `None`; this
-    /// constructor exists so the field has the Phase 4-ready type.
     ///
     /// # Arguments
     ///
     /// * `store` - history-store mutex.
-    /// * `ns_id` - history-store namespace partition.
-    /// * `secondary_ordinal` - ordinal added to the secondary kind-tag base.
+    /// * `collection_id` - durable collection identifier.
+    /// * `index_id` - durable secondary index identifier.
     ///
     /// # Returns
     ///
@@ -148,13 +154,13 @@ impl<'a, S: BTreePageStore> SecondaryHistoryProbe<'a, S> {
     #[must_use]
     pub(in crate::storage::paged_engine) fn new(
         store: &'a std::sync::Mutex<HistoryStore<S>>,
-        ns_id: u32,
-        secondary_ordinal: u8,
+        collection_id: i64,
+        index_id: i64,
     ) -> Self {
         Self {
             store,
-            ns_id,
-            kind_tag: KIND_SEC_INDEX_BASE.saturating_add(secondary_ordinal),
+            collection_id,
+            index_id,
         }
     }
 }
@@ -169,6 +175,6 @@ impl<S: BTreePageStore> HistoryProbe for SecondaryHistoryProbe<'_, S> {
             .store
             .lock()
             .map_err(|_| Error::Internal("history_store mutex poisoned".into()))?;
-        guard.probe_sec_index(self.ns_id, key, self.kind_tag, read_ts)
+        guard.probe_sec_index(self.collection_id, self.index_id, key, read_ts)
     }
 }

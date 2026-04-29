@@ -15,6 +15,15 @@
 //!
 //! Expected result: all tests pass under the default parallel test harness.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use bson::Document;
 use mqlite::Client;
@@ -255,9 +264,9 @@ fn tc4_overflow_page_alloc_under_churn() {
 
     // Run the churn body inside catch_unwind so a panic from the engine
     // does not poison the global GC mutex and corrupt sibling tests.
-    let path_clone = path.clone();
-    let pa = payload_a.clone();
-    let pb = payload_b.clone();
+    let path_clone = path;
+    let pa = payload_a;
+    let pb = payload_b;
 
     let result =
         std::panic::catch_unwind(move || {
@@ -482,9 +491,8 @@ fn tc6_cross_collection_independence_under_txn_isolation() {
             "TC6: collA doc _id={i} not found after checkpoint+reopen — durability failure"
         );
         let d = found.unwrap();
-        assert_eq!(
+        assert!(
             d.get_bool("from_a").unwrap_or(false),
-            true,
             "TC6: collA doc _id={i} has wrong from_a field"
         );
     }
@@ -556,7 +564,7 @@ fn tc7_concurrent_readers_during_failing_writes() {
     });
 
     // Reader thread: scan until writer signals done.
-    let reader_client = client.clone();
+    let reader_client = client;
     let reader_stop = Arc::clone(&stop);
     let reader = thread::spawn(move || {
         let col = reader_client.database("d").collection::<Document>("x");
@@ -602,9 +610,8 @@ fn tc7_concurrent_readers_during_failing_writes() {
             row.get("partial").is_none(),
             "TC7: final scan found 'partial' field from a rolled-back write"
         );
-        assert_eq!(
+        assert!(
             row.get_bool("committed").unwrap_or(false),
-            true,
             "TC7: committed field must be true"
         );
     }
@@ -695,9 +702,8 @@ fn tc8_allocator_drain_safety() {
             .find_one(doc! { "_id": i })
             .expect("find new doc")
             .expect("new doc must exist");
-        assert_eq!(
+        assert!(
             d.get_bool("new_batch").unwrap_or(false),
-            true,
             "TC8: new batch doc {i} must have new_batch=true"
         );
     }

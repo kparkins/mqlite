@@ -638,7 +638,7 @@ fn build_index_populates_from_data_tree() {
         ),
     ];
 
-    for (id, mut doc) in docs.clone() {
+    for (id, mut doc) in docs {
         doc.insert("_id", id.clone());
         let key = encode_key(&id);
         let value = bson::to_vec(&doc).unwrap();

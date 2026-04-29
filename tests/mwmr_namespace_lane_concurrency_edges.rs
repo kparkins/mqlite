@@ -4,6 +4,15 @@
 //! acceptance gates in `mwmr_namespace_lanes.rs`.  Each test targets a specific
 //! failure mode of the MWMR concurrency model.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use bson::oid::ObjectId;
 use bson::Document;
@@ -97,6 +106,10 @@ fn mixed_workload_writers_readers_ddl_500ms() {
     }
 
     // 4 writer threads.
+    #[allow(
+        clippy::needless_collect,
+        reason = "spawn all writer threads before joining them"
+    )]
     let writer_handles: Vec<_> = (0..4i32)
         .map(|wt| {
             let c = client.clone();
@@ -202,8 +215,8 @@ fn lane_acquisition_busy_timeout_10ms() {
         col.insert_one(&doc! { "_id": 1, "payload": "a".repeat(512) })
     });
 
-    let cb = client.clone();
-    let bb = barrier.clone();
+    let cb = client;
+    let bb = barrier;
     let h_b = thread::spawn(move || {
         bb.wait();
         let col = cb.database("busy_test").collection::<Document>("shared");
@@ -572,7 +585,7 @@ fn interleaving_insert_many_same_ns_count_100() {
     });
 
     let cb = client.clone();
-    let bb = barrier.clone();
+    let bb = barrier;
     let h_b = thread::spawn(move || {
         bb.wait();
         let col = cb.database("batch").collection::<Document>("shared");

@@ -12,6 +12,15 @@
 //! does not increment this constant. It lives at a separate lock position
 //! (position 0.5 — leaf-only), intentionally below every main position.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 // The library re-exposes `N_MAIN_POOLS` through the crate-private
 // `storage::buffer_pool` module; integration tests cannot reach
 // `pub(crate)` items, so we replicate the invariant here as a direct

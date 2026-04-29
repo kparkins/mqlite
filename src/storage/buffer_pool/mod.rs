@@ -32,7 +32,7 @@
 // mutex, `BufferPool::inner_4k`) in the database-wide total order. Any
 // path that acquires both partitions MUST acquire 32 KB before 4 KB, and
 // must NOT re-enter the history-store partition (position 1),
-// `DeferredFreeQueue::pending` (1.5), or `AllocatorHandle::state` (2)
+// `PageLifetimeQueue::pending` (1.5), or `AllocatorHandle::state` (2)
 // while holding either partition mutex. The canonical definition of the
 // full order (positions 1 → 1.5 → 2 → 3 → 4 → 5 → 6) lives at the top of
 // `src/mvcc/read_view.rs` — edit both blocks together or neither.
@@ -42,6 +42,9 @@
 mod chains;
 mod partition;
 
+use std::collections::{BTreeMap, VecDeque};
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -50,7 +53,10 @@ use std::sync::{
 use crate::error::{Error, Result};
 use crate::mvcc::metrics;
 use crate::mvcc::read_view::ReadViewRegistry;
+use crate::mvcc::version::VersionEntry;
 use crate::storage::allocator::AllocatorHandle;
+use crate::storage::page::PAGE_TYPE_LEAF;
+use crate::storage::reconcile::plan::TreeIdent;
 
 use partition::Partition;
 
@@ -174,6 +180,76 @@ impl Drop for PinnedPage<'_> {
         let _ = self
             .pool
             .unpin_internal(self.page_number, self.page_size, self.dirty, data);
+    }
+}
+
+/// Delta chains retained on a folded leaf after reconciliation.
+#[allow(dead_code)]
+pub(crate) type RetainedLeafChains = BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>;
+
+/// Point-in-time resident leaf image and chains for checkpoint reconcile.
+#[allow(dead_code)]
+pub(crate) struct ReconcileLeafSnapshot {
+    /// Current base leaf page image.
+    pub(crate) base_image: Vec<u8>,
+    /// Current resident per-key version chains.
+    pub(crate) chains: RetainedLeafChains,
+}
+
+/// Typed pin guard accepted by [`BufferPool::replace_leaf_and_chains`].
+///
+/// The guard is intentionally non-`Clone`, non-`Copy`, and non-`Send`.
+#[allow(dead_code)]
+pub(crate) struct PinnedLeafForReconcile<'pool> {
+    pool: &'pool BufferPool,
+    ident: TreeIdent,
+    page_number: u32,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl PinnedLeafForReconcile<'_> {
+    /// Return the pinned leaf page number.
+    #[allow(dead_code)]
+    pub(crate) fn page_number(&self) -> u32 {
+        self.page_number
+    }
+}
+
+impl std::fmt::Debug for PinnedLeafForReconcile<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedLeafForReconcile")
+            .field("ident", &self.ident)
+            .field("page_number", &self.page_number)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PinnedLeafForReconcile<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .pool
+            .unpin_internal(self.page_number, PageSize::Large32k, false, None);
+    }
+}
+
+/// Errors from guarded folded-leaf replacement.
+#[allow(dead_code)]
+pub(crate) enum ReplaceLeafError<'pool> {
+    /// The target leaf frame is no longer resident.
+    NotResident,
+    /// The replacement image is not a 32 KB leaf page.
+    NotLeaf,
+    /// Another pin is active; the caller receives the guard back.
+    FrameCoWRefused(PinnedLeafForReconcile<'pool>),
+}
+
+impl std::fmt::Debug for ReplaceLeafError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotResident => f.write_str("NotResident"),
+            Self::NotLeaf => f.write_str("NotLeaf"),
+            Self::FrameCoWRefused(guard) => f.debug_tuple("FrameCoWRefused").field(guard).finish(),
+        }
     }
 }
 
@@ -383,13 +459,130 @@ impl BufferPool {
         })
     }
 
+    /// Pin a resident 32 KB leaf for a checkpoint reconcile install.
+    ///
+    /// This pin path does not perform I/O. A dirty-leaf reconcile pass works
+    /// from resident frames and fails closed if the frame disappeared.
+    #[allow(dead_code)]
+    pub(crate) fn pin_leaf_for_reconcile(
+        &self,
+        ident: TreeIdent,
+        page_number: u32,
+    ) -> std::result::Result<PinnedLeafForReconcile<'_>, ReplaceLeafError<'_>> {
+        let mut guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| ReplaceLeafError::NotResident)?;
+        let idx = guard
+            .page_map
+            .get(&page_number)
+            .copied()
+            .ok_or(ReplaceLeafError::NotResident)?;
+        let frame = guard.frames[idx]
+            .as_mut()
+            .ok_or(ReplaceLeafError::NotResident)?;
+        if frame.data.load().first().copied() != Some(PAGE_TYPE_LEAF) {
+            return Err(ReplaceLeafError::NotLeaf);
+        }
+        frame.pin_count += 1;
+        frame.ref_bit = true;
+
+        Ok(PinnedLeafForReconcile {
+            pool: self,
+            ident,
+            page_number,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Snapshot a resident 32 KB leaf page image and its current chains.
+    ///
+    /// Returns `Ok(None)` when the page is no longer resident. A non-leaf
+    /// resident frame is an invariant violation for dirty-leaf reconciliation.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_leaf_for_reconcile(
+        &self,
+        page_number: u32,
+    ) -> Result<Option<ReconcileLeafSnapshot>> {
+        let guard = self
+            .inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+        let Some(&idx) = guard.page_map.get(&page_number) else {
+            return Ok(None);
+        };
+        let frame = guard.frames[idx].as_ref().ok_or_else(|| {
+            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+        })?;
+        let base_image = frame.data.load_full().as_ref().clone();
+        if base_image.first().copied() != Some(PAGE_TYPE_LEAF) {
+            return Err(Error::Internal(
+                "dirty-leaf reconcile target is not a leaf page".into(),
+            ));
+        }
+        Ok(Some(ReconcileLeafSnapshot {
+            base_image,
+            chains: frame.deltas.clone(),
+        }))
+    }
+
+    /// Atomically replace a resident leaf page image and retained chains.
+    ///
+    /// The 32 KB partition mutex is held across both the `Frame::data`
+    /// publication and the `Frame::deltas` replacement. If any other pin is
+    /// active when the mutex is held, the guard is returned so callers can
+    /// restore chains before dropping the pin.
+    #[allow(dead_code)]
+    pub(crate) fn replace_leaf_and_chains<'guard>(
+        &self,
+        guard: PinnedLeafForReconcile<'guard>,
+        new_base: Vec<u8>,
+        retained_chains: RetainedLeafChains,
+    ) -> std::result::Result<(), ReplaceLeafError<'guard>> {
+        if !std::ptr::eq(self, guard.pool) {
+            return Err(ReplaceLeafError::NotResident);
+        }
+        if new_base.len() != PageSize::Large32k.bytes()
+            || new_base.first().copied() != Some(PAGE_TYPE_LEAF)
+        {
+            return Err(ReplaceLeafError::NotLeaf);
+        }
+
+        let mut retained_chains = retained_chains;
+        let mut partition = self
+            .inner_32k
+            .lock()
+            .map_err(|_| ReplaceLeafError::NotResident)?;
+        let idx = partition
+            .page_map
+            .get(&guard.page_number)
+            .copied()
+            .ok_or(ReplaceLeafError::NotResident)?;
+        let frame = partition.frames[idx]
+            .as_mut()
+            .ok_or(ReplaceLeafError::NotResident)?;
+
+        if frame.pin_count > 1 {
+            return Err(ReplaceLeafError::FrameCoWRefused(guard));
+        }
+
+        for chain in retained_chains.values_mut() {
+            let _ = Arc::make_mut(chain);
+        }
+        frame.data.store(Arc::new(new_base));
+        frame.deltas = retained_chains;
+        frame.dirty = true;
+
+        Ok(())
+    }
+
     /// Pin `page_number` with chain reconciliation on the miss path.
     ///
     /// Identical to [`BufferPool::pin`] on a cache hit. On a miss, the
     /// chosen victim frame's version chains are pruned against the current
     /// `ReadViewRegistry` horizon BEFORE eviction, so aged entries never
     /// outlive the frame that hosts them. After the pin returns, the
-    /// writer-serialized [`DeferredFreeQueue`] drain is invoked to reclaim
+    /// writer-serialized [`PageLifetimeQueue`] drain is invoked to reclaim
     /// overflow pages whose refcount reached zero as a side-effect of the
     /// prune.
     ///
@@ -454,11 +647,11 @@ impl BufferPool {
             (guard.data_snapshot(idx), dropped)
         };
 
-        // 3. Tick counters + drain deferred-free queue outside the latch.
+        // 3. Tick counters + drain page-lifetime queue outside the latch.
         if dropped > 0 {
             metrics::record_reconcile_entries_dropped(dropped as u64);
         }
-        metrics::set_deferred_free_queue_depth(allocator.deferred_free_queue().depth() as u64);
+        metrics::set_deferred_free_queue_depth(allocator.page_lifetime_queue().depth() as u64);
         allocator.drain_free_queue(self.io.as_ref())?;
 
         Ok(PinnedPage {
@@ -597,6 +790,10 @@ pub(crate) mod default_sizes {
 mod delta_order_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod us005_tests;
+#[cfg(test)]
+mod us006_tests;
 #[cfg(test)]
 mod us013_tests;
 #[cfg(test)]

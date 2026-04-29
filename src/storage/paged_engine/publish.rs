@@ -81,10 +81,12 @@ pub(crate) fn build_published_catalog(
     let collections = catalog.list_collections()?;
     let mut namespaces: HashMap<i64, NamespaceSnapshot> = HashMap::with_capacity(collections.len());
     let mut namespace_id_by_name: HashMap<String, i64> = HashMap::with_capacity(collections.len());
+    let mut index_owner_by_id: HashMap<i64, i64> = HashMap::new();
     for coll in collections {
         let indexes = catalog.list_indexes(&coll.name)?;
         let mut idxs = Vec::with_capacity(indexes.len());
         for idx in indexes {
+            index_owner_by_id.insert(idx.id, coll.id);
             idxs.push(PublishedIndex {
                 id: idx.id,
                 name: idx.name.clone(),
@@ -111,6 +113,7 @@ pub(crate) fn build_published_catalog(
     Ok(PublishedCatalog {
         namespaces,
         namespace_id_by_name,
+        index_owner_by_id,
     })
 }
 

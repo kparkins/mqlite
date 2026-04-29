@@ -6,7 +6,6 @@ use bson::doc;
 use super::state::ReadOpScope;
 use super::visibility::WriteVisibility;
 use super::*;
-use crate::error::Result;
 use crate::index::IndexModel;
 use crate::options::IndexOptions;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
@@ -74,7 +73,7 @@ fn test_phase3_secondary_history_is_none_and_correct() {
         .expect("namespace is published");
     assert_eq!(vis.ns_id, ns_snap.id);
     assert_eq!(vis.read_view.visible_ts(), epoch.visible_ts);
-    assert!(vis.secondary_history.is_none());
+    let _secondary_history = vis.secondary_history_probe(1);
     drop(vis);
 
     let model = IndexModel::builder()

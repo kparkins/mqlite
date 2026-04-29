@@ -11,6 +11,15 @@
 //! an empty snapshot) and ticks the
 //! `mvcc.read_views_force_expired_total` counter exactly once per call.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use mqlite::mvcc::metrics::{read_views_force_expired_snapshot, reset_read_views_force_expired};
 use mqlite::mvcc::timestamp::Ts;
 use mqlite::mvcc::ReadView;

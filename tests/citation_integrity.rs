@@ -3,6 +3,15 @@
 //! Runs scripts/verify_phase_citations.py in --strict mode; fails on any
 //! citation drift. Corresponds to docs/STORAGE-CONTRACTS-FROZEN.md Contract 3.8.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::process::Command;
 
 #[test]

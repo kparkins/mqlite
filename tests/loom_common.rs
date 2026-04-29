@@ -9,6 +9,14 @@
 //! Cargo feature so that `cargo test --lib` (and ordinary `cargo test`) does
 //! not attempt to build it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
 #![cfg(feature = "loom-tests")]
 
 /// Atomics + Mutex shim. Production code in `src/mvcc/*` (T2+) follows this

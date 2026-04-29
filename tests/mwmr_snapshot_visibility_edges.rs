@@ -20,6 +20,15 @@
 //! 8. `btree_split_under_writes` — 2000 docs with 500-byte values in batches
 //!    of 100; after each batch, all docs retrievable by _id.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use bson::Document;
 use mqlite::{Client, IndexModel};
@@ -282,7 +291,7 @@ fn list_indexes_returns_ready_only() {
     let barrier = Arc::new(Barrier::new(2));
 
     // Background thread: build an index.
-    let client_builder = client.clone();
+    let client_builder = client;
     let b_builder = Arc::clone(&barrier);
     let build_thread = thread::spawn(move || {
         b_builder.wait();
@@ -319,13 +328,9 @@ fn list_indexes_returns_ready_only() {
 
     // After build completes the index must be present.
     let final_indexes = col.list_indexes().unwrap();
-    let score_idx: Vec<_> = final_indexes
-        .iter()
-        .filter(|i| i.name == "score_1")
-        .collect();
+    let score_idx_count = final_indexes.iter().filter(|i| i.name == "score_1").count();
     assert_eq!(
-        score_idx.len(),
-        1,
+        score_idx_count, 1,
         "score_1 index must appear in list_indexes after create_index completes"
     );
 

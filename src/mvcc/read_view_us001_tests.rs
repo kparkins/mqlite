@@ -21,6 +21,7 @@ fn empty_catalog() -> Arc<PublishedCatalog> {
     Arc::new(PublishedCatalog {
         namespaces: HashMap::new(),
         namespace_id_by_name: HashMap::new(),
+        index_owner_by_id: HashMap::new(),
     })
 }
 

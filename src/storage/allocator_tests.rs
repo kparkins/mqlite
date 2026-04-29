@@ -665,6 +665,10 @@ fn incref_overflow_contended_saturation_exact_500_winners() {
     const THREADS: usize = 8;
     const PER_THREAD: usize = 125;
 
+    #[allow(
+        clippy::needless_collect,
+        reason = "spawn all overflow refcount workers before joining them"
+    )]
     let handles: Vec<_> = (0..THREADS)
         .map(|_| {
             let h = handle.clone();
@@ -704,7 +708,8 @@ fn drain_free_queue_frees_zero_refcount_pages() {
     handle.incref_overflow(2).unwrap();
     let post = handle.decref_overflow(2);
     assert_eq!(post, 0);
-    handle.enqueue_deferred_free(2);
+    handle.enqueue_overflow_deferred_free(2);
+    handle.advance_page_lifetime_checkpoint_fence();
 
     let freed = handle.drain_free_queue(&io).unwrap();
     assert_eq!(freed, 1);
@@ -722,11 +727,12 @@ fn drain_free_queue_requeues_nonzero_refcount_pages() {
 
     // Page 3 enqueued but refcount is still 1 (e.g., a late re-bump).
     handle.incref_overflow(3).unwrap();
-    handle.enqueue_deferred_free(3);
+    handle.enqueue_overflow_deferred_free(3);
+    handle.advance_page_lifetime_checkpoint_fence();
 
     let freed = handle.drain_free_queue(&io).unwrap();
     assert_eq!(freed, 0, "non-zero refcount page must not be freed");
-    assert_eq!(handle.deferred_free_queue().depth(), 1, "must be requeued");
+    assert_eq!(handle.page_lifetime_queue().depth(), 1, "must be requeued");
     // Page 3 must NOT be on the free list.
     let head = handle.with_header(|h| h.free_list_head_32k).unwrap();
     assert_eq!(head, 0);
@@ -739,4 +745,72 @@ fn drain_free_queue_empty_is_noop() {
     let handle = AllocatorHandle::new(hdr);
     let freed = handle.drain_free_queue(&io).unwrap();
     assert_eq!(freed, 0);
+}
+
+#[test]
+fn test_overflow_deferred_free_drain_after_fence() {
+    let io = MockIo::new();
+    let mut hdr = fresh_header();
+    hdr.total_page_count = 5;
+    let handle = AllocatorHandle::new(hdr);
+
+    handle.incref_overflow(2).unwrap();
+    assert_eq!(handle.decref_overflow(2), 0);
+    handle.enqueue_overflow_deferred_free(2);
+
+    let freed_before_checkpoint = handle.drain_free_queue(&io).unwrap();
+    assert_eq!(
+        freed_before_checkpoint, 0,
+        "refcount-zero page must wait until checkpoint fence advances"
+    );
+    assert_eq!(handle.page_lifetime_queue().depth(), 1);
+    assert_eq!(handle.with_header(|h| h.free_list_head_32k).unwrap(), 0);
+
+    handle.advance_page_lifetime_checkpoint_fence();
+
+    let freed_after_checkpoint = handle.drain_free_queue(&io).unwrap();
+    assert_eq!(freed_after_checkpoint, 1);
+    assert_eq!(handle.page_lifetime_queue().depth(), 0);
+    assert_eq!(handle.with_header(|h| h.free_list_head_32k).unwrap(), 2);
+}
+
+#[test]
+fn drain_deferred_free_reservations_wait_for_checkpoint_fence() {
+    let mut hdr = fresh_header();
+    hdr.total_page_count = 5;
+    let handle = AllocatorHandle::new(hdr);
+
+    handle.incref_overflow(4).unwrap();
+    assert_eq!(handle.decref_overflow(4), 0);
+    handle.enqueue_overflow_deferred_free(4);
+
+    let reserved_before_checkpoint = handle.drain_deferred_free_reservations();
+    assert!(
+        reserved_before_checkpoint.is_empty(),
+        "txn reservation drain must also honor the checkpoint fence"
+    );
+    assert_eq!(handle.page_lifetime_queue().depth(), 1);
+
+    handle.advance_page_lifetime_checkpoint_fence();
+
+    let reserved_after_checkpoint = handle.drain_deferred_free_reservations();
+    assert_eq!(reserved_after_checkpoint, vec![4]);
+    assert_eq!(handle.page_lifetime_queue().depth(), 0);
+}
+
+#[test]
+fn page_lifetime_queue_requeues_nonzero_refcount_after_checkpoint() {
+    let io = MockIo::new();
+    let mut hdr = fresh_header();
+    hdr.total_page_count = 5;
+    let handle = AllocatorHandle::new(hdr);
+
+    handle.incref_overflow(3).unwrap();
+    handle.enqueue_overflow_deferred_free(3);
+    handle.advance_page_lifetime_checkpoint_fence();
+
+    let freed = handle.drain_free_queue(&io).unwrap();
+    assert_eq!(freed, 0, "non-zero refcount page must not be freed");
+    assert_eq!(handle.page_lifetime_queue().depth(), 1, "must be requeued");
+    assert_eq!(handle.with_header(|h| h.free_list_head_32k).unwrap(), 0);
 }

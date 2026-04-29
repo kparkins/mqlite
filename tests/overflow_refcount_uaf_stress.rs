@@ -37,6 +37,14 @@
 //! the zero state). Each thread performs exactly one decref, mirroring the
 //! `Drop` half of the RAII contract.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
 #![cfg(feature = "loom-tests")]
 
 #[cfg(loom)]

@@ -8,22 +8,29 @@
 //! at the top of `src/mvcc/read_view.rs` pins this at position **1**
 //! (outermost).
 //!
-//! ## Key schema (v1 — Format Lock)
+//! ## Key schema (Phase 4 — Format Lock)
 //!
 //! ```text
-//! key = (ns_id: u32 BE)(kind_tag: u8)(key_bytes: bytes)(start_ts: Ts BE 12B)
+//! key = collection_id(i64 BE)
+//!     | tree_kind(u8)
+//!     | index_id(i64 BE)
+//!     | key_len(u32 BE)
+//!     | key_bytes
+//!     | start_ts(Ts BE 12B)
+//!     | counter(u32 BE)
 //! ```
 //!
-//! * `ns_id` — collection/namespace identifier. Big-endian so lexicographic
-//!   sort matches numeric sort for prefix scans.
-//! * `kind_tag` — [`KIND_PRIMARY`] (`0x00`) for primary-document versions;
-//!   [`KIND_SEC_INDEX_BASE`] (`0x01`)..=`0xFE` for secondary-index versions.
-//!   `0xFF` is reserved.
+//! * `collection_id` — durable collection identifier. Big-endian so
+//!   lexicographic sort matches numeric sort for prefix scans.
+//! * `tree_kind` — [`HISTORY_TREE_KIND_PRIMARY`] (`0x00`) for primary data
+//!   trees or [`HISTORY_TREE_KIND_SECONDARY`] (`0x01`) for secondary indexes.
+//! * `index_id` — durable secondary index id, or `0` for primary data trees.
+//! * `key_len` — length delimiter for `key_bytes`, preventing prefix aliasing.
 //! * `key_bytes` — for primary: document id; for sec-index: compound key.
 //! * `start_ts` — [`Ts::to_be_bytes`] so chronological order equals
-//!   lexicographic order. A descending range scan from
-//!   `(ns, kind, key, read_ts)` finds the newest version `<= read_ts`
-//!   as the first hit.
+//!   lexicographic order.
+//! * `counter` — stable duplicate disambiguator for spills with the same
+//!   `(TreeIdent, key, start_ts)`.
 //!
 //! ## Probe semantics
 //!
@@ -60,6 +67,8 @@ use crate::mvcc::timestamp::Ts;
 use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::btree::{BTree, BTreePageStore};
+use crate::storage::btree_store::BufferPoolPageStore;
+use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
 
 // ---------------------------------------------------------------------------
 // Thread-local non-recursion sentinel
@@ -97,21 +106,72 @@ impl Drop for HistoryStoreGuard {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Kind tags
-// ---------------------------------------------------------------------------
+/// History key tree-kind tag for primary collection data.
+pub(crate) const HISTORY_TREE_KIND_PRIMARY: u8 = 0x00;
 
-/// Kind-tag for a primary-document version entry.
-pub(crate) const KIND_PRIMARY: u8 = 0x00;
+/// History key tree-kind tag for secondary index data.
+pub(crate) const HISTORY_TREE_KIND_SECONDARY: u8 = 0x01;
 
-/// Kind-tag base for secondary-index version entries. Add the 1-based
-/// sec-index ordinal (1..=0xFE) to get the concrete tag.
-#[allow(dead_code)]
-pub(crate) const KIND_SEC_INDEX_BASE: u8 = 0x01;
+const HISTORY_PRIMARY_INDEX_ID: i64 = 0;
+const HISTORY_KEY_FIXED_PREFIX_LEN: usize = 8 + 1 + 8 + 4;
+const HISTORY_KEY_TS_LEN: usize = 12;
+const HISTORY_KEY_COUNTER_LEN: usize = 4;
 
-/// Reserved upper bound; kinds above this are not valid.
-#[allow(dead_code)]
-pub(crate) const KIND_RESERVED: u8 = 0xFF;
+/// In-memory batch of history-store writes for one folded-leaf install.
+///
+/// Reconciliation stages old committed versions here first, then commits the
+/// batch to the history-store B-tree before removing those versions from the
+/// main leaf. This makes the history-before-leaf ordering explicit at the
+/// call boundary.
+#[derive(Debug, Default)]
+pub(crate) struct HistorySpillTxn {
+    staged: Vec<StagedHistorySpill>,
+}
+
+impl HistorySpillTxn {
+    /// Create an empty history spill transaction.
+    pub(crate) fn new() -> Self {
+        Self { staged: Vec::new() }
+    }
+
+    /// Return the number of staged history writes.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.staged.len()
+    }
+
+    /// Return true when the transaction has no staged writes.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.staged.is_empty()
+    }
+
+    fn stage(
+        &mut self,
+        ident: TreeIdent,
+        key_bytes: &[u8],
+        entry: &VersionEntry,
+        counter: u32,
+    ) -> Result<()> {
+        let entry = entry.try_clone().ok_or_else(|| {
+            Error::Internal("history_store: overflow ref dropped before history spill".into())
+        })?;
+        self.staged.push(StagedHistorySpill {
+            ident,
+            key_bytes: key_bytes.to_vec(),
+            entry,
+            counter,
+        });
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct StagedHistorySpill {
+    ident: TreeIdent,
+    key_bytes: Vec<u8>,
+    entry: VersionEntry,
+    counter: u32,
+}
 
 fn ts_from_le_slice(bytes: &[u8]) -> Ts {
     let mut out = [0u8; 12];
@@ -135,55 +195,97 @@ fn u64_from_le_slice(bytes: &[u8]) -> u64 {
 // Key encoding / decoding
 // ---------------------------------------------------------------------------
 
-/// Encode a history-store key per the v1 schema.
+/// Encode a history-store key per the Phase 4 schema.
 ///
-/// Layout: `(ns_id BE 4)(kind_tag 1)(key_bytes)(start_ts BE 12)`.
+/// Layout:
+/// `(collection_id BE 8)(tree_kind 1)(index_id BE 8)(key_len BE 4)`
+/// `(key_bytes)(start_ts BE 12)(counter BE 4)`.
 pub(crate) fn encode_history_key(
-    ns_id: u32,
-    kind_tag: u8,
+    ident: &TreeIdent,
     key_bytes: &[u8],
     start_ts: Ts,
+    counter: u32,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + key_bytes.len() + 12);
-    out.extend_from_slice(&ns_id.to_be_bytes());
-    out.push(kind_tag);
+    let (tree_kind, index_id) = history_tree_parts(ident);
+    let mut out = Vec::with_capacity(
+        HISTORY_KEY_FIXED_PREFIX_LEN
+            + key_bytes.len()
+            + HISTORY_KEY_TS_LEN
+            + HISTORY_KEY_COUNTER_LEN,
+    );
+    out.extend_from_slice(&ident.collection_id.to_be_bytes());
+    out.push(tree_kind);
+    out.extend_from_slice(&index_id.to_be_bytes());
+    out.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
     out.extend_from_slice(key_bytes);
     out.extend_from_slice(&start_ts.to_be_bytes());
+    out.extend_from_slice(&counter.to_be_bytes());
     out
 }
 
 /// Inverse of [`encode_history_key`]. Returns `None` when `bytes` is too
 /// short to carry a valid header/footer.
-#[allow(dead_code)]
-pub(crate) fn decode_history_key(bytes: &[u8]) -> Option<(u32, u8, &[u8], Ts)> {
-    if bytes.len() < 4 + 1 + 12 {
+#[cfg(test)]
+pub(crate) fn decode_history_key(bytes: &[u8]) -> Option<(TreeIdent, &[u8], Ts, u32)> {
+    if bytes.len() < HISTORY_KEY_FIXED_PREFIX_LEN + HISTORY_KEY_TS_LEN + HISTORY_KEY_COUNTER_LEN {
         return None;
     }
-    let ns_id = u32::from_be_bytes(bytes[0..4].try_into().ok()?);
-    let kind_tag = bytes[4];
-    let body_end = bytes.len() - 12;
-    let key_bytes = &bytes[5..body_end];
+    let collection_id = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
+    let tree_kind = bytes[8];
+    let index_id = i64::from_be_bytes(bytes[9..17].try_into().ok()?);
+    let key_len = u32::from_be_bytes(bytes[17..21].try_into().ok()?) as usize;
+    let key_start = HISTORY_KEY_FIXED_PREFIX_LEN;
+    let key_end = key_start.checked_add(key_len)?;
+    let ts_end = key_end.checked_add(HISTORY_KEY_TS_LEN)?;
+    let counter_end = ts_end.checked_add(HISTORY_KEY_COUNTER_LEN)?;
+    if bytes.len() != counter_end {
+        return None;
+    }
+    let ident = history_ident_from_parts(collection_id, tree_kind, index_id)?;
+    let key_bytes = &bytes[key_start..key_end];
     let mut ts_buf = [0u8; 12];
-    ts_buf.copy_from_slice(&bytes[body_end..]);
+    ts_buf.copy_from_slice(&bytes[key_end..ts_end]);
     let start_ts = Ts::from_be_bytes(ts_buf);
-    Some((ns_id, kind_tag, key_bytes, start_ts))
+    let counter = u32::from_be_bytes(bytes[ts_end..counter_end].try_into().ok()?);
+    Some((ident, key_bytes, start_ts, counter))
 }
 
-/// Build the inclusive upper bound of a descending probe: the largest key
-/// that shares `(ns, kind, key_bytes)` with the probe target and has
-/// `start_ts <= read_ts`. The v1 schema means this is simply the encoding
-/// of `(ns, kind, key_bytes, read_ts)`.
-fn probe_upper_bound(ns_id: u32, kind_tag: u8, key_bytes: &[u8], read_ts: Ts) -> Vec<u8> {
-    encode_history_key(ns_id, kind_tag, key_bytes, read_ts)
+fn history_tree_parts(ident: &TreeIdent) -> (u8, i64) {
+    match ident.kind {
+        TreeKind::Primary => (HISTORY_TREE_KIND_PRIMARY, HISTORY_PRIMARY_INDEX_ID),
+        TreeKind::Secondary { index_id } => (HISTORY_TREE_KIND_SECONDARY, index_id),
+    }
 }
 
-/// Build the prefix that every entry for `(ns, kind, key_bytes)` shares.
-/// Used to confirm a scanned key still belongs to the probe target before
-/// decoding it as a version entry.
-fn probe_prefix(ns_id: u32, kind_tag: u8, key_bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + key_bytes.len());
-    out.extend_from_slice(&ns_id.to_be_bytes());
-    out.push(kind_tag);
+#[cfg(test)]
+fn history_ident_from_parts(collection_id: i64, tree_kind: u8, index_id: i64) -> Option<TreeIdent> {
+    let kind = match tree_kind {
+        HISTORY_TREE_KIND_PRIMARY if index_id == HISTORY_PRIMARY_INDEX_ID => TreeKind::Primary,
+        HISTORY_TREE_KIND_SECONDARY => TreeKind::Secondary { index_id },
+        _ => return None,
+    };
+    Some(TreeIdent {
+        collection_id,
+        kind,
+    })
+}
+
+/// Build the inclusive upper bound for a probe over one length-delimited key.
+fn probe_upper_bound(ident: &TreeIdent, key_bytes: &[u8], read_ts: Ts) -> Vec<u8> {
+    let mut out = probe_prefix(ident, key_bytes);
+    out.extend_from_slice(&read_ts.to_be_bytes());
+    out.extend_from_slice(&u32::MAX.to_be_bytes());
+    out
+}
+
+/// Build the prefix that every entry for `(TreeIdent, key_bytes)` shares.
+fn probe_prefix(ident: &TreeIdent, key_bytes: &[u8]) -> Vec<u8> {
+    let (tree_kind, index_id) = history_tree_parts(ident);
+    let mut out = Vec::with_capacity(HISTORY_KEY_FIXED_PREFIX_LEN + key_bytes.len());
+    out.extend_from_slice(&ident.collection_id.to_be_bytes());
+    out.push(tree_kind);
+    out.extend_from_slice(&index_id.to_be_bytes());
+    out.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
     out.extend_from_slice(key_bytes);
     out
 }
@@ -196,7 +298,6 @@ const DATA_KIND_INLINE: u8 = 0;
 const DATA_KIND_OVERFLOW: u8 = 1;
 
 /// Serialize a `VersionEntry` to the history-store value layout.
-#[cfg(test)]
 pub(crate) fn encode_version_entry_value(entry: &VersionEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + 12 + 8 + 1 + 1 + 16);
     out.extend_from_slice(&entry.start_ts.to_le_bytes());
@@ -314,7 +415,7 @@ impl<S: BTreePageStore> HistoryStore<S> {
     /// Phase 1 uses [`HistoryStore::create_empty_root`] at open time;
     /// this raw constructor stays as part of the API surface for
     /// Phase 4 (§8.11) history repopulation.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn create(store: S) -> Result<Self> {
         Ok(Self {
             tree: BTree::create(store)?,
@@ -345,7 +446,6 @@ impl<S: BTreePageStore> HistoryStore<S> {
     /// Phase 1 uses [`HistoryStore::create_empty_root`] at open time;
     /// Phase 4 (§8.11) wires this constructor for cross-lifetime
     /// history repopulation.
-    #[allow(dead_code)]
     pub(crate) fn open(store: S, root_page: u32, root_level: u8) -> Self {
         Self {
             tree: BTree::open(store, root_page, root_level),
@@ -354,68 +454,147 @@ impl<S: BTreePageStore> HistoryStore<S> {
     }
 
     /// Attach an allocator handle for rehydrating overflow entries on probe.
-    #[allow(dead_code)]
     pub(crate) fn with_overflow_allocator(mut self, allocator: Arc<AllocatorHandle>) -> Self {
         self.overflow_allocator = Some(allocator);
         self
     }
 
-    /// Insert a version entry at `(ns, kind, key_bytes, entry.start_ts)`.
-    #[cfg(test)]
-    pub(crate) fn insert(
-        &mut self,
-        ns_id: u32,
-        kind_tag: u8,
+    /// Stage a primary-tree version entry in a history spill transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if `ident` does not identify a primary
+    /// tree.
+    pub(crate) fn spill_primary(
+        txn: &mut HistorySpillTxn,
+        ident: TreeIdent,
         key_bytes: &[u8],
         entry: &VersionEntry,
+        counter: u32,
     ) -> Result<()> {
+        if !matches!(&ident.kind, TreeKind::Primary) {
+            return Err(Error::Internal(
+                "history_store: primary spill requires primary tree identity".into(),
+            ));
+        }
+        txn.stage(ident, key_bytes, entry, counter)
+    }
+
+    /// Stage a secondary-index version entry in a history spill transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if `ident` does not identify a secondary
+    /// index tree.
+    pub(crate) fn spill_sec_index(
+        txn: &mut HistorySpillTxn,
+        ident: TreeIdent,
+        key_bytes: &[u8],
+        entry: &VersionEntry,
+        counter: u32,
+    ) -> Result<()> {
+        if !matches!(&ident.kind, TreeKind::Secondary { .. }) {
+            return Err(Error::Internal(
+                "history_store: secondary spill requires secondary tree identity".into(),
+            ));
+        }
+        txn.stage(ident, key_bytes, entry, counter)
+    }
+
+    /// Commit a staged history spill batch into the history-store B-tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns any B-tree insert or duplicate-key error encountered while
+    /// applying the staged writes.
+    pub(crate) fn commit_spill_txn(&mut self, txn: HistorySpillTxn) -> Result<()> {
+        if txn.is_empty() {
+            return Ok(());
+        }
         let _guard = HistoryStoreGuard::enter();
-        let key = encode_history_key(ns_id, kind_tag, key_bytes, entry.start_ts);
+        for write in txn.staged {
+            let StagedHistorySpill {
+                ident,
+                key_bytes,
+                entry,
+                counter,
+            } = write;
+            let inserted = self.apply_spill(&ident, &key_bytes, &entry, counter)?;
+            if inserted {
+                forget_history_record_overflow_ref(entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_spill(
+        &mut self,
+        ident: &TreeIdent,
+        key_bytes: &[u8],
+        entry: &VersionEntry,
+        counter: u32,
+    ) -> Result<bool> {
+        let key = encode_history_key(ident, key_bytes, entry.start_ts, counter);
         let value = encode_version_entry_value(entry);
-        self.tree.insert(&key, &value)
+        if let Some(existing) = self.tree.get(&key)? {
+            if existing == value {
+                return Ok(false);
+            }
+            return Err(Error::DuplicateKey {
+                detail: "history_store: duplicate spill key has different value bytes".into(),
+            });
+        }
+        self.tree.insert(&key, &value)?;
+        Ok(true)
     }
 
     /// Probe for the newest entry with `start_ts <= read_ts` at
-    /// `(ns, KIND_PRIMARY, doc_id)`.
+    /// `(collection_id, primary tree, doc_id)`.
     ///
     /// Returns `None` when no such entry exists.
     pub(crate) fn probe_primary(
         &self,
-        ns_id: u32,
+        collection_id: i64,
         doc_id: &[u8],
         read_ts: Ts,
     ) -> Result<Option<VersionEntry>> {
-        self.probe(ns_id, KIND_PRIMARY, doc_id, read_ts, false)
+        let ident = TreeIdent {
+            collection_id,
+            kind: TreeKind::Primary,
+        };
+        self.probe(&ident, doc_id, read_ts, false)
     }
 
     /// Probe for the newest sec-index version with `start_ts <= read_ts`
-    /// at `(ns, KIND_SEC_INDEX_BASE + ordinal, sec_key)`. A live tombstone
-    /// hit causes the probe to return `None` and tick
+    /// at `(collection_id, secondary index_id, sec_key)`. A live tombstone hit
+    /// causes the probe to return `None` and tick
     /// `secondary_index_tombstone_hits_total`.
-    #[allow(dead_code)]
     pub(crate) fn probe_sec_index(
         &self,
-        ns_id: u32,
+        collection_id: i64,
+        index_id: i64,
         sec_key: &[u8],
-        kind_tag: u8,
         read_ts: Ts,
     ) -> Result<Option<VersionEntry>> {
-        self.probe(ns_id, kind_tag, sec_key, read_ts, true)
+        let ident = TreeIdent {
+            collection_id,
+            kind: TreeKind::Secondary { index_id },
+        };
+        self.probe(&ident, sec_key, read_ts, true)
     }
 
     /// Inner shared probe. `skip_tombstones` toggles the sec-index
     /// "tombstone wins → hide" rule.
     fn probe(
         &self,
-        ns_id: u32,
-        kind_tag: u8,
+        ident: &TreeIdent,
         key_bytes: &[u8],
         read_ts: Ts,
         skip_tombstones: bool,
     ) -> Result<Option<VersionEntry>> {
         let _guard = HistoryStoreGuard::enter();
-        let upper = probe_upper_bound(ns_id, kind_tag, key_bytes, read_ts);
-        let prefix = probe_prefix(ns_id, kind_tag, key_bytes);
+        let upper = probe_upper_bound(ident, key_bytes, read_ts);
+        let prefix = probe_prefix(ident, key_bytes);
 
         // Range-scan ascending over the full prefix, truncated at `upper`.
         // Descending scans are not exposed on `BTree`; the scan is bounded
@@ -440,10 +619,7 @@ impl<S: BTreePageStore> HistoryStore<S> {
             let value_bytes = cell_value_bytes(cell_value)?;
             let entry =
                 decode_version_entry_value(&value_bytes, self.overflow_allocator.as_deref())?;
-            if entry.start_ts > read_ts {
-                // Defensive — should not happen because `upper` clips the
-                // scan, but the comparison is cheap and makes the rule
-                // explicit.
+            if entry.start_ts > read_ts || read_ts >= entry.stop_ts {
                 continue;
             }
             if skip_tombstones && entry.is_tombstone {
@@ -453,6 +629,35 @@ impl<S: BTreePageStore> HistoryStore<S> {
             return Ok(Some(entry));
         }
         Ok(None)
+    }
+}
+
+impl HistoryStore<BufferPoolPageStore> {
+    /// Commit staged history writes durably before the caller installs the
+    /// matching folded leaf.
+    ///
+    /// The history B-tree root is persisted to the file header after the batch
+    /// is applied because inserting the staged versions can split the history
+    /// root. The subsequent handle flush writes the history pool and updated
+    /// header before the caller proceeds with main-leaf installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns any B-tree, header-update, or flush error encountered while
+    /// durably applying the staged batch.
+    pub(crate) fn commit_spill_txn_durable(&mut self, txn: HistorySpillTxn) -> Result<()> {
+        if txn.is_empty() {
+            return Ok(());
+        }
+        let handle = Arc::clone(self.tree.store.handle());
+        self.commit_spill_txn(txn)?;
+        let root_page = self.tree.root_page;
+        let root_level = self.tree.root_level;
+        handle.allocator().update_header(|h| {
+            h.history_store_root_page = root_page;
+            h.history_store_root_level = root_level;
+        })?;
+        handle.flush()
     }
 }
 
@@ -564,6 +769,28 @@ fn cell_value_bytes(value: crate::storage::btree::CellValue) -> Result<Vec<u8>> 
     }
 }
 
+fn forget_history_record_overflow_ref(entry: VersionEntry) {
+    if let VersionData::Overflow(oref) = entry.data {
+        std::mem::forget(oref);
+    }
+}
+
 #[cfg(test)]
 #[path = "history_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "history_store_us009_tests.rs"]
+mod us009_tests;
+
+#[cfg(test)]
+#[path = "history_store_us011_tests.rs"]
+mod us011_tests;
+
+#[cfg(test)]
+#[path = "history_store_us012_tests.rs"]
+mod us012_tests;
+
+#[cfg(test)]
+#[path = "history_store_us013_tests.rs"]
+mod us013_tests;

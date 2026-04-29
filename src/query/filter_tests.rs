@@ -152,8 +152,8 @@ fn comparison_array_any_element() {
 fn comparison_datetime() {
     let t0 = Bson::DateTime(DateTime::from_millis(1000));
     let t1 = Bson::DateTime(DateTime::from_millis(2000));
-    let doc_val = doc! { "ts": t1.clone() };
-    let filter = doc! { "ts": { "$gt": t0.clone() } };
+    let doc_val = doc! { "ts": t1 };
+    let filter = doc! { "ts": { "$gt": t0 } };
     assert!(matches(filter, doc_val));
 }
 
@@ -560,7 +560,7 @@ fn elem_match_operator_mode_single_condition() {
     ));
     assert!(no_match(
         doc! { "scores": { "$elemMatch": { "$gt": 100 } } },
-        doc.clone()
+        doc
     ));
 }
 
@@ -576,7 +576,7 @@ fn elem_match_operator_mode_multi_condition() {
     // No single element satisfies $gt:10 AND $lt:12.
     assert!(no_match(
         doc! { "scores": { "$elemMatch": { "$gt": 10, "$lt": 12 } } },
-        doc.clone()
+        doc
     ));
 }
 
@@ -595,7 +595,7 @@ fn elem_match_document_mode() {
     ));
     assert!(no_match(
         doc! { "items": { "$elemMatch": { "qty": { "$gt": 20 } } } },
-        doc.clone()
+        doc
     ));
 }
 
@@ -616,7 +616,7 @@ fn elem_match_document_mode_multi_field() {
     // Neither element satisfies qty > 10 AND price > 4 simultaneously.
     assert!(no_match(
         doc! { "items": { "$elemMatch": { "qty": { "$gt": 10 }, "price": { "$gt": 4 } } } },
-        doc.clone()
+        doc
     ));
 }
 
@@ -647,20 +647,14 @@ fn all_basic() {
         doc.clone()
     ));
     // One required tag absent.
-    assert!(no_match(
-        doc! { "tags": { "$all": ["rust", "java"] } },
-        doc.clone()
-    ));
+    assert!(no_match(doc! { "tags": { "$all": ["rust", "java"] } }, doc));
 }
 
 #[test]
 fn all_superset() {
     // $all list is a superset of the array — must fail.
     let doc = doc! { "nums": [1, 2] };
-    assert!(no_match(
-        doc! { "nums": { "$all": [1, 2, 3] } },
-        doc.clone()
-    ));
+    assert!(no_match(doc! { "nums": { "$all": [1, 2, 3] } }, doc));
 }
 
 #[test]
@@ -707,7 +701,7 @@ fn all_with_elem_match() {
         doc! { "results": { "$all": [
             { "$elemMatch": { "product": "abc", "score": { "$gt": 20 } } }
         ] } },
-        doc.clone()
+        doc
     ));
 }
 
@@ -720,14 +714,14 @@ fn size_exact_match() {
     let doc = doc! { "items": [1, 2, 3] };
     assert!(matches(doc! { "items": { "$size": 3 } }, doc.clone()));
     assert!(no_match(doc! { "items": { "$size": 2 } }, doc.clone()));
-    assert!(no_match(doc! { "items": { "$size": 4 } }, doc.clone()));
+    assert!(no_match(doc! { "items": { "$size": 4 } }, doc));
 }
 
 #[test]
 fn size_empty_array() {
     let doc = doc! { "items": [] };
     assert!(matches(doc! { "items": { "$size": 0 } }, doc.clone()));
-    assert!(no_match(doc! { "items": { "$size": 1 } }, doc.clone()));
+    assert!(no_match(doc! { "items": { "$size": 1 } }, doc));
 }
 
 #[test]
@@ -743,7 +737,7 @@ fn size_non_array_no_match() {
 fn size_float_whole_number() {
     // 3.0 is accepted as a whole number.
     let doc = doc! { "items": [1, 2, 3] };
-    assert!(matches(doc! { "items": { "$size": 3.0_f64 } }, doc.clone()));
+    assert!(matches(doc! { "items": { "$size": 3.0_f64 } }, doc));
 }
 
 #[test]
@@ -766,7 +760,7 @@ fn regex_basic_match() {
         doc! { "name": { "$regex": "^Alice" } },
         doc.clone()
     ));
-    assert!(no_match(doc! { "name": { "$regex": "^Bob" } }, doc.clone()));
+    assert!(no_match(doc! { "name": { "$regex": "^Bob" } }, doc));
 }
 
 #[test]
@@ -776,10 +770,7 @@ fn regex_case_insensitive() {
         doc! { "name": { "$regex": "alice", "$options": "i" } },
         doc.clone()
     ));
-    assert!(no_match(
-        doc! { "name": { "$regex": "alice" } },
-        doc.clone()
-    ));
+    assert!(no_match(doc! { "name": { "$regex": "alice" } }, doc));
 }
 
 #[test]
@@ -790,10 +781,7 @@ fn regex_multiline_flag() {
         doc! { "text": { "$regex": "^world", "$options": "m" } },
         doc.clone()
     ));
-    assert!(no_match(
-        doc! { "text": { "$regex": "^world" } },
-        doc.clone()
-    ));
+    assert!(no_match(doc! { "text": { "$regex": "^world" } }, doc));
 }
 
 #[test]
@@ -804,10 +792,7 @@ fn regex_dotall_flag() {
         doc! { "text": { "$regex": "hello.world", "$options": "s" } },
         doc.clone()
     ));
-    assert!(no_match(
-        doc! { "text": { "$regex": "hello.world" } },
-        doc.clone()
-    ));
+    assert!(no_match(doc! { "text": { "$regex": "hello.world" } }, doc));
 }
 
 #[test]
@@ -833,10 +818,7 @@ fn regex_array_field() {
     // $regex matches if any string element in the array matches.
     let doc = doc! { "tags": ["rust", "systems", "fast"] };
     assert!(matches(doc! { "tags": { "$regex": "^rust" } }, doc.clone()));
-    assert!(no_match(
-        doc! { "tags": { "$regex": "^python" } },
-        doc.clone()
-    ));
+    assert!(no_match(doc! { "tags": { "$regex": "^python" } }, doc));
 }
 
 #[test]
@@ -849,7 +831,7 @@ fn regex_combined_with_other_ops() {
     ));
     assert!(no_match(
         doc! { "name": { "$regex": "^B", "$exists": true } },
-        doc.clone()
+        doc
     ));
 }
 
@@ -863,7 +845,7 @@ fn regex_bson_regular_expression_shorthand() {
             options: "i".to_string(),
         })
     };
-    assert!(matches(filter.clone(), doc.clone()));
+    assert!(matches(filter, doc.clone()));
 
     let filter_no_match = bson::doc! {
         "name": Bson::RegularExpression(bson::Regex {

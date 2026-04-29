@@ -15,6 +15,15 @@
 //! catalog_header_sync_count, root_neutral_commit_count); for US-006
 //! we only need the rebuild observable.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::{doc, Document};
 use mqlite::mvcc::metrics::{
     published_snapshot_rebuilds_snapshot, reset_published_snapshot_rebuilds,

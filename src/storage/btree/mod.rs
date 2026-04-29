@@ -36,11 +36,11 @@ type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
 
 /// Reader-path history fallthrough.
 ///
-/// Bound to a specific `(ns_id, kind_tag)` at the call site — the BTree
+/// Bound to a specific durable tree identity at the call site — the BTree
 /// layer only sees an opaque probe object and walks `(key, read_ts)`.
-/// A `None` return means "no entry ≤ read_ts"; a `Some(entry)` return
-/// means the probe found the newest visible history version (tombstones
-/// included — the caller treats tombstones as "key absent").
+/// A `None` return means "no visible history entry"; a `Some(entry)` return
+/// means the probe found the newest history version visible at `read_ts`
+/// (tombstones included — the caller treats tombstones as "key absent").
 pub(crate) trait HistoryProbe {
     fn probe(
         &self,
@@ -80,6 +80,7 @@ pub(super) const MIN_LEAF_BYTES: usize = PAGE_SIZE_LEAF as usize / 2;
 
 mod chain;
 mod node;
+pub(crate) mod reconcile;
 
 use chain::*;
 pub(crate) use node::CellValue;
@@ -483,6 +484,14 @@ mod btree_us005_tests;
 #[cfg(test)]
 #[path = "../btree_us006_tests.rs"]
 mod btree_us006_tests;
+
+#[cfg(test)]
+#[path = "../btree_phase4_us007_tests.rs"]
+mod btree_phase4_us007_tests;
+
+#[cfg(test)]
+#[path = "../btree_us012_tests.rs"]
+mod btree_us012_tests;
 
 #[cfg(test)]
 #[path = "../btree_us016_tests.rs"]

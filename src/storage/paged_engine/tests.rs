@@ -133,10 +133,7 @@ fn upsert_creates_document_when_no_match() {
             "test.c",
             &doc! { "email": "a@b.com" },
             &doc! { "$set": { "name": "Alice" } },
-            &UpdateOptions {
-                upsert: true,
-                ..Default::default()
-            },
+            &UpdateOptions { upsert: true },
             false,
         )
         .unwrap();
@@ -907,11 +904,11 @@ fn publish_commit_root_neutral_reuses_catalog_arc() {
 
     // Force a publish with no published-catalog dirty. `publish_commit`
     // must clone the previous catalog Arc rather than build a new one.
-    let md_w = e.metadata.write().unwrap();
+    let md_r = e.metadata.read().unwrap();
     let _commit = e.commit_seq.lock().unwrap();
     let next_ts = e.shared.oracle.commit().unwrap();
     let new_epoch = {
-        let cat = md_w.catalog.lock().unwrap();
+        let cat = md_r.catalog.lock().unwrap();
         publish_commit(&e.shared, &cat, next_ts, PublishDirty::default()).unwrap()
     };
 
@@ -938,7 +935,7 @@ fn publish_commit_dirty_path_builds_new_catalog_arc() {
     let prev = e.shared.published.load_full();
     let prev_catalog_arc = Arc::clone(&prev.catalog);
 
-    let md_w = e.metadata.write().unwrap();
+    let md_r = e.metadata.read().unwrap();
     let _commit = e.commit_seq.lock().unwrap();
     let next_ts = e.shared.oracle.commit().unwrap();
     let dirty = PublishDirty {
@@ -946,7 +943,7 @@ fn publish_commit_dirty_path_builds_new_catalog_arc() {
         catalog_header_dirty: false,
     };
     let new_epoch = {
-        let cat = md_w.catalog.lock().unwrap();
+        let cat = md_r.catalog.lock().unwrap();
         publish_commit(&e.shared, &cat, next_ts, dirty).unwrap()
     };
 
@@ -974,9 +971,9 @@ fn publish_commit_rejects_stale_visible_ts() {
     let prev = e.shared.published.load_full();
     // Inject a stale Ts (equal to the current one) — must panic via
     // the monotonicity debug_assert.
-    let md_w = e.metadata.write().unwrap();
+    let md_r = e.metadata.read().unwrap();
     let _commit = e.commit_seq.lock().unwrap();
-    let cat = md_w.catalog.lock().unwrap();
+    let cat = md_r.catalog.lock().unwrap();
     let _ = publish_commit(&e.shared, &cat, prev.visible_ts, PublishDirty::default());
 }
 

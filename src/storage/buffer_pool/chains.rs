@@ -3,7 +3,8 @@
 //! The per-key delta chains live on the 32 KB leaf partition's frames.
 //! This module extends [`BufferPool`] with the take / put / snapshot /
 //! clear / drain helpers the MVCC writer and reader lanes use to manipulate
-//! those chains, plus the [`BufferPool::reconcile`] walk.
+//! those chains, plus the test-only [`BufferPool::reconcile`] compatibility
+//! wrapper over [`BufferPool::replace_leaf_and_chains`].
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -20,10 +21,17 @@ use crate::mvcc::read_view::ReadViewRegistry;
 use crate::mvcc::timestamp::Ts;
 #[cfg(test)]
 use crate::storage::allocator::AllocatorHandle;
+#[cfg(test)]
+use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
 
 use super::{BufferPool, PageSize};
+#[cfg(test)]
+use super::{ReplaceLeafError, RetainedLeafChains};
 
 type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
+
+#[cfg(test)]
+const RECONCILE_COMPAT_COLLECTION_ID: i64 = 0;
 
 impl BufferPool {
     // -----------------------------------------------------------------------
@@ -213,7 +221,7 @@ impl BufferPool {
     ///
     /// `OverflowRef::Drop` RAII runs on every dropped `VersionEntry`. When
     /// a drop brings an overflow refcount to 0, the page is enqueued on
-    /// `DeferredFreeQueue` (lock position 1.5 — a leaf mutex, safe to
+    /// `PageLifetimeQueue` (lock position 1.5 — a leaf mutex, safe to
     /// acquire transiently while holding the partition mutex at position 3).
     /// After releasing the partition mutex, the caller's writer-serialization
     /// context guarantees it is safe to drain the queue via
@@ -239,56 +247,85 @@ impl BufferPool {
         // 1. Snapshot the horizon BEFORE any partition latch.
         let ort = registry.oldest_required_ts();
 
-        // 2. Walk chains under the partition mutex. `Arc::make_mut` clones
-        //    only if a snapshot reader still holds the previous Arc — the
-        //    old chain keeps its pinned refcounts, the reader stays safe,
-        //    and we mutate a fresh copy in-place.
-        let dropped = {
-            let mut guard = self
+        // 2. Snapshot retained chains and the current page image under the
+        //    partition mutex. The actual install goes through the Phase 4
+        //    guarded replacement primitive below.
+        let Some((new_base, retained_chains, dropped)) = ({
+            let guard = self
                 .inner_32k
                 .lock()
                 .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
             let Some(&idx) = guard.page_map.get(&page) else {
                 return Ok(0);
             };
-            let frame = guard.frames[idx].as_mut().ok_or_else(|| {
+            let frame = guard.frames[idx].as_ref().ok_or_else(|| {
                 Error::Internal("page_map invariant: frame must exist at mapped slot".into())
             })?;
 
             let mut dropped_count = 0usize;
-            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.deltas.len());
-            keys.extend(frame.deltas.keys().cloned());
+            let mut retained_chains = RetainedLeafChains::new();
 
-            for key in keys {
-                let Some(chain_arc) = frame.deltas.get_mut(&key) else {
-                    continue;
-                };
+            for (key, chain_arc) in &frame.deltas {
                 let before = chain_arc.len();
+                let retained: VecDeque<VersionEntry> = chain_arc
+                    .iter()
+                    .filter(|entry| entry.stop_ts == Ts::MAX || entry.stop_ts > ort)
+                    .cloned()
+                    .collect();
+                dropped_count += before - retained.len();
 
-                // Retain the live head (`stop_ts == Ts::MAX`) unconditionally
-                // and any committed-replaced entry whose `stop_ts` is still
-                // above the horizon (so some reader can still see it).
-                // Entries with `stop_ts <= ort && stop_ts < Ts::MAX` are
-                // invisible to every live reader and get dropped.
-                let chain_mut = Arc::make_mut(chain_arc);
-                chain_mut.retain(|e| e.stop_ts == Ts::MAX || e.stop_ts > ort);
-
-                let after = chain_arc.len();
-                dropped_count += before - after;
-
-                if chain_arc.is_empty() {
-                    // A chain whose entries all aged out drops away.
-                    frame.deltas.remove(&key);
+                if !retained.is_empty() {
+                    retained_chains.insert(key.clone(), Arc::new(retained));
                 }
             }
 
-            dropped_count
+            Some((
+                frame.data.load_full().as_ref().clone(),
+                retained_chains,
+                dropped_count,
+            ))
+        }) else {
+            return Ok(0);
         };
+
+        if dropped > 0 {
+            let pin = self
+                .pin_leaf_for_reconcile(
+                    TreeIdent {
+                        collection_id: RECONCILE_COMPAT_COLLECTION_ID,
+                        kind: TreeKind::Primary,
+                    },
+                    page,
+                )
+                .map_err(|err| match err {
+                    ReplaceLeafError::NotResident => {
+                        Error::Internal("buffer pool reconcile: resident frame disappeared".into())
+                    }
+                    ReplaceLeafError::NotLeaf => {
+                        Error::Internal("buffer pool reconcile: target frame is not a leaf".into())
+                    }
+                    ReplaceLeafError::FrameCoWRefused(_) => {
+                        Error::Internal("buffer pool reconcile: unexpected CoW refusal".into())
+                    }
+                })?;
+            self.replace_leaf_and_chains(pin, new_base, retained_chains)
+                .map_err(|err| match err {
+                    ReplaceLeafError::NotResident => {
+                        Error::Internal("buffer pool reconcile: resident frame disappeared".into())
+                    }
+                    ReplaceLeafError::NotLeaf => Error::Internal(
+                        "buffer pool reconcile: replacement frame is not a leaf".into(),
+                    ),
+                    ReplaceLeafError::FrameCoWRefused(_) => {
+                        Error::Internal("buffer pool reconcile: unexpected CoW refusal".into())
+                    }
+                })?;
+        }
 
         // 3. Tick the reconcile counter and refresh the queue-depth gauge
         //    using the current queue size (drain below is authoritative).
         metrics::record_reconcile_entries_dropped(dropped as u64);
-        metrics::set_deferred_free_queue_depth(allocator.deferred_free_queue().depth() as u64);
+        metrics::set_deferred_free_queue_depth(allocator.page_lifetime_queue().depth() as u64);
 
         // 4. Writer-serialized drain — caller holds the writer lock. The
         //    drain re-checks refcount under Acquire before freeing.

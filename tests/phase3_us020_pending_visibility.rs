@@ -1,5 +1,14 @@
 //! US-020 public test host for Pending visibility before publish.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 

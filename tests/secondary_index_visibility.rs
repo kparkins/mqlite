@@ -12,6 +12,15 @@
 //! diagnostic counters. This test exercises the public primitives
 //! exposed on the `mqlite::mvcc` module.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 

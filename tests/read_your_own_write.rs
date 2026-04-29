@@ -8,6 +8,15 @@
 //!   is within the pinned sequencer frontier.
 //! - A committed entry is always visible once `read_ts >= start_ts`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 

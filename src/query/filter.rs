@@ -2,8 +2,6 @@
 //!
 //! Entry point: [`eval_filter`].
 //!
-#![allow(dead_code)]
-//!
 //! # Supported operators
 //!
 //! **Comparison:** `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`

@@ -3,8 +3,10 @@
 
 use super::*;
 use crate::storage::btree::MemPageStore;
+use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
 
 const EXPECTED_GC_PASS_TICK: u64 = 1;
+const SECONDARY_INDEX_ID: i64 = 1;
 
 fn ts(ms: u64, logical: u32) -> Ts {
     Ts {
@@ -35,73 +37,130 @@ fn tombstone(start: Ts, stop: Ts, txn: u64) -> VersionEntry {
     }
 }
 
+fn primary_ident(collection_id: i64) -> TreeIdent {
+    TreeIdent {
+        collection_id,
+        kind: TreeKind::Primary,
+    }
+}
+
+fn secondary_ident(collection_id: i64, index_id: i64) -> TreeIdent {
+    TreeIdent {
+        collection_id,
+        kind: TreeKind::Secondary { index_id },
+    }
+}
+
+trait HistoryStoreTestSpillExt {
+    fn spill_primary(
+        &mut self,
+        collection_id: i64,
+        key_bytes: &[u8],
+        entry: &VersionEntry,
+        counter: u32,
+    ) -> Result<()>;
+
+    fn spill_sec_index(
+        &mut self,
+        collection_id: i64,
+        index_id: i64,
+        key_bytes: &[u8],
+        entry: &VersionEntry,
+        counter: u32,
+    ) -> Result<()>;
+}
+
+impl HistoryStoreTestSpillExt for HistoryStore<MemPageStore> {
+    fn spill_primary(
+        &mut self,
+        collection_id: i64,
+        key_bytes: &[u8],
+        entry: &VersionEntry,
+        counter: u32,
+    ) -> Result<()> {
+        let mut txn = HistorySpillTxn::new();
+        HistoryStore::<MemPageStore>::spill_primary(
+            &mut txn,
+            primary_ident(collection_id),
+            key_bytes,
+            entry,
+            counter,
+        )?;
+        self.commit_spill_txn(txn)
+    }
+
+    fn spill_sec_index(
+        &mut self,
+        collection_id: i64,
+        index_id: i64,
+        key_bytes: &[u8],
+        entry: &VersionEntry,
+        counter: u32,
+    ) -> Result<()> {
+        let mut txn = HistorySpillTxn::new();
+        HistoryStore::<MemPageStore>::spill_sec_index(
+            &mut txn,
+            secondary_ident(collection_id, index_id),
+            key_bytes,
+            entry,
+            counter,
+        )?;
+        self.commit_spill_txn(txn)
+    }
+}
+
 // -----------------------------------------------------------------------
 // Key schema
 // -----------------------------------------------------------------------
 
 #[test]
 fn key_schema_encode_decode_roundtrip() {
-    let key = encode_history_key(
-        7,
-        KIND_PRIMARY,
-        b"abc",
-        Ts {
-            physical_ms: 100,
-            logical: 5,
-        },
-    );
-    // (ns=7 BE) || (kind=0) || b"abc" || (ts BE 12B)
-    // 4 + 1 + 3 + 12 = 20
-    assert_eq!(key.len(), 20);
-    assert_eq!(&key[0..4], &[0, 0, 0, 7]);
-    assert_eq!(key[4], KIND_PRIMARY);
-    assert_eq!(&key[5..8], b"abc");
-    let ts_buf: [u8; 12] = key[8..20].try_into().unwrap();
-    assert_eq!(
-        Ts::from_be_bytes(ts_buf),
-        Ts {
-            physical_ms: 100,
-            logical: 5
-        }
-    );
+    let ident = primary_ident(7);
+    let start_ts = Ts {
+        physical_ms: 100,
+        logical: 5,
+    };
+    let key = encode_history_key(&ident, b"abc", start_ts, 0);
+    assert_eq!(key.len(), 8 + 1 + 8 + 4 + 3 + 12 + 4);
+    assert_eq!(&key[0..8], &7i64.to_be_bytes());
+    assert_eq!(key[8], HISTORY_TREE_KIND_PRIMARY);
+    assert_eq!(&key[9..17], &0i64.to_be_bytes());
+    assert_eq!(&key[17..21], &3u32.to_be_bytes());
+    assert_eq!(&key[21..24], b"abc");
+    let ts_buf: [u8; 12] = key[24..36].try_into().unwrap();
+    assert_eq!(Ts::from_be_bytes(ts_buf), start_ts);
+    assert_eq!(&key[36..40], &0u32.to_be_bytes());
 
-    let (ns, kind, key_bytes, start_ts) = decode_history_key(&key).unwrap();
-    assert_eq!(ns, 7);
-    assert_eq!(kind, KIND_PRIMARY);
+    let (decoded_ident, key_bytes, decoded_start_ts, counter) = decode_history_key(&key).unwrap();
+    assert_eq!(decoded_ident, ident);
     assert_eq!(key_bytes, b"abc");
-    assert_eq!(
-        start_ts,
-        Ts {
-            physical_ms: 100,
-            logical: 5
-        }
-    );
+    assert_eq!(decoded_start_ts, start_ts);
+    assert_eq!(counter, 0);
 }
 
 #[test]
 fn key_schema_primary_vs_sec_index_do_not_alias() {
-    // Same (ns, bytes, start_ts), different kind_tag — must not collide.
-    let pri = encode_history_key(1, KIND_PRIMARY, b"K", ts(50, 0));
-    let sec = encode_history_key(1, KIND_SEC_INDEX_BASE, b"K", ts(50, 0));
+    let pri = encode_history_key(&primary_ident(1), b"K", ts(50, 0), 0);
+    let sec = encode_history_key(&secondary_ident(1, SECONDARY_INDEX_ID), b"K", ts(50, 0), 0);
     assert_ne!(pri, sec);
-    // Primary sorts before sec-index (kind_tag 0x00 < 0x01).
+    // Primary sorts before secondary (tree_kind 0x00 < 0x01).
     assert!(pri < sec);
 }
 
 #[test]
 fn key_schema_lexicographic_sort_matches_chronological() {
-    // Same (ns, kind, key_bytes), different start_ts.
-    let early = encode_history_key(9, KIND_PRIMARY, b"X", ts(10, 0));
-    let mid = encode_history_key(9, KIND_PRIMARY, b"X", ts(10, 7));
-    let late = encode_history_key(9, KIND_PRIMARY, b"X", ts(11, 0));
+    let ident = primary_ident(9);
+    let early = encode_history_key(&ident, b"X", ts(10, 0), 0);
+    let mid = encode_history_key(&ident, b"X", ts(10, 7), 0);
+    let late = encode_history_key(&ident, b"X", ts(11, 0), 0);
     assert!(early < mid);
     assert!(mid < late);
 }
 
 #[test]
 fn key_schema_ns_id_big_endian_prefix_groups_by_namespace() {
-    let ns1_first = encode_history_key(1, KIND_PRIMARY, b"zzz", ts(100, 0));
-    let ns2_first = encode_history_key(2, KIND_PRIMARY, b"aaa", ts(0, 0));
+    let ns1_first = encode_history_key(&primary_ident(1), b"zzz", ts(100, 0), 0);
+    let ns2_first = encode_history_key(&primary_ident(2), b"aaa", ts(0, 0), 0);
     // ns1_first must sort before ns2_first even though b"zzz" > b"aaa" —
     // the ns prefix dominates.
     assert!(ns1_first < ns2_first);
@@ -109,7 +168,7 @@ fn key_schema_ns_id_big_endian_prefix_groups_by_namespace() {
 
 #[test]
 fn key_schema_decode_rejects_truncated_buffer() {
-    assert!(decode_history_key(&[0, 0, 0, 1, KIND_PRIMARY]).is_none());
+    assert!(decode_history_key(&[0, 0, 0, 1, HISTORY_TREE_KIND_PRIMARY]).is_none());
 }
 
 // -----------------------------------------------------------------------
@@ -153,36 +212,16 @@ fn version_entry_truncated_buffer_errors() {
 #[test]
 fn cold_read_probe_returns_newest_version_below_read_ts() {
     let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
-    // Three versions of doc "d" at ts 5, 10, 50 — all in ns=3.
-    hs.insert(
-        3,
-        KIND_PRIMARY,
-        b"d",
-        &inline_entry(ts(5, 0), ts(10, 0), 1, b"v5"),
-    )
-    .unwrap();
-    hs.insert(
-        3,
-        KIND_PRIMARY,
-        b"d",
-        &inline_entry(ts(10, 0), ts(50, 0), 2, b"v10"),
-    )
-    .unwrap();
-    hs.insert(
-        3,
-        KIND_PRIMARY,
-        b"d",
-        &inline_entry(ts(50, 0), ts(100, 0), 3, b"v50"),
-    )
-    .unwrap();
+    // Three versions of doc "d" at ts 5, 10, 50 — all in collection id 3.
+    hs.spill_primary(3, b"d", &inline_entry(ts(5, 0), ts(10, 0), 1, b"v5"), 0)
+        .unwrap();
+    hs.spill_primary(3, b"d", &inline_entry(ts(10, 0), ts(50, 0), 2, b"v10"), 0)
+        .unwrap();
+    hs.spill_primary(3, b"d", &inline_entry(ts(50, 0), Ts::MAX, 3, b"v50"), 0)
+        .unwrap();
     // Noise in another namespace — must not leak into the ns=3 probe.
-    hs.insert(
-        4,
-        KIND_PRIMARY,
-        b"d",
-        &inline_entry(ts(5, 0), ts(100, 0), 9, b"other"),
-    )
-    .unwrap();
+    hs.spill_primary(4, b"d", &inline_entry(ts(5, 0), ts(100, 0), 9, b"other"), 0)
+        .unwrap();
 
     // read_ts = 30 → should return v10.
     let got = hs.probe_primary(3, b"d", ts(30, 0)).unwrap().unwrap();
@@ -205,19 +244,15 @@ fn cold_read_probe_returns_newest_version_below_read_ts() {
 #[test]
 fn cold_read_probe_respects_namespace_and_kind_boundaries() {
     let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
-    // Same key bytes, same ns, different kind_tag → must not cross.
-    hs.insert(
+    // Same key bytes, same collection, different tree kind must not cross.
+    hs.spill_primary(1, b"K", &inline_entry(ts(10, 0), Ts::MAX, 1, b"primary"), 0)
+        .unwrap();
+    hs.spill_sec_index(
         1,
-        KIND_PRIMARY,
+        SECONDARY_INDEX_ID,
         b"K",
-        &inline_entry(ts(10, 0), ts(20, 0), 1, b"primary"),
-    )
-    .unwrap();
-    hs.insert(
-        1,
-        KIND_SEC_INDEX_BASE,
-        b"K",
-        &inline_entry(ts(10, 0), ts(20, 0), 2, b"sec"),
+        &inline_entry(ts(10, 0), Ts::MAX, 2, b"sec"),
+        0,
     )
     .unwrap();
 
@@ -228,7 +263,7 @@ fn cold_read_probe_respects_namespace_and_kind_boundaries() {
     }
 
     let sec = hs
-        .probe_sec_index(1, b"K", KIND_SEC_INDEX_BASE, ts(100, 0))
+        .probe_sec_index(1, SECONDARY_INDEX_ID, b"K", ts(100, 0))
         .unwrap()
         .unwrap();
     match sec.data {
@@ -241,24 +276,26 @@ fn cold_read_probe_respects_namespace_and_kind_boundaries() {
 fn sec_index_tombstone_hides_candidate_and_ticks_metric() {
     let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
     // A sec-index tombstone at ts=50; newest entry `<= read_ts`.
-    hs.insert(
+    hs.spill_sec_index(
         1,
-        KIND_SEC_INDEX_BASE,
+        SECONDARY_INDEX_ID,
         b"K",
         &inline_entry(ts(10, 0), ts(50, 0), 1, b"real"),
+        0,
     )
     .unwrap();
-    hs.insert(
+    hs.spill_sec_index(
         1,
-        KIND_SEC_INDEX_BASE,
+        SECONDARY_INDEX_ID,
         b"K",
         &tombstone(ts(50, 0), Ts::MAX, 2),
+        0,
     )
     .unwrap();
 
     crate::mvcc::metrics::reset_secondary_index_tombstone_hits();
     let got = hs
-        .probe_sec_index(1, b"K", KIND_SEC_INDEX_BASE, ts(100, 0))
+        .probe_sec_index(1, SECONDARY_INDEX_ID, b"K", ts(100, 0))
         .unwrap();
     assert!(got.is_none(), "tombstone must hide the candidate");
     assert!(
@@ -284,13 +321,8 @@ fn history_store_isolated_from_main_data_store() {
     let main_root_before = main_tree.root_page;
 
     let mut hs = HistoryStore::create(hist_store).unwrap();
-    hs.insert(
-        1,
-        KIND_PRIMARY,
-        b"K",
-        &inline_entry(ts(10, 0), Ts::MAX, 1, b"v"),
-    )
-    .unwrap();
+    hs.spill_primary(1, b"K", &inline_entry(ts(10, 0), Ts::MAX, 1, b"v"), 0)
+        .unwrap();
     // A full probe round-trip would also traverse the history store only.
     let _ = hs.probe_primary(1, b"K", ts(100, 0)).unwrap();
 
@@ -311,16 +343,16 @@ fn history_store_isolated_from_main_data_store() {
 fn gc_pass_deletes_exactly_the_expired_entries() {
     let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
     let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
-    // 10_000 entries keyed by (ns=1, KIND_PRIMARY, i-big-endian)
+    // 10_000 entries keyed by (collection=1, primary, i-big-endian)
     // with distinct start_ts per entry. stop_ts == start_ts + 1 so
     // `stop_ts <= ort == 3000` iff start_ts < 3000.
     for i in 0..10_000u64 {
         let key = (i as u32).to_be_bytes();
-        hs.insert(
+        hs.spill_primary(
             1,
-            KIND_PRIMARY,
             &key,
             &inline_entry(ts(i, 0), ts(i + 1, 0), i, format!("v{i}").as_bytes()),
+            0,
         )
         .unwrap();
     }
@@ -344,7 +376,7 @@ fn gc_pass_deletes_exactly_the_expired_entries() {
     // Post-GC: a probe at read_ts = 5000 for a non-GC'd key must still
     // resolve; a probe for a GC'd key must return None.
     let live_key = (5000u32).to_be_bytes();
-    let got = hs.probe_primary(1, &live_key, ts(10_000, 0)).unwrap();
+    let got = hs.probe_primary(1, &live_key, ts(5000, 0)).unwrap();
     assert!(got.is_some(), "non-expired entry must still be reachable");
 
     let gc_key = (0u32).to_be_bytes();
@@ -363,27 +395,12 @@ fn gc_pass_respects_active_readview_horizon() {
     //   A: stop_ts = 50 (expired — visible to no live reader)
     //   B: stop_ts = 150 (STILL visible at ts 100 — must NOT be deleted)
     //   C: stop_ts = Ts::MAX (live head — must NEVER be deleted)
-    hs.insert(
-        1,
-        KIND_PRIMARY,
-        b"A",
-        &inline_entry(ts(10, 0), ts(50, 0), 1, b"a"),
-    )
-    .unwrap();
-    hs.insert(
-        1,
-        KIND_PRIMARY,
-        b"B",
-        &inline_entry(ts(90, 0), ts(150, 0), 2, b"b"),
-    )
-    .unwrap();
-    hs.insert(
-        1,
-        KIND_PRIMARY,
-        b"C",
-        &inline_entry(ts(100, 0), Ts::MAX, 3, b"c"),
-    )
-    .unwrap();
+    hs.spill_primary(1, b"A", &inline_entry(ts(10, 0), ts(50, 0), 1, b"a"), 0)
+        .unwrap();
+    hs.spill_primary(1, b"B", &inline_entry(ts(90, 0), ts(150, 0), 2, b"b"), 0)
+        .unwrap();
+    hs.spill_primary(1, b"C", &inline_entry(ts(100, 0), Ts::MAX, 3, b"c"), 0)
+        .unwrap();
 
     let result = hs.gc_pass(ts(100, 0)).unwrap();
     assert_eq!(result.entries_deleted, 1, "only A expires at ort=100");
@@ -393,7 +410,7 @@ fn gc_pass_respects_active_readview_horizon() {
         "A should be GC'd"
     );
     assert!(
-        hs.probe_primary(1, b"B", ts(200, 0)).unwrap().is_some(),
+        hs.probe_primary(1, b"B", ts(100, 0)).unwrap().is_some(),
         "B has stop_ts=150 > ort=100; must be retained"
     );
     assert!(
@@ -404,10 +421,10 @@ fn gc_pass_respects_active_readview_horizon() {
 
 /// Plan T8 acceptance bullet 1: overflow-bearing entries get their
 /// refcount decremented by RAII on GC. At refcount 0 the page is
-/// enqueued on the allocator's deferred-free queue and counted in
+/// enqueued on the allocator's page-lifetime queue and counted in
 /// `pages_freed`.
 #[test]
-fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_deferred_free() {
+fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_lifetime_entry() {
     let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
     use crate::storage::allocator::AllocatorHandle;
     use crate::storage::header::FileHeader;
@@ -434,13 +451,14 @@ fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_deferred_free() {
         )),
         is_tombstone: false,
     };
-    // Insert serializes the bytes; re-seed the refcount post-insert to
-    // match the "caller leaks its OverflowRef" production semantics.
-    hs.insert(1, KIND_PRIMARY, b"K", &overflow_entry).unwrap();
-    std::mem::forget(overflow_entry);
+    // Insert serializes the bytes and transfers one cloned refcount into the
+    // history record. Dropping the live entry simulates the folded leaf
+    // invalidating its resident chain after the durable history insert.
+    hs.spill_primary(1, b"K", &overflow_entry, 0).unwrap();
+    drop(overflow_entry);
     assert_eq!(alloc.overflow_refcount(777), 1);
 
-    let before_depth = alloc.deferred_free_queue().depth();
+    let before_depth = alloc.page_lifetime_queue().depth();
     let result = hs.gc_pass(ts(100, 0)).unwrap();
     assert_eq!(result.entries_deleted, 1);
     assert_eq!(
@@ -453,7 +471,7 @@ fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_deferred_free() {
         "RAII decref must bring refcount to 0"
     );
     assert_eq!(
-        alloc.deferred_free_queue().depth(),
+        alloc.page_lifetime_queue().depth(),
         before_depth + 1,
         "refcount 0 drop must enqueue first_page for deferred free"
     );
@@ -465,13 +483,8 @@ fn gc_pass_overflow_entries_decref_via_raii_and_enqueue_deferred_free() {
 fn gc_pass_noop_still_ticks_counter() {
     let _gc_lock = crate::mvcc::metrics::GC_PASSES_TEST_LOCK.lock().unwrap();
     let mut hs = HistoryStore::create(MemPageStore::new()).unwrap();
-    hs.insert(
-        1,
-        KIND_PRIMARY,
-        b"K",
-        &inline_entry(ts(10, 0), Ts::MAX, 1, b"live"),
-    )
-    .unwrap();
+    hs.spill_primary(1, b"K", &inline_entry(ts(10, 0), Ts::MAX, 1, b"live"), 0)
+        .unwrap();
 
     let gc_passes_before = crate::mvcc::metrics::history_store_gc_passes_snapshot();
     let result = hs.gc_pass(ts(1000, 0)).unwrap();

@@ -8,6 +8,15 @@
 //!   the Building index, so the finished index contains every document
 //!   (including those inserted during the build).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
+
 use bson::doc;
 use bson::Document;
 use mqlite::{Client, IndexModel};
@@ -292,9 +301,8 @@ fn drop_index_during_build_succeeds() {
         .collection::<Document>("big")
         .list_indexes()
         .unwrap();
-    let tag_indexes: Vec<_> = indexes.iter().filter(|i| i.name == "tag_1").collect();
     assert!(
-        tag_indexes.is_empty(),
+        indexes.iter().all(|i| i.name != "tag_1"),
         "tag_1 index must be absent after drop_index succeeds"
     );
 }

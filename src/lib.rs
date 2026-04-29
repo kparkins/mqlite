@@ -96,6 +96,19 @@
 //! - **Wire protocol**: no authentication — bind to `127.0.0.1` only;
 //!   see the [Wire Protocol Security Advisory](https://github.com/kyleparkinson/mqlite/blob/master/docs/WIRE-SECURITY.md)
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::missing_panics_doc,
+        clippy::missing_errors_doc,
+        clippy::module_inception,
+        reason = "test modules use assertion-style panics and setup unwraps"
+    )
+)]
+
 // ---------------------------------------------------------------------------
 // Public modules
 // ---------------------------------------------------------------------------

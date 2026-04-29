@@ -12,6 +12,7 @@ use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::{CollectionEntry, IndexEntry, IndexState};
 use crate::storage::handle::BufferPoolHandle;
+use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::secondary_index::{
     update_index_on_delete, update_index_on_insert, update_index_on_update,
 };
@@ -165,10 +166,8 @@ pub(super) fn maintain_secondary_on_insert(
     for entry in entries {
         let store = new_txn_store(shared, overlay);
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-        let history = vis
-            .secondary_history
-            .as_ref()
-            .map(|probe| probe as &dyn HistoryProbe);
+        let history_probe = vis.secondary_history_probe(entry.id);
+        let history = Some(&history_probe as &dyn HistoryProbe);
         let is_multikey = update_index_on_insert(
             doc,
             doc_id,
@@ -245,10 +244,8 @@ pub(super) fn maintain_secondary_on_update(
     for entry in entries {
         let store = new_txn_store(shared, overlay);
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
-        let history = vis
-            .secondary_history
-            .as_ref()
-            .map(|probe| probe as &dyn HistoryProbe);
+        let history_probe = vis.secondary_history_probe(entry.id);
+        let history = Some(&history_probe as &dyn HistoryProbe);
         let is_multikey = update_index_on_update(
             old_doc,
             new_doc,
@@ -306,6 +303,7 @@ pub(super) fn install_pending_sec_index(
     }
 
     for write in writes {
+        let ident = secondary_tree_ident(shared, write.index_id)?;
         let entry = entry_by_id.get(&write.index_id).ok_or_else(|| {
             Error::Internal(format!(
                 "pending sec-index write references unknown index_id {}",
@@ -341,9 +339,24 @@ pub(super) fn install_pending_sec_index(
             .handle
             .pool()
             .put_chain(leaf_page, write.key, chain_arc)?;
+        shared.mark_leaf_dirty(ident, leaf_page, DirtyReason::SecondaryWrite);
     }
 
     Ok(())
+}
+
+fn secondary_tree_ident(shared: &SharedState, index_id: i64) -> Result<TreeIdent> {
+    let epoch = shared.published.load_full();
+    let collection_id = epoch.catalog.index_owner_by_id(index_id).ok_or_else(|| {
+        Error::Internal(format!(
+            "published catalog missing owner for secondary index_id {}",
+            index_id
+        ))
+    })?;
+    Ok(TreeIdent {
+        collection_id,
+        kind: TreeKind::Secondary { index_id },
+    })
 }
 
 /// Install staged primary-tree writes as fresh heads on each key's
@@ -367,10 +380,11 @@ pub(super) fn install_pending_primary(
     use crate::storage::buffer_pool::PageSize;
 
     for write in writes {
-        let (root_page, root_level) = match catalog_lock(md).get_collection(&write.ns)? {
-            Some(c) => (c.data_root_page, c.data_root_level),
+        let coll = match catalog_lock(md).get_collection(&write.ns)? {
+            Some(c) => c,
             None => continue,
         };
+        let (root_page, root_level) = (coll.data_root_page, coll.data_root_level);
         let tree = BTree::open(new_txn_store(shared, overlay), root_page, root_level);
         let leaf_page = tree.find_leaf(&write.key)?;
         let _pin = shared.handle.fetch_page(leaf_page, PageSize::Large32k)?;
@@ -402,6 +416,14 @@ pub(super) fn install_pending_primary(
             .handle
             .pool()
             .put_chain(leaf_page, write.key, chain_arc)?;
+        shared.mark_leaf_dirty(
+            TreeIdent {
+                collection_id: coll.id,
+                kind: TreeKind::Primary,
+            },
+            leaf_page,
+            DirtyReason::PrimaryWrite,
+        );
     }
     Ok(())
 }
@@ -733,9 +755,22 @@ pub(super) fn drop_index(
     let lane_arc = engine.lane_for(ns);
     let _lane_guard = engine.acquire_lane(lane_arc)?;
     engine.run_ddl(|shared, md, overlay| {
-        let removed = catalog_lock(md).drop_index(ns, name)?;
+        let (removed, dropped_ident) = {
+            let mut cat = catalog_lock(md);
+            let collection = cat.get_collection(ns)?;
+            let index = cat.get_index(ns, name)?;
+            let dropped_ident = collection.zip(index).map(|(collection, index)| TreeIdent {
+                collection_id: collection.id,
+                kind: TreeKind::Secondary { index_id: index.id },
+            });
+            let removed = cat.drop_index(ns, name)?;
+            (removed, dropped_ident)
+        };
         if removed {
             sync_catalog_root_overlay(shared, md, overlay)?;
+            if let Some(ident) = dropped_ident {
+                shared.clear_dirty_tree(&ident);
+            }
             Ok(())
         } else {
             Err(crate::error::Error::Internal(format!(

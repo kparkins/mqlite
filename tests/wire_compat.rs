@@ -35,6 +35,14 @@
 //!
 //! All tests use a randomly assigned port to avoid conflicts.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "test and bench targets use assertion-style panics and setup unwraps"
+)]
 #![cfg(feature = "wire")]
 
 use std::io::{Read, Write};

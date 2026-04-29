@@ -2,7 +2,7 @@
 //!
 //! Every writer path runs inside a `WriteTxn` that:
 //!
-//! 1. On `begin`: drains the deferred-free queue under
+//! 1. On `begin`: drains checkpoint-eligible page-lifetime entries under
 //!    `AllocatorHandle::state` so any refcount-0 pages from earlier reader
 //!    drops are returned to the free list before the new commit allocates.
 //! 2. Accumulates pending overflow-chain pins in `self.pending` (RAII
@@ -291,9 +291,9 @@ impl WriteTxn {
     ///    `MutexGuard<'_, BpBackend>` from `PagedEngine::inner`). This
     ///    function does not acquire it — ownership is external to keep
     ///    `WriteTxn` lifetime-parameter-free.
-    /// 2. Drain the deferred-free queue. Any refcount-0 pages from prior
-    ///    reader drops return to the free list before the new commit
-    ///    allocates (prevents stale-free collisions).
+    /// 2. Drain checkpoint-eligible page-lifetime entries. Any refcount-0
+    ///    pages whose enqueue fence is older than the checkpoint fence return
+    ///    to the free list before the new commit allocates.
     /// 3. Initialize empty `pending` / `page_writes` / `refcount_deltas`.
     pub(crate) fn begin(
         txn_id: u64,
@@ -598,7 +598,7 @@ impl Drop for WriteTxn {
         // has already been moved out via `std::mem::take` — nothing to do.
         // Abort path: `Vec<OverflowRef>` drop runs `OverflowRef::drop` on
         // every entry. Each decref is atomic; a 0-post-decrement transitions
-        // the page into the deferred-free queue (lock-order position 1.5).
+        // the page into the page-lifetime queue (lock-order position 1.5).
     }
 }
 
@@ -691,8 +691,7 @@ mod tests {
     use crate::storage::handle::BufferPoolHandle;
     use crate::storage::header::FileHeader;
     use crate::storage::test_support::{ArcIo, MockIo};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     fn fresh_allocator() -> AllocatorHandle {
         AllocatorHandle::new(FileHeader::new(0, 0, 0))
@@ -775,7 +774,7 @@ mod tests {
 
         drop(t);
         assert_eq!(alloc.overflow_refcount(33), 0);
-        assert_eq!(alloc.deferred_free_queue().depth(), 1);
+        assert_eq!(alloc.page_lifetime_queue().depth(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -783,8 +782,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn begin_drains_deferred_free_queue() {
-        // Arrange: an AllocatorHandle whose deferred_free_queue has entries
+    fn begin_checks_page_lifetime_queue() {
+        // Arrange: an AllocatorHandle whose page-lifetime queue has entries
         // from prior reader drops. `begin` must drain them before we
         // construct a WriteTxn.
         let handle = fresh_handle();
@@ -794,20 +793,13 @@ mod tests {
         {
             let _r = OverflowRef::new_owned(99, 32, alloc.clone()).unwrap();
         }
-        assert_eq!(alloc.deferred_free_queue().depth(), 1);
+        assert_eq!(alloc.page_lifetime_queue().depth(), 1);
 
-        // Note: drain_free_queue in a pure-in-memory handle cannot actually
-        // free pages without a corresponding header state; the test here
-        // exercises only the fact that `begin` invokes it. In this fresh
-        // fixture the page isn't in the allocator's free-list state so
-        // `drain_free_queue` will attempt and fail to free. We assert only
-        // that `begin` returns without panic.
+        // The entry's checkpoint fence has not advanced, so `begin` should
+        // observe the queue but leave it pending.
         let result = WriteTxn::begin(1, &alloc, handle.page_source());
-        // Accept either Ok (drain succeeded because fresh pool is empty
-        // and free_32k succeeds on unknown page), or an error — both prove
-        // that begin invoked drain_free_queue. What matters for protocol
-        // correctness is that drain_free_queue was called.
-        let _ = result;
+        result.expect("begin with a non-eligible page-lifetime entry");
+        assert_eq!(alloc.page_lifetime_queue().depth(), 1);
     }
 
     #[test]
@@ -869,7 +861,7 @@ mod tests {
 
         t.rollback();
         assert_eq!(alloc.overflow_refcount(88), 0);
-        assert_eq!(alloc.deferred_free_queue().depth(), 1);
+        assert_eq!(alloc.page_lifetime_queue().depth(), 1);
     }
 
     #[test]
@@ -1198,12 +1190,11 @@ mod tests {
         use crate::journal::log_file::{DecodeCtx, LogicalOpKind, LogicalTxnFrame};
         use crate::journal::JournalManager;
         use crate::mvcc::timestamp::TimestampOracle;
-        use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
+        use crate::storage::buffer_pool::{default_sizes, BufferPool};
         use crate::storage::catalog::{CollectionEntry, IndexEntry, IndexState};
         use crate::storage::handle::BufferPoolHandle;
         use crate::storage::header::FileHeader;
         use bson::Document;
-        use std::collections::HashMap;
         use std::fs::OpenOptions;
         use std::sync::{Arc, Mutex as StdMutex};
 
