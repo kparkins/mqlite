@@ -15,7 +15,7 @@
 //! Contract 3.2 predicate (see docs/STORAGE-CONTRACTS-FROZEN.md §3.2):
 //!
 //!   CRUD writers serialize through the namespace lane and then the global
-//!   commit_seq in that order; publication happens only after staged secondary
+//!   journal envelope in that order; publication happens only after staged secondary
 //!   work, primary install, overlay commit, journal flush, ChainCommit, and
 //!   commit_txn complete.
 //!

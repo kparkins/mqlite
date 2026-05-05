@@ -9,10 +9,10 @@
 //!    decref on abort — pages enqueue for deferred-free on Drop).
 //! 3. On `commit`: requests a `commit_ts` from the oracle, emits exactly
 //!    one `ChainCommit` journal frame carrying the commit timestamp and any
-//!    refcount deltas / page writes, fsyncs the journal, and transfers
-//!    ownership of the pending `OverflowRef`s into the installed version
-//!    chains (refcounts remain bumped post-commit because the chain now
-//!    holds the pin).
+//!    refcount deltas / page writes, and transfers ownership of the pending
+//!    `OverflowRef`s into the installed version chains (refcounts remain
+//!    bumped post-commit because the chain now holds the pin). Durability sync
+//!    is owned by the caller's journal envelope.
 //! 4. On `rollback` / `Drop`: pending `OverflowRef`s decref via RAII.
 //!
 //! ## Lock ownership
@@ -36,6 +36,15 @@ use crate::storage::allocator::AllocatorHandle;
 use crate::storage::buffer_pool::PageSource;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::paged_engine::publish::PublishDirty;
+
+/// Stage-time identity of the live version head a writer observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedHead {
+    /// Start timestamp of the observed live head.
+    pub commit_ts: Ts,
+    /// Transaction identifier of the observed live head.
+    pub txn_id: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Namespace string — cheap clone via Arc refcount
@@ -122,6 +131,8 @@ pub(crate) struct SecIndexWrite {
     pub(crate) index_root_page: u32,
     /// Compound key bytes (from `encode_compound_key` in `keys`).
     pub(crate) key: Vec<u8>,
+    /// Stage-time head observed by the writer, if any.
+    pub expected_head: Option<ExpectedHead>,
     /// Operation kind — insert with id bytes or delete (tombstone).
     pub(crate) op: SecIndexOp,
 }
@@ -160,6 +171,8 @@ pub(crate) struct PrimaryWrite {
     pub(crate) ns: Ns,
     /// B+ tree cell key (e.g. `encode_key(_id)`).
     pub(crate) key: Vec<u8>,
+    /// Stage-time head observed by the writer, if any.
+    pub expected_head: Option<ExpectedHead>,
     /// Kind of write, carrying any associated payload bytes.
     pub(crate) op: PrimaryOp,
 }
@@ -341,6 +354,7 @@ impl WriteTxn {
             index_id,
             index_root_page,
             key,
+            expected_head: None,
             op: SecIndexOp::Insert { id_bytes },
         });
     }
@@ -359,6 +373,7 @@ impl WriteTxn {
             index_id,
             index_root_page,
             key,
+            expected_head: None,
             op: SecIndexOp::Delete,
         });
     }
@@ -387,11 +402,13 @@ impl WriteTxn {
         ns: impl Into<Ns>,
         key: Vec<u8>,
         data: Vec<u8>,
+        expected_head: Option<ExpectedHead>,
     ) {
         self.pending_primary.push(PrimaryWrite {
             ns_id,
             ns: ns.into(),
             key,
+            expected_head,
             op: PrimaryOp::Insert { data },
         });
     }
@@ -403,21 +420,30 @@ impl WriteTxn {
         ns: impl Into<Ns>,
         key: Vec<u8>,
         data: Vec<u8>,
+        expected_head: Option<ExpectedHead>,
     ) {
         self.pending_primary.push(PrimaryWrite {
             ns_id,
             ns: ns.into(),
             key,
+            expected_head,
             op: PrimaryOp::Update { data },
         });
     }
 
     /// Stage a primary-tree delete (tombstone) for commit-time chain installation.
-    pub(crate) fn stage_primary_delete(&mut self, ns_id: i64, ns: impl Into<Ns>, key: Vec<u8>) {
+    pub(crate) fn stage_primary_delete(
+        &mut self,
+        ns_id: i64,
+        ns: impl Into<Ns>,
+        key: Vec<u8>,
+        expected_head: Option<ExpectedHead>,
+    ) {
         self.pending_primary.push(PrimaryWrite {
             ns_id,
             ns: ns.into(),
             key,
+            expected_head,
             op: PrimaryOp::Delete,
         });
     }
@@ -478,9 +504,9 @@ impl WriteTxn {
     ///
     /// This is the S5-only half of [`emit_logical_txn_frame`]: it consumes
     /// the pre-allocated `commit_ts` Cell and returns the frame without doing
-    /// journal I/O. `run_write_existing` appends and fsyncs the returned frame
-    /// at S6 so rollback handling can distinguish frame construction from
-    /// durability.
+    /// journal I/O. `run_write_existing` appends the returned frame inside the
+    /// journal envelope so rollback handling can distinguish frame construction
+    /// from durability.
     pub(crate) fn build_logical_txn_frame(
         &self,
         journal: &BufferPoolHandle,
@@ -561,12 +587,12 @@ impl WriteTxn {
         self.commit_chain_commit(journal, commit_ts)
     }
 
-    /// Append and fsync the S7 `ChainCommit` frame for this transaction.
+    /// Append the S7 `ChainCommit` frame for this transaction.
     ///
     /// Returns the drained overflow refs and secondary-index write list after
-    /// the durable chain commit is on disk. This consumes `self`; on any
-    /// append/sync failure, `Drop` still owns the drained vectors and aborts
-    /// their refcounts normally.
+    /// the chain commit has been appended. This consumes `self`; on any append
+    /// failure, `Drop` still owns the drained vectors and aborts their refcounts
+    /// normally.
     pub(crate) fn commit_chain_commit(
         mut self,
         journal: &BufferPoolHandle,
@@ -578,7 +604,6 @@ impl WriteTxn {
         let pending_sec_index = std::mem::take(&mut self.pending_sec_index).into_vec();
 
         journal.append_chain_commit(commit_ts, refcount_deltas, page_writes)?;
-        journal.journal_sync()?;
 
         self.finalized = true;
         Ok((pending, pending_sec_index))
@@ -979,9 +1004,21 @@ mod tests {
     #[test]
     fn stage_primary_insert_accumulates() {
         let mut t = WriteTxn::new(1);
-        t.stage_primary_insert(777, "ns.a".to_string(), b"k1".to_vec(), b"v1".to_vec());
-        t.stage_primary_update(777, "ns.a".to_string(), b"k2".to_vec(), b"v2".to_vec());
-        t.stage_primary_delete(777, "ns.a".to_string(), b"k3".to_vec());
+        t.stage_primary_insert(
+            777,
+            "ns.a".to_string(),
+            b"k1".to_vec(),
+            b"v1".to_vec(),
+            None,
+        );
+        t.stage_primary_update(
+            777,
+            "ns.a".to_string(),
+            b"k2".to_vec(),
+            b"v2".to_vec(),
+            None,
+        );
+        t.stage_primary_delete(777, "ns.a".to_string(), b"k3".to_vec(), None);
 
         assert_eq!(t.pending_primary.len(), 3);
         assert_eq!(t.pending_primary[0].ns_id, 777);
@@ -1022,9 +1059,9 @@ mod tests {
         // 2 sec writes + 3 primary writes — staged in the order below.
         t.stage_sec_index_insert(10, 100, b"s0".to_vec(), b"id0".to_vec());
         t.stage_sec_index_delete(11, 101, b"s1".to_vec());
-        t.stage_primary_insert(20, "ns".to_string(), b"p0".to_vec(), b"v0".to_vec());
-        t.stage_primary_update(20, "ns".to_string(), b"p1".to_vec(), b"v1".to_vec());
-        t.stage_primary_delete(20, "ns".to_string(), b"p2".to_vec());
+        t.stage_primary_insert(20, "ns".to_string(), b"p0".to_vec(), b"v0".to_vec(), None);
+        t.stage_primary_update(20, "ns".to_string(), b"p1".to_vec(), b"v1".to_vec(), None);
+        t.stage_primary_delete(20, "ns".to_string(), b"p2".to_vec(), None);
 
         let sec_snap: Vec<SecIndexWrite> = t.pending_sec_index.iter().cloned().collect();
         let pri_snap: Vec<PrimaryWrite> = t.pending_primary.iter().cloned().collect();
@@ -1131,6 +1168,7 @@ mod tests {
             orig_entry.name.clone(),
             b"k".to_vec(),
             b"v".to_vec(),
+            None,
         );
         t.stage_sec_index_insert(
             orig_index.id,
@@ -1292,6 +1330,7 @@ mod tests {
             live_collection.name.clone(),
             b"k".to_vec(),
             b"v".to_vec(),
+            None,
         );
         t.stage_sec_index_insert(
             live_index.id,

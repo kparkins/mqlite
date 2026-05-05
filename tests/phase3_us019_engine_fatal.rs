@@ -19,15 +19,15 @@ fn fullsync_options() -> OpenOptions {
     OpenOptions::new().durability(DurabilityMode::FullSync)
 }
 
-fn assert_engine_fatal<T>(result: mqlite::Result<T>) {
+fn assert_internal<T>(result: mqlite::Result<T>) {
     assert!(
-        matches!(result, Err(Error::EngineFatal)),
-        "expected EngineFatal"
+        matches!(result, Err(Error::Internal(_))),
+        "expected pre-durable internal failure"
     );
 }
 
 #[test]
-fn test_post_durable_install_failure_poisons_engine() {
+fn test_repeated_primary_install_failure_aborts_pre_durable_without_poison() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("us019-fatal.mqlite");
 
@@ -46,50 +46,62 @@ fn test_post_durable_install_failure_poisons_engine() {
         "S9 failure must be retried exactly once"
     );
 
+    let journal_len_before_repeated_failure = std::fs::metadata(crash_harness::journal_path(&path))
+        .expect("journal metadata before repeated failure")
+        .len();
     client.__us019_set_primary_install_failures(2);
-    assert_engine_fatal(
+    assert_internal(
         db.collection::<Document>("c")
-            .insert_one(&doc! { "_id": 2i32, "phase": "fatal" }),
+            .insert_one(&doc! { "_id": 2i32, "phase": "aborted" }),
     );
     assert_eq!(
         client.__us019_primary_install_attempts(),
         2,
         "S9 repeated failure must stop after the retry"
     );
-
-    let journal_len_after_fatal = std::fs::metadata(crash_harness::journal_path(&path))
-        .expect("journal metadata after fatal")
-        .len();
-    assert_engine_fatal(
-        db.collection::<Document>("c")
-            .find_one(doc! { "_id": 1i32 }),
-    );
-    assert_engine_fatal(
-        db.collection::<Document>("c")
-            .insert_one(&doc! { "_id": 3i32, "phase": "poisoned" }),
-    );
-    let journal_len_after_poisoned_ops = std::fs::metadata(crash_harness::journal_path(&path))
-        .expect("journal metadata after poisoned ops")
+    let journal_len_after_repeated_failure = std::fs::metadata(crash_harness::journal_path(&path))
+        .expect("journal metadata after repeated failure")
         .len();
     assert_eq!(
-        journal_len_after_poisoned_ops, journal_len_after_fatal,
-        "poisoned read/write attempts must not append durable state"
+        journal_len_after_repeated_failure, journal_len_before_repeated_failure,
+        "pre-durable install failure must not append durable state"
     );
+    assert!(db
+        .collection::<Document>("c")
+        .find_one(doc! { "_id": 1i32 })
+        .expect("engine remains readable")
+        .is_some());
+    assert!(db
+        .collection::<Document>("c")
+        .find_one(doc! { "_id": 2i32 })
+        .expect("aborted write remains readable")
+        .is_none());
+    db.collection::<Document>("c")
+        .insert_one(&doc! { "_id": 3i32, "phase": "not-poisoned" })
+        .expect("engine must remain writable after pre-durable abort");
     assert_eq!(
         client.__us019_primary_install_attempts(),
-        2,
-        "poisoned write must return before another resident install attempt"
+        3,
+        "successful follow-up write should use one normal primary install attempt"
     );
 
     std::mem::forget(client);
     let reopened = Client::open_with_options(&path, fullsync_options()).expect("reopen");
-    let doc = reopened
-        .database("db")
+    let db = reopened.database("db");
+    let doc = db
+        .collection::<Document>("c")
+        .find_one(doc! { "_id": 1i32 })
+        .expect("find recovered committed doc")
+        .expect("first committed doc must recover");
+    assert_eq!(doc.get_i32("_id").ok(), Some(1));
+    let aborted = db
         .collection::<Document>("c")
         .find_one(doc! { "_id": 2i32 })
-        .expect("find recovered doc")
-        .expect("logical replay must recover the post-S7 committed doc");
-    assert_eq!(doc.get_i32("_id").ok(), Some(2));
+        .expect("find aborted doc after recovery");
+    assert!(
+        aborted.is_none(),
+        "pre-durable aborted doc must not recover from the journal"
+    );
 }
 
 #[test]

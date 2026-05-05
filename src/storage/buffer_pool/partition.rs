@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
 use crate::mvcc::version::{VersionEntry, VersionState};
 
+use super::page_latch::PageLatch;
 use super::{PageSize, PageSource};
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,14 @@ pub(super) struct Frame {
     /// without a matching chain. Both cases are legal; see Phase 3 §10.4 for
     /// the decision table.
     pub(super) deltas: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+    /// Phase 5 §10.18 page-local latch. Acquired AFTER the partition mutex
+    /// is released by `BufferPool::pin_for_read`/`pin_for_write` and held
+    /// for the lifetime of the wrapping `LatchedPinnedPage`. The latch is
+    /// scoped to a single resident `Frame`: cache hits reuse it across
+    /// pin/unpin cycles, while a cache miss installs a fresh latch with
+    /// the new page (§10.18 rule 1 — `PageLatch` is bound to the Frame).
+    #[allow(dead_code)]
+    pub(super) latch: PageLatch,
 }
 
 fn has_live_committed_head(frame: &Frame) -> bool {
@@ -97,6 +106,7 @@ impl Partition {
     ///
     /// - Empty slot → immediate winner.
     /// - `pin_count > 0` → skipped entirely.
+    /// - exclusive `PageLatch` held → skipped without acquiring a latch guard.
     /// - `ref_bit = 1` → cleared (second chance) and skipped.
     /// - `ref_bit = 0 && pin_count = 0` → victim.
     ///
@@ -112,6 +122,9 @@ impl Partition {
                 None => return Some(idx),
                 Some(frame) => {
                     if frame.pin_count > 0 {
+                        continue;
+                    }
+                    if frame.latch.is_exclusively_held() {
                         continue;
                     }
                     if frame.ref_bit {
@@ -130,9 +143,10 @@ impl Partition {
     /// Lock-order note (T6): any caller that reaches this method along a
     /// reconciliation path MUST have snapshotted
     /// `ReadViewRegistry::oldest_required_ts()` *before* acquiring the
-    /// partition mutex (see `BufferPool::reconcile`). Registry (position 5)
-    /// is below the partition mutex (positions 3/4) in the total order, so
-    /// re-acquiring it while holding the partition lock is forbidden.
+    /// partition mutex and before any page latch (see
+    /// `BufferPool::reconcile`). Registry (position 5) is below the
+    /// partition mutex / page-latch positions (3/3a/3b) in the total order,
+    /// so re-acquiring it while holding those locks is forbidden.
     fn evict_frame(&mut self, idx: usize, io: &dyn PageSource, size: PageSize) -> Result<()> {
         if let Some(frame) = &self.frames[idx] {
             let was_dirty = frame.dirty;
@@ -192,6 +206,7 @@ impl Partition {
             dirty: false,
             ref_bit: true,
             deltas: BTreeMap::new(),
+            latch: PageLatch::new(),
         });
         self.page_map.insert(page_number, idx);
 
@@ -258,6 +273,7 @@ impl Partition {
             dirty: false,
             ref_bit: true,
             deltas: BTreeMap::new(),
+            latch: PageLatch::new(),
         });
         self.page_map.insert(page_number, idx);
 
@@ -404,3 +420,7 @@ impl Partition {
         self.page_map.contains_key(&page_number)
     }
 }
+
+#[cfg(test)]
+#[path = "partition_us015_tests.rs"]
+mod us015_tests;

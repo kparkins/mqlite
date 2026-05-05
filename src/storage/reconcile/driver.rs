@@ -99,20 +99,25 @@ fn reconcile_leaf(
         Ok(synthesized) => synthesized,
         Err(_) => return Ok(LeafReconcileOutcome::NotInstallable),
     };
-    let pin = match engine
+    let mut planned_pages = [page_id];
+    planned_pages.sort_unstable();
+    let mut latched_pages = match engine
         .shared
         .handle
         .pool()
-        .pin_leaf_for_reconcile(ident, page_id)
+        .pin_leaf_set_for_reconcile(ident, &planned_pages)
     {
-        Ok(pin) => pin,
+        Ok(pages) => pages,
         Err(err) => return map_replace_error(err),
+    };
+    let Some(page) = latched_pages.first_mut() else {
+        return Ok(LeafReconcileOutcome::NotInstallable);
     };
 
     let history_spills = synthesized.history_spill.len();
     commit_history_spills(engine, &synthesized)?;
     match engine.shared.handle.pool().replace_leaf_and_chains(
-        pin,
+        page,
         synthesized.new_base,
         synthesized.retained_chains,
     ) {
@@ -173,11 +178,9 @@ fn clear_installed_dirty_pages(engine: &PagedEngine, ident: &TreeIdent, pages: &
     }
 }
 
-fn map_replace_error(err: ReplaceLeafError<'_>) -> Result<LeafReconcileOutcome> {
+fn map_replace_error(err: ReplaceLeafError) -> Result<LeafReconcileOutcome> {
     match err {
-        ReplaceLeafError::NotResident | ReplaceLeafError::FrameCoWRefused(_) => {
-            Ok(LeafReconcileOutcome::NotInstallable)
-        }
+        ReplaceLeafError::NotResident => Ok(LeafReconcileOutcome::NotInstallable),
         ReplaceLeafError::NotLeaf => Err(Error::Internal(
             "dirty-leaf reconcile target is not a leaf page".into(),
         )),

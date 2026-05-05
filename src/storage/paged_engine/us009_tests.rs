@@ -76,6 +76,7 @@ fn pending_insert(ns: &str, doc: &Document) -> Result<PrimaryWrite> {
         ns_id: NS_ID,
         ns: Ns::from(ns),
         key: encode_key(doc.get("_id").unwrap_or(&Bson::Null)),
+        expected_head: None,
         op: PrimaryOp::Insert {
             data: doc_bytes(doc)?,
         },

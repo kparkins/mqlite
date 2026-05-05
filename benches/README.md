@@ -96,6 +96,33 @@ cargo bench --bench read_epoch_root_neutral -- --baseline phase0
 
 ---
 
+### Phase 5 US-021 — same-collection multi-writer CRUD
+
+```
+cargo bench --bench phase5_multiwriter -- --save-baseline phase5
+```
+
+Workload: one pre-split collection, 1, 2, 4, 8, and 16 concurrent root-neutral
+update writers using disjoint `_id` key bands so the timed writes target
+separate leaf ranges without measuring structural split work. Each measured
+iteration updates one document per writer. Payload classes are exactly 256B,
+4KiB, and 32KiB. Each case runs under both
+`DurabilityMode::Interval(Duration::from_millis(100))` and
+`DurabilityMode::FullSync`. The benchmark prints Phase 0-style metadata for
+each case: writer count, namespace id, payload class and bytes, durability
+mode, rustc version, CPU model, core count, OS/arch, and git commit. The Phase
+0 baseline materialization and pass/fail comparison are separate Phase 5
+stories; this command saves the Phase 5 Criterion baseline under
+`target/criterion/`.
+
+Compare against phase0 after US-032 materializes the baseline:
+
+```
+cargo bench --bench phase5_multiwriter -- --baseline phase0
+```
+
+---
+
 ### US-013 — reopen latency
 
 ```

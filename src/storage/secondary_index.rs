@@ -539,6 +539,7 @@ fn update_index_on_insert_direct<S: BTreePageStore>(
 ///
 /// Propagates storage errors.  `Error::DuplicateKey` is returned if a unique
 /// index would be violated by existing data.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_index<S1, S2>(
     data_tree: &BTree<S1>,
     index_tree: &mut BTree<S2>,
@@ -562,6 +563,42 @@ where
 
         let doc: Document = bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
 
+        let doc_id = doc.get("_id").ok_or_else(|| {
+            Error::Internal("document missing '_id' field during index build".into())
+        })?;
+
+        let is_multikey = update_index_on_insert_direct(&doc, doc_id, index_tree, index_entry)?;
+        if is_multikey {
+            any_multikey = true;
+        }
+    }
+
+    Ok(any_multikey)
+}
+
+/// Build (or rebuild) a secondary index from MVCC-visible primary rows.
+///
+/// Ordinary CRUD now keeps logical row authority in resident delta chains, so
+/// DDL-style index builds must scan the primary tree through the same MVCC
+/// merge path used by readers. Base-only cells remain sufficient for legacy
+/// callers of [`build_index`], while this helper is used by the paged engine's
+/// online `create_index` path.
+pub(crate) fn build_index_mvcc<S1, S2>(
+    data_tree: &BTree<S1>,
+    index_tree: &mut BTree<S2>,
+    index_entry: &IndexEntry,
+    view: &ReadView,
+    history: Option<&dyn HistoryProbe>,
+) -> Result<bool>
+where
+    S1: BTreePageStore,
+    S2: BTreePageStore,
+{
+    let all_entries = data_tree.range_scan_mvcc(None, None, view, history)?;
+    let mut any_multikey = false;
+
+    for (_, doc_bytes) in all_entries {
+        let doc: Document = bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
         let doc_id = doc.get("_id").ok_or_else(|| {
             Error::Internal("document missing '_id' field during index build".into())
         })?;

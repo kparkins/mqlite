@@ -112,11 +112,12 @@ fn replace_leaf_and_chains_swaps_base_and_retained_chains() {
     let mut retained = BTreeMap::new();
     retained.insert(RETAINED_KEY.to_vec(), chain(b"retained"));
 
-    let guard = pool
+    let mut guard = pool
         .pin_leaf_for_reconcile(primary_ident(), PAGE_ID)
         .unwrap();
-    pool.replace_leaf_and_chains(guard, leaf_page(0xA5), retained)
+    pool.replace_leaf_and_chains(&mut guard, leaf_page(0xA5), retained)
         .unwrap();
+    drop(guard);
 
     let page = pool.pin(PAGE_ID, PageSize::Large32k).unwrap();
     assert_eq!(page.data()[PAYLOAD_OFFSET], 0xA5);
@@ -132,45 +133,40 @@ fn replace_leaf_and_chains_swaps_base_and_retained_chains() {
 }
 
 #[test]
-fn frame_cow_refused_returns_the_guard_and_keeps_frame_unchanged() {
+fn concurrent_plain_pin_keeps_snapshot_while_latched_replacement_commits() {
     let pool = pool_with_leaf(PAGE_ID);
     let reader_pin = pool.pin(PAGE_ID, PageSize::Large32k).unwrap();
-    let guard = pool
+    let mut guard = pool
         .pin_leaf_for_reconcile(primary_ident(), PAGE_ID)
         .unwrap();
 
-    let error = pool
-        .replace_leaf_and_chains(guard, leaf_page(0xF0), BTreeMap::new())
-        .unwrap_err();
-
-    let returned_guard = match error {
-        ReplaceLeafError::FrameCoWRefused(guard) => guard,
-        other => panic!("expected FrameCoWRefused, got {other:?}"),
-    };
-    assert_eq!(returned_guard.page_number(), PAGE_ID);
+    pool.replace_leaf_and_chains(&mut guard, leaf_page(0xF0), BTreeMap::new())
+        .unwrap();
+    assert_eq!(reader_pin.data()[PAYLOAD_OFFSET], 0x11);
     assert_eq!(pool.inner_32k.lock().unwrap().pin_count(PAGE_ID), Some(2));
 
-    drop(returned_guard);
+    drop(guard);
     assert_eq!(pool.inner_32k.lock().unwrap().pin_count(PAGE_ID), Some(1));
     drop(reader_pin);
     assert_eq!(pool.inner_32k.lock().unwrap().pin_count(PAGE_ID), Some(0));
 
     let page = pool.pin(PAGE_ID, PageSize::Large32k).unwrap();
-    assert_eq!(page.data()[PAYLOAD_OFFSET], 0x11);
+    assert_eq!(page.data()[PAYLOAD_OFFSET], 0xF0);
 }
 
 #[test]
 fn not_leaf_drops_guard_without_replacing_frame() {
     let pool = pool_with_leaf(PAGE_ID);
-    let guard = pool
+    let mut guard = pool
         .pin_leaf_for_reconcile(primary_ident(), PAGE_ID)
         .unwrap();
 
     let error = pool
-        .replace_leaf_and_chains(guard, non_leaf_page(), BTreeMap::new())
+        .replace_leaf_and_chains(&mut guard, non_leaf_page(), BTreeMap::new())
         .unwrap_err();
 
     assert!(matches!(error, ReplaceLeafError::NotLeaf));
+    drop(guard);
     assert_eq!(pool.inner_32k.lock().unwrap().pin_count(PAGE_ID), Some(0));
 
     let page = pool.pin(PAGE_ID, PageSize::Large32k).unwrap();
@@ -181,9 +177,10 @@ fn not_leaf_drops_guard_without_replacing_frame() {
 fn pin_leaf_for_reconcile_reports_non_resident_pages() {
     let pool = pool_with_leaf(PAGE_ID);
 
-    let error = pool
-        .pin_leaf_for_reconcile(primary_ident(), PAGE_ID + 1)
-        .unwrap_err();
+    let error = match pool.pin_leaf_for_reconcile(primary_ident(), PAGE_ID + 1) {
+        Ok(_) => panic!("expected NotResident"),
+        Err(error) => error,
+    };
 
     assert!(matches!(error, ReplaceLeafError::NotResident));
 }

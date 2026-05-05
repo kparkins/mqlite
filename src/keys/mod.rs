@@ -43,6 +43,8 @@
 
 use bson::{Binary, Bson, Decimal128, Document};
 
+use crate::error::{Error, Result};
+
 // ---------------------------------------------------------------------------
 // Type discriminant bytes (MongoDB canonical ordering)
 // ---------------------------------------------------------------------------
@@ -155,6 +157,142 @@ pub fn encode_compound_key(fields: &[(&Bson, bool)]) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// Return the unique-index prefix range for a staged compound secondary key.
+///
+/// `field_directions` describes the indexed fields only; the trailing `_id`
+/// field is always ascending and is deliberately excluded from the returned
+/// range. The returned start key includes the separator before `_id`, matching
+/// the historical unique-prefix scan shape.
+pub(crate) fn compound_prefix_range_excluding_trailing_id(
+    key: &[u8],
+    field_directions: &[bool],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut offset = 0usize;
+    for (idx, ascending) in field_directions.iter().enumerate() {
+        if idx > 0 {
+            require_byte(key, offset, COMPOUND_SEP, "compound field separator")?;
+            offset += 1;
+        }
+        offset = skip_encoded_value(key, offset, *ascending)?;
+    }
+    require_byte(key, offset, COMPOUND_SEP, "trailing _id separator")?;
+    let split = offset + 1;
+    let start = key[..split].to_vec();
+    let mut end = start.clone();
+    if let Some(last) = end.last_mut() {
+        *last = last.saturating_add(1);
+    }
+    Ok((start, end))
+}
+
+fn require_byte(bytes: &[u8], offset: usize, expected: u8, context: &str) -> Result<()> {
+    match bytes.get(offset).copied() {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(Error::Internal(format!(
+            "compound key: expected {context} 0x{expected:02x} at {offset}, got 0x{actual:02x}"
+        ))),
+        None => Err(Error::Internal(format!(
+            "compound key: missing {context} at {offset}"
+        ))),
+    }
+}
+
+fn raw_key_byte(bytes: &[u8], offset: usize, ascending: bool) -> Result<u8> {
+    let byte = bytes
+        .get(offset)
+        .copied()
+        .ok_or_else(|| Error::Internal(format!("compound key: truncated at {offset}")))?;
+    Ok(if ascending { byte } else { !byte })
+}
+
+fn skip_encoded_value(bytes: &[u8], offset: usize, ascending: bool) -> Result<usize> {
+    let ty = raw_key_byte(bytes, offset, ascending)?;
+    let offset = offset + 1;
+    match ty {
+        TYPE_MIN_KEY | TYPE_NULL | TYPE_MAX_KEY => Ok(offset),
+        TYPE_NUMBER => checked_skip(bytes, offset, 17, "number"),
+        TYPE_SYMBOL | TYPE_STRING => skip_encoded_string(bytes, offset, ascending),
+        TYPE_OBJECT => skip_encoded_document(bytes, offset, ascending),
+        TYPE_ARRAY => skip_encoded_array(bytes, offset, ascending),
+        TYPE_BIN_DATA => skip_encoded_binary(bytes, offset, ascending),
+        TYPE_OBJECT_ID => checked_skip(bytes, offset, 12, "object id"),
+        TYPE_BOOLEAN => checked_skip(bytes, offset, 1, "boolean"),
+        TYPE_DATE => checked_skip(bytes, offset, 8, "date"),
+        TYPE_TIMESTAMP => checked_skip(bytes, offset, 8, "timestamp"),
+        TYPE_REGEXP => {
+            let after_pattern = skip_encoded_string(bytes, offset, ascending)?;
+            skip_encoded_string(bytes, after_pattern, ascending)
+        }
+        other => Err(Error::Internal(format!(
+            "compound key: unknown encoded BSON type 0x{other:02x} at {}",
+            offset.saturating_sub(1)
+        ))),
+    }
+}
+
+fn checked_skip(bytes: &[u8], offset: usize, len: usize, context: &str) -> Result<usize> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::Internal(format!("compound key: {context} length overflow")))?;
+    if end <= bytes.len() {
+        Ok(end)
+    } else {
+        Err(Error::Internal(format!(
+            "compound key: truncated {context} payload at {offset}"
+        )))
+    }
+}
+
+fn skip_encoded_string(bytes: &[u8], mut offset: usize, ascending: bool) -> Result<usize> {
+    loop {
+        let raw = raw_key_byte(bytes, offset, ascending)?;
+        offset += 1;
+        if raw == 0 {
+            return Ok(offset);
+        }
+    }
+}
+
+fn skip_encoded_document(bytes: &[u8], mut offset: usize, ascending: bool) -> Result<usize> {
+    loop {
+        if raw_key_byte(bytes, offset, ascending)? == 0 {
+            return Ok(offset + 1);
+        }
+        offset = skip_encoded_string(bytes, offset, ascending)?;
+        offset = skip_encoded_value(bytes, offset, ascending)?;
+    }
+}
+
+fn skip_encoded_array(bytes: &[u8], mut offset: usize, ascending: bool) -> Result<usize> {
+    loop {
+        if raw_key_byte(bytes, offset, ascending)? == 0 {
+            return Ok(offset + 1);
+        }
+        offset = skip_encoded_value(bytes, offset, ascending)?;
+        if raw_key_byte(bytes, offset, ascending)? != 0 {
+            return Err(Error::Internal(format!(
+                "compound key: array element separator missing at {offset}"
+            )));
+        }
+        offset += 1;
+    }
+}
+
+fn skip_encoded_binary(bytes: &[u8], offset: usize, ascending: bool) -> Result<usize> {
+    let len_offset = checked_skip(bytes, offset, 1, "binary subtype")?;
+    let len_end = checked_skip(bytes, len_offset, 4, "binary length")?;
+    let mut len_bytes = [0u8; 4];
+    for (idx, slot) in len_bytes.iter_mut().enumerate() {
+        *slot = raw_key_byte(bytes, len_offset + idx, ascending)?;
+    }
+    checked_skip(
+        bytes,
+        len_end,
+        u32::from_be_bytes(len_bytes) as usize,
+        "binary bytes",
+    )
 }
 
 // ---------------------------------------------------------------------------

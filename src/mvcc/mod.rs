@@ -17,7 +17,6 @@ pub use metrics::{
     // Phase 1 §10.10 counters (US-012)
     catalog_header_sync_count_snapshot,
     chain_migration_entries_moved_snapshot,
-    commit_seq_wait_ns_snapshot,
     crud_commits_root_changing_snapshot,
     crud_commits_root_neutral_snapshot,
     deferred_free_queue_depth_snapshot,
@@ -30,6 +29,7 @@ pub use metrics::{
     hlc_advance_events_snapshot,
     journal_chain_commit_frames_snapshot,
     journal_commits_snapshot,
+    journal_mutex_wait_ns_snapshot,
     lane_wait_ns_snapshot,
     // Phase 2 §7 / US-024 — logical-frame counters / gauges
     logical_txn_append_bytes_snapshot,
@@ -57,7 +57,6 @@ pub use metrics::{
     reconcile_entries_dropped_snapshot,
     record_catalog_header_sync,
     record_chain_migration_entries_moved,
-    record_commit_seq_wait_ns,
     record_crud_commit_root_changing,
     record_crud_commit_root_neutral,
     record_delta_bearing_frame,
@@ -67,6 +66,7 @@ pub use metrics::{
     record_hlc_advance,
     record_journal_chain_commit_frame,
     record_journal_commit,
+    record_journal_mutex_wait_ns,
     record_lane_wait_ns,
     record_logical_txn_append_bytes,
     record_logical_txn_append_duration_ms,
@@ -93,7 +93,6 @@ pub use metrics::{
     reset_active_read_views,
     reset_catalog_header_sync_count,
     reset_chain_migration_entries_moved,
-    reset_commit_seq_wait_ns,
     reset_crud_commits_root_changing,
     reset_crud_commits_root_neutral,
     reset_deferred_free_queue_depth,
@@ -106,6 +105,7 @@ pub use metrics::{
     reset_hlc_advance_events,
     reset_journal_chain_commit_frames,
     reset_journal_commits,
+    reset_journal_mutex_wait_ns,
     reset_lane_wait_ns,
     reset_logical_txn_append_bytes,
     reset_logical_txn_append_durations,
@@ -146,10 +146,12 @@ pub use metrics::{
     version_chain_depth_p99_snapshot,
 };
 #[allow(unused_imports)]
-pub use read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
+pub use read_view::{ChainSnapshot, ReadView, ReadViewRegistry, TestFrontierHandle};
 #[allow(unused_imports)]
 pub use timestamp::{HlcState, TimestampOracle, Ts};
 #[allow(unused_imports)]
-pub(crate) use transaction::{PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite, WriteTxn};
+pub(crate) use transaction::{
+    ExpectedHead, PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite, WriteTxn,
+};
 #[allow(unused_imports)]
 pub use version::{OverflowRef, VersionData, VersionEntry, VersionState};

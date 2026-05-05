@@ -21,6 +21,21 @@ use crate::storage::test_support::{ArcIo, MockIo};
 const LIVE_READER_NS: &str = "test.us012.live_reader";
 const SPIN_LIMIT: usize = 10_000;
 
+fn paged_engine_source() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/paged_engine.rs");
+    std::fs::read_to_string(path).expect("read paged_engine.rs")
+}
+
+fn assert_ordered(source: &str, markers: &[&str]) {
+    let mut cursor = 0;
+    for marker in markers {
+        let offset = source[cursor..]
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing marker after byte {cursor}: {marker}"));
+        cursor += offset + marker.len();
+    }
+}
+
 fn buffered_engine() -> Result<PagedEngine> {
     let io = Arc::new(MockIo::default());
     let pool = Arc::new(BufferPool::new(
@@ -37,11 +52,11 @@ fn buffered_engine() -> Result<PagedEngine> {
 }
 
 fn collection_entry(engine: &PagedEngine, ns: &str) -> Result<CollectionEntry> {
-    let md = engine
+    let _md = engine
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    let entry = super::catalog_ops::catalog_lock(&md)
+    let entry = super::catalog_ops::catalog_lock(&engine.metadata_state)
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal("collection missing".into()))?;
     Ok(entry)
@@ -68,6 +83,84 @@ fn primary_chain_for_id(
     let entries: Vec<VersionEntry> = chain.iter().cloned().collect();
     engine.shared.handle.pool().put_chain(leaf, key, chain)?;
     Ok(entries)
+}
+
+#[test]
+fn test_run_write_existing_uses_authoritative_us012_sequence() {
+    let source = paged_engine_source();
+
+    assert_ordered(
+        &source,
+        &[
+            "let slot = match self.register_ordinary_crud_slot()",
+            "self.install_pending_sec_index_with_retry",
+            "self.install_pending_primary_with_retry",
+            "self.lock_journal_mutex()",
+            "self.shared.handle.begin_txn()",
+            "overlay.commit_structural_only",
+            "self.shared.handle.append_logical_txn",
+            "txn.commit_chain_commit",
+            "self.commit_legacy_header_frame()",
+            "self.flush_under_journal_mutex()",
+            "flip_pending_to_committed_for",
+            ".mark_ready(slot",
+        ],
+    );
+
+    assert!(
+        source.contains("publish_sequencer.register_with_oracle(&self.shared.oracle)"),
+        "US-012 ordinary CRUD registration must reserve a publish slot through the oracle"
+    );
+}
+
+#[test]
+fn test_run_write_existing_has_no_legacy_lane_calls_or_retired_sequence_field() {
+    let source = paged_engine_source();
+    let retired_field = concat!("commit", "_seq");
+
+    assert!(
+        !source.contains("lane_for"),
+        "US-012 removes lane_for from src/storage/paged_engine.rs"
+    );
+    assert!(
+        !source.contains("acquire_lane"),
+        "US-012 removes acquire_lane from src/storage/paged_engine.rs"
+    );
+    assert!(
+        !source.contains(&format!("{retired_field}: Mutex"))
+            && !source.contains(&format!("{retired_field}:")),
+        "US-012 keeps the deleted commit-sequence field/construction absent"
+    );
+}
+
+#[test]
+fn test_mark_ready_closure_is_publish_only() {
+    let source = paged_engine_source();
+    let mark_ready = source
+        .find(".mark_ready(slot")
+        .expect("mark_ready call exists");
+    let closure = &source[mark_ready..];
+    let closure_end = closure
+        .find("record_crud_commit_")
+        .expect("publish closure is followed by commit metrics");
+    let closure = &closure[..closure_end];
+
+    assert!(
+        !closure.contains("flip_pending_to_committed_for"),
+        "Pending-to-Committed flip must happen before mark_ready"
+    );
+    assert!(
+        !closure.contains("lock_journal_mutex") && !closure.contains("journal_mutex"),
+        "mark_ready closure must not enter the journal mutex"
+    );
+    assert!(
+        !closure.contains("metadata.read"),
+        "mark_ready closure must not acquire metadata.read()"
+    );
+    assert!(
+        !closure.contains("WriteConflict"),
+        "post-durable mark_ready closure must not return WriteConflict"
+    );
 }
 
 #[test]

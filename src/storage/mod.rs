@@ -25,3 +25,5 @@ pub(crate) mod secondary_index;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod txn_page_store;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod txn_page_store_us008_probe;

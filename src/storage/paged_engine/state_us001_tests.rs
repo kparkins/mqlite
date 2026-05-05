@@ -28,7 +28,7 @@ fn new_shared_state() -> Arc<super::SharedState> {
         FileHeader::new_now(),
     ));
 
-    let (_metadata, shared) = MetadataState::new(handle, 0, 0).expect("create metadata state");
+    let (_metadata, shared) = MetadataState::new(handle, 0, 0, 3).expect("create metadata state");
     shared
 }
 

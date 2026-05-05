@@ -63,7 +63,7 @@ fn update_publishes_exactly_once_per_commit() {
 }
 
 /// §10.8 #20: interleaved DDL and CRUD on distinct namespaces —
-/// every successive visible_ts must be >= previous (commit_seq + the
+/// every successive visible_ts must be >= previous (journal envelope + the
 /// strict-monotonic oracle.commit() path guarantee this).
 #[test]
 fn visible_ts_monotonic_under_interleaved_ddl_and_crud() {

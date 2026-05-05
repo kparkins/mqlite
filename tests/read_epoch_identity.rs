@@ -265,12 +265,18 @@ fn drop_namespace_publishes_new_catalog_after_barrier() {
 }
 
 #[test]
-fn ready_index_root_move_publishes_new_catalog() {
-    // Force a split of the Ready secondary index root by growing a
-    // large payload dataset alongside long indexed keys. The generation must
-    // advance at least once when the index root moves (§10.3 row:
-    // Ready secondary insert, root moved → mark_published +
-    // mark_header).
+fn ready_index_root_move_reuses_catalog_generation() {
+    // §10.8 #13 / Phase 5 §10.17.1 / US-006 — under the Phase 5
+    // §10.17.1 metadata-guard protocol the published `catalog_generation`
+    // is reserved for DDL identity advances only. CRUD root moves
+    // rebuild `Arc<PublishedCatalog>` (the data_root_page in a
+    // `NamespaceSnapshot` advances) but they MUST NOT advance
+    // `catalog_generation`, otherwise concurrent CRUD writers would
+    // false-positive the captured-identity gate even when no DDL ran.
+    //
+    // The "publishes a new catalog Arc" half of §10.8 #13 is owned by
+    // `tests/phase1_dirty_flags.rs` (rebuild counter); this test
+    // pins the §10.17.1 generation-stability half.
     let (client, _d) = new_client("d13");
     let col = client.database("db").collection::<Document>("c");
     col.insert_one(&doc! { "_id": 0i32, "s": "aaaa" }).unwrap();
@@ -290,17 +296,22 @@ fn ready_index_root_move_publishes_new_catalog() {
         .unwrap();
     }
     let post = client.__published_catalog_gen();
-    assert_ne!(
+    assert_eq!(
         pre, post,
-        "§10.8 #13: a Ready index root split must publish a new catalog generation \
-         (new root_page in PublishedIndex)"
+        "§10.17.1 / US-006: ordinary CRUD (Ready index root split) must NOT \
+         advance the published catalog_generation; only DDL paths reserve \
+         next_catalog_gen and stamp a new generation."
     );
 }
 
 #[test]
-fn data_root_move_publishes_new_catalog() {
-    // Inserts into a fresh namespace until the data tree root splits.
-    // Each insert is nominally root-neutral until the split point.
+fn data_root_move_reuses_catalog_generation() {
+    // §10.8 #14 / Phase 5 §10.17.1 / US-006 — same contract as #13
+    // but exercising the primary data-tree root rather than a
+    // secondary index. CRUD root moves rebuild the published Arc
+    // (data_root_page advances in `NamespaceSnapshot`) but the DDL
+    // identity counter held in `catalog_generation` is reserved
+    // exclusively for DDL `next_catalog_gen` reservations.
     let (client, _d) = new_client("d14");
     let col = client.database("db").collection::<Document>("c");
     col.insert_one(&doc! { "_id": 0i32 }).unwrap();
@@ -319,9 +330,10 @@ fn data_root_move_publishes_new_catalog() {
         .unwrap();
     }
     let post = client.__published_catalog_gen();
-    assert_ne!(
+    assert_eq!(
         pre, post,
-        "§10.8 #14: data-tree root split must publish a new catalog generation \
-         (new data_root_page in NamespaceSnapshot)"
+        "§10.17.1 / US-006: CRUD data-tree root split must NOT advance \
+         the published catalog_generation; only DDL bumps it via \
+         next_catalog_gen reservation."
     );
 }

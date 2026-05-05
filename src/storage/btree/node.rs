@@ -333,6 +333,131 @@ impl LeafNode {
         Ok(LeafCell { key, value })
     }
 
+    /// Return the value for `key` without allocating every cell in the leaf.
+    pub(super) fn cell_value(data: &[u8], key: &[u8]) -> Result<Option<CellValue>> {
+        let hdr = LeafPageHeader::from_bytes(data)?;
+        hdr.validate_type()?;
+
+        let n = hdr.entry_count as usize;
+        let cell_ptr_base = LEAF_HEADER_SIZE;
+        if cell_ptr_base + n * 2 > data.len() {
+            return Err(Error::Internal(
+                "leaf page: cell pointer array out of bounds".into(),
+            ));
+        }
+
+        let mut left = 0usize;
+        let mut right = n;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let mid_key = Self::cell_key_at(data, mid)?;
+            match mid_key.cmp(key) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    let offset = Self::cell_offset_at(data, mid)?;
+                    return Self::cell_value_at(data, offset).map(Some);
+                }
+                std::cmp::Ordering::Greater => right = mid,
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn cell_offset_at(data: &[u8], index: usize) -> Result<usize> {
+        let ptr_offset = LEAF_HEADER_SIZE + index * 2;
+        if ptr_offset + 2 > data.len() {
+            return Err(Error::Internal(
+                "leaf page: cell pointer out of bounds".into(),
+            ));
+        }
+        Ok(u16::from_le_bytes([data[ptr_offset], data[ptr_offset + 1]]) as usize)
+    }
+
+    fn cell_key_at(data: &[u8], index: usize) -> Result<&[u8]> {
+        let offset = Self::cell_offset_at(data, index)?;
+        if offset + 2 > data.len() {
+            return Err(Error::Internal(format!(
+                "leaf cell at offset {offset} is out of bounds (page len {})",
+                data.len()
+            )));
+        }
+        let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        let pos = offset + 2;
+        if pos + key_len > data.len() {
+            return Err(Error::Internal("leaf cell: key out of bounds".into()));
+        }
+        Ok(&data[pos..pos + key_len])
+    }
+
+    fn cell_value_at(data: &[u8], offset: usize) -> Result<CellValue> {
+        if offset + 2 > data.len() {
+            return Err(Error::Internal(format!(
+                "leaf cell at offset {offset} is out of bounds (page len {})",
+                data.len()
+            )));
+        }
+        let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        let pos = offset + 2;
+        if pos + key_len + 1 > data.len() {
+            return Err(Error::Internal(
+                "leaf cell: key or value_type out of bounds".into(),
+            ));
+        }
+        let value_type = data[pos + key_len];
+        let value_pos = pos + key_len + 1;
+        match value_type {
+            VALUE_TYPE_INLINE => {
+                if value_pos + 4 > data.len() {
+                    return Err(Error::Internal(
+                        "leaf cell: inline bson_len out of bounds".into(),
+                    ));
+                }
+                let bson_len = u32::from_le_bytes([
+                    data[value_pos],
+                    data[value_pos + 1],
+                    data[value_pos + 2],
+                    data[value_pos + 3],
+                ]) as usize;
+                let data_start = value_pos + 4;
+                if data_start + bson_len > data.len() {
+                    return Err(Error::Internal(
+                        "leaf cell: inline bson data out of bounds".into(),
+                    ));
+                }
+                Ok(CellValue::Inline(
+                    data[data_start..data_start + bson_len].to_vec(),
+                ))
+            }
+            VALUE_TYPE_OVERFLOW => {
+                if value_pos + 8 > data.len() {
+                    return Err(Error::Internal(
+                        "leaf cell: overflow pointer out of bounds".into(),
+                    ));
+                }
+                let first_page = u32::from_le_bytes([
+                    data[value_pos],
+                    data[value_pos + 1],
+                    data[value_pos + 2],
+                    data[value_pos + 3],
+                ]);
+                let total_length = u32::from_le_bytes([
+                    data[value_pos + 4],
+                    data[value_pos + 5],
+                    data[value_pos + 6],
+                    data[value_pos + 7],
+                ]);
+                Ok(CellValue::Overflow {
+                    first_page,
+                    total_length,
+                })
+            }
+            other => Err(Error::Internal(format!(
+                "unknown cell value type 0x{other:02X}"
+            ))),
+        }
+    }
+
     /// Serialize this leaf node into a 32 KB page buffer.
     ///
     /// Returns `Err` if the total cell data exceeds the page capacity.

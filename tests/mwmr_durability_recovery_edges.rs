@@ -9,8 +9,9 @@
 #![doc = "Integration test requiring the test-hooks feature."]
 #![cfg(feature = "test-hooks")]
 
-//! PR 10 edge-case tests — FullSync journal fsync-only + dropped_namespaces
-//! guard + page-0 re-read on recovery.
+//! PR 10 edge-case tests — FullSync journal fsync-only + drop barrier
+//! incarnation isolation (Phase 5 §10.1.1 retired the legacy
+//! `dropped_namespaces` guard) + page-0 re-read on recovery.
 //!
 //! All tests use `tempfile::tempdir()` so that each run starts with a clean
 //! file.  None of these tests modify `src/`.
@@ -237,9 +238,9 @@ fn tc4_create_after_drop_same_name_five_cycles() {
             Err(e) => panic!("unexpected error dropping 'x' on cycle {cycle}: {e:?}"),
         }
 
-        // Explicitly re-create the collection after the drop.
-        // `create_collection` clears the dropped_namespaces guard so that
-        // subsequent inserts are not blocked by the same-session protection.
+        // Explicitly re-create the collection after the drop. Phase 5 §10.1.1
+        // retired the legacy name-keyed `dropped_namespaces` guard; durable id
+        // monotonicity now isolates incarnations of the same name.
         db.create_collection("x")
             .expect("create_collection after drop");
 

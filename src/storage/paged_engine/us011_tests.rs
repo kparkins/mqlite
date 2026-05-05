@@ -65,7 +65,7 @@ fn create_ready_email_index(engine: &PagedEngine, ns: &str) -> Result<IndexEntry
 fn create_building_email_index(engine: &PagedEngine, ns: &str, unique: bool) -> Result<IndexEntry> {
     engine.create_namespace(ns)?;
     let outcome = engine.create_index_reserve(ns, &email_index_model(unique), EMAIL_INDEX)?;
-    if !matches!(outcome, super::index_maint::ReserveOutcome::Reserved) {
+    if !matches!(outcome, super::index_maint::ReserveOutcome::Reserved(_)) {
         return Err(Error::Internal(
             "expected new Building index reservation".into(),
         ));
@@ -76,11 +76,11 @@ fn create_building_email_index(engine: &PagedEngine, ns: &str, unique: bool) -> 
 }
 
 fn index_entry(engine: &PagedEngine, ns: &str) -> Result<IndexEntry> {
-    let md = engine
+    let _md = engine
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    let entry = super::catalog_ops::catalog_lock(&md)
+    let entry = super::catalog_ops::catalog_lock(&engine.metadata_state)
         .get_index(ns, EMAIL_INDEX)?
         .ok_or_else(|| Error::Internal("email index missing".into()))?;
     Ok(entry)
@@ -90,11 +90,11 @@ fn collection_entry(
     engine: &PagedEngine,
     ns: &str,
 ) -> Result<crate::storage::catalog::CollectionEntry> {
-    let md = engine
+    let _md = engine
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    let entry = super::catalog_ops::catalog_lock(&md)
+    let entry = super::catalog_ops::catalog_lock(&engine.metadata_state)
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal("collection missing".into()))?;
     Ok(entry)

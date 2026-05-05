@@ -117,11 +117,14 @@ impl PublishedCatalog {
 
 /// Atomically published read epoch. The outer object is what `ArcSwap`
 /// swaps; all fields must be observed through a single guard.
+///
+/// US-037 removed the duplicated `sequencer_frontier` snapshot from this
+/// type; readers now load the live frontier from `PublishSequencer`
+/// through `ReadView::sequencer_frontier()` (§10.19 C-1).
 pub(crate) struct PublishedEpoch {
     pub visible_ts: Ts,
     pub catalog: Arc<PublishedCatalog>,
     pub catalog_generation: u64,
-    pub sequencer_frontier: Ts,
 }
 
 #[cfg(test)]

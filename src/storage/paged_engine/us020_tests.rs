@@ -43,11 +43,11 @@ fn buffered_engine() -> Result<PagedEngine> {
 }
 
 fn collection_entry(engine: &PagedEngine, ns: &str) -> Result<CollectionEntry> {
-    let md = engine
+    let _md = engine
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    let entry = super::catalog_ops::catalog_lock(&md)
+    let entry = super::catalog_ops::catalog_lock(&engine.metadata_state)
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal("collection missing".into()))?;
     Ok(entry)
@@ -152,6 +152,7 @@ fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
     let foreign_view = Arc::new(ReadView::new_for_epoch(
         Arc::clone(&pre_publish_epoch),
         u64::MAX,
+        Arc::clone(&engine.shared.publish_sequencer),
     ));
     let observed = wait_for_pending_snapshot(&engine, leaf, &key, Arc::clone(&foreign_view));
     let pre_publish_find = engine.find(NS, &doc! { "_id": TARGET_ID }, &FindOptions::new());
@@ -163,10 +164,19 @@ fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
         ));
     }
 
-    gate.wait();
-    writer.join().expect("writer thread panicked");
-
-    let observed = observed?;
+    // The writer is paused at the publish_pause hook between
+    // commit_legacy_header_frame and rebuild_and_publish_locked. Sample
+    // the live `published_frontier` and run every "before publish"
+    // assertion BEFORE releasing the gate; once the writer publishes,
+    // §10.19 C-1 advances the live frontier and the foreign-Pending
+    // visibility predicate flips (US-037).
+    if observed.is_err() {
+        gate.wait();
+        writer.join().expect("writer thread panicked");
+        observed?;
+        unreachable!("observed was Err; we returned above via ?");
+    }
+    let observed = observed.expect("observed is Ok");
     assert_eq!(
         observed.snapshot.chain_len(&key),
         1,
@@ -180,13 +190,22 @@ fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
             return Err(Error::Internal("expected pending entry".into()));
         }
     };
+    let pre_publish_frontier = engine
+        .shared
+        .publish_sequencer
+        .published_frontier
+        .load(std::sync::atomic::Ordering::Acquire);
     assert!(
-        observed.pending_entry.start_ts > pre_publish_epoch.sequencer_frontier,
-        "pre-publish epoch must not have advanced the sequencer frontier"
+        observed.pending_entry.start_ts > pre_publish_frontier,
+        "pre-publish frontier must not have advanced past the Pending start_ts"
     );
     assert_eq!(foreign_view.visible_ts(), pre_publish_epoch.visible_ts);
 
-    let writer_view = ReadView::new_for_epoch(Arc::clone(&pre_publish_epoch), pending_txn_id);
+    let writer_view = ReadView::new_for_epoch(
+        Arc::clone(&pre_publish_epoch),
+        pending_txn_id,
+        Arc::clone(&engine.shared.publish_sequencer),
+    );
     let writer_visible = observed
         .snapshot
         .visible_at(&key, &writer_view)
@@ -204,10 +223,19 @@ fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
         "engine read path must reject the foreign Pending head before publish"
     );
 
-    let post_publish_epoch = engine.shared.load_published();
+    let pending_start_ts = observed.pending_entry.start_ts;
+
+    gate.wait();
+    writer.join().expect("writer thread panicked");
+
+    let post_publish_frontier = engine
+        .shared
+        .publish_sequencer
+        .published_frontier
+        .load(std::sync::atomic::Ordering::Acquire);
     assert!(
-        post_publish_epoch.sequencer_frontier >= observed.pending_entry.start_ts,
-        "S12 publish must advance the frontier past the Pending start_ts"
+        post_publish_frontier >= pending_start_ts,
+        "S12 publish must advance the live sequencer frontier past the Pending start_ts"
     );
     let (post_publish_docs, _) =
         engine.find(NS, &doc! { "_id": TARGET_ID }, &FindOptions::new())?;

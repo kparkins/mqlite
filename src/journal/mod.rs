@@ -18,10 +18,10 @@
 //! sidecar for the index. This matches the WiredTiger/MongoDB model: the
 //! journal is the only durable artifact, the index is a pure cache.
 //!
-//! Durability is provided by `flush()`-ing the journal file after every
-//! commit frame and every `ChainCommit` frame, so the next open's recovery
-//! scan can replay any committed batch and discard any trailing
-//! uncommitted frames.
+//! Durability is provided by appending commit records to the journal, with
+//! explicit sync ownership at higher-level durability boundaries. Recovery
+//! scans can replay any committed batch and discard any trailing uncommitted
+//! frames.
 //!
 //! On clean close, [`JournalManager::close_and_cleanup`] checkpoints all
 //! journal pages into the main file and deletes the journal, leaving only
@@ -38,6 +38,10 @@ pub(crate) mod log_file;
 mod recovery;
 #[allow(dead_code)]
 pub(crate) mod shm;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod us018_test_probe;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod us039_test_probe;
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -193,9 +197,8 @@ impl JournalManager {
     ///
     /// Emits one `ChainCommitFrame` carrying `commit_ts`, `refcount_deltas`,
     /// and zero or more `page_writes`. The frame is written at the current
-    /// `write_cursor`; the cursor advances past the encoded frame. An
-    /// `fsync`-equivalent `flush()` is called before the cursor advances so
-    /// the frame is durable before any later frames can overwrite its tail.
+    /// `write_cursor`; the cursor advances past the encoded frame. Durability
+    /// belongs to the caller's explicit sync boundary, not to this append path.
     ///
     /// The in-memory index is NOT updated — `ChainCommit` frames carry no
     /// single page number (every `page_writes` entry has its own). Recovery
@@ -219,7 +222,6 @@ impl JournalManager {
             .seek(SeekFrom::Start(frame_offset))
             .map_err(Error::Io)?;
         self.journal_file.write_all(&bytes).map_err(Error::Io)?;
-        self.journal_file.flush().map_err(Error::Io)?;
         self.write_cursor += bytes.len() as u64;
         Ok(frame_offset)
     }
@@ -239,14 +241,13 @@ impl JournalManager {
             .seek(SeekFrom::Start(frame_offset))
             .map_err(Error::Io)?;
         self.journal_file.write_all(&bytes).map_err(Error::Io)?;
-        self.journal_file.flush().map_err(Error::Io)?;
         self.write_cursor += bytes.len() as u64;
         crate::mvcc::metrics::record_logical_txn_append_bytes(bytes.len() as u64);
         // §7 / US-024 AC#3 — duration timing is sampled OUTSIDE the
-        // commit_seq critical section by `LogicalTxnAppendPercentileRefresh`
+        // journal critical section by `LogicalTxnAppendPercentileRefresh`
         // in `src/storage/paged_engine.rs::run_write_existing`. The
         // RAII guard captures `Instant::now()` BEFORE acquiring the
-        // commit_seq mutex and samples elapsed AFTER releasing it
+        // journal_mutex and samples elapsed AFTER releasing it
         // (LIFO drop order). No `Instant::now()` inside the journal
         // critical section.
         Ok(frame_offset)
@@ -337,7 +338,6 @@ impl JournalManager {
         frame_hdr
             .write(&mut self.journal_file, page_data)
             .map_err(Error::Io)?;
-        self.journal_file.flush().map_err(Error::Io)?;
 
         self.write_cursor += (JOURNAL_FRAME_HEADER_SIZE + page_size.bytes()) as u64;
 
@@ -571,7 +571,10 @@ impl JournalManager {
     /// journal frame data survives a process crash. Main-file contents are NOT
     /// touched — this is the FullSync hot path, not a checkpoint.
     pub(crate) fn sync_journal(&self) -> Result<()> {
-        self.journal_file.sync_data().map_err(Error::Io)
+        self.journal_file.sync_data().map_err(Error::Io)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self::us039_test_probe::record_journal_sync_os_boundary();
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

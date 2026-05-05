@@ -45,6 +45,37 @@ impl<S: BTreePageStore> BTree<S> {
         Ok(())
     }
 
+    /// Replace the value for an existing key without changing tree shape.
+    ///
+    /// Returns `Ok(false)` when the key is absent. This is used by checkpoint
+    /// materialization to fold a resident MVCC head over a stale base cell
+    /// without running the delete path first; deleting the stale cell can free
+    /// pages that the stale base image still references until replacement is
+    /// committed.
+    pub(crate) fn replace_existing(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
+        let cell_value = if value.len() > OVERFLOW_THRESHOLD {
+            let first_page = write_overflow_chain(&mut self.store, value)?;
+            CellValue::Overflow {
+                first_page,
+                total_length: value.len() as u32,
+            }
+        } else {
+            CellValue::Inline(value.to_vec())
+        };
+
+        let leaf_page = self.find_leaf(key)?;
+        let (buf, _) = self.store.read_leaf(leaf_page)?;
+        let mut node = LeafNode::parse(&buf[..])?;
+        let idx = match node.binary_search(key) {
+            Ok(idx) => idx,
+            Err(_) => return Ok(false),
+        };
+        node.cells[idx].value = cell_value;
+        let encoded = node.encode()?;
+        self.store.write_leaf_structural(leaf_page, &encoded)?;
+        Ok(true)
+    }
+
     /// Recursive insert into the subtree rooted at `page` (at `level`).
     ///
     /// Returns `Some(SplitResult)` if the node at `page` split.
@@ -108,7 +139,7 @@ impl<S: BTreePageStore> BTree<S> {
             };
             node.cells.insert(pos, new_cell);
             let encoded = node.encode()?;
-            self.store.write_leaf(page, &encoded)?;
+            self.store.write_leaf_structural(page, &encoded)?;
             Ok(None)
         } else {
             // Leaf is full: split.
@@ -171,14 +202,15 @@ impl<S: BTreePageStore> BTree<S> {
             let mut old_next = LeafNode::parse(&old_next_buf[..])?;
             old_next.prev_leaf_page = right_page;
             let enc = old_next.encode()?;
-            self.store.write_leaf(right_node.next_leaf_page, &enc)?;
+            self.store
+                .write_leaf_structural(right_node.next_leaf_page, &enc)?;
         }
 
         // Write both nodes.
         let left_enc = left_node.encode()?;
         let right_enc = right_node.encode()?;
-        self.store.write_leaf(left_page, &left_enc)?;
-        self.store.write_leaf(right_page, &right_enc)?;
+        self.store.write_leaf_structural(left_page, &left_enc)?;
+        self.store.write_leaf_structural(right_page, &right_enc)?;
 
         Ok(Some(SplitResult {
             promoted_key,

@@ -186,8 +186,14 @@ fn same_namespace_writers_serialize() {
     );
 }
 
-/// drop_namespace called concurrently with writes on that namespace
-/// must wait the writers out and complete cleanly. Reopen sees no rows.
+/// drop_namespace called concurrently with writes on that namespace must
+/// wait the writers out and complete cleanly. Phase 5 §10.1.1 retired the
+/// legacy `dropped_namespaces` resurrection guard, so the post-F5 contract
+/// is: after `drop_namespace` returns and reopen, durable id monotonicity
+/// guarantees pre-drop documents are gone. Any post-drop writer that races
+/// past the drop bootstraps a fresh incarnation of the same name with a
+/// strictly greater `CollectionEntry.id`, so leaked rows (if any) carry
+/// only post-drop data and never pre-drop seed data.
 #[test]
 fn drop_namespace_waits_for_writers() {
     let dir = tempfile::tempdir().unwrap();
@@ -230,12 +236,18 @@ fn drop_namespace_waits_for_writers() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().unwrap();
 
-    // Reopen: collection should not exist (or exist empty).
+    // Reopen: pre-drop seed documents must be gone — durable id monotonicity
+    // (Phase 1 §10.7, Phase 5 §10.1.1 F5 retirement) isolates incarnations.
     drop(client);
     let client2 = Client::open(&path).unwrap();
     let col2 = client2
         .database("victim_db")
         .collection::<Document>("victim_coll");
-    let count = col2.count_documents(doc! {}).unwrap_or(0);
-    assert_eq!(count, 0, "dropped collection must be empty after reopen");
+    let seed_count = col2
+        .count_documents(doc! { "v": "seed" })
+        .expect("count by seed marker");
+    assert_eq!(
+        seed_count, 0,
+        "pre-drop seed documents must not survive drop+reopen",
+    );
 }

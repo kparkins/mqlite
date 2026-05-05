@@ -176,8 +176,64 @@ pub use storage::header::{read_durable_header_counters, DurableHeaderCounters};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use storage::paged_engine::test_accessors::{
-    arm_phase3_commit_failpoint, Phase3CommitFailpoint, Phase3CommitFailpointGuard,
-    WriteBodyEntryEvent, WriteBodyEntryHookGuard,
+    arm_phase3_commit_failpoint, CreateIndexBuildHookGuard, Phase3CommitFailpoint,
+    Phase3CommitFailpointGuard, Us007JournalBeginHookGuard, Us007JournalObservations,
+    Us026CleanupObservations, Us026PostRegisterFailpoint, WriteBodyEntryEvent,
+    WriteBodyEntryHookGuard,
+};
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::buffer_pool::us019_test_probe::page_latch_upgrade_race_counts as __us019_page_latch_upgrade_race_counts;
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use journal::us018_test_probe::{
+    append_logical_replay_frames as __us018_append_logical_replay_frames, Us018LogicalReplayFrame,
+};
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use journal::us039_test_probe::Us039AppendSyncObservations;
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::paged_engine::us017_test_probe::{
+    Us017GroupCommitObservations, Us017GroupCommitPauseGuard,
+};
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::paged_engine::us010_test_probe::{
+    drain_events as __us010_drain_events,
+    force_revalidation_failures as __us010_force_revalidation_failures,
+    push_classification_override_names as __us010_push_classification_override_names,
+    reset as __us010_reset_probe, Us010ProbeEvent,
+};
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::btree::us025_test_probe::{
+    drain_events as __us025_drain_events, reset as __us025_reset_probe, Us025CrabbingEvent,
+};
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use storage::btree::us016_test_probe::{
+    drain_latch_samples as __us016_drain_latch_samples,
+    install_range_scan_iteration_pause as __us016_install_range_scan_iteration_pause,
+    reset as __us016_reset_probe, Us016RangeScanPauseGuard, Us016ReadLatchSample,
+};
+
+#[doc(hidden)]
+pub use storage::buffer_pool::us020_test_probe::{
+    us020_upgrade_loser_backoff_progress, us020_writer_preference_bounds_reader_starvation,
+    Us020UpgradeRaceProgress,
+};
+
+#[doc(hidden)]
+pub use storage::paged_engine::us020_test_probe::{
+    Us020PublishSequencer, Us020PublishSlot, Us020WriterRegistry, Us020WriterTicket,
 };
 
 // Collection action types (returned by Collection methods; users chain options onto them)

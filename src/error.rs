@@ -30,6 +30,52 @@ pub mod codes {
     pub const DOCUMENT_TOO_LARGE: i32 = 10334;
 }
 
+/// Why an [`Error::WriteConflict`] was raised.
+///
+/// Phase 5 §10.3.3 first-committer-wins detection points produce these
+/// reasons; §10.17.1, §10.24, and §10.25 each contribute additional
+/// variants (`CatalogGenerationChanged`, `StructuralContention`,
+/// `UniqueConflict`). The discriminants are part of the public contract
+/// and are matched directly by US-002 tests.
+#[derive(Debug, Clone)]
+pub enum WriteConflictReason {
+    /// The writer's `ReadView` predates a concurrent committed head on the
+    /// same key. Detected at the read-then-modify precheck (§10.3.1 A) or
+    /// at delta-install commit when the expected concrete head no longer
+    /// matches (§10.3.1 C).
+    StaleSnapshot,
+    /// Two readers on the same page-local latch requested upgrade; one
+    /// loses. Retry is immediate and does not require a new `ReadView`
+    /// (§10.3.1 B).
+    UpgradeRace,
+    /// Two writers installed deltas on the same primary key; the
+    /// first-committer wins. Caller should open a fresh `ReadView` before
+    /// retrying (§10.3.1 C, §10.20).
+    SameKeyConflict {
+        /// Up to the first 32 bytes of the conflicting key, for
+        /// diagnostics. Not load-bearing.
+        key_preview: Vec<u8>,
+    },
+    /// The captured catalog generation no longer matches the published
+    /// epoch when the writer revalidated before its install / journal
+    /// envelope. Pre-durable; rolls back only in-memory staging
+    /// (§10.17.1).
+    CatalogGenerationChanged,
+    /// Multi-leaf install could not acquire all required exclusive page
+    /// latches in ascending `page_id` order. Partial acquisition is
+    /// released and the caller may retry (§10.24).
+    StructuralContention,
+    /// A unique-index install observed another live (non-Aborted,
+    /// `stop_ts == Ts::MAX`) entry whose compound-key prefix excluding
+    /// the trailing `_id` equals this writer's prefix; the
+    /// first-committer wins (§10.25).
+    UniqueConflict {
+        /// Up to the first 32 bytes of the conflicting unique-key prefix,
+        /// for diagnostics. Not load-bearing.
+        key_prefix_preview: Vec<u8>,
+    },
+}
+
 /// The primary error type for mqlite operations.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -57,6 +103,24 @@ pub enum Error {
          - Configure a busy timeout: OpenOptions::new().busy_timeout(Duration::from_secs(5))"
     )]
     WriterBusy,
+
+    /// A concurrent writer committed a conflicting change. Caller decides
+    /// whether to retry. Distinct from `WriterBusy`, which signals namespace
+    /// or lane contention with no logical conflict.
+    ///
+    /// Reasons are enumerated in [`WriteConflictReason`]; the §10.3.3 text
+    /// is part of the contract and is matched by the US-002 discriminant
+    /// test.
+    #[error(
+        "WriteConflict — another writer committed a conflicting change.\n\
+         Reason: {reason:?}\n\
+         This is a first-committer-wins engine; the caller may re-run the \
+         transaction against a fresh ReadView."
+    )]
+    WriteConflict {
+        /// Why the conflict occurred. See [`WriteConflictReason`].
+        reason: WriteConflictReason,
+    },
 
     /// An MQL operator is not supported by mqlite.
     #[error(
@@ -320,11 +384,49 @@ pub enum Error {
     RecoveryPoolExhausted,
 
     /// The engine reached a post-durable state that requires reopening.
+    ///
+    /// Phase 5 §10.19.0 C-2 / US-036 — once the `journal_mutex` durability
+    /// envelope or FullSync cohort fsync completes, an in-memory failure
+    /// during Pending→Committed flip or `mark_ready` cannot be represented
+    /// as `Aborted` because durable bytes already exist on disk. The
+    /// engine is poisoned, refuses new operations, and must be reopened.
     #[error(
-        "engine fatal: post-durable in-memory state could not be repaired; \
-         the engine is poisoned, refuses new operations, and must be reopened"
+        "engine fatal: post-durable in-memory state could not be repaired \
+         ({reason:?}); the engine is poisoned, refuses new operations, \
+         and must be reopened"
     )]
-    EngineFatal,
+    EngineFatal {
+        /// Why the post-durable failure was unrecoverable. See
+        /// [`EngineFatalReason`].
+        reason: EngineFatalReason,
+    },
+}
+
+/// Why an [`Error::EngineFatal`] was raised.
+///
+/// Phase 5 §10.19.0 C-2 / US-036 — distinguishes the post-durable
+/// in-memory failure that escalated to engine poison. The discriminants
+/// are part of the public contract and are matched directly by US-036
+/// tests. New variants are not added by later Phase 5 stories; the three
+/// listed here cover every post-durable failure site (CRUD publish,
+/// Pending→Committed flip, DDL publish).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineFatalReason {
+    /// A post-durable failure during the ordinary CRUD `mark_ready`
+    /// publish closure or its surrounding post-durable scope. The
+    /// `journal_mutex` envelope has already completed when this is
+    /// raised (§10.19.0 C-2, §10.21).
+    PostDurablePublishFailure,
+    /// A post-durable failure flipping `VersionState::Pending` →
+    /// `Committed` via `flip_pending_to_committed_for`. The durable
+    /// journal commit has completed; in-memory state cannot be
+    /// reconciled (§10.20.1, §10.21).
+    PostDurablePendingFlipFailure,
+    /// A post-durable failure during a DDL publish closure (create or
+    /// drop index, drop namespace, create-index cleanup). The durable
+    /// DDL envelope has already completed when this is raised
+    /// (§10.8.1, §10.8.2, §10.8.3).
+    PostDurableDdlPublishFailure,
 }
 
 impl Error {

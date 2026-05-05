@@ -104,7 +104,7 @@ fn typed_constructor_holds_pin_until_guard_drop() {
         .pin_leaf_for_reconcile(primary_ident(), PAGE_ID)
         .unwrap();
 
-    assert_eq!(guard.page_number(), PAGE_ID);
+    assert_eq!(guard.page_id(), PAGE_ID);
     assert_eq!(pool.inner_32k.lock().unwrap().pin_count(PAGE_ID), Some(1));
 
     drop(guard);
@@ -118,12 +118,13 @@ fn replace_leaf_accepts_typed_guard_and_releases_pin_on_success() {
     let mut retained = BTreeMap::new();
     retained.insert(RETAINED_KEY.to_vec(), chain(b"retained"));
 
-    let guard = pool
+    let mut guard = pool
         .pin_leaf_for_reconcile(primary_ident(), PAGE_ID)
         .unwrap();
 
-    pool.replace_leaf_and_chains(guard, leaf_page(0xA5), retained)
+    pool.replace_leaf_and_chains(&mut guard, leaf_page(0xA5), retained)
         .unwrap();
+    drop(guard);
 
     assert_eq!(pool.inner_32k.lock().unwrap().pin_count(PAGE_ID), Some(0));
 
@@ -135,9 +136,10 @@ fn replace_leaf_accepts_typed_guard_and_releases_pin_on_success() {
 fn not_resident_is_reported_before_a_guard_exists() {
     let pool = pool_with_leaf(PAGE_ID);
 
-    let error = pool
-        .pin_leaf_for_reconcile(primary_ident(), PAGE_ID + 1)
-        .unwrap_err();
+    let error = match pool.pin_leaf_for_reconcile(primary_ident(), PAGE_ID + 1) {
+        Ok(_) => panic!("expected NotResident"),
+        Err(error) => error,
+    };
 
     assert!(matches!(error, ReplaceLeafError::NotResident));
     assert_eq!(pool.inner_32k.lock().unwrap().pin_count(PAGE_ID), Some(0));

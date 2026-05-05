@@ -54,12 +54,11 @@ fn buffered_engine() -> PagedEngine {
 }
 
 fn collection(engine: &PagedEngine) -> CollectionEntry {
-    let md = engine.metadata.read().expect("metadata read");
-    let entry = catalog_ops::catalog_lock(&md)
+    let _md = engine.metadata.read().expect("metadata read");
+    catalog_ops::catalog_lock(&engine.metadata_state)
         .get_collection(NS)
         .expect("read catalog")
-        .expect("collection exists");
-    entry
+        .expect("collection exists")
 }
 
 fn primary_chain_for_key(
@@ -192,14 +191,16 @@ fn test_replay_applier_is_idempotent_on_double_apply() {
     let parsed = parsed_frame(vec![primary_insert(coll.id, 1, OP_ORDINAL)]);
 
     {
-        let md = engine.metadata.read().expect("metadata read");
-        apply_parsed_logical_frames(&engine.shared, &md, &parsed).expect("first apply");
+        let _md = engine.metadata.read().expect("metadata read");
+        apply_parsed_logical_frames(&engine.shared, &engine.metadata_state, &parsed)
+            .expect("first apply");
     }
     let after_first = primary_chain_for_key(&engine, &coll, &key);
 
     {
-        let md = engine.metadata.read().expect("metadata read");
-        apply_parsed_logical_frames(&engine.shared, &md, &parsed).expect("second apply");
+        let _md = engine.metadata.read().expect("metadata read");
+        apply_parsed_logical_frames(&engine.shared, &engine.metadata_state, &parsed)
+            .expect("second apply");
     }
     let after_second = primary_chain_for_key(&engine, &coll, &key);
 
@@ -236,6 +237,7 @@ fn test_replay_applier_failure_leaves_no_reader_visible_partial_state() {
         Arc::clone(engine.shared.handle.read_view_registry()),
         visible_before_replay,
         99,
+        Arc::clone(&engine.shared.publish_sequencer),
     );
     let good_key = encode_key(&Bson::Int32(1));
     let bad_key = encode_key(&Bson::Int32(2));
@@ -252,8 +254,8 @@ fn test_replay_applier_failure_leaves_no_reader_visible_partial_state() {
     let parsed = parsed_frame(vec![primary_insert(coll.id, 1, 0), bad_op]);
 
     let err = {
-        let md = engine.metadata.read().expect("metadata read");
-        apply_parsed_logical_frames(&engine.shared, &md, &parsed)
+        let _md = engine.metadata.read().expect("metadata read");
+        apply_parsed_logical_frames(&engine.shared, &engine.metadata_state, &parsed)
             .expect_err("overflow replay should fail")
     };
     assert!(

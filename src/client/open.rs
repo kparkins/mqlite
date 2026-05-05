@@ -251,6 +251,8 @@ impl Client {
             catalog_root_level,
             opts.busy_timeout,
             opts.busy_handler.clone(),
+            opts.smo_classification_retry_cap,
+            opts.durability.clone(),
         )?);
         let inner = Arc::new(ClientInner::new(
             Some(path.clone()),

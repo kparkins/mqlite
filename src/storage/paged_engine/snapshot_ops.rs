@@ -25,7 +25,8 @@ use super::btree_ops::btree_collscan;
 use super::catalog_ops::rebuild_and_publish_locked;
 use super::doc_helpers::{apply_projection_to_doc, sort_docs};
 use super::index_maint::{
-    index_bounds_free, index_entry_id_free, materialize_ready_secondary_deltas_for_checkpoint,
+    index_bounds_free, index_entry_id_free, materialize_primary_deltas_for_checkpoint,
+    materialize_ready_secondary_deltas_for_checkpoint,
 };
 use super::publish::PublishDirty;
 use super::state::SharedState;
@@ -37,11 +38,23 @@ pub(super) fn open_snapshot_read_view(
     shared: &SharedState,
     epoch: Arc<PublishedEpoch>,
 ) -> Arc<ReadView> {
+    // §10.19 C-1 / US-037: retry the (epoch, frontier) publish pair
+    // before constructing the view. The caller already loaded `epoch`,
+    // so we only spin on the frontier side until it catches up.
+    while shared
+        .publish_sequencer
+        .published_frontier
+        .load(Ordering::Acquire)
+        < epoch.visible_ts
+    {
+        std::hint::spin_loop();
+    }
     let txn_id = shared.txn_counter.fetch_add(1, Ordering::Relaxed);
     ReadView::open_for_epoch(
         Arc::clone(shared.handle.read_view_registry()),
         epoch,
         txn_id,
+        Arc::clone(&shared.publish_sequencer),
     )
 }
 
@@ -348,10 +361,11 @@ fn execute_plan_from_snap(
 // ---------------------------------------------------------------------------
 
 pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()> {
-    let md = engine
+    let _md_w = engine
         .metadata
         .write()
         .map_err(|_| crate::error::Error::Internal("metadata RwLock poisoned".into()))?;
+    let md = &engine.metadata_state;
     let checkpoint_ts = engine.shared.published.load_full().visible_ts;
     let ort = engine
         .shared
@@ -360,8 +374,11 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         .oldest_required_ts();
 
     let mut overlay = crate::storage::txn_page_store::TxnOverlay::new();
-    let published_catalog_dirty =
-        materialize_ready_secondary_deltas_for_checkpoint(&engine.shared, &md, &mut overlay)?;
+    let primary_catalog_dirty =
+        materialize_primary_deltas_for_checkpoint(&engine.shared, md, &mut overlay)?;
+    let secondary_catalog_dirty =
+        materialize_ready_secondary_deltas_for_checkpoint(&engine.shared, md, &mut overlay)?;
+    let published_catalog_dirty = primary_catalog_dirty || secondary_catalog_dirty;
     let mut base_store = super::catalog_ops::new_store(&engine.shared);
     overlay.commit(&mut base_store, &engine.shared.handle)?;
     if published_catalog_dirty {
@@ -369,11 +386,21 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         dirty.mark_published();
         dirty.mark_header();
         let publish_ts = engine.shared.oracle.commit()?;
-        rebuild_and_publish_locked(&engine.shared, &md, publish_ts, dirty)?;
+        // Phase 5 §10.17.1 / US-006: checkpoint materializes Ready
+        // secondary deltas under `metadata.write()` and is a DDL-style
+        // publish. Reserve the next catalog generation BEFORE publish so
+        // readers observe the same ordered identity advance contract as
+        // create/drop_index.
+        let reserved_gen = engine
+            .shared
+            .next_catalog_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        rebuild_and_publish_locked(&engine.shared, md, publish_ts, dirty, Some(reserved_gen))?;
     }
 
     let (root_page, root_level) = {
-        let cat = super::catalog_ops::catalog_lock(&md);
+        let cat = super::catalog_ops::catalog_lock(md);
         (cat.root_page(), cat.root_level())
     };
     engine.shared.handle.allocator().update_header(|h| {
@@ -389,7 +416,7 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         .map(|entry| entry.key().clone())
         .collect::<Vec<_>>();
     for ident in dirty_idents {
-        let _ = reconcile_tree_dirty_set(engine, &md, ident, checkpoint_ts, ort)?;
+        reconcile_tree_dirty_set(engine, md, ident, checkpoint_ts, ort)?;
     }
 
     {
@@ -425,7 +452,10 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
             .page_lifetime_queue()
             .depth() as u64,
     );
-    engine.shared.handle.flush()?;
+    {
+        let _journal = engine.lock_journal_mutex();
+        engine.flush_under_journal_mutex()?;
+    }
     let checkpointed_journal = engine.shared.handle.emergency_checkpoint()?;
     if !checkpointed_journal {
         engine.shared.handle.advance_page_lifetime_checkpoint()?;
@@ -437,8 +467,15 @@ pub(super) fn close(engine: &super::PagedEngine) -> crate::error::Result<()> {
     checkpoint(engine)
 }
 
+#[allow(
+    dead_code,
+    reason = "FullSync CRUD now syncs through group commit before publish; \
+              this helper backs the explicit StorageEngine journal_sync surface"
+)]
 pub(super) fn journal_sync(engine: &super::PagedEngine) -> crate::error::Result<()> {
-    engine.shared.handle.journal_sync()
+    let _journal = engine.lock_journal_mutex();
+    engine.flush_under_journal_mutex()?;
+    engine.sync_journal_under_journal_mutex()
 }
 
 pub(super) fn snapshot_bytes(

@@ -3,9 +3,10 @@
 //! * `drop_collection_barrier` — open N ReadViews, issue `drop_collection`,
 //!   verify every registered view is force-expired, new reads return empty,
 //!   no deadlock.
-//! * `drop_same_session_resurrection_guard` — drop_namespace blocks implicit
-//!   same-session re-bootstrap (Contract 3.6); explicit create_namespace clears
-//!   the guard and subsequent inserts succeed.
+//! * `drop_same_session_resurrection_guard` — pins post-F5 Contract 3.6
+//!   (`docs/STORAGE-CONTRACTS-FROZEN.md`): durable id monotonicity isolates
+//!   incarnations. `drop_namespace` + `create_namespace` yields a fresh
+//!   `CollectionEntry.id` and pre-drop documents are not visible.
 //! * `reader_stable_across_other_ns_commits` — ReadView `read_ts` pin keeps
 //!   a reader's snapshot stable while an unrelated namespace commits.
 //! * `overflow_pages_stable_under_mixed_load` — 4W/4R/ReadView-churn for a
@@ -121,24 +122,25 @@ fn drop_collection_barrier() {
 }
 
 // ---------------------------------------------------------------------------
-// Contract 3.6 — same-session resurrection guard (direct assertion)
+// Contract 3.6 — drop barrier (F5 retired the same-session resurrection guard)
 // ---------------------------------------------------------------------------
 
-/// Directly asserts the `dropped_namespaces` resurrection-guard from Contract 3.6.
+/// Phase 5 §10.1.1 retired the legacy name-keyed `dropped_namespaces`
+/// resurrection guard. Durable monotonic ns ids (Phase 1 §10.7) are now
+/// the structural barrier: `create_namespace` after `drop_namespace`
+/// always allocates a fresh `CollectionEntry.id`, so a recreated
+/// namespace cannot observe data from a prior incarnation.
 ///
-/// Sequence:
-/// 1. create_namespace "ns" implicitly (via first insert).
-/// 2. Prove insert works.
+/// This test pins the post-F5 contract (STORAGE-CONTRACTS-FROZEN.md §3.6,
+/// post-F5 invariant):
+/// 1. create_namespace "ns" implicitly via first insert.
+/// 2. Prove insert works and one document is visible.
 /// 3. drop_namespace "ns" via `db.drop_collection`.
-/// 4. Attempt an implicit use (insert without explicit create_namespace).
-/// 5. Assert the attempt fails with `Error::CollectionNotFound` — the variant
-///    returned by `bootstrap_namespace` at src/storage/paged_engine.rs:191-193
-///    when `dropped_namespaces` contains the name.
-/// 6. Call create_namespace explicitly (via `db.create_collection`).
-/// 7. Insert into the recreated namespace — assert it succeeds.
+/// 4. Re-create "ns" explicitly and insert a fresh document.
+/// 5. The recreated namespace contains exactly the new document — no
+///    pre-drop data resurrected.
 ///
 /// Contract ref: docs/STORAGE-CONTRACTS-FROZEN.md §3.6.
-/// Guard source:  src/storage/paged_engine.rs:183-194, :566-628.
 #[test]
 fn drop_same_session_resurrection_guard() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -161,27 +163,27 @@ fn drop_same_session_resurrection_guard() {
     db.drop_collection("ns")
         .expect("drop_collection must succeed");
 
-    // Step 4-5: implicit re-use must be blocked by the resurrection guard.
-    // The guard returns Error::CollectionNotFound (not a string-matched error).
-    let err = col
-        .insert_one(&doc! { "_id": 2, "v": "post-drop-implicit" })
-        .expect_err("insert after drop without explicit create must fail");
-    assert!(
-        matches!(err, mqlite::Error::CollectionNotFound { .. }),
-        "resurrection guard must return Error::CollectionNotFound, got: {err:?}",
-    );
-
-    // Step 6: explicit create_namespace clears the guard.
+    // Step 4: explicitly re-create the namespace; this allocates a fresh
+    // durable `CollectionEntry.id` per Phase 1 §10.7.
     db.create_collection("ns")
-        .expect("explicit create_collection must succeed");
+        .expect("explicit create_collection after drop must succeed");
 
-    // Step 7: insert into the recreated namespace must succeed.
-    col.insert_one(&doc! { "_id": 3, "v": "after-explicit-create" })
+    // Step 5: insert into the recreated namespace and confirm none of the
+    // pre-drop data is visible — durable id monotonicity isolates the
+    // incarnations.
+    col.insert_one(&doc! { "_id": 2, "v": "after-recreate" })
         .expect("insert after explicit create must succeed");
     assert_eq!(
         col.count_documents(doc! {}).expect("count after recreate"),
         1,
-        "recreated collection must contain exactly 1 document",
+        "recreated collection must contain exactly the post-recreate document",
+    );
+    let pre_drop = col
+        .count_documents(doc! { "v": "before-drop" })
+        .expect("count by pre-drop value");
+    assert_eq!(
+        pre_drop, 0,
+        "pre-drop documents must not be visible in the recreated namespace",
     );
 }
 

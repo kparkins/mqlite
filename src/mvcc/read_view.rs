@@ -14,36 +14,45 @@
 //! harnesses can permute them.
 //
 // LOCK-ORDER:
-// The full database-wide total order; any path that acquires two or more of
-// these mutexes MUST acquire them in this order, and release in reverse:
+// Database-wide total order (Phase 5 revision). Any path acquiring two or
+// more of these MUST acquire in this order and release in reverse:
 //
 // 1.   history-store partition mutex (outermost)
 // 1.5. PageLifetimeQueue::pending mutex
 //      — brief; acquired by OverflowRef::Drop on 0-refcount transition to push
 //      a u32 first_page, by drain_free_queue on writer path to drain.
-//      OverflowRef::Drop acquires 1.5 and releases immediately (no downstream
-//      acquisitions). drain_free_queue acquires 1.5 first, then
-//      AllocatorHandle::state (1.5 → 2).
-// 2.   AllocatorHandle::state mutex (Arc<Mutex<AllocatorState>>)
-//      — for any alloc_*/free_*/free_overflow_chain / refcount-header-write op
-//      that must update FileHeader free lists. Atomic page-header refcount ops
-//      (incref_overflow, decref_overflow) happen WITHOUT this mutex and are
-//      lock-free.
+// 2.   AllocatorHandle::state mutex
 // 3.   32 KB main partition mutex (BufferPool::inner_32k)
-// 4.   4 KB main partition mutex  (BufferPool::inner_4k)
+//      Used only to find/pin/unpin a frame. It is released before acquiring
+//      PageLatch, so partition mutex and PageLatch are never nested.
+// 3a.  PageLatch on a resident leaf frame
+//      — Shared or Exclusive mode. Acquired AFTER pin_page has released
+//      the partition mutex. A thread holding multiple page latches must
+//      acquire them in ascending page-id order.
+// 3b.  4 KB main partition mutex (BufferPool::inner_4k)
+// 4.   [unused — historical 4 KB slot kept for table stability]
 // 5.   ReadViewRegistry mutex (Arc<Mutex<BTreeMap<u64, u64>>>)
-// 6.   writer serialization mutex
+// 6.   PublishSequencer mutex
+//      — held for register_with_oracle slot allocation, mark_ready /
+//      mark_aborted transitions, and dense window advancement. Publish
+//      closures must not acquire metadata, PageLatch, or journal_mutex.
+// 7.   NsWriterRegistry admission mutex (per-ns)
+//      — held only during admit/release; brief. Takes after metadata.read()
+//      on CRUD, after metadata.write() on DDL. Waits on cvar while
+//      close_and_drain is active.
+// 8.   catalog Mutex (inside MetadataState)
+//      — innermost. No further locks acquired under it.
 //
-// Readers DO NOT acquire `AllocatorHandle::state` for pure reads (refcount
-// atomics live on the page header and are lock-free). The reader-path
-// `OverflowRef::Drop` DOES acquire `PageLifetimeQueue::pending` briefly
-// (push a u32) when decref brings count to 0 — this is the ONLY lock any
-// reader path acquires; it is strictly above the allocator mutex in the
-// order and closed before any other acquisition. Free-side
-// `drain_free_queue` acquires `PageLifetimeQueue::pending` first, then
-// `AllocatorHandle::state`, and is called only from writer-serialized
-// context (writer mutex held). `ReadViewRegistry::oldest_required_ts()`
-// MUST be snapshotted **before** any partition mutex is acquired in a
+// `metadata` RwLock is NOT in this numbered table because it is an
+// orthogonal DDL-vs-CRUD fence: CRUD `read()` is held only for id capture
+// plus the brief NsWriterRegistry admit; DDL `write()` is held for the DDL
+// body and drain. The RwLock itself has no interaction with the numbered
+// positions after CRUD drops it before the body.
+//
+// Readers still DO NOT acquire `AllocatorHandle::state` for pure reads.
+// The reader-path OverflowRef::Drop still acquires PageLifetimeQueue::pending
+// briefly when decref brings count to 0. ReadViewRegistry::oldest_required_ts()
+// MUST be snapshotted BEFORE any partition mutex or page latch in any
 // reconciliation path.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -62,6 +71,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::mvcc::timestamp::Ts;
 use crate::mvcc::version::{VersionEntry, VersionState};
+use crate::storage::paged_engine::publish_sequencer::PublishSequencer;
 use crate::storage::root_snapshot::{PublishedCatalog, PublishedEpoch};
 
 /// A snapshot handle for an active reader.
@@ -99,6 +109,11 @@ pub struct ReadView {
     registry: Option<Arc<ReadViewRegistry>>,
     /// Published visibility tuple pinned for this view's lifetime.
     epoch: Arc<PublishedEpoch>,
+    /// Live sequencer frontier provider captured from `SharedState` when
+    /// the view is opened (§10.19 C-1, US-037). The view loads the live
+    /// `published_frontier` for foreign-Pending visibility checks instead
+    /// of caching a stale snapshot inside `PublishedEpoch`.
+    publish_sequencer: Arc<PublishSequencer>,
 }
 
 impl std::fmt::Debug for ReadView {
@@ -112,7 +127,7 @@ impl std::fmt::Debug for ReadView {
                 &self.pin_ops_in_flight.load(Ordering::Acquire),
             )
             .field("catalog_generation", &self.epoch.catalog_generation)
-            .field("sequencer_frontier", &self.epoch.sequencer_frontier)
+            .field("sequencer_frontier", &self.sequencer_frontier())
             .finish()
     }
 }
@@ -121,18 +136,49 @@ impl ReadView {
     /// Construct a fresh, live `ReadView` not tracked by any registry.
     /// Prefer `ReadViewRegistry::open` on reader paths — this constructor
     /// exists for tests and internal snapshot fixtures.
+    ///
+    /// Standalone callers receive a fresh sequencer pinned at
+    /// `Ts::default()` so foreign-Pending visibility checks default to
+    /// "frontier has not advanced". Tests that need an explicit frontier
+    /// value should use `new_with_frontier`.
     #[must_use]
     pub fn new(read_ts: Ts, txn_id: u64) -> Self {
-        Self::new_for_epoch(standalone_epoch(read_ts), txn_id)
+        Self::new_for_epoch(
+            standalone_epoch(read_ts),
+            txn_id,
+            PublishSequencer::new_from(Ts::default()),
+        )
+    }
+
+    /// Test-only standalone constructor with an explicit sequencer
+    /// frontier. Builds a fresh `PublishSequencer` pinned at `frontier`
+    /// so the live-frontier accessor returns it. Production paths must
+    /// route through `new_for_epoch` / `open_for_epoch` with a sequencer
+    /// captured from `SharedState`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn new_with_frontier(read_ts: Ts, txn_id: u64, frontier: Ts) -> Self {
+        Self::new_for_epoch(
+            standalone_epoch(read_ts),
+            txn_id,
+            PublishSequencer::new_from(frontier),
+        )
     }
 
     /// Construct a `ReadView` over an already-loaded published epoch.
     ///
     /// Reader paths load `SharedState.published` once, clone that epoch
     /// into the view, and read all visibility metadata from this pinned
-    /// value for the rest of the snapshot lifetime.
+    /// value for the rest of the snapshot lifetime. The view also pins
+    /// `Arc<PublishSequencer>` so foreign-Pending visibility loads the
+    /// live `published_frontier` (§10.19 C-1, US-037) instead of a
+    /// stale snapshot.
     #[must_use]
-    pub(crate) fn new_for_epoch(epoch: Arc<PublishedEpoch>, txn_id: u64) -> Self {
+    pub(crate) fn new_for_epoch(
+        epoch: Arc<PublishedEpoch>,
+        txn_id: u64,
+        publish_sequencer: Arc<PublishSequencer>,
+    ) -> Self {
         Self {
             read_ts: epoch.visible_ts,
             txn_id,
@@ -140,6 +186,7 @@ impl ReadView {
             pin_ops_in_flight: AtomicU32::new(0),
             registry: None,
             epoch,
+            publish_sequencer,
         }
     }
 
@@ -148,9 +195,17 @@ impl ReadView {
     /// the view's `txn_id`, bounding the duration that `read_ts` pins the
     /// `oldest_required_ts()` horizon. The registry slot also tracks a
     /// `Weak<ReadView>` so `force_expire_all` can iterate live views.
+    ///
+    /// Standalone callers receive a fresh sequencer pinned at
+    /// `Ts::default()`; production paths must use `open_for_epoch`.
     #[must_use]
     pub fn open(registry: Arc<ReadViewRegistry>, read_ts: Ts, txn_id: u64) -> Arc<Self> {
-        Self::open_for_epoch(registry, standalone_epoch(read_ts), txn_id)
+        Self::open_for_epoch(
+            registry,
+            standalone_epoch(read_ts),
+            txn_id,
+            PublishSequencer::new_from(Ts::default()),
+        )
     }
 
     /// Open a registry-tracked view over an already-loaded published epoch.
@@ -159,6 +214,7 @@ impl ReadView {
         registry: Arc<ReadViewRegistry>,
         epoch: Arc<PublishedEpoch>,
         txn_id: u64,
+        publish_sequencer: Arc<PublishSequencer>,
     ) -> Arc<Self> {
         let read_ts = epoch.visible_ts;
         let view = Arc::new(Self {
@@ -168,6 +224,7 @@ impl ReadView {
             pin_ops_in_flight: AtomicU32::new(0),
             registry: Some(Arc::clone(&registry)),
             epoch,
+            publish_sequencer,
         });
         registry.register(txn_id, read_ts, Arc::downgrade(&view));
         view
@@ -191,10 +248,14 @@ impl ReadView {
         self.epoch.catalog_generation
     }
 
-    /// Published sequencer frontier pinned by the view.
+    /// Live sequencer frontier published by `PublishSequencer` (§10.19
+    /// C-1, US-037). Loads `publish_sequencer.published_frontier` with
+    /// `Acquire`; never reads a cached `PublishedEpoch` field.
     #[must_use]
     pub(crate) fn sequencer_frontier(&self) -> Ts {
-        self.epoch.sequencer_frontier
+        self.publish_sequencer
+            .published_frontier
+            .load(Ordering::Acquire)
     }
 
     /// True iff this view has been force-expired. Readers MUST check this
@@ -281,6 +342,49 @@ impl ReadView {
     }
 }
 
+/// Test-only handle that owns an `Arc<PublishSequencer>` so integration
+/// tests can advance the live `published_frontier` after a `ReadView`
+/// is opened against the same sequencer (US-037 acceptance test).
+///
+/// Always compiled — the canonical `cargo test --release --test
+/// mwmr_p5_frontier read_view_uses_live_publish_sequencer_frontier`
+/// gate runs without enabling the `test-hooks` feature, so this thin
+/// wrapper must be visible at the public API boundary.
+pub struct TestFrontierHandle {
+    sequencer: Arc<PublishSequencer>,
+}
+
+impl TestFrontierHandle {
+    /// Construct a fresh sequencer pinned at `initial_frontier`.
+    #[must_use]
+    pub fn new(initial_frontier: Ts) -> Self {
+        Self {
+            sequencer: PublishSequencer::new_from(initial_frontier),
+        }
+    }
+
+    /// Advance the live `published_frontier` to `ts`. Mirrors what
+    /// `PublishSequencer::mark_ready` does after the publish closure
+    /// stores the new epoch (§10.19 C-1).
+    pub fn advance(&self, ts: Ts) {
+        self.sequencer
+            .published_frontier
+            .store(ts, Ordering::Release);
+    }
+
+    /// Open a `ReadView` against this handle's sequencer. The view
+    /// loads the live frontier through `ReadView::sequencer_frontier()`
+    /// so subsequent `advance` calls are observed by the same view.
+    #[must_use]
+    pub fn read_view(&self, read_ts: Ts, txn_id: u64) -> ReadView {
+        ReadView::new_for_epoch(
+            standalone_epoch(read_ts),
+            txn_id,
+            Arc::clone(&self.sequencer),
+        )
+    }
+}
+
 fn standalone_epoch(read_ts: Ts) -> Arc<PublishedEpoch> {
     Arc::new(PublishedEpoch {
         visible_ts: read_ts,
@@ -290,7 +394,6 @@ fn standalone_epoch(read_ts: Ts) -> Arc<PublishedEpoch> {
             index_owner_by_id: HashMap::new(),
         }),
         catalog_generation: 0,
-        sequencer_frontier: Ts::default(),
     })
 }
 
@@ -504,6 +607,46 @@ impl ChainSnapshot {
         // Re-check poison AFTER the bumps. If force-expiry fired while we
         // were cloning, drop the cloned chains here — RAII decrefs every
         // entry we just bumped so the net refcount delta is zero.
+        if let Some(v) = &view {
+            let poisoned_after = v.poisoned.load(Ordering::Acquire);
+            v.pin_ops_in_flight.fetch_sub(1, Ordering::Release);
+            if poisoned_after {
+                return ChainSnapshot {
+                    chains: BTreeMap::new(),
+                    view,
+                };
+            }
+        }
+
+        ChainSnapshot { chains, view }
+    }
+
+    /// Construct a snapshot containing only the resident chain for `key`.
+    ///
+    /// Point reads only need the chain for the searched key. Cloning the
+    /// entire leaf's delta map on every point lookup recreates the same
+    /// per-reader allocation pressure as copying full page images.
+    #[must_use]
+    pub fn new_for_key(
+        source: &BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+        key: &[u8],
+        view: Option<Arc<ReadView>>,
+    ) -> Self {
+        if let Some(v) = &view {
+            if v.poisoned.load(Ordering::Acquire) {
+                return ChainSnapshot {
+                    chains: BTreeMap::new(),
+                    view,
+                };
+            }
+            v.pin_ops_in_flight.fetch_add(1, Ordering::Release);
+        }
+
+        let mut chains = BTreeMap::new();
+        if let Some(chain) = source.get(key) {
+            chains.insert(key.to_vec(), chain.iter().cloned().collect());
+        }
+
         if let Some(v) = &view {
             let poisoned_after = v.poisoned.load(Ordering::Acquire);
             v.pin_ops_in_flight.fetch_sub(1, Ordering::Release);

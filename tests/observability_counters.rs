@@ -15,7 +15,7 @@
 //! moves exactly as specified by the PRD acceptance criteria. Tests reset
 //! the counter first, perform the action under test, then assert the delta.
 //!
-//! The lane-wait vs commit_seq-wait split is exercised by two dedicated
+//! Lane wait and journal-envelope wait are exercised by dedicated
 //! concurrent-writer tests.
 //!
 //! All tests acquire `COUNTER_SERIAL` before touching process-global
@@ -29,12 +29,12 @@ use std::thread;
 use std::time::Duration;
 
 use mqlite::mvcc::metrics::{
-    commit_seq_wait_ns_snapshot, crud_commits_root_changing_snapshot,
-    crud_commits_root_neutral_snapshot, emergency_checkpoint_triggers_snapshot,
-    lane_wait_ns_snapshot, published_snapshot_rebuilds_snapshot,
-    recovery_chain_commit_frames_snapshot, recovery_legacy_page_frames_snapshot,
-    reset_commit_seq_wait_ns, reset_crud_commits_root_changing, reset_crud_commits_root_neutral,
-    reset_emergency_checkpoint_triggers, reset_lane_wait_ns, reset_published_snapshot_rebuilds,
+    crud_commits_root_changing_snapshot, crud_commits_root_neutral_snapshot,
+    emergency_checkpoint_triggers_snapshot, journal_mutex_wait_ns_snapshot, lane_wait_ns_snapshot,
+    published_snapshot_rebuilds_snapshot, recovery_chain_commit_frames_snapshot,
+    recovery_legacy_page_frames_snapshot, reset_crud_commits_root_changing,
+    reset_crud_commits_root_neutral, reset_emergency_checkpoint_triggers,
+    reset_journal_mutex_wait_ns, reset_lane_wait_ns, reset_published_snapshot_rebuilds,
     reset_recovery_chain_commit_frames, reset_recovery_legacy_page_frames,
 };
 
@@ -180,7 +180,7 @@ fn lane_wait_ns_total_rises_with_same_namespace_writers() {
     col.insert_one(&doc! { "_id": -1i32, "v": 0 }).unwrap();
 
     reset_lane_wait_ns();
-    reset_commit_seq_wait_ns();
+    reset_journal_mutex_wait_ns();
 
     const N: i32 = 200;
     let barrier = Arc::new(Barrier::new(2));
@@ -217,68 +217,55 @@ fn lane_wait_ns_total_rises_with_same_namespace_writers() {
 }
 
 // ---------------------------------------------------------------------------
-// Counter 3b — commit_seq_wait_ns_total (different-namespace contention)
+// Counter 3b — journal_mutex_wait_ns_total (journal-envelope contention)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn commit_seq_wait_ns_total_rises_with_different_namespace_writers() {
+fn journal_mutex_wait_ns_total_rises_with_concurrent_writers() {
     let _guard = COUNTER_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("csq_wait.mqlite");
+    let path = dir.path().join("journal_wait.mqlite");
     let client = Client::open(&path).unwrap();
 
-    // Pre-create both namespaces so the writers do not race on bootstrap
-    // (which itself contends on commit_seq and would pollute the lane/seq
-    // split).
-    let col_a = client.database("csqdb").collection::<Document>("ns_a");
+    // Pre-create both namespaces so the writers do not race on bootstrap.
+    let col_a = client.database("jmwdb").collection::<Document>("ns_a");
     col_a.insert_one(&doc! { "_id": -1i32, "v": 0 }).unwrap();
-    let col_b = client.database("csqdb").collection::<Document>("ns_b");
+    let col_b = client.database("jmwdb").collection::<Document>("ns_b");
     col_b.insert_one(&doc! { "_id": -1i32, "v": 0 }).unwrap();
 
     reset_lane_wait_ns();
-    reset_commit_seq_wait_ns();
+    reset_journal_mutex_wait_ns();
 
-    const N: i32 = 200;
-    let barrier = Arc::new(Barrier::new(2));
+    const CONTEND_WINDOW_MS: u64 = 50;
+    let mut first_hook = client.__us007_install_journal_begin_hook(false);
     let c1 = client.clone();
-    let b1 = Arc::clone(&barrier);
-    let t1 = thread::spawn(move || {
-        let col = c1.database("csqdb").collection::<Document>("ns_a");
-        b1.wait();
-        for i in 0..N {
-            col.insert_one(&doc! { "_id": i, "payload": "x".repeat(256) })
-                .unwrap();
-        }
+    let first = thread::spawn(move || {
+        let col = c1.database("jmwdb").collection::<Document>("ns_a");
+        col.insert_one(&doc! { "_id": 1i32, "payload": "x".repeat(256) })
+            .unwrap();
     });
-    let c2 = client.clone();
-    let b2 = Arc::clone(&barrier);
-    let t2 = thread::spawn(move || {
-        let col = c2.database("csqdb").collection::<Document>("ns_b");
-        b2.wait();
-        for i in 0..N {
-            col.insert_one(&doc! { "_id": i, "payload": "x".repeat(256) })
-                .unwrap();
-        }
-    });
-    t1.join().unwrap();
-    t2.join().unwrap();
+    first_hook
+        .wait_until_entered()
+        .expect("first writer reached journal envelope");
 
-    let lane_wait = lane_wait_ns_snapshot();
-    let commit_seq_wait = commit_seq_wait_ns_snapshot();
+    let c2 = client.clone();
+    let second = thread::spawn(move || {
+        let col = c2.database("jmwdb").collection::<Document>("ns_b");
+        col.insert_one(&doc! { "_id": 2i32, "payload": "x".repeat(256) })
+            .unwrap();
+    });
+
+    thread::sleep(Duration::from_millis(CONTEND_WINDOW_MS));
+    first_hook.release().expect("release first writer");
+    first.join().unwrap();
+    second.join().unwrap();
+
+    let journal_wait = journal_mutex_wait_ns_snapshot();
     assert!(
-        commit_seq_wait > 0,
-        "two writers on DIFFERENT namespaces must record nonzero \
-         commit_seq_wait_ns_total; saw commit_seq_wait_ns_total={}",
-        commit_seq_wait
-    );
-    // Lanes are disjoint, so lane contention should be near-zero relative
-    // to commit_seq contention. Allow 10% headroom for noise.
-    assert!(
-        lane_wait < commit_seq_wait,
-        "disjoint-namespace writers should record lane_wait < commit_seq_wait; \
-         saw lane_wait={}, commit_seq_wait={}",
-        lane_wait,
-        commit_seq_wait
+        journal_wait > 0,
+        "two concurrent writers contending on journal_mutex must record nonzero \
+         journal_mutex_wait_ns_total; saw journal_mutex_wait_ns_total={}",
+        journal_wait
     );
 }
 

@@ -9,6 +9,7 @@
     reason = "test and bench targets use assertion-style panics and setup unwraps"
 )]
 
+use mqlite::error::EngineFatalReason;
 use mqlite::Error;
 
 #[test]
@@ -40,12 +41,15 @@ fn phase3_recovery_pool_exhausted_display_has_operator_guidance() {
 
 #[test]
 fn phase3_engine_fatal_display_describes_reopen_requirement() {
-    let err = Error::EngineFatal;
+    let err = Error::EngineFatal {
+        reason: EngineFatalReason::PostDurablePendingFlipFailure,
+    };
 
     assert_eq!(
         err.to_string(),
-        "engine fatal: post-durable in-memory state could not be repaired; \
-         the engine is poisoned, refuses new operations, and must be reopened"
+        "engine fatal: post-durable in-memory state could not be repaired \
+         (PostDurablePendingFlipFailure); the engine is poisoned, refuses \
+         new operations, and must be reopened"
     );
     assert_eq!(err.code(), None);
 }

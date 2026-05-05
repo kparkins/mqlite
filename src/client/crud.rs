@@ -43,7 +43,7 @@ impl ClientInner {
             _ => crate::storage::oid::ObjectIdGenerator::generate(),
         };
         // MF-5: FullSync guarantees data survives a process crash after this
-        // call returns.  Flush dirty pages then fsync.
+        // call returns. The storage engine owns the sync boundary.
         self.flush_and_sync_if_fullsync()?;
         Ok(InsertOneResult { inserted_id: oid })
     }
@@ -100,7 +100,8 @@ impl ClientInner {
         }
 
         // MF-5: FullSync guarantees all successfully inserted documents
-        // survive a process crash after this call returns.
+        // survive a process crash after this call returns. The storage
+        // engine owns each committed write's sync boundary.
         self.flush_and_sync_if_fullsync()?;
         Ok(InsertManyResult {
             inserted_ids,
@@ -280,26 +281,16 @@ impl ClientInner {
         self.engine.checkpoint()
     }
 
-    /// Flush dirty pages to disk and, if configured for `FullSync`, call
-    /// `fsync(2)` to ensure data reaches the storage device.
+    /// Preserve the old client-layer durability hook.
     ///
-    /// Called after every write operation when
-    /// [`DurabilityMode::FullSync`] is active.  This is the MF-5 guarantee:
-    /// after this method returns, the written data survives a process crash.
-    ///
-    /// # Durability model
-    ///
-    /// Writers append frames to the journal (including a `ChainCommit` frame)
-    /// inline before returning to the caller. The journal IS the durability
-    /// point: once the journal is fsync'd the commit is crash-safe. Moving
-    /// journal frames into the main file (checkpoint) is an admin operation
-    /// that runs via `checkpoint()` or on drop — it is NOT required for
-    /// per-write crash safety.
+    /// FullSync is now enforced by the storage engine before a write
+    /// publishes. Keeping this method as a no-op avoids a second client-side
+    /// fsync after group commit has already covered the write's ticket.
     fn flush_and_sync_if_fullsync(&self) -> Result<()> {
-        if self.opts.durability != DurabilityMode::FullSync {
+        if self.opts.durability == DurabilityMode::FullSync {
             return Ok(());
         }
-        self.engine.journal_sync()
+        Ok(())
     }
 
     pub(crate) fn backup(&self, dest: &Path) -> Result<()> {

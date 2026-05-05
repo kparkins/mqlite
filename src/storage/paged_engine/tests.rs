@@ -240,11 +240,13 @@ fn buffered_create_namespace_appears_in_list() {
 }
 
 #[test]
-fn buffered_create_namespace_idempotent() {
+fn buffered_create_namespace_rejects_duplicate_name() {
     let (e, _io) = buffered_engine();
     e.create_namespace("mydb.users").unwrap();
-    // Second call must not error (namespace already exists).
-    e.create_namespace("mydb.users").unwrap();
+    let err = e
+        .create_namespace("mydb.users")
+        .expect_err("duplicate namespace create must fail");
+    assert!(matches!(err, Error::DuplicateKey { .. }));
     assert_eq!(e.list_namespaces().unwrap().len(), 1);
 }
 
@@ -904,12 +906,12 @@ fn publish_commit_root_neutral_reuses_catalog_arc() {
 
     // Force a publish with no published-catalog dirty. `publish_commit`
     // must clone the previous catalog Arc rather than build a new one.
-    let md_r = e.metadata.read().unwrap();
-    let _commit = e.commit_seq.lock().unwrap();
+    let _md_r = e.metadata.read().unwrap();
+    let _journal = e.shared.journal_mutex.lock();
     let next_ts = e.shared.oracle.commit().unwrap();
     let new_epoch = {
-        let cat = md_r.catalog.lock().unwrap();
-        publish_commit(&e.shared, &cat, next_ts, PublishDirty::default()).unwrap()
+        let cat = e.metadata_state.catalog.lock().unwrap();
+        publish_commit(&e.shared, &cat, next_ts, PublishDirty::default(), None).unwrap()
     };
 
     assert!(
@@ -935,16 +937,19 @@ fn publish_commit_dirty_path_builds_new_catalog_arc() {
     let prev = e.shared.published.load_full();
     let prev_catalog_arc = Arc::clone(&prev.catalog);
 
-    let md_r = e.metadata.read().unwrap();
-    let _commit = e.commit_seq.lock().unwrap();
+    let _md_r = e.metadata.read().unwrap();
+    let _journal = e.shared.journal_mutex.lock();
     let next_ts = e.shared.oracle.commit().unwrap();
     let dirty = PublishDirty {
         published_catalog_dirty: true,
         catalog_header_dirty: false,
     };
     let new_epoch = {
-        let cat = md_r.catalog.lock().unwrap();
-        publish_commit(&e.shared, &cat, next_ts, dirty).unwrap()
+        let cat = e.metadata_state.catalog.lock().unwrap();
+        // DDL-style publish: pass an explicit reservation so the new
+        // epoch's catalog_generation advances per §10.17.1 / US-006.
+        let prev_gen = e.shared.published.load_full().catalog_generation;
+        publish_commit(&e.shared, &cat, next_ts, dirty, Some(prev_gen + 1)).unwrap()
     };
 
     assert!(
@@ -971,10 +976,16 @@ fn publish_commit_rejects_stale_visible_ts() {
     let prev = e.shared.published.load_full();
     // Inject a stale Ts (equal to the current one) — must panic via
     // the monotonicity debug_assert.
-    let md_r = e.metadata.read().unwrap();
-    let _commit = e.commit_seq.lock().unwrap();
-    let cat = md_r.catalog.lock().unwrap();
-    let _ = publish_commit(&e.shared, &cat, prev.visible_ts, PublishDirty::default());
+    let _md_r = e.metadata.read().unwrap();
+    let _journal = e.shared.journal_mutex.lock();
+    let cat = e.metadata_state.catalog.lock().unwrap();
+    let _ = publish_commit(
+        &e.shared,
+        &cat,
+        prev.visible_ts,
+        PublishDirty::default(),
+        None,
+    );
 }
 
 // ---------------------------------------------------------------------------

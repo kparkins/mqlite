@@ -28,23 +28,34 @@
 //! single-writer lock enforces this at a higher level.
 //
 // LOCK-ORDER (CRITICAL-1): this file owns positions **3** (32 KB
-// partition mutex, `BufferPool::inner_32k`) and **4** (4 KB partition
-// mutex, `BufferPool::inner_4k`) in the database-wide total order. Any
-// path that acquires both partitions MUST acquire 32 KB before 4 KB, and
-// must NOT re-enter the history-store partition (position 1),
+// partition mutex, `BufferPool::inner_32k`), **3a** (`PageLatch`), and
+// **3b** (4 KB partition mutex, `BufferPool::inner_4k`) in the
+// database-wide total order. Any path that acquires both partitions MUST
+// acquire 32 KB before 4 KB. A partition mutex is used only to
+// find/pin/unpin a frame and is released before acquiring `PageLatch`.
+// Paths must NOT re-enter the history-store partition (position 1),
 // `PageLifetimeQueue::pending` (1.5), or `AllocatorHandle::state` (2)
-// while holding either partition mutex. The canonical definition of the
-// full order (positions 1 → 1.5 → 2 → 3 → 4 → 5 → 6) lives at the top of
+// while holding either partition mutex or a page latch. The canonical
+// definition of the full order lives at the top of
 // `src/mvcc/read_view.rs` — edit both blocks together or neither.
 // The reconciliation path snapshots `ReadViewRegistry::oldest_required_ts()`
-// (position 5) BEFORE acquiring a partition mutex.
+// (position 5) BEFORE acquiring a partition mutex or page latch.
 
 mod chains;
+// US-029 wires `PageLatch` into `Frame` and produces `LatchedPinnedPage`,
+// but production CRUD call sites that consume those handles ship in
+// later Phase 5 stories (US-024 / US-025). The primitive APIs in
+// `page_latch.rs` therefore look unused to the lib-only dead-code lint
+// despite being exercised by the buffer-pool unit tests.
+#[allow(dead_code)]
+mod page_latch;
 mod partition;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod us019_test_probe;
+pub mod us020_test_probe;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
-use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -52,13 +63,15 @@ use std::sync::{
 
 use crate::error::{Error, Result};
 use crate::mvcc::metrics;
-use crate::mvcc::read_view::ReadViewRegistry;
-use crate::mvcc::version::VersionEntry;
+use crate::mvcc::read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
+use crate::mvcc::version::{VersionEntry, VersionState};
+use crate::mvcc::{ExpectedHead, Ts};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::page::PAGE_TYPE_LEAF;
 use crate::storage::reconcile::plan::TreeIdent;
 
-use partition::Partition;
+use page_latch::{LatchMode, PageLatch, PageLatchExclusive, PageLatchShared};
+use partition::{Frame, Partition};
 
 /// Default warning threshold for delta-bearing frame density.
 pub(crate) const DELTA_BEARING_FRAMES_WARN_THRESHOLD_DEFAULT: f64 = 0.75;
@@ -196,60 +209,365 @@ pub(crate) struct ReconcileLeafSnapshot {
     pub(crate) chains: RetainedLeafChains,
 }
 
-/// Typed pin guard accepted by [`BufferPool::replace_leaf_and_chains`].
-///
-/// The guard is intentionally non-`Clone`, non-`Copy`, and non-`Send`.
-#[allow(dead_code)]
-pub(crate) struct PinnedLeafForReconcile<'pool> {
-    pool: &'pool BufferPool,
-    ident: TreeIdent,
-    page_number: u32,
-    _not_send: PhantomData<Rc<()>>,
-}
-
-impl PinnedLeafForReconcile<'_> {
-    /// Return the pinned leaf page number.
-    #[allow(dead_code)]
-    pub(crate) fn page_number(&self) -> u32 {
-        self.page_number
-    }
-}
-
-impl std::fmt::Debug for PinnedLeafForReconcile<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PinnedLeafForReconcile")
-            .field("ident", &self.ident)
-            .field("page_number", &self.page_number)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for PinnedLeafForReconcile<'_> {
-    fn drop(&mut self) {
-        let _ = self
-            .pool
-            .unpin_internal(self.page_number, PageSize::Large32k, false, None);
-    }
-}
-
 /// Errors from guarded folded-leaf replacement.
 #[allow(dead_code)]
-pub(crate) enum ReplaceLeafError<'pool> {
+pub(crate) enum ReplaceLeafError {
     /// The target leaf frame is no longer resident.
     NotResident,
     /// The replacement image is not a 32 KB leaf page.
     NotLeaf,
-    /// Another pin is active; the caller receives the guard back.
-    FrameCoWRefused(PinnedLeafForReconcile<'pool>),
 }
 
-impl std::fmt::Debug for ReplaceLeafError<'_> {
+impl std::fmt::Debug for ReplaceLeafError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotResident => f.write_str("NotResident"),
             Self::NotLeaf => f.write_str("NotLeaf"),
-            Self::FrameCoWRefused(guard) => f.debug_tuple("FrameCoWRefused").field(guard).finish(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LatchedPinnedPage (Phase 5 §10.18 — pin-plus-latch RAII handle)
+// ---------------------------------------------------------------------------
+
+/// Internal latch hold for [`LatchedPinnedPage`]. The variant chosen on
+/// construction matches the [`LatchMode`] requested by the caller; on drop
+/// the embedded guard is released BEFORE the pin (§10.18 rule 2). The
+/// guards are inhabited only for their `Drop` side effect (latch release);
+/// the lint allow keeps the type-level wrapper expressive without a
+/// compiler warning about the unread payload.
+#[allow(dead_code)]
+enum LatchHold<'pool> {
+    Shared(PageLatchShared<'pool>),
+    Exclusive(PageLatchExclusive<'pool>),
+}
+
+/// Wrapper around a [`LatchHold`] that ties the test-only
+/// `EVENT_LATCH_RELEASE` event to the *actual* moment the underlying
+/// `parking_lot` guard is dropped (§10.18 drop-order proof).
+///
+/// `Drop` first consumes `inner`, which runs the wrapped guard's
+/// destructor and physically unlocks the `PageLatch`. Only after that
+/// unlock has happened does the test probe record. A future refactor
+/// that reordered drop versus recording would also reorder the
+/// observable side effect: callers cannot mask a regression by moving
+/// recording lines without also moving the actual unlock.
+struct LatchHoldRecorder<'pool> {
+    inner: Option<LatchHold<'pool>>,
+}
+
+impl<'pool> LatchHoldRecorder<'pool> {
+    fn new(hold: LatchHold<'pool>) -> Self {
+        Self { inner: Some(hold) }
+    }
+}
+
+impl Drop for LatchHoldRecorder<'_> {
+    fn drop(&mut self) {
+        // Step 1 — physically drop the inner guard. parking_lot's
+        // `RwLockReadGuard` / `RwLockWriteGuard` releases its lock at
+        // this `drop` call.
+        drop(self.inner.take());
+        // Step 2 — record the latch-release event AFTER the unlock has
+        // actually happened. In production the line is a no-op.
+        #[cfg(test)]
+        us029_test_probe::record_drop_event(us029_test_probe::EVENT_LATCH_RELEASE);
+    }
+}
+
+/// Pin-plus-latch RAII handle (Phase 5 §10.18).
+///
+/// The sole legal way to hold both a buffer-pool pin and a `PageLatch`
+/// simultaneously. Construction is via [`BufferPool::pin_for_read`] or
+/// [`BufferPool::pin_for_write`]; the partition mutex is acquired, the
+/// pin is bumped, the partition mutex is released, and only then is the
+/// page-local latch acquired. Drop reverses that order: latch first,
+/// pin second (§10.18 rule 2).
+///
+/// `LatchedPinnedPage` is `!Send` (the `_not_send: PhantomData<*const ()>`
+/// marker rejects cross-thread transfer). The handle borrows from the
+/// buffer pool and the `parking_lot` guard inside [`LatchHold`] is
+/// thread-pinned by the underlying `parking_lot::RwLock`.
+#[allow(dead_code)]
+pub(crate) struct LatchedPinnedPage<'pool> {
+    /// Buffer pool reference used by `Drop` to call back into
+    /// `unpin_internal`. Tied to the same lifetime as the latch hold.
+    pool: &'pool BufferPool,
+    /// Frame pointer — stable while `pin_count > 0` because CLOCK
+    /// eviction skips pinned frames and the partition slot vector is
+    /// pre-allocated (no reallocation moves frames).
+    frame_ptr: *const Frame,
+    /// Page id (page number) wrapped by this handle.
+    page_id: u32,
+    /// Page-size partition that owns this frame (4 KiB or 32 KiB);
+    /// recorded so `Drop` can re-enter the correct partition mutex
+    /// when releasing the pin.
+    page_size: PageSize,
+    /// Mode in which the page-local latch is currently held.
+    latch_mode: LatchMode,
+    /// Live latch hold; taken (`None`) by `Drop` before the pin is
+    /// released so the latch is dropped strictly first (§10.18 rule 2).
+    /// Wrapped in [`LatchHoldRecorder`] so the test-only release event
+    /// fires AFTER the underlying guard is physically unlocked.
+    latch_hold: Option<LatchHoldRecorder<'pool>>,
+    /// `*const ()` marker to make the handle `!Send` — page latches are
+    /// thread-pinned in production (`parking_lot::RwLock` guards keep
+    /// the acquiring thread on the lock owner list).
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'pool> LatchedPinnedPage<'pool> {
+    /// Page id (page number) this handle pins.
+    #[allow(dead_code)]
+    pub(crate) fn page_id(&self) -> u32 {
+        self.page_id
+    }
+
+    /// Mode in which the page-local latch is currently held.
+    #[allow(dead_code)]
+    pub(crate) fn latch_mode(&self) -> LatchMode {
+        self.latch_mode
+    }
+
+    /// Clone the current page-byte snapshot while this handle holds the
+    /// page-local latch.
+    #[allow(
+        dead_code,
+        reason = "US-010 public classifier uses this narrow latch read path"
+    )]
+    pub(crate) fn data_snapshot(&self) -> Arc<Vec<u8>> {
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted while the snapshot Arc is loaded.
+        let frame = unsafe { &*self.frame_ptr };
+        frame.data.load_full()
+    }
+
+    /// Copy resident delta chains while holding `LatchedPinnedPage::Shared`.
+    ///
+    /// This is a copies/clones only snapshot path: it never mutates the
+    /// resident chain map and never acquires a buffer-pool partition mutex
+    /// while the page latch is held.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_chains(&self, view: Option<Arc<ReadView>>) -> Result<ChainSnapshot> {
+        if self.latch_mode != LatchMode::Shared {
+            return Err(Error::Internal(
+                "LatchedPinnedPage::snapshot_chains requires a shared page latch".into(),
+            ));
+        }
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The shared page latch prevents concurrent writers while
+        // `ChainSnapshot::new` clones the map entries.
+        let frame = unsafe { &*self.frame_ptr };
+        Ok(ChainSnapshot::new(&frame.deltas, view))
+    }
+
+    /// Copy only the resident delta chain for `key` while holding the
+    /// reader-side page latch.
+    pub(crate) fn snapshot_chain_for_key(
+        &self,
+        key: &[u8],
+        view: Option<Arc<ReadView>>,
+    ) -> Result<ChainSnapshot> {
+        if self.latch_mode != LatchMode::Shared {
+            return Err(Error::Internal(
+                "LatchedPinnedPage::snapshot_chain_for_key requires a shared page latch".into(),
+            ));
+        }
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The shared page latch prevents concurrent writers while
+        // the single resident chain is cloned.
+        let frame = unsafe { &*self.frame_ptr };
+        Ok(ChainSnapshot::new_for_key(&frame.deltas, key, view))
+    }
+
+    /// Return the identity of the current live chain head for `key`.
+    ///
+    /// Aborted entries are ignored. Foreign pending entries still count as
+    /// live heads for first-committer-wins checks.
+    pub(crate) fn expected_head(&self, key: &[u8]) -> Option<ExpectedHead> {
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The page latch held by this handle serializes access to
+        // the frame-local delta map for US-009 callers.
+        let frame = unsafe { &*self.frame_ptr };
+        frame.deltas.get(key).and_then(|chain| {
+            chain
+                .iter()
+                .find(|entry| {
+                    entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted)
+                })
+                .map(|entry| ExpectedHead {
+                    commit_ts: entry.start_ts,
+                    txn_id: entry.txn_id,
+                })
+        })
+    }
+
+    /// Return true when this page carries a pending entry for `txn_id`.
+    pub(crate) fn has_pending_txn(&self, txn_id: u64) -> bool {
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The shared or exclusive page latch serializes access to
+        // the frame-local delta map while this read walks the chains.
+        let frame = unsafe { &*self.frame_ptr };
+        frame.deltas.values().any(|chain| {
+            chain.iter().any(
+                |entry| matches!(entry.state, VersionState::Pending { txn_id: id } if id == txn_id),
+            )
+        })
+    }
+
+    /// Return the chain for `key`, or an empty caller-owned chain.
+    pub(crate) fn get_or_create_chain(&self, key: &[u8]) -> Result<Arc<VecDeque<VersionEntry>>> {
+        // This helper is used by exclusive install paths, even though it only
+        // reads. Requiring exclusive keeps the install classifier and
+        // mutation under one latch hold.
+        self.require_exclusive("get_or_create_chain")?;
+        // SAFETY: see `expected_head`.
+        let frame = unsafe { &*self.frame_ptr };
+        Ok(frame
+            .deltas
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(VecDeque::new())))
+    }
+
+    /// Return true when this leaf's resident delta map has a live key in range.
+    pub(crate) fn has_live_delta_key_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        exclude_key: &[u8],
+    ) -> Result<bool> {
+        self.require_exclusive("has_live_delta_key_in_range")?;
+        // SAFETY: see `expected_head`; the exclusive page latch serializes
+        // delta-map access for the install-time unique-prefix scan.
+        let frame = unsafe { &*self.frame_ptr };
+        for (key, chain) in frame.deltas.range(start.to_vec()..end.to_vec()) {
+            if key.as_slice() == exclude_key {
+                continue;
+            }
+            if chain.iter().any(|entry| {
+                entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted)
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Install `chain` for `key`.
+    pub(crate) fn put_chain(
+        &mut self,
+        key: Vec<u8>,
+        chain: Arc<VecDeque<VersionEntry>>,
+    ) -> Result<()> {
+        self.require_exclusive("put_chain")?;
+        // SAFETY: see `take_chain`.
+        let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
+        frame.deltas.insert(key, chain);
+        Ok(())
+    }
+
+    /// Flip every pending entry for `txn_id` on this page.
+    pub(crate) fn flip_pending_for_txn(
+        &mut self,
+        txn_id: u64,
+        commit_ts: Option<Ts>,
+    ) -> Result<usize> {
+        self.require_exclusive("flip_pending_for_txn")?;
+        // SAFETY: see `take_chain`.
+        let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
+        let mut flipped = 0usize;
+        for chain_arc in frame.deltas.values_mut() {
+            let chain = Arc::make_mut(chain_arc);
+            for idx in 0..chain.len() {
+                let pending_start_ts = match chain.get(idx) {
+                    Some(entry)
+                        if matches!(
+                            entry.state,
+                            VersionState::Pending { txn_id: pending } if pending == txn_id
+                        ) =>
+                    {
+                        entry.start_ts
+                    }
+                    _ => continue,
+                };
+
+                let mut restore_after_abort = false;
+                if let Some(entry) = chain.get_mut(idx) {
+                    match commit_ts {
+                        Some(ts) => {
+                            entry.start_ts = ts;
+                            entry.state = VersionState::Committed;
+                        }
+                        None => {
+                            entry.state = VersionState::Aborted;
+                            restore_after_abort = true;
+                        }
+                    }
+                    flipped += 1;
+                }
+                if restore_after_abort {
+                    restore_previous_head_after_abort(chain, idx, pending_start_ts);
+                }
+            }
+        }
+        Ok(flipped)
+    }
+
+    fn require_exclusive(&self, operation: &str) -> Result<()> {
+        if self.latch_mode == LatchMode::Exclusive {
+            return Ok(());
+        }
+        Err(Error::Internal(format!(
+            "LatchedPinnedPage::{operation} requires an exclusive page latch"
+        )))
+    }
+}
+
+fn restore_previous_head_after_abort(
+    chain: &mut VecDeque<VersionEntry>,
+    aborted_idx: usize,
+    aborted_start_ts: Ts,
+) {
+    if let Some(prev) = chain.iter_mut().skip(aborted_idx + 1).find(|entry| {
+        !matches!(entry.state, VersionState::Aborted) && entry.stop_ts == aborted_start_ts
+    }) {
+        prev.stop_ts = Ts::MAX;
+    }
+}
+
+impl Drop for LatchedPinnedPage<'_> {
+    fn drop(&mut self) {
+        // §10.18 rule 2 — release the latch BEFORE releasing the pin.
+        // The recorder wrapper makes the latch-release event fire only
+        // after the underlying parking_lot guard has unlocked, so
+        // anybody who reorders this `drop(recorder)` line and the
+        // `unpin_internal` call below will see the event order flip
+        // too — the test asserts that order.
+        debug_assert!(
+            self.latch_hold.is_some(),
+            "LatchedPinnedPage::drop: latch_hold must be Some on entry; \
+             releasing the pin while the latch is still held would violate \
+             §10.18 rule 2 (latch-before-pin drop order)",
+        );
+        let recorder = self.latch_hold.take();
+        // Dropping `recorder` runs `LatchHoldRecorder::drop`, which
+        // physically releases the latch THEN records the event.
+        drop(recorder);
+        debug_assert!(
+            self.latch_hold.is_none(),
+            "LatchedPinnedPage::drop: latch_hold must be released before \
+             the pin (§10.18 rule 2)",
+        );
+        // Drop must not panic; swallow the unpin error like `PinnedPage`.
+        let _ = self
+            .pool
+            .unpin_internal(self.page_id, self.page_size, false, None);
+        // Pin-release event fires AFTER `unpin_internal` returns, so
+        // the recorded order matches the actual side-effect order.
+        #[cfg(test)]
+        us029_test_probe::record_drop_event(us029_test_probe::EVENT_PIN_RELEASE);
     }
 }
 
@@ -459,7 +777,8 @@ impl BufferPool {
         })
     }
 
-    /// Pin a resident 32 KB leaf for a checkpoint reconcile install.
+    /// Pin and exclusively latch one resident 32 KB leaf for checkpoint
+    /// reconcile.
     ///
     /// This pin path does not perform I/O. A dirty-leaf reconcile pass works
     /// from resident frames and fails closed if the frame disappeared.
@@ -468,31 +787,82 @@ impl BufferPool {
         &self,
         ident: TreeIdent,
         page_number: u32,
-    ) -> std::result::Result<PinnedLeafForReconcile<'_>, ReplaceLeafError<'_>> {
-        let mut guard = self
-            .inner_32k
-            .lock()
-            .map_err(|_| ReplaceLeafError::NotResident)?;
-        let idx = guard
-            .page_map
-            .get(&page_number)
-            .copied()
-            .ok_or(ReplaceLeafError::NotResident)?;
-        let frame = guard.frames[idx]
-            .as_mut()
-            .ok_or(ReplaceLeafError::NotResident)?;
-        if frame.data.load().first().copied() != Some(PAGE_TYPE_LEAF) {
-            return Err(ReplaceLeafError::NotLeaf);
-        }
-        frame.pin_count += 1;
-        frame.ref_bit = true;
+    ) -> std::result::Result<LatchedPinnedPage<'_>, ReplaceLeafError> {
+        let mut pages = self.pin_leaf_set_for_reconcile(ident, &[page_number])?;
+        pages.pop().ok_or(ReplaceLeafError::NotResident)
+    }
 
-        Ok(PinnedLeafForReconcile {
-            pool: self,
-            ident,
-            page_number,
-            _not_send: PhantomData,
-        })
+    /// Pin all planned reconcile leaf pages, then acquire exclusive latches.
+    ///
+    /// US-028 requires two-phase acquisition: all planned pages are pinned
+    /// while holding the 32 KiB partition mutex, then that mutex is released,
+    /// then `PageLatch::Exclusive` is acquired in the caller's ascending
+    /// `page_id` order. If any planned page is unavailable, no partial
+    /// acquisition is returned and any prior pins are released before the
+    /// recoverable error is surfaced.
+    pub(crate) fn pin_leaf_set_for_reconcile(
+        &self,
+        _ident: TreeIdent,
+        planned_pages: &[u32],
+    ) -> std::result::Result<Vec<LatchedPinnedPage<'_>>, ReplaceLeafError> {
+        debug_assert!(
+            planned_pages.windows(2).all(|pair| pair[0] < pair[1]),
+            "US-028 reconcile planned page set must be sorted and unique"
+        );
+
+        let pinned = {
+            let mut guard = self
+                .inner_32k
+                .lock()
+                .map_err(|_| ReplaceLeafError::NotResident)?;
+            let mut frame_indexes = Vec::with_capacity(planned_pages.len());
+            for &page_number in planned_pages {
+                let idx = guard
+                    .page_map
+                    .get(&page_number)
+                    .copied()
+                    .ok_or(ReplaceLeafError::NotResident)?;
+                let frame = guard.frames[idx]
+                    .as_ref()
+                    .ok_or(ReplaceLeafError::NotResident)?;
+                if frame.data.load().first().copied() != Some(PAGE_TYPE_LEAF) {
+                    return Err(ReplaceLeafError::NotLeaf);
+                }
+                frame_indexes.push((page_number, idx));
+            }
+
+            let mut pinned = Vec::with_capacity(frame_indexes.len());
+            for (page_number, idx) in frame_indexes {
+                let frame = guard.frames[idx]
+                    .as_mut()
+                    .ok_or(ReplaceLeafError::NotResident)?;
+                frame.pin_count += 1;
+                frame.ref_bit = true;
+                pinned.push((page_number, frame as *const Frame));
+            }
+            pinned
+        };
+
+        let mut latched = Vec::with_capacity(pinned.len());
+        for (page_id, frame_ptr) in pinned {
+            // SAFETY: each frame was pinned before the partition mutex was
+            // released, so CLOCK eviction cannot remove the frame while this
+            // handle is being constructed.
+            let latch_ref: &PageLatch = unsafe { &(*frame_ptr).latch };
+            latched.push(LatchedPinnedPage {
+                pool: self,
+                frame_ptr,
+                page_id,
+                page_size: PageSize::Large32k,
+                latch_mode: LatchMode::Exclusive,
+                latch_hold: Some(LatchHoldRecorder::new(LatchHold::Exclusive(
+                    latch_ref.lock_exclusive(),
+                ))),
+                _not_send: PhantomData,
+            });
+        }
+
+        Ok(latched)
     }
 
     /// Snapshot a resident 32 KB leaf page image and its current chains.
@@ -528,20 +898,22 @@ impl BufferPool {
 
     /// Atomically replace a resident leaf page image and retained chains.
     ///
-    /// The 32 KB partition mutex is held across both the `Frame::data`
-    /// publication and the `Frame::deltas` replacement. If any other pin is
-    /// active when the mutex is held, the guard is returned so callers can
-    /// restore chains before dropping the pin.
+    /// US-028 requires the caller to pass a [`LatchedPinnedPage`] that holds
+    /// `PageLatch::Exclusive` for the reconcile target. No partition mutex is
+    /// acquired by this helper; the page-local latch is the resident chain
+    /// mutation authority for checkpoint reconcile and CRUD writers.
     #[allow(dead_code)]
-    pub(crate) fn replace_leaf_and_chains<'guard>(
+    pub(crate) fn replace_leaf_and_chains(
         &self,
-        guard: PinnedLeafForReconcile<'guard>,
+        page: &mut LatchedPinnedPage<'_>,
         new_base: Vec<u8>,
         retained_chains: RetainedLeafChains,
-    ) -> std::result::Result<(), ReplaceLeafError<'guard>> {
-        if !std::ptr::eq(self, guard.pool) {
+    ) -> std::result::Result<(), ReplaceLeafError> {
+        if !std::ptr::eq(self, page.pool) {
             return Err(ReplaceLeafError::NotResident);
         }
+        page.require_exclusive("replace_leaf_and_chains")
+            .map_err(|_| ReplaceLeafError::NotResident)?;
         if new_base.len() != PageSize::Large32k.bytes()
             || new_base.first().copied() != Some(PAGE_TYPE_LEAF)
         {
@@ -549,25 +921,15 @@ impl BufferPool {
         }
 
         let mut retained_chains = retained_chains;
-        let mut partition = self
-            .inner_32k
-            .lock()
-            .map_err(|_| ReplaceLeafError::NotResident)?;
-        let idx = partition
-            .page_map
-            .get(&guard.page_number)
-            .copied()
-            .ok_or(ReplaceLeafError::NotResident)?;
-        let frame = partition.frames[idx]
-            .as_mut()
-            .ok_or(ReplaceLeafError::NotResident)?;
-
-        if frame.pin_count > 1 {
-            return Err(ReplaceLeafError::FrameCoWRefused(guard));
-        }
-
         for chain in retained_chains.values_mut() {
             let _ = Arc::make_mut(chain);
+        }
+        // SAFETY: `page` owns a live pin, keeping the frame resident, and
+        // `replace_leaf_and_chains` requires the exclusive page latch before
+        // mutating resident page bytes or chains.
+        let frame = unsafe { &mut *page.frame_ptr.cast_mut() };
+        if frame.page_number != page.page_id {
+            return Err(ReplaceLeafError::NotResident);
         }
         frame.data.store(Arc::new(new_base));
         frame.deltas = retained_chains;
@@ -588,8 +950,8 @@ impl BufferPool {
     ///
     /// **Lock-order contract:**
     /// 1. `ReadViewRegistry::oldest_required_ts()` is snapshotted BEFORE
-    ///    the partition mutex. Position 5 is below positions 3/4 in the
-    ///    total order.
+    ///    the partition mutex or page latch. Position 5 is below
+    ///    positions 3/3a/3b in the total order.
     /// 2. The partition mutex is released before `drain_free_queue` is
     ///    invoked, so the allocator-state mutex (position 2) is never
     ///    nested under a partition mutex (positions 3/4).
@@ -662,6 +1024,216 @@ impl BufferPool {
             write_buf: None,
             dirty: false,
         })
+    }
+
+    /// Pin `page_id` and acquire its page-local latch in **exclusive** mode
+    /// (Phase 5 §10.18). Returns the sole legal pin-plus-latch RAII handle.
+    ///
+    /// This is the canonical 1-argument API spelled out in
+    /// `.omc/phase-05-prd.json` US-029. It defers to
+    /// [`BufferPool::pin_then_latch`] with the page size resolved by
+    /// [`BufferPool::detect_page_size`] (32 KiB by default for cache
+    /// misses; resident pages route to whichever partition currently
+    /// holds them). Phase 5 CRUD targets leaf pages (32 KiB), so the
+    /// default is correct for the first-class call sites.
+    ///
+    /// **Lock-order contract (§10.18 — partition mutex and latch are never
+    /// nested):**
+    /// 1. Acquire the partition mutex.
+    /// 2. Bump `pin_count` (and load the page on a cache miss).
+    /// 3. Capture a stable raw pointer to the resident frame.
+    /// 4. **Release** the partition mutex.
+    /// 5. Acquire the page-local latch in exclusive mode.
+    ///
+    /// # Errors
+    ///
+    /// - Partition mutex poisoned.
+    /// - All frames in the partition are pinned (pool exhaustion).
+    /// - I/O backend error during a cache-miss load.
+    #[allow(dead_code)]
+    pub(crate) fn pin_for_write(&self, page_id: u32) -> Result<LatchedPinnedPage<'_>> {
+        let size = self.detect_page_size(page_id);
+        self.pin_then_latch(page_id, size, LatchMode::Exclusive)
+    }
+
+    /// Pin `page_id` with an explicit page-size partition and acquire its
+    /// page-local latch in exclusive mode.
+    ///
+    /// B-tree DDL cleanup already knows each page's allocator size from the
+    /// tree traversal, so it uses this size-explicit path instead of the
+    /// resident-frame heuristic in [`BufferPool::pin_for_write`].
+    pub(crate) fn pin_for_write_sized(
+        &self,
+        page_id: u32,
+        size: PageSize,
+    ) -> Result<LatchedPinnedPage<'_>> {
+        self.pin_then_latch(page_id, size, LatchMode::Exclusive)
+    }
+
+    /// Pin `page_id` and acquire its page-local latch in **shared** mode
+    /// (Phase 5 §10.18). Returns the sole legal pin-plus-latch RAII handle.
+    ///
+    /// Canonical 1-argument API per US-029 (size resolved via
+    /// [`BufferPool::detect_page_size`]). Same lock-order contract as
+    /// [`BufferPool::pin_for_write`].
+    ///
+    /// # Errors
+    ///
+    /// - Partition mutex poisoned.
+    /// - All frames in the partition are pinned (pool exhaustion).
+    /// - I/O backend error during a cache-miss load.
+    #[allow(dead_code)]
+    pub(crate) fn pin_for_read(&self, page_id: u32) -> Result<LatchedPinnedPage<'_>> {
+        let size = self.detect_page_size(page_id);
+        self.pin_then_latch(page_id, size, LatchMode::Shared)
+    }
+
+    /// Pin `page_id` with an explicit page-size partition and acquire its
+    /// page-local latch in shared mode.
+    pub(crate) fn pin_for_read_sized(
+        &self,
+        page_id: u32,
+        size: PageSize,
+    ) -> Result<LatchedPinnedPage<'_>> {
+        self.pin_then_latch(page_id, size, LatchMode::Shared)
+    }
+
+    /// Resolve the size partition for a page id by probing residency.
+    ///
+    /// The 32 KiB partition is checked first per the lock-order rule in
+    /// `src/mvcc/read_view.rs` (position 3 before position 4); residency
+    /// hits in either partition route to that partition. A cache miss
+    /// defaults to 32 KiB, matching Phase 5's leaf-focused CRUD.
+    fn detect_page_size(&self, page_id: u32) -> PageSize {
+        if let Ok(g) = self.inner_32k.lock() {
+            if g.page_map.contains_key(&page_id) {
+                return PageSize::Large32k;
+            }
+        }
+        if let Ok(g) = self.inner_4k.lock() {
+            if g.page_map.contains_key(&page_id) {
+                return PageSize::Small4k;
+            }
+        }
+        PageSize::Large32k
+    }
+
+    /// Internal helper backing [`BufferPool::pin_for_read`] and
+    /// [`BufferPool::pin_for_write`]. Tests use this entry point when
+    /// they need explicit-size control (e.g., to exercise the 4 KiB
+    /// partition).
+    pub(super) fn pin_then_latch(
+        &self,
+        page_id: u32,
+        size: PageSize,
+        mode: LatchMode,
+    ) -> Result<LatchedPinnedPage<'_>> {
+        let lock = match size {
+            PageSize::Small4k => &self.inner_4k,
+            PageSize::Large32k => &self.inner_32k,
+        };
+
+        // Step 1-4: pin under the partition mutex, capture frame_ptr,
+        // release the mutex.
+        let frame_ptr: *const Frame = {
+            let mut guard = lock
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            let idx = guard.pin_page(page_id, self.io.as_ref(), size)?;
+            let frame = guard.frames[idx].as_ref().ok_or_else(|| {
+                Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+            })?;
+            frame as *const Frame
+        };
+
+        // Step 5: acquire the latch with the partition mutex already
+        // released. SAFETY: `pin_count > 0` keeps the frame slot
+        // resident; the partition slot vector is pre-allocated and
+        // never reallocated, so `frame_ptr` remains valid for the
+        // lifetime of `self` while the pin is live. Reads through the
+        // pointer touch only the latch, which itself provides interior
+        // mutability through `parking_lot::RwLock`.
+        let latch_ref: &PageLatch = unsafe { &(*frame_ptr).latch };
+        let hold = match mode {
+            LatchMode::Shared => LatchHold::Shared(latch_ref.lock_shared()),
+            LatchMode::Exclusive => LatchHold::Exclusive(latch_ref.lock_exclusive()),
+        };
+
+        Ok(LatchedPinnedPage {
+            pool: self,
+            frame_ptr,
+            page_id,
+            page_size: size,
+            latch_mode: mode,
+            latch_hold: Some(LatchHoldRecorder::new(hold)),
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Pin a resident 32 KiB frame and acquire its shared page latch.
+    ///
+    /// Unlike [`Self::pin_for_read`], this helper never performs I/O or
+    /// installs a cache-miss victim. It is for metadata walks over currently
+    /// resident frame-local chains where a miss simply means another thread
+    /// evicted the frame before the walk reached it.
+    fn pin_resident_32k_for_read(&self, page_id: u32) -> Result<Option<LatchedPinnedPage<'_>>> {
+        let frame_ptr: *const Frame = {
+            let mut guard = self
+                .inner_32k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            let Some(&idx) = guard.page_map.get(&page_id) else {
+                return Ok(None);
+            };
+            let frame = guard.frames[idx].as_mut().ok_or_else(|| {
+                Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+            })?;
+            frame.pin_count += 1;
+            frame.ref_bit = true;
+            frame as *const Frame
+        };
+
+        // SAFETY: the frame was pinned before the partition mutex was
+        // released, so CLOCK eviction cannot remove it while the latch is
+        // acquired and wrapped.
+        let latch_ref: &PageLatch = unsafe { &(*frame_ptr).latch };
+        Ok(Some(LatchedPinnedPage {
+            pool: self,
+            frame_ptr,
+            page_id,
+            page_size: PageSize::Large32k,
+            latch_mode: LatchMode::Shared,
+            latch_hold: Some(LatchHoldRecorder::new(LatchHold::Shared(
+                latch_ref.lock_shared(),
+            ))),
+            _not_send: PhantomData,
+        }))
+    }
+
+    /// Return resident 32 KiB pages carrying a pending entry for `txn_id`.
+    pub(crate) fn pages_with_pending_txn(&self, txn_id: u64) -> Result<Vec<u32>> {
+        let resident_pages = {
+            let guard = self
+                .inner_32k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            guard
+                .frames
+                .iter()
+                .filter_map(|frame| frame.as_ref().map(|frame| frame.page_number))
+                .collect::<BTreeSet<_>>()
+        };
+
+        let mut pages = Vec::new();
+        for page_id in resident_pages {
+            let Some(page) = self.pin_resident_32k_for_read(page_id)? else {
+                continue;
+            };
+            if page.has_pending_txn(txn_id) {
+                pages.push(page_id);
+            }
+        }
+        Ok(pages)
     }
 
     /// Write all dirty pages in both partitions to disk and clear dirty bits.
@@ -794,9 +1366,15 @@ mod tests;
 mod us005_tests;
 #[cfg(test)]
 mod us006_tests;
+#[cfg(any(test, feature = "test-hooks"))]
+mod us009_test_probe;
 #[cfg(test)]
 mod us013_tests;
 #[cfg(test)]
 mod us014_tests;
 #[cfg(test)]
 mod us015_tests;
+#[cfg(test)]
+mod us029_test_probe;
+#[cfg(test)]
+mod us029_tests;

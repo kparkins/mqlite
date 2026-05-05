@@ -26,11 +26,13 @@
 //! (e.g. into the catalog or file header) if durability is required.
 
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
+use crate::storage::buffer_pool::PageSize;
 
 type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
 
@@ -49,6 +51,49 @@ pub(crate) trait HistoryProbe {
     ) -> Result<Option<VersionEntry>>;
 }
 use crate::storage::page::{OVERFLOW_HEADER_SIZE, PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
+
+/// Immutable 32 KiB leaf page image returned by reader paths.
+///
+/// Buffer-pool readers can hold the existing published `ArcSwap<Vec<u8>>`
+/// snapshot without cloning the page bytes. Writer-side overlays still return
+/// owned images so mutable paths never edit shared frame snapshots in place.
+#[derive(Clone)]
+pub(crate) enum LeafPageImage {
+    Shared(Arc<Vec<u8>>),
+    Owned(Box<[u8; PAGE_SIZE_LEAF as usize]>),
+}
+
+impl LeafPageImage {
+    pub(crate) fn shared(data: Arc<Vec<u8>>) -> Result<Self> {
+        if data.len() != PAGE_SIZE_LEAF as usize {
+            return Err(crate::error::Error::Internal(format!(
+                "leaf page image has {} bytes, expected {}",
+                data.len(),
+                PAGE_SIZE_LEAF
+            )));
+        }
+        Ok(Self::Shared(data))
+    }
+
+    pub(crate) fn owned(data: Box<[u8; PAGE_SIZE_LEAF as usize]>) -> Self {
+        Self::Owned(data)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Shared(data) => data.as_slice(),
+            Self::Owned(data) => data.as_slice(),
+        }
+    }
+}
+
+impl Deref for LeafPageImage {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -74,6 +119,19 @@ pub(super) const MIN_LEAF_CELLS: usize = 4;
 /// redistributed.
 pub(super) const MIN_LEAF_BYTES: usize = PAGE_SIZE_LEAF as usize / 2;
 
+/// One page on a root-to-leaf B-tree traversal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BTreePathStep {
+    /// Page reached at this step.
+    pub(crate) page_id: u32,
+    /// Parent page from the previous step, or `None` for the root.
+    pub(crate) parent_page: Option<u32>,
+    /// Child slot in `parent_page`, or `None` for the root.
+    pub(crate) child_slot: Option<usize>,
+    /// B-tree level of `page_id` (`0` means leaf).
+    pub(crate) level: u8,
+}
+
 // ---------------------------------------------------------------------------
 // Submodules
 // ---------------------------------------------------------------------------
@@ -81,10 +139,61 @@ pub(super) const MIN_LEAF_BYTES: usize = PAGE_SIZE_LEAF as usize / 2;
 mod chain;
 mod node;
 pub(crate) mod reconcile;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod us016_test_probe;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod us025_test_probe;
 
 use chain::*;
 pub(crate) use node::CellValue;
 use node::{InternalNode, LeafNode};
+
+/// Return true when the encoded leaf contains a base cell in `[start, end)`.
+pub(crate) fn leaf_contains_key_in_range(
+    data: &[u8],
+    start: &[u8],
+    end: &[u8],
+    exclude_key: &[u8],
+) -> Result<bool> {
+    let node = LeafNode::parse(data)?;
+    let mut idx = node.binary_search(start).unwrap_or_else(|insert| insert);
+    while let Some(cell) = node.cells.get(idx) {
+        let key = cell.key.as_slice();
+        if key >= end {
+            break;
+        }
+        if key != exclude_key {
+            return Ok(true);
+        }
+        idx += 1;
+    }
+    Ok(false)
+}
+
+/// Return sibling leaf page ids that may also contain keys in `[start, end)`.
+pub(crate) fn leaf_unique_prefix_sibling_pages(
+    data: &[u8],
+    start: &[u8],
+    end: &[u8],
+) -> Result<Vec<u32>> {
+    let node = LeafNode::parse(data)?;
+    let mut pages = Vec::with_capacity(2);
+    if let Some(first) = node.cells.first() {
+        if node.prev_leaf_page != 0 && start <= first.key.as_slice() {
+            pages.push(node.prev_leaf_page);
+        }
+    } else if node.prev_leaf_page != 0 {
+        pages.push(node.prev_leaf_page);
+    }
+    if let Some(last) = node.cells.last() {
+        if node.next_leaf_page != 0 && end > last.key.as_slice() {
+            pages.push(node.next_leaf_page);
+        }
+    } else if node.next_leaf_page != 0 {
+        pages.push(node.next_leaf_page);
+    }
+    Ok(pages)
+}
 
 // ---------------------------------------------------------------------------
 // Page store abstraction
@@ -95,6 +204,11 @@ use node::{InternalNode, LeafNode};
 /// Implementors can back the store with the buffer pool + page allocator for
 /// production use, or with an in-memory hash map for unit tests.
 pub(crate) trait BTreePageStore {
+    /// Shared page guard held by reader traversal.
+    type SharedReadGuard<'a>
+    where
+        Self: 'a;
+
     /// Read a 4 KB internal page into a heap-allocated buffer.
     fn read_internal(&self, page: u32) -> Result<Box<[u8; PAGE_SIZE_INTERNAL as usize]>>;
 
@@ -112,17 +226,56 @@ pub(crate) trait BTreePageStore {
     /// `None` is returned when the backing implementation has no MVCC
     /// chains for `page` (e.g. overflow pages read through the same API,
     /// or a buffer pool frame that is not currently resident).
-    fn read_leaf(
+    fn read_leaf(&self, page: u32) -> Result<(LeafPageImage, Option<ChainSnapshot>)>;
+
+    /// Pin `page` and acquire the reader-side shared page latch.
+    ///
+    /// Implementations without page-local latches may return a no-op guard.
+    fn pin_shared_for_read<'a>(
+        &'a self,
+        page: u32,
+        size: PageSize,
+    ) -> Result<Self::SharedReadGuard<'a>>;
+
+    /// Read an internal page while its reader guard is still live.
+    fn read_internal_guarded(
         &self,
         page: u32,
-    ) -> Result<(Box<[u8; PAGE_SIZE_LEAF as usize]>, Option<ChainSnapshot>)>;
+        _guard: &Self::SharedReadGuard<'_>,
+    ) -> Result<Box<[u8; PAGE_SIZE_INTERNAL as usize]>> {
+        self.read_internal(page)
+    }
+
+    /// Read a leaf page while its reader guard is still live.
+    fn read_leaf_guarded(
+        &self,
+        page: u32,
+        _guard: &Self::SharedReadGuard<'_>,
+    ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
+        self.read_leaf(page)
+    }
+
+    /// Read a point-lookup leaf while its reader guard is still live.
+    fn read_leaf_for_key_guarded(
+        &self,
+        page: u32,
+        guard: &Self::SharedReadGuard<'_>,
+        key: &[u8],
+    ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
+        let _ = key;
+        self.read_leaf_guarded(page, guard)
+    }
 
     /// Write a 4 KB internal page.
     fn write_internal(&mut self, page: u32, data: &[u8; PAGE_SIZE_INTERNAL as usize])
         -> Result<()>;
 
     /// Write a 32 KB leaf (or overflow) page.
-    fn write_leaf(&mut self, page: u32, data: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()>;
+    fn write_leaf_structural(
+        &mut self,
+        page: u32,
+        data: &[u8; PAGE_SIZE_LEAF as usize],
+    ) -> Result<()>;
 
     /// Allocate a new 4 KB internal page.  Returns the page number.
     fn alloc_internal(&mut self) -> Result<u32>;
@@ -224,6 +377,11 @@ impl MemPageStore {
 }
 
 impl BTreePageStore for MemPageStore {
+    type SharedReadGuard<'a>
+        = ()
+    where
+        Self: 'a;
+
     fn read_internal(&self, page: u32) -> Result<Box<[u8; PAGE_SIZE_INTERNAL as usize]>> {
         Ok(self
             .internal_pages
@@ -232,10 +390,7 @@ impl BTreePageStore for MemPageStore {
             .unwrap_or_else(|| Box::new([0u8; PAGE_SIZE_INTERNAL as usize])))
     }
 
-    fn read_leaf(
-        &self,
-        page: u32,
-    ) -> Result<(Box<[u8; PAGE_SIZE_LEAF as usize]>, Option<ChainSnapshot>)> {
+    fn read_leaf(&self, page: u32) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
         let buf = self
             .leaf_pages
             .get(&page)
@@ -245,7 +400,15 @@ impl BTreePageStore for MemPageStore {
             .leaf_chains
             .get(&page)
             .map(|src| ChainSnapshot::new(src, None));
-        Ok((buf, snap))
+        Ok((LeafPageImage::owned(buf), snap))
+    }
+
+    fn pin_shared_for_read<'a>(
+        &'a self,
+        _page: u32,
+        _size: PageSize,
+    ) -> Result<Self::SharedReadGuard<'a>> {
+        Ok(())
     }
 
     fn write_internal(
@@ -257,7 +420,11 @@ impl BTreePageStore for MemPageStore {
         Ok(())
     }
 
-    fn write_leaf(&mut self, page: u32, data: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()> {
+    fn write_leaf_structural(
+        &mut self,
+        page: u32,
+        data: &[u8; PAGE_SIZE_LEAF as usize],
+    ) -> Result<()> {
         self.leaf_pages.insert(page, Box::new(*data));
         Ok(())
     }
@@ -406,7 +573,7 @@ impl<S: BTreePageStore> BTree<S> {
             cells: Vec::new(),
         };
         let buf = node.encode()?;
-        store.write_leaf(root_page, &buf)?;
+        store.write_leaf_structural(root_page, &buf)?;
         Ok(BTree {
             store,
             root_page,
@@ -428,7 +595,7 @@ impl<S: BTreePageStore> BTree<S> {
             cells: Vec::new(),
         };
         let buf = node.encode()?;
-        store.write_leaf(root_page, &buf)?;
+        store.write_leaf_structural(root_page, &buf)?;
         Ok(BTree {
             store,
             root_page,
@@ -459,6 +626,41 @@ impl<S: BTreePageStore> BTree<S> {
     pub(crate) fn free_all_pages(mut self) -> Result<()> {
         free_subtree(&mut self.store, self.root_page, self.root_level)
     }
+
+    /// Return every page occupied by this B+ tree with its allocator page size.
+    ///
+    /// The list includes internal, leaf, and overflow pages. Callers that need
+    /// deterministic multi-page latch ordering should sort the returned vector
+    /// by page id before acquiring latches.
+    pub(crate) fn collect_pages_by_size(&mut self) -> Result<Vec<(u32, PageSize)>> {
+        let mut pages = Vec::new();
+        collect_subtree_pages(&mut self.store, self.root_page, self.root_level, &mut pages)?;
+        Ok(pages)
+    }
+}
+
+/// Return whether `data` has room for an inserted leaf cell.
+pub(crate) fn leaf_can_insert_value(data: &[u8], key_len: usize, value_len: usize) -> Result<bool> {
+    let node = LeafNode::parse(data)?;
+    Ok(node.can_insert(encoded_leaf_cell_size(key_len, value_len)))
+}
+
+/// Return whether deleting `key` from `data` would make a non-root leaf rebalance.
+pub(crate) fn leaf_needs_rebalance_after_delete(data: &[u8], key: &[u8]) -> Result<bool> {
+    let mut node = LeafNode::parse(data)?;
+    if let Ok(idx) = node.binary_search(key) {
+        node.cells.remove(idx);
+    }
+    Ok(node.needs_rebalance())
+}
+
+fn encoded_leaf_cell_size(key_len: usize, value_len: usize) -> usize {
+    let value_size = if value_len > OVERFLOW_THRESHOLD {
+        8
+    } else {
+        4 + value_len
+    };
+    2 + key_len + 1 + value_size
 }
 
 mod delete;
@@ -500,3 +702,7 @@ mod btree_us016_tests;
 #[cfg(test)]
 #[path = "../btree_us017_tests.rs"]
 mod btree_us017_tests;
+
+#[cfg(test)]
+#[path = "../btree_us035_tests.rs"]
+mod btree_us035_tests;

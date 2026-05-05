@@ -242,7 +242,11 @@ fn lane_acquisition_busy_timeout_10ms() {
 
 /// Seed 10 docs, spawn 4 writers looping inserts on that ns, then after 100ms
 /// drop_collection. Drop must complete without deadlock. Writers may error but
-/// must not panic. After drop+reopen, namespace is gone (count = 0).
+/// must not panic. Phase 5 §10.1.1 retired the legacy `dropped_namespaces`
+/// guard; durable id monotonicity now isolates incarnations, so the post-F5
+/// invariant is "no pre-drop seed documents survive drop+reopen". Any
+/// post-drop writer that races past the drop bootstraps a fresh incarnation
+/// of the same name with a strictly greater `CollectionEntry.id`.
 #[test]
 fn drop_namespace_mid_write_burst() {
     let dir = tempfile::tempdir().unwrap();
@@ -290,17 +294,20 @@ fn drop_namespace_mid_write_burst() {
         h.join().expect("writer thread panicked");
     }
 
-    // Reopen and confirm namespace is gone or empty.
+    // Reopen and confirm pre-drop seed documents are isolated by durable
+    // id monotonicity (Phase 5 §10.1.1). Any post-drop writer-bootstrapped
+    // documents under the same name belong to a fresh incarnation with a
+    // strictly greater `CollectionEntry.id`.
     drop(client);
     let client2 = Client::open(&path).unwrap();
-    let count = client2
+    let seed_count = client2
         .database("drop_mid")
         .collection::<Document>("victim")
-        .count_documents(doc! {})
+        .count_documents(doc! { "v": "seed" })
         .unwrap_or(0);
     assert_eq!(
-        count, 0,
-        "namespace must be empty (or absent) after drop+reopen"
+        seed_count, 0,
+        "pre-drop seed documents must not survive drop+reopen"
     );
 }
 
@@ -346,16 +353,16 @@ fn bootstrap_race_new_namespace() {
 }
 
 // ---------------------------------------------------------------------------
-// TC6: commit_seq monotonicity under churn
+// TC6: journal_mutex serialization under churn
 // ---------------------------------------------------------------------------
 
 /// 8 threads each insert 50 docs into DIFFERENT namespaces concurrently.
-/// After join: every namespace has exactly 50 docs — a broken commit_seq
+/// After join: every namespace has exactly 50 docs — a broken journal_mutex envelope
 /// would manifest as lost writes or corrupt scan state.
 #[test]
-fn commit_seq_monotonicity_under_churn() {
+fn journal_mutex_serialization_under_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("commit_seq.mqlite");
+    let path = dir.path().join("journal_mutex.mqlite");
     let client = Client::open(&path).unwrap();
 
     const THREADS: usize = 8;
@@ -404,7 +411,7 @@ fn commit_seq_monotonicity_under_churn() {
                 .unwrap();
             assert!(
                 doc.is_some(),
-                "ns{t}: _id={id} missing after concurrent inserts (commit_seq corruption?)"
+                "ns{t}: _id={id} missing after concurrent inserts (journal_mutex corruption?)"
             );
         }
     }

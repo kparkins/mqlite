@@ -77,7 +77,7 @@ fn test_class_b_b_dual_writes_during_build_survive_reopen_and_merge() {
         .expect("reserve Building index");
     assert!(matches!(
         outcome,
-        super::index_maint::ReserveOutcome::Reserved
+        super::index_maint::ReserveOutcome::Reserved(_)
     ));
     engine
         .create_index_build(NS, TAG_INDEX)

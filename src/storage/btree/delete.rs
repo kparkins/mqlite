@@ -66,7 +66,7 @@ impl<S: BTreePageStore> BTree<S> {
         }
 
         let encoded = node.encode()?;
-        self.store.write_leaf(page, &encoded)?;
+        self.store.write_leaf_structural(page, &encoded)?;
 
         // Check for underflow and potentially merge/redistribute.
         if node.needs_rebalance() && !path.is_empty() {
@@ -257,8 +257,8 @@ impl<S: BTreePageStore> BTree<S> {
         parent.entries[separator_idx].0 = separator_key;
         let parent_enc = parent.encode()?;
 
-        self.store.write_leaf(left_page, &left_enc)?;
-        self.store.write_leaf(right_page, &right_enc)?;
+        self.store.write_leaf_structural(left_page, &left_enc)?;
+        self.store.write_leaf_structural(right_page, &right_enc)?;
         self.store.write_internal(parent_page, &parent_enc)?;
         Ok(())
     }
@@ -284,11 +284,12 @@ impl<S: BTreePageStore> BTree<S> {
             let mut next_node = LeafNode::parse(&next_buf[..])?;
             next_node.prev_leaf_page = left_page;
             let enc = next_node.encode()?;
-            self.store.write_leaf(node.next_leaf_page, &enc)?;
+            self.store
+                .write_leaf_structural(node.next_leaf_page, &enc)?;
         }
 
         let left_enc = left_node.encode()?;
-        self.store.write_leaf(left_page, &left_enc)?;
+        self.store.write_leaf_structural(left_page, &left_enc)?;
         if !self.store.chains_empty(page)? {
             return Err(Error::Internal(
                 "free_leaf called with non-empty version chain".into(),
@@ -321,11 +322,12 @@ impl<S: BTreePageStore> BTree<S> {
             let mut prev_node = LeafNode::parse(&prev_buf[..])?;
             prev_node.next_leaf_page = right_page;
             let enc = prev_node.encode()?;
-            self.store.write_leaf(node.prev_leaf_page, &enc)?;
+            self.store
+                .write_leaf_structural(node.prev_leaf_page, &enc)?;
         }
 
         let right_enc = right_node.encode()?;
-        self.store.write_leaf(right_page, &right_enc)?;
+        self.store.write_leaf_structural(right_page, &right_enc)?;
         if !self.store.chains_empty(page)? {
             return Err(Error::Internal(
                 "free_leaf called with non-empty version chain".into(),

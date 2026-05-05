@@ -8,8 +8,9 @@
 //!
 //! [`BufferPoolPageStore`] holds `Arc<BufferPoolHandle>`.
 //!
-//! - **Reads**: pin the page, copy the data into a heap-allocated buffer, unpin.
-//!   The copy is required to satisfy the `Box<[u8; SIZE]>` return type.
+//! - **Reads**: pin the page, clone the immutable page-image `Arc`, snapshot
+//!   resident chains, then unpin. Leaf readers carry the shared immutable image
+//!   instead of cloning 32 KiB per reader.
 //!
 //! - **Writes**: pin the page, copy the supplied buffer in, mark dirty, unpin.
 //!   The dirty bit causes the page to be written to disk on the next
@@ -32,8 +33,8 @@ use std::sync::Arc;
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
-use crate::storage::btree::BTreePageStore;
-use crate::storage::buffer_pool::{PageSize, PinnedPage};
+use crate::storage::btree::{BTreePageStore, LeafPageImage};
+use crate::storage::buffer_pool::{LatchedPinnedPage, PageSize, PinnedPage};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
@@ -58,6 +59,11 @@ pub(crate) struct BufferPoolPageStore {
     /// allocated by a history-routed store live in a disjoint cache so that
     /// writes to the history store never re-enter main-pool partition mutexes.
     is_history: bool,
+}
+
+pub(crate) enum SharedReaderPage<'a> {
+    Latched(LatchedPinnedPage<'a>),
+    Pinned(PinnedPage<'a>),
 }
 
 impl BufferPoolPageStore {
@@ -106,6 +112,11 @@ impl BufferPoolPageStore {
 }
 
 impl BTreePageStore for BufferPoolPageStore {
+    type SharedReadGuard<'a>
+        = SharedReaderPage<'a>
+    where
+        Self: 'a;
+
     // -----------------------------------------------------------------------
     // Reads
     // -----------------------------------------------------------------------
@@ -118,20 +129,99 @@ impl BTreePageStore for BufferPoolPageStore {
         // pinned auto-unpins here
     }
 
-    fn read_leaf(&self, page: u32) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
+    fn read_leaf(&self, page: u32) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
+        if !self.is_history {
+            let latched = self.handle.pool().pin_for_read(page)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            let hold_start = crate::storage::btree::us016_test_probe::begin_leaf_hold(page, 0);
+            let page_data = latched.data_snapshot();
+            let snap = Some(latched.snapshot_chains(None)?);
+            drop(latched);
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::storage::btree::us016_test_probe::finish_leaf_hold(hold_start);
+            return Ok((LeafPageImage::shared(page_data)?, snap));
+        }
+
         let pinned = self.fetch(page, PageSize::Large32k)?;
         let mut buf = Box::new([0u8; LEAF_SIZE]);
         buf.copy_from_slice(pinned.data());
-        // The page is pinned — the frame is guaranteed resident, so we can
-        // snapshot its MVCC chains before unpinning. History-routed stores
-        // never carry version chains, so we skip the snapshot on them.
-        let snap = if self.is_history {
-            None
-        } else {
-            self.handle.pool().snapshot_chains(page, None)?
-        };
-        Ok((buf, snap))
+        Ok((LeafPageImage::owned(buf), None))
         // pinned auto-unpins here
+    }
+
+    fn pin_shared_for_read<'a>(
+        &'a self,
+        page: u32,
+        size: PageSize,
+    ) -> Result<Self::SharedReadGuard<'a>> {
+        if self.is_history {
+            return self.fetch(page, size).map(SharedReaderPage::Pinned);
+        }
+        self.handle
+            .pool()
+            .pin_for_read_sized(page, size)
+            .map(SharedReaderPage::Latched)
+    }
+
+    fn read_internal_guarded(
+        &self,
+        _page: u32,
+        guard: &Self::SharedReadGuard<'_>,
+    ) -> Result<Box<[u8; INTERNAL_SIZE]>> {
+        let mut buf = Box::new([0u8; INTERNAL_SIZE]);
+        match guard {
+            SharedReaderPage::Latched(page) => {
+                let page_data = page.data_snapshot();
+                buf.copy_from_slice(&page_data[..INTERNAL_SIZE]);
+            }
+            SharedReaderPage::Pinned(page) => buf.copy_from_slice(page.data()),
+        }
+        Ok(buf)
+    }
+
+    fn read_leaf_guarded(
+        &self,
+        _page: u32,
+        guard: &Self::SharedReadGuard<'_>,
+    ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
+        match guard {
+            SharedReaderPage::Latched(page) => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                let hold_start =
+                    crate::storage::btree::us016_test_probe::begin_leaf_hold(page.page_id(), 0);
+                let page_data = page.data_snapshot();
+                let snap = Some(page.snapshot_chains(None)?);
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::storage::btree::us016_test_probe::finish_leaf_hold(hold_start);
+                Ok((LeafPageImage::shared(page_data)?, snap))
+            }
+            SharedReaderPage::Pinned(page) => {
+                let mut buf = Box::new([0u8; LEAF_SIZE]);
+                buf.copy_from_slice(page.data());
+                Ok((LeafPageImage::owned(buf), None))
+            }
+        }
+    }
+
+    fn read_leaf_for_key_guarded(
+        &self,
+        page: u32,
+        guard: &Self::SharedReadGuard<'_>,
+        key: &[u8],
+    ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
+        match guard {
+            SharedReaderPage::Latched(page) => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                let hold_start =
+                    crate::storage::btree::us016_test_probe::begin_leaf_hold(page.page_id(), 0);
+                let page_data = page.data_snapshot();
+                let snap = Some(page.snapshot_chain_for_key(key, None)?);
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::storage::btree::us016_test_probe::finish_leaf_hold(hold_start);
+                Ok((LeafPageImage::shared(page_data)?, snap))
+            }
+            SharedReaderPage::Pinned(_) => self.read_leaf(page),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -145,7 +235,7 @@ impl BTreePageStore for BufferPoolPageStore {
         // pinned auto-unpins here; dirty bit set by data_mut()
     }
 
-    fn write_leaf(&mut self, page: u32, data: &[u8; LEAF_SIZE]) -> Result<()> {
+    fn write_leaf_structural(&mut self, page: u32, data: &[u8; LEAF_SIZE]) -> Result<()> {
         let mut pinned = self.fetch(page, PageSize::Large32k)?;
         pinned.data_mut().copy_from_slice(data);
         Ok(())
@@ -315,7 +405,7 @@ mod tests {
         let mut data = [0u8; LEAF_SIZE];
         data[0] = 0xCC;
         data[32760] = 0xDD;
-        store.write_leaf(pn, &data).unwrap();
+        store.write_leaf_structural(pn, &data).unwrap();
 
         let (read_back, _) = store.read_leaf(pn).unwrap();
         assert_eq!(read_back[0], 0xCC);
@@ -385,3 +475,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "btree_store_us035_tests.rs"]
+mod us035_tests;

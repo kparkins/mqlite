@@ -6,16 +6,18 @@ use std::cmp::Ordering as CmpOrdering;
 use std::ops::Bound;
 
 use crate::error::Result;
-use crate::mvcc::read_view::ReadView;
+use crate::mvcc::read_view::{ChainSnapshot, ReadView};
 use crate::mvcc::version::{VersionData, VersionEntry};
+use crate::storage::buffer_pool::PageSize;
 
 use super::chain::read_overflow_chain;
 use super::node::{InternalNode, LeafNode};
-use super::{BTree, BTreePageStore, CellValue, HistoryProbe};
+use super::{BTree, BTreePageStore, CellValue, HistoryProbe, LeafPageImage};
 
 /// A visible delta key paired with `Some(value)` for live versions or `None`
 /// for tombstones.
 pub(crate) type VisibleDeltaEntry = (Vec<u8>, Option<Vec<u8>>);
+type LeafRead = (LeafPageImage, Option<ChainSnapshot>);
 
 impl<S: BTreePageStore> BTree<S> {
     // -----------------------------------------------------------------------
@@ -28,13 +30,8 @@ impl<S: BTreePageStore> BTree<S> {
     /// (the caller must call [`BTree::read_overflow`] explicitly).  Use
     /// [`BTree::get`] for a fully resolved lookup.
     pub(crate) fn search(&self, key: &[u8]) -> Result<Option<CellValue>> {
-        let leaf_page = self.find_leaf(key)?;
-        let (buf, _) = self.store.read_leaf(leaf_page)?;
-        let node = LeafNode::parse(&buf[..])?;
-        match node.binary_search(key) {
-            Ok(i) => Ok(Some(node.cells[i].value.clone())),
-            Err(_) => Ok(None),
-        }
+        let (_, (buf, _)) = self.read_leaf_for_point_key_latch_coupled(key)?;
+        LeafNode::cell_value(&buf[..], key)
     }
 
     /// Like [`BTree::search`] but resolves overflow pointers, returning the raw
@@ -71,8 +68,7 @@ impl<S: BTreePageStore> BTree<S> {
         view: &ReadView,
         history: Option<&dyn HistoryProbe>,
     ) -> Result<Option<Vec<u8>>> {
-        let leaf_page = self.find_leaf(key)?;
-        let (buf, snap) = self.store.read_leaf(leaf_page)?;
+        let (_, (buf, snap)) = self.read_leaf_for_point_key_latch_coupled(key)?;
         if let Some(snap) = snap.as_ref() {
             if let Some(entry) = snap.visible_at(key, view) {
                 if entry.is_tombstone {
@@ -110,20 +106,17 @@ impl<S: BTreePageStore> BTree<S> {
                 }
             }
         }
-        let node = LeafNode::parse(&buf[..])?;
-        match node.binary_search(key) {
-            Ok(i) => match &node.cells[i].value {
-                CellValue::Inline(v) => Ok(Some(v.clone())),
-                CellValue::Overflow {
-                    first_page,
-                    total_length,
-                } => Ok(Some(read_overflow_chain(
-                    &self.store,
-                    *first_page,
-                    *total_length,
-                )?)),
-            },
-            Err(_) => Ok(None),
+        match LeafNode::cell_value(&buf[..], key)? {
+            Some(CellValue::Inline(v)) => Ok(Some(v)),
+            Some(CellValue::Overflow {
+                first_page,
+                total_length,
+            }) => Ok(Some(read_overflow_chain(
+                &self.store,
+                first_page,
+                total_length,
+            )?)),
+            None => Ok(None),
         }
     }
 
@@ -147,14 +140,13 @@ impl<S: BTreePageStore> BTree<S> {
         let mut results = Vec::new();
 
         // Find the first leaf that might contain start_key.
-        let first_leaf = match start_key {
-            Some(k) => self.find_leaf(k)?,
-            None => self.leftmost_leaf()?,
+        let (_, mut leaf_read) = match start_key {
+            Some(k) => self.read_leaf_for_key_latch_coupled(k)?,
+            None => self.read_leftmost_leaf_latch_coupled()?,
         };
 
-        let mut cur_page = first_leaf;
-        'outer: while cur_page != 0 {
-            let (buf, _) = self.store.read_leaf(cur_page)?;
+        loop {
+            let (buf, _) = leaf_read;
             let node = LeafNode::parse(&buf[..])?;
 
             let start_idx = match start_key {
@@ -169,13 +161,17 @@ impl<S: BTreePageStore> BTree<S> {
                 let cell = &node.cells[i];
                 if let Some(ek) = end_key {
                     if cell.key.as_slice() > ek {
-                        break 'outer;
+                        return Ok(results);
                     }
                 }
                 results.push((cell.key.clone(), cell.value.clone()));
             }
 
-            cur_page = node.next_leaf_page;
+            let cur_page = node.next_leaf_page;
+            if cur_page == 0 {
+                break;
+            }
+            leaf_read = self.store.read_leaf(cur_page)?;
         }
 
         Ok(results)
@@ -219,9 +215,9 @@ impl<S: BTreePageStore> BTree<S> {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-        let first_leaf = match start {
-            Bound::Included(k) | Bound::Excluded(k) => self.find_leaf(k)?,
-            Bound::Unbounded => self.leftmost_leaf()?,
+        let (_, mut leaf_read) = match start {
+            Bound::Included(k) | Bound::Excluded(k) => self.read_leaf_for_key_latch_coupled(k)?,
+            Bound::Unbounded => self.read_leftmost_leaf_latch_coupled()?,
         };
 
         let resolve_entry = |entry: &VersionEntry| -> Result<Vec<u8>> {
@@ -243,9 +239,8 @@ impl<S: BTreePageStore> BTree<S> {
             }
         };
 
-        let mut cur_page = first_leaf;
-        'outer: while cur_page != 0 {
-            let (buf, snap) = self.store.read_leaf(cur_page)?;
+        loop {
+            let (buf, snap) = leaf_read;
             let node = LeafNode::parse(&buf[..])?;
 
             let start_idx = base_start_index(&node, start);
@@ -265,7 +260,7 @@ impl<S: BTreePageStore> BTree<S> {
                 };
 
                 if end_excludes_key(end, source.key()) {
-                    break 'outer;
+                    return Ok(results);
                 }
 
                 match source {
@@ -317,7 +312,11 @@ impl<S: BTreePageStore> BTree<S> {
                 }
             }
 
-            cur_page = node.next_leaf_page;
+            let cur_page = node.next_leaf_page;
+            if cur_page == 0 {
+                break;
+            }
+            leaf_read = self.store.read_leaf(cur_page)?;
         }
 
         Ok(results)
@@ -329,10 +328,10 @@ impl<S: BTreePageStore> BTree<S> {
     /// images without treating the base page as visibility authority.
     pub(crate) fn visible_delta_entries(&self, view: &ReadView) -> Result<Vec<VisibleDeltaEntry>> {
         let mut results = Vec::new();
-        let mut cur_page = self.leftmost_leaf()?;
+        let (_, mut leaf_read) = self.read_leftmost_leaf_latch_coupled()?;
 
-        while cur_page != 0 {
-            let (buf, snap) = self.store.read_leaf(cur_page)?;
+        loop {
+            let (buf, snap) = leaf_read;
             let node = LeafNode::parse(&buf[..])?;
             if let Some(snapshot) = snap.as_ref() {
                 for (key, entry) in snapshot.visible_range(Bound::Unbounded, Bound::Unbounded, view)
@@ -352,7 +351,11 @@ impl<S: BTreePageStore> BTree<S> {
                     results.push((key.to_vec(), value));
                 }
             }
-            cur_page = node.next_leaf_page;
+            let cur_page = node.next_leaf_page;
+            if cur_page == 0 {
+                break;
+            }
+            leaf_read = self.store.read_leaf(cur_page)?;
         }
 
         Ok(results)
@@ -361,6 +364,106 @@ impl<S: BTreePageStore> BTree<S> {
     // -----------------------------------------------------------------------
     // Private helpers (shared with writers)
     // -----------------------------------------------------------------------
+
+    /// Traverse root-to-leaf with reader latch coupling and read the leaf
+    /// while the leaf shared latch is still held.
+    fn read_leaf_for_key_latch_coupled(&self, key: &[u8]) -> Result<(u32, LeafRead)> {
+        let mut page = self.root_page;
+        let mut level = self.root_level;
+        let mut guard = self
+            .store
+            .pin_shared_for_read(page, page_size_for_level(level))?;
+        record_reader_shared_acquire(page, level);
+
+        while level > 0 {
+            let buf = self.store.read_internal_guarded(page, &guard)?;
+            let node = InternalNode::parse(&buf[..])?;
+            let child_page = node.find_child(key);
+            let child_level = level - 1;
+            let child_guard = self
+                .store
+                .pin_shared_for_read(child_page, page_size_for_level(child_level))?;
+            record_reader_shared_acquire(child_page, child_level);
+            record_reader_parent_release_after_child(page, child_page);
+            drop(guard);
+            guard = child_guard;
+            page = child_page;
+            level = child_level;
+        }
+
+        let leaf = self.store.read_leaf_guarded(page, &guard)?;
+        drop(guard);
+        pause_before_iteration()?;
+        Ok((page, leaf))
+    }
+
+    /// Traverse root-to-leaf for a point read and snapshot only `key`'s
+    /// resident delta chain while the leaf shared latch is still held.
+    fn read_leaf_for_point_key_latch_coupled(&self, key: &[u8]) -> Result<(u32, LeafRead)> {
+        let mut page = self.root_page;
+        let mut level = self.root_level;
+        let mut guard = self
+            .store
+            .pin_shared_for_read(page, page_size_for_level(level))?;
+        record_reader_shared_acquire(page, level);
+
+        while level > 0 {
+            let buf = self.store.read_internal_guarded(page, &guard)?;
+            let node = InternalNode::parse(&buf[..])?;
+            let child_page = node.find_child(key);
+            let child_level = level - 1;
+            let child_guard = self
+                .store
+                .pin_shared_for_read(child_page, page_size_for_level(child_level))?;
+            record_reader_shared_acquire(child_page, child_level);
+            record_reader_parent_release_after_child(page, child_page);
+            drop(guard);
+            guard = child_guard;
+            page = child_page;
+            level = child_level;
+        }
+
+        let leaf = self.store.read_leaf_for_key_guarded(page, &guard, key)?;
+        drop(guard);
+        pause_before_iteration()?;
+        Ok((page, leaf))
+    }
+
+    /// Follow the leftmost path with reader latch coupling and copy the leaf
+    /// while the leaf shared latch is still held.
+    fn read_leftmost_leaf_latch_coupled(&self) -> Result<(u32, LeafRead)> {
+        let mut page = self.root_page;
+        let mut level = self.root_level;
+        let mut guard = self
+            .store
+            .pin_shared_for_read(page, page_size_for_level(level))?;
+        record_reader_shared_acquire(page, level);
+
+        while level > 0 {
+            let buf = self.store.read_internal_guarded(page, &guard)?;
+            let node = InternalNode::parse(&buf[..])?;
+            let child_page = if node.entries.is_empty() {
+                node.rightmost_child
+            } else {
+                node.entries[0].1
+            };
+            let child_level = level - 1;
+            let child_guard = self
+                .store
+                .pin_shared_for_read(child_page, page_size_for_level(child_level))?;
+            record_reader_shared_acquire(child_page, child_level);
+            record_reader_parent_release_after_child(page, child_page);
+            drop(guard);
+            guard = child_guard;
+            page = child_page;
+            level = child_level;
+        }
+
+        let leaf = self.store.read_leaf_guarded(page, &guard)?;
+        drop(guard);
+        pause_before_iteration()?;
+        Ok((page, leaf))
+    }
 
     /// Traverse from the root to the leaf page that should contain `key`.
     pub(crate) fn find_leaf(&self, key: &[u8]) -> Result<u32> {
@@ -377,8 +480,51 @@ impl<S: BTreePageStore> BTree<S> {
         Ok(page)
     }
 
+    /// Traverse from the root to the leaf page for `key`, retaining parent
+    /// linkage for post-latch structural revalidation.
+    pub(crate) fn path_to_leaf(&self, key: &[u8]) -> Result<Vec<super::BTreePathStep>> {
+        let mut path = Vec::new();
+        let mut page = self.root_page;
+        let mut level = self.root_level;
+        let mut parent_page = None;
+        let mut child_slot = None;
+
+        loop {
+            path.push(super::BTreePathStep {
+                page_id: page,
+                parent_page,
+                child_slot,
+                level,
+            });
+
+            if level == 0 {
+                return Ok(path);
+            }
+
+            let buf = self.store.read_internal(page)?;
+            let node = InternalNode::parse(&buf[..])?;
+            let idx = node.find_child_idx(key);
+            let child_page = node.child_at(idx);
+            parent_page = Some(page);
+            child_slot = Some(idx);
+            page = child_page;
+            level -= 1;
+        }
+    }
+
+    /// Verify that a previously planned root-to-leaf path still resolves to
+    /// the same pages and child slots.
+    pub(crate) fn revalidate_path(
+        &self,
+        key: &[u8],
+        expected: &[super::BTreePathStep],
+    ) -> Result<bool> {
+        Ok(self.path_to_leaf(key)? == expected)
+    }
+
     /// Follow leftmost child pointers from the root to reach the
     /// leftmost leaf page.
+    #[allow(dead_code, reason = "unit tests and tree invariants use this helper")]
     pub(super) fn leftmost_leaf(&self) -> Result<u32> {
         let mut page = self.root_page;
         let mut level = self.root_level;
@@ -446,4 +592,38 @@ fn end_excludes_key(end: Bound<&[u8]>, key: &[u8]) -> bool {
         Bound::Included(end_key) => key > end_key,
         Bound::Excluded(end_key) => key >= end_key,
     }
+}
+
+fn page_size_for_level(level: u8) -> PageSize {
+    if level == 0 {
+        PageSize::Large32k
+    } else {
+        PageSize::Small4k
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn record_reader_shared_acquire(page_id: u32, level: u8) {
+    super::us025_test_probe::record_shared_acquire(page_id, level);
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn record_reader_shared_acquire(_page_id: u32, _level: u8) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn record_reader_parent_release_after_child(parent_page: u32, child_page: u32) {
+    super::us025_test_probe::record_parent_release_after_child(parent_page, child_page);
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn record_reader_parent_release_after_child(_parent_page: u32, _child_page: u32) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn pause_before_iteration() -> Result<()> {
+    super::us016_test_probe::pause_before_iteration()
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn pause_before_iteration() -> Result<()> {
+    Ok(())
 }

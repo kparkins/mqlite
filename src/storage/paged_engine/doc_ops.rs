@@ -7,8 +7,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
-use crate::keys::encode_key;
-use crate::mvcc::transaction::Ns;
+use crate::mvcc::transaction::{ExpectedHead, Ns};
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
     ReturnDocument, UpdateOptions,
@@ -29,7 +28,38 @@ use super::snapshot_ops::{
 };
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
+use crate::storage::btree_store::BufferPoolPageStore;
+use crate::storage::root_snapshot::NamespaceSnapshot;
 use crate::storage::txn_page_store::TxnOverlay;
+
+fn expected_head_for_key(
+    shared: &SharedState,
+    ns_snap: &NamespaceSnapshot,
+    key: &[u8],
+) -> Result<Option<ExpectedHead>> {
+    let tree = BTree::open(
+        BufferPoolPageStore::new(Arc::clone(&shared.handle)),
+        ns_snap.data_root_page,
+        ns_snap.data_root_level,
+    );
+    let leaf_page = tree.find_leaf(key)?;
+    let page = shared.handle.pool().pin_for_read(leaf_page)?;
+    Ok(page.expected_head(key))
+}
+
+fn attach_expected_heads(
+    shared: &SharedState,
+    ns_snap: &NamespaceSnapshot,
+    pairs: Vec<(Vec<u8>, Document)>,
+) -> Result<Vec<(Vec<u8>, Document, Option<ExpectedHead>)>> {
+    pairs
+        .into_iter()
+        .map(|(key, doc)| {
+            let expected_head = expected_head_for_key(shared, ns_snap, &key)?;
+            Ok((key, doc, expected_head))
+        })
+        .collect()
+}
 
 pub(super) fn stage_insert_body(
     shared: &SharedState,
@@ -70,7 +100,7 @@ pub(super) fn stage_insert_body(
         txn.mark_published();
         txn.mark_header();
     }
-    txn.stage_primary_insert(entry_id, ns_arc, key, bson_bytes);
+    txn.stage_primary_insert(entry_id, ns_arc, key, bson_bytes, None);
     maintain_secondary_on_insert(shared, md, overlay, ns, &doc, &id, vis, txn)?;
     Ok(id)
 }
@@ -140,7 +170,7 @@ pub(super) fn update(
 
     let snap = engine.shared.load_published();
     let ns_snap_opt = snap.catalog.get_by_name(ns);
-    let matched_pairs: Vec<(Vec<u8>, Document)> = match ns_snap_opt {
+    let matched_pairs: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = match ns_snap_opt {
         None => {
             if opts.upsert {
                 return do_upsert_update(engine, ns, filter, update_doc);
@@ -151,13 +181,17 @@ pub(super) fn update(
                 upserted_id: None,
             });
         }
-        Some(ns_snap) => execute_snapshot_pairs_only(
+        Some(ns_snap) => attach_expected_heads(
             &engine.shared,
-            ns,
             ns_snap,
-            filter,
-            Arc::clone(&snap),
-            false,
+            execute_snapshot_pairs_only(
+                &engine.shared,
+                ns,
+                ns_snap,
+                filter,
+                Arc::clone(&snap),
+                false,
+            )?,
         )?,
     };
 
@@ -165,7 +199,7 @@ pub(super) fn update(
         return do_upsert_update(engine, ns, filter, update_doc);
     }
 
-    let pairs_to_process: Vec<(Vec<u8>, Document)> = if many {
+    let pairs_to_process: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = if many {
         matched_pairs
     } else {
         matched_pairs.into_iter().take(1).collect()
@@ -175,7 +209,7 @@ pub(super) fn update(
     engine.run_write_existing(ns, |shared, md, overlay, txn, vis| {
         let mut matched_count = 0u64;
         let mut modified_count = 0u64;
-        for (key, mut doc) in pairs_to_process {
+        for (key, mut doc, expected_head) in pairs_to_process {
             matched_count += 1;
             let before = doc.clone();
             let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
@@ -189,27 +223,13 @@ pub(super) fn update(
                 )?;
                 let entry_opt = catalog_lock(md).get_collection(ns)?;
                 if let Some(entry) = entry_opt {
-                    let entry_id = entry.id;
-                    let mut tree = BTree::open(
-                        new_txn_store(shared, overlay),
-                        entry.data_root_page,
-                        entry.data_root_level,
+                    txn.stage_primary_update(
+                        entry.id,
+                        ns_arc.clone(),
+                        key,
+                        new_bytes,
+                        expected_head,
                     );
-                    tree.delete(&key)?;
-                    tree.insert(&key, &new_bytes)?;
-                    if tree.root_page != entry.data_root_page
-                        || tree.root_level != entry.data_root_level
-                    {
-                        let mut updated = entry;
-                        updated.data_root_page = tree.root_page;
-                        updated.data_root_level = tree.root_level;
-                        catalog_lock(md).update_collection(&updated)?;
-                        sync_catalog_root_overlay(shared, md, overlay)?;
-                        // Phase 1 §10.3 — data-tree root moved on update.
-                        txn.mark_published();
-                        txn.mark_header();
-                    }
-                    txn.stage_primary_update(entry_id, ns_arc.clone(), key, new_bytes);
                 }
             }
         }
@@ -228,24 +248,29 @@ pub(super) fn delete(
     many: bool,
 ) -> Result<DeleteResult> {
     let snap = engine.shared.load_published();
-    let pairs_to_delete: Vec<(Vec<u8>, Document)> = match snap.catalog.get_by_name(ns) {
-        None => return Ok(DeleteResult { deleted_count: 0 }),
-        Some(ns_snap) => {
-            let pairs = execute_snapshot_pairs_only(
-                &engine.shared,
-                ns,
-                ns_snap,
-                filter,
-                Arc::clone(&snap),
-                false,
-            )?;
-            if many {
-                pairs
-            } else {
-                pairs.into_iter().take(1).collect()
+    let pairs_to_delete: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
+        match snap.catalog.get_by_name(ns) {
+            None => return Ok(DeleteResult { deleted_count: 0 }),
+            Some(ns_snap) => {
+                let pairs = attach_expected_heads(
+                    &engine.shared,
+                    ns_snap,
+                    execute_snapshot_pairs_only(
+                        &engine.shared,
+                        ns,
+                        ns_snap,
+                        filter,
+                        Arc::clone(&snap),
+                        false,
+                    )?,
+                )?;
+                if many {
+                    pairs
+                } else {
+                    pairs.into_iter().take(1).collect()
+                }
             }
-        }
-    };
+        };
 
     let deleted_count = pairs_to_delete.len() as u64;
     if deleted_count == 0 {
@@ -254,31 +279,12 @@ pub(super) fn delete(
 
     let ns_arc = Ns::from(ns);
     engine.run_write_existing(ns, |shared, md, overlay, txn, _vis| {
-        for (key, doc) in &pairs_to_delete {
+        for (key, doc, expected_head) in &pairs_to_delete {
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             maintain_secondary_on_delete(shared, md, overlay, ns, doc, &doc_id, txn)?;
             let entry_opt = catalog_lock(md).get_collection(ns)?;
             if let Some(entry) = entry_opt {
-                let entry_id = entry.id;
-                let mut tree = BTree::open(
-                    new_txn_store(shared, overlay),
-                    entry.data_root_page,
-                    entry.data_root_level,
-                );
-                tree.delete(key)?;
-                if tree.root_page != entry.data_root_page
-                    || tree.root_level != entry.data_root_level
-                {
-                    let mut updated = entry;
-                    updated.data_root_page = tree.root_page;
-                    updated.data_root_level = tree.root_level;
-                    catalog_lock(md).update_collection(&updated)?;
-                    sync_catalog_root_overlay(shared, md, overlay)?;
-                    // Phase 1 §10.3 — data-tree root moved on delete.
-                    txn.mark_published();
-                    txn.mark_header();
-                }
-                txn.stage_primary_delete(entry_id, ns_arc.clone(), key.clone());
+                txn.stage_primary_delete(entry.id, ns_arc.clone(), key.clone(), *expected_head);
             }
         }
         Ok(())
@@ -318,22 +324,27 @@ pub(super) fn find_one_and_update_doc(
     }
 
     let snap = engine.shared.load_published();
-    let mut matched: Vec<(Vec<u8>, Document)> = match snap.catalog.get_by_name(ns) {
-        None => {
-            if opts.upsert {
-                return fam_upsert_update(engine, ns, filter, update_doc, opts);
+    let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
+        match snap.catalog.get_by_name(ns) {
+            None => {
+                if opts.upsert {
+                    return fam_upsert_update(engine, ns, filter, update_doc, opts);
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-        Some(ns_snap) => execute_snapshot_pairs_only(
-            &engine.shared,
-            ns,
-            ns_snap,
-            filter,
-            Arc::clone(&snap),
-            false,
-        )?,
-    };
+            Some(ns_snap) => attach_expected_heads(
+                &engine.shared,
+                ns_snap,
+                execute_snapshot_pairs_only(
+                    &engine.shared,
+                    ns,
+                    ns_snap,
+                    filter,
+                    Arc::clone(&snap),
+                    false,
+                )?,
+            )?,
+        };
 
     if matched.is_empty() {
         if opts.upsert {
@@ -343,10 +354,10 @@ pub(super) fn find_one_and_update_doc(
     }
 
     if let Some(s) = &opts.sort {
-        matched.sort_by(|(_, a), (_, b)| compare_docs(a, b, s));
+        matched.sort_by(|(_, a, _), (_, b, _)| compare_docs(a, b, s));
     }
 
-    let (key, mut doc) = matched.remove(0);
+    let (key, mut doc, expected_head) = matched.remove(0);
     let before = doc.clone();
     let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
     apply_update(&mut doc, update_doc, false)?;
@@ -360,25 +371,7 @@ pub(super) fn find_one_and_update_doc(
         )?;
         let entry_opt = catalog_lock(md).get_collection(ns)?;
         if let Some(entry) = entry_opt {
-            let entry_id = entry.id;
-            let mut tree = BTree::open(
-                new_txn_store(shared, overlay),
-                entry.data_root_page,
-                entry.data_root_level,
-            );
-            tree.delete(&key)?;
-            tree.insert(&key, &new_bytes)?;
-            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-                let mut updated = entry;
-                updated.data_root_page = tree.root_page;
-                updated.data_root_level = tree.root_level;
-                catalog_lock(md).update_collection(&updated)?;
-                sync_catalog_root_overlay(shared, md, overlay)?;
-                // Phase 1 §10.3 — data-tree root moved on CRUD write.
-                txn.mark_published();
-                txn.mark_header();
-            }
-            txn.stage_primary_update(entry_id, ns_arc.clone(), key, new_bytes);
+            txn.stage_primary_update(entry.id, ns_arc.clone(), key, new_bytes, expected_head);
         }
         Ok(())
     })?;
@@ -396,27 +389,32 @@ pub(super) fn find_one_and_delete_doc(
     opts: &FindOneAndDeleteOptions,
 ) -> Result<Option<Document>> {
     let snap = engine.shared.load_published();
-    let mut matched: Vec<(Vec<u8>, Document)> = match snap.catalog.get_by_name(ns) {
-        None => return Ok(None),
-        Some(ns_snap) => execute_snapshot_pairs_only(
-            &engine.shared,
-            ns,
-            ns_snap,
-            filter,
-            Arc::clone(&snap),
-            false,
-        )?,
-    };
+    let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
+        match snap.catalog.get_by_name(ns) {
+            None => return Ok(None),
+            Some(ns_snap) => attach_expected_heads(
+                &engine.shared,
+                ns_snap,
+                execute_snapshot_pairs_only(
+                    &engine.shared,
+                    ns,
+                    ns_snap,
+                    filter,
+                    Arc::clone(&snap),
+                    false,
+                )?,
+            )?,
+        };
 
     if matched.is_empty() {
         return Ok(None);
     }
 
     if let Some(s) = &opts.sort {
-        matched.sort_by(|(_, a), (_, b)| compare_docs(a, b, s));
+        matched.sort_by(|(_, a, _), (_, b, _)| compare_docs(a, b, s));
     }
 
-    let (key, doc) = matched.remove(0);
+    let (key, doc, expected_head) = matched.remove(0);
     let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
     let ns_arc = Ns::from(ns);
@@ -424,24 +422,7 @@ pub(super) fn find_one_and_delete_doc(
         maintain_secondary_on_delete(shared, md, overlay, ns, &doc, &doc_id, txn)?;
         let entry_opt = catalog_lock(md).get_collection(ns)?;
         if let Some(entry) = entry_opt {
-            let entry_id = entry.id;
-            let mut tree = BTree::open(
-                new_txn_store(shared, overlay),
-                entry.data_root_page,
-                entry.data_root_level,
-            );
-            tree.delete(&key)?;
-            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-                let mut updated = entry;
-                updated.data_root_page = tree.root_page;
-                updated.data_root_level = tree.root_level;
-                catalog_lock(md).update_collection(&updated)?;
-                sync_catalog_root_overlay(shared, md, overlay)?;
-                // Phase 1 §10.3 — data-tree root moved on CRUD write.
-                txn.mark_published();
-                txn.mark_header();
-            }
-            txn.stage_primary_delete(entry_id, ns_arc.clone(), key);
+            txn.stage_primary_delete(entry.id, ns_arc.clone(), key, expected_head);
         }
         Ok(())
     })?;
@@ -457,22 +438,27 @@ pub(super) fn find_one_and_replace_doc(
     opts: &FindOneAndReplaceOptions,
 ) -> Result<Option<Document>> {
     let snap = engine.shared.load_published();
-    let mut matched: Vec<(Vec<u8>, Document)> = match snap.catalog.get_by_name(ns) {
-        None => {
-            if opts.upsert {
-                return fam_upsert_replace(engine, ns, replacement, opts);
+    let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
+        match snap.catalog.get_by_name(ns) {
+            None => {
+                if opts.upsert {
+                    return fam_upsert_replace(engine, ns, replacement, opts);
+                }
+                return Ok(None);
             }
-            return Ok(None);
-        }
-        Some(ns_snap) => execute_snapshot_pairs_only(
-            &engine.shared,
-            ns,
-            ns_snap,
-            filter,
-            Arc::clone(&snap),
-            false,
-        )?,
-    };
+            Some(ns_snap) => attach_expected_heads(
+                &engine.shared,
+                ns_snap,
+                execute_snapshot_pairs_only(
+                    &engine.shared,
+                    ns,
+                    ns_snap,
+                    filter,
+                    Arc::clone(&snap),
+                    false,
+                )?,
+            )?,
+        };
 
     if matched.is_empty() {
         if opts.upsert {
@@ -482,17 +468,16 @@ pub(super) fn find_one_and_replace_doc(
     }
 
     if let Some(s) = &opts.sort {
-        matched.sort_by(|(_, a), (_, b)| compare_docs(a, b, s));
+        matched.sort_by(|(_, a, _), (_, b, _)| compare_docs(a, b, s));
     }
 
-    let (old_key, old_doc) = matched.remove(0);
+    let (old_key, old_doc, expected_head) = matched.remove(0);
 
     let mut new_doc = replacement.clone();
     let original_id = old_doc.get("_id").cloned().unwrap_or(Bson::Null);
     new_doc.insert("_id", original_id.clone());
     validate_document(&new_doc)?;
 
-    let new_key = encode_key(&original_id);
     let new_bytes = bson::to_vec(&new_doc).map_err(Error::BsonSerialization)?;
 
     let old_doc_clone = old_doc.clone();
@@ -513,25 +498,7 @@ pub(super) fn find_one_and_replace_doc(
         )?;
         let entry_opt = catalog_lock(md).get_collection(ns)?;
         if let Some(entry) = entry_opt {
-            let entry_id = entry.id;
-            let mut tree = BTree::open(
-                new_txn_store(shared, overlay),
-                entry.data_root_page,
-                entry.data_root_level,
-            );
-            tree.delete(&old_key)?;
-            tree.insert(&new_key, &new_bytes)?;
-            if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-                let mut updated = entry;
-                updated.data_root_page = tree.root_page;
-                updated.data_root_level = tree.root_level;
-                catalog_lock(md).update_collection(&updated)?;
-                sync_catalog_root_overlay(shared, md, overlay)?;
-                // Phase 1 §10.3 — data-tree root moved on CRUD write.
-                txn.mark_published();
-                txn.mark_header();
-            }
-            txn.stage_primary_update(entry_id, ns_arc.clone(), new_key, new_bytes);
+            txn.stage_primary_update(entry.id, ns_arc.clone(), old_key, new_bytes, expected_head);
         }
         Ok(())
     })?;
@@ -579,7 +546,7 @@ pub(super) fn do_upsert_update(
             txn.mark_published();
             txn.mark_header();
         }
-        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes);
+        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
         Ok(id)
     })?;
@@ -628,7 +595,7 @@ pub(super) fn fam_upsert_update(
             txn.mark_published();
             txn.mark_header();
         }
-        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes);
+        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
         Ok(())
     })?;
@@ -674,7 +641,7 @@ pub(super) fn fam_upsert_replace(
             txn.mark_published();
             txn.mark_header();
         }
-        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes);
+        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
         Ok(())
     })?;

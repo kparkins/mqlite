@@ -17,6 +17,7 @@
 //! A `cfg(loom)` shim around `std::sync::Mutex` lets loom harnesses
 //! permute the oracle's critical section without touching production code.
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -120,6 +121,85 @@ impl Ts {
         Ts {
             physical_ms: u64::from_be_bytes(p),
             logical: u32::from_be_bytes(l),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AtomicTs — seqlock-style atomic Ts cell (Phase 5 §10.19 C-1)
+// ---------------------------------------------------------------------------
+
+/// Lock-free atomic [`Ts`] cell.
+///
+/// Phase 5 §10.19 C-1 requires a "lock-free `published_frontier: AtomicTs`"
+/// behind the `PublishSequencer`. `Ts` is 96 bits wide, so a native
+/// `AtomicU96`/`AtomicU128` is unavailable on stable Rust. `AtomicTs` is a
+/// seqlock that pairs the 96-bit value with a 64-bit version counter; the
+/// writer increments the version twice (odd while writing, even when
+/// done), and readers retry if the version changes mid-load.
+///
+/// Concurrent writers are not supported: the `PublishSequencer` only
+/// stores into `published_frontier` while holding the sequencer mutex, so
+/// the seqlock writer-side is single-producer by construction.
+#[derive(Debug)]
+pub(crate) struct AtomicTs {
+    seq: AtomicU64,
+    physical_ms: AtomicU64,
+    logical: AtomicU32,
+}
+
+impl AtomicTs {
+    /// Construct an `AtomicTs` initialized to `ts`.
+    pub(crate) fn new(ts: Ts) -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            physical_ms: AtomicU64::new(ts.physical_ms),
+            logical: AtomicU32::new(ts.logical),
+        }
+    }
+
+    /// Atomically store `ts`. Single-producer (seqlock writer side).
+    ///
+    /// `_order` is accepted for API compatibility with the
+    /// `published_frontier.store(_, Ordering::Release)` pattern in §10.19;
+    /// the seqlock implementation always uses the necessary memory
+    /// orderings internally and ignores the parameter.
+    pub(crate) fn store(&self, ts: Ts, _order: Ordering) {
+        // Bump version into the odd/"writer in progress" state.
+        let prev = self.seq.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(
+            prev.is_multiple_of(2),
+            "AtomicTs::store called concurrently with another writer (seq must be even)"
+        );
+        self.physical_ms.store(ts.physical_ms, Ordering::Release);
+        self.logical.store(ts.logical, Ordering::Release);
+        // Bump version back to the even/"writer done" state.
+        self.seq.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Atomically load the current `Ts`. Lock-free reader path: retries
+    /// on a concurrent in-progress writer.
+    ///
+    /// `_order` is accepted for API compatibility; the seqlock always
+    /// uses Acquire on the version load.
+    pub(crate) fn load(&self, _order: Ordering) -> Ts {
+        loop {
+            let s1 = self.seq.load(Ordering::Acquire);
+            // Odd version means a writer is mid-store; spin and retry.
+            if s1 % 2 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let physical_ms = self.physical_ms.load(Ordering::Acquire);
+            let logical = self.logical.load(Ordering::Acquire);
+            let s2 = self.seq.load(Ordering::Acquire);
+            if s1 == s2 {
+                return Ts {
+                    physical_ms,
+                    logical,
+                };
+            }
+            std::hint::spin_loop();
         }
     }
 }

@@ -66,7 +66,6 @@ pub(crate) fn install_recovered_published_epoch(
         visible_ts,
         catalog: Arc::new(build_published_catalog(&catalog)?),
         catalog_generation: 1,
-        sequencer_frontier: visible_ts,
     });
     shared.published.store(epoch);
     #[cfg(any(test, feature = "test-hooks"))]

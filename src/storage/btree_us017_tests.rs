@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::mvcc::{ChainSnapshot, Ts, VersionData, VersionEntry, VersionState};
+use crate::storage::buffer_pool::PageSize;
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
-use super::{BTree, BTreePageStore, MemPageStore};
+use super::{BTree, BTreePageStore, LeafPageImage, MemPageStore};
 
 const SPLIT_VALUE_BYTES: usize = 6_000;
 const BASE_KEYS_BEFORE_SPLIT: [u64; 4] = [10, 20, 30, 40];
@@ -28,7 +29,7 @@ type ChainDrain = Vec<(Vec<u8>, ChainArc)>;
 type InternalPageBytes = [u8; PAGE_SIZE_INTERNAL as usize];
 type InternalPage = Box<[u8; PAGE_SIZE_INTERNAL as usize]>;
 type LeafPageBytes = [u8; PAGE_SIZE_LEAF as usize];
-type LeafRead = (Box<[u8; PAGE_SIZE_LEAF as usize]>, Option<ChainSnapshot>);
+type LeafRead = (LeafPageImage, Option<ChainSnapshot>);
 
 #[derive(Clone, Copy)]
 enum ChainDistribution {
@@ -147,6 +148,11 @@ impl ObservedStore {
 }
 
 impl BTreePageStore for ObservedStore {
+    type SharedReadGuard<'a>
+        = ()
+    where
+        Self: 'a;
+
     fn read_internal(&self, page: u32) -> Result<InternalPage> {
         self.with_store(|store| store.read_internal(page))
     }
@@ -155,12 +161,20 @@ impl BTreePageStore for ObservedStore {
         self.with_store(|store| store.read_leaf(page))
     }
 
+    fn pin_shared_for_read<'a>(
+        &'a self,
+        _page: u32,
+        _size: PageSize,
+    ) -> Result<Self::SharedReadGuard<'a>> {
+        Ok(())
+    }
+
     fn write_internal(&mut self, page: u32, data: &InternalPageBytes) -> Result<()> {
         self.with_store_mut(|store| store.write_internal(page, data))
     }
 
-    fn write_leaf(&mut self, page: u32, data: &LeafPageBytes) -> Result<()> {
-        self.with_store_mut(|store| store.write_leaf(page, data))
+    fn write_leaf_structural(&mut self, page: u32, data: &LeafPageBytes) -> Result<()> {
+        self.with_store_mut(|store| store.write_leaf_structural(page, data))
     }
 
     fn alloc_internal(&mut self) -> Result<u32> {

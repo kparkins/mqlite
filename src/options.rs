@@ -7,6 +7,7 @@ use crate::storage::buffer_pool::DELTA_BEARING_FRAMES_WARN_THRESHOLD_DEFAULT;
 
 const DELTA_BEARING_FRAMES_WARN_THRESHOLD_MIN: f64 = 0.0;
 const DELTA_BEARING_FRAMES_WARN_THRESHOLD_MAX: f64 = 1.0;
+const SMO_CLASSIFICATION_RETRY_CAP_DEFAULT: u32 = 3;
 
 /// Durability mode controls when data is fsynced to disk.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +77,9 @@ pub struct OpenOptions {
     /// Warn when delta-bearing frames reach this fraction of configured frames.
     /// Default: 0.75.
     pub(crate) delta_bearing_frames_warn_threshold: f64,
+    /// Maximum stale-SMO classification retries before returning
+    /// `WriteConflict { StructuralContention }`. Default: 3.
+    pub(crate) smo_classification_retry_cap: u32,
 }
 
 impl Default for OpenOptions {
@@ -91,6 +95,7 @@ impl Default for OpenOptions {
             create_if_missing: true,
             max_readers: 64,
             delta_bearing_frames_warn_threshold: DELTA_BEARING_FRAMES_WARN_THRESHOLD_DEFAULT,
+            smo_classification_retry_cap: SMO_CLASSIFICATION_RETRY_CAP_DEFAULT,
         }
     }
 }
@@ -175,6 +180,14 @@ impl OpenOptions {
     #[must_use]
     pub fn delta_bearing_frames_warn_threshold(mut self, threshold: f64) -> Self {
         self.delta_bearing_frames_warn_threshold = threshold;
+        self
+    }
+
+    /// Set the maximum stale-SMO classification retries before returning
+    /// `WriteConflict { StructuralContention }`.
+    #[must_use]
+    pub fn smo_classification_retry_cap(mut self, cap: u32) -> Self {
+        self.smo_classification_retry_cap = cap;
         self
     }
 

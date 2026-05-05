@@ -45,13 +45,23 @@ pub(super) fn btree_insert_doc<S: BTreePageStore>(
         ns,
     )?;
     let key = encode_key(&id_bson);
-    let bson_bytes = bson::to_vec(doc).map_err(Error::BsonSerialization)?;
-    tree.insert(&key, &bson_bytes).map_err(|e| match e {
-        Error::DuplicateKey { .. } => Error::DuplicateKey {
+    if tree
+        .get_mvcc(&key, vis.read_view.as_ref(), history)?
+        .is_some()
+    {
+        return Err(Error::DuplicateKey {
             detail: "document with _id already exists".to_string(),
-        },
-        other => other,
-    })?;
+        });
+    }
+    let bson_bytes = bson::to_vec(doc).map_err(Error::BsonSerialization)?;
+    if tree.search(&key)?.is_none() {
+        tree.insert(&key, &bson_bytes).map_err(|e| match e {
+            Error::DuplicateKey { .. } => Error::DuplicateKey {
+                detail: "document with _id already exists".to_string(),
+            },
+            other => other,
+        })?;
+    }
     let tree_root = tree.root_page;
     Ok((id_bson, key, bson_bytes, tree_root))
 }

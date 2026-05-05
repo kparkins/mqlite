@@ -26,9 +26,18 @@
 use bson::{Bson, Document};
 
 #[cfg(any(test, feature = "test-hooks"))]
-use super::paged_engine::test_accessors::WriteBodyEntryHookGuard;
+use super::paged_engine::test_accessors::{
+    CreateIndexBuildHookGuard, Us007JournalBeginHookGuard, Us007JournalObservations,
+    Us026CleanupObservations, Us026PostRegisterFailpoint, WriteBodyEntryHookGuard,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+use super::paged_engine::us017_test_probe::{
+    Us017GroupCommitObservations, Us017GroupCommitPauseGuard,
+};
 #[cfg(any(test, feature = "test-hooks"))]
 use super::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::journal::us039_test_probe::Us039AppendSyncObservations;
 use crate::{
     error::Result,
     index::{IndexInfo, IndexModel},
@@ -39,7 +48,11 @@ use crate::{
     results::{DeleteResult, UpdateResult},
 };
 #[cfg(any(test, feature = "test-hooks"))]
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{
+    atomic::AtomicBool,
+    mpsc::{Receiver, Sender},
+    Arc,
+};
 
 /// The stable interface between the mqlite public API and storage.
 ///
@@ -178,9 +191,9 @@ pub trait StorageEngine: Send + Sync {
     // engine's unit of storage.
     // -------------------------------------------------------------------------
 
-    /// Create `ns` if it does not already exist.
+    /// Create `ns`.
     ///
-    /// This is a no-op when the namespace already exists.
+    /// Returns [`Error::DuplicateKey`] when the namespace already exists.
     fn create_namespace(&self, ns: &str) -> Result<()>;
 
     /// Drop `ns` and all its documents and indexes.
@@ -209,6 +222,11 @@ pub trait StorageEngine: Send + Sync {
     /// On FullSync writes this is called per write instead of a full
     /// checkpoint. The journal IS the durability point; main-file checkpoint
     /// runs separately via `checkpoint()` (admin) or background GC.
+    #[allow(
+        dead_code,
+        reason = "FullSync CRUD now syncs inside the engine group-commit path; \
+                  the trait method remains for explicit admin/test sync callers"
+    )]
     fn journal_sync(&self) -> Result<()>;
 
     /// Flush, checkpoint, and release all engine resources.
@@ -274,10 +292,9 @@ pub trait StorageEngine: Send + Sync {
         0
     }
 
-    /// Test-only accessor: sample the current `PublishedEpoch.sequencer_frontier`.
-    ///
-    /// Used by Phase 3 recovery tests to verify the open-time published epoch
-    /// binds `visible_ts` and `sequencer_frontier` coherently.
+    /// Test-only accessor: sample the live `PublishSequencer.published_frontier`
+    /// (§10.19 C-1). Used by Phase 3 / Phase 5 recovery tests to verify the
+    /// reopen-time engine seeds the live frontier from the recovered HLC.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     fn published_sequencer_frontier(&self) -> (u64, u32) {
@@ -322,6 +339,122 @@ pub trait StorageEngine: Send + Sync {
         0
     }
 
+    /// Hidden US-009 test hook: inspect resident primary-chain states.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us009_primary_chain_states(&self, _ns: &str, _id: &Bson) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Hidden US-009 test hook: inject a committed resident primary head.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us009_inject_primary_committed_head(
+        &self,
+        _ns: &str,
+        _doc: &Document,
+        _commit_ts: crate::mvcc::Ts,
+        _txn_id: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Hidden US-009 test hook: inspect resident secondary-chain states.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us009_secondary_chain_states(
+        &self,
+        _ns: &str,
+        _index_name: &str,
+        _doc: &Document,
+        _id: &Bson,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Hidden US-009 test hook: reset pending-flip / publish ordering probes.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us009_reset_flip_publish_order(&self) {}
+
+    /// Hidden US-009 test hook: pending-flip order and publish-ready order.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us009_flip_publish_order(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// Hidden US-009 test hook: fail after committed flip before publish.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us009_fail_after_committed_flip_once(&self) {}
+
+    /// Hidden US-028 test hook: resolve the primary leaf for `_id`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us028_primary_leaf_for_id(&self, _ns: &str, _id: &Bson) -> Result<u32> {
+        Err(crate::error::Error::Internal(
+            "us028 primary-leaf probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-028 test hook: hold the reconcile exclusive latch for a leaf.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us028_hold_primary_leaf_reconcile_latch(
+        &self,
+        _ns: &str,
+        _id: &Bson,
+        _ready: Sender<()>,
+        _release: Receiver<()>,
+    ) -> Result<()> {
+        Err(crate::error::Error::Internal(
+            "us028 reconcile-latch probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-028 test hook: hold the writer exclusive latch for a leaf.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us028_hold_primary_leaf_writer_latch(
+        &self,
+        _ns: &str,
+        _id: &Bson,
+        _ready: Sender<()>,
+        _release: Receiver<()>,
+    ) -> Result<()> {
+        Err(crate::error::Error::Internal(
+            "us028 writer-latch probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-025 test hook: hold the reader shared latch for a leaf.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us025_hold_primary_leaf_reader_latch(
+        &self,
+        _ns: &str,
+        _id: &Bson,
+        _ready: Sender<()>,
+        _release: Receiver<()>,
+    ) -> Result<()> {
+        Err(crate::error::Error::Internal(
+            "us025 reader-latch probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-026 test hook: arm one post-register cleanup failpoint.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us026_arm_post_register_failpoint(&self, _failpoint: Us026PostRegisterFailpoint) {}
+
+    /// Hidden US-026 test hook: snapshot cleanup observations.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us026_cleanup_observations(&self) -> Us026CleanupObservations {
+        Us026CleanupObservations::default()
+    }
+
     /// Hidden US-021c test hook: pause the next write body for `ns`.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
@@ -330,6 +463,129 @@ pub trait StorageEngine: Send + Sync {
         ns: &str,
         observe_flag: Option<Arc<AtomicBool>>,
     ) -> WriteBodyEntryHookGuard;
+
+    /// Hidden US-013 test hook: pause `create_index_build` at scan entry.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn install_create_index_build_hook(
+        &self,
+        ns: &str,
+        index_name: &str,
+    ) -> CreateIndexBuildHookGuard;
+
+    /// Hidden US-038 test hook: pause `create_index_build`, then fail it
+    /// after release so the production cleanup path runs.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn install_create_index_build_failure_hook(
+        &self,
+        ns: &str,
+        index_name: &str,
+    ) -> CreateIndexBuildHookGuard;
+
+    /// Hidden US-007 test hook: pause immediately after `begin_txn`
+    /// while `journal_mutex` is held.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us007_install_journal_begin_hook(
+        &self,
+        _fail_after_release: bool,
+    ) -> Us007JournalBeginHookGuard;
+
+    /// Hidden US-007 test hook: reset journal-envelope counters.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us007_reset_journal_observations(&self) {}
+
+    /// Hidden US-007 test hook: snapshot journal-envelope counters.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us007_journal_observations(&self) -> Us007JournalObservations {
+        Us007JournalObservations {
+            guarded_flushes: 0,
+            unguarded_flushes: 0,
+            guarded_syncs: 0,
+            unguarded_syncs: 0,
+        }
+    }
+
+    /// Hidden US-039 test hook: reset append/sync ownership counters.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us039_reset_append_sync_observations(&self) {
+        crate::journal::us039_test_probe::reset();
+    }
+
+    /// Hidden US-039 test hook: snapshot append/sync ownership counters.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us039_append_sync_observations(&self) -> Us039AppendSyncObservations {
+        crate::journal::us039_test_probe::snapshot()
+    }
+
+    /// Hidden US-017 test hook: reset group-commit probe state.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us017_reset_group_commit_probe(&self) {}
+
+    /// Hidden US-017 test hook: make the next leader wait for a cohort size.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us017_expect_group_commit_cohort_size(&self, _expected: u64) {}
+
+    /// Hidden US-017 test hook: fail the next group-commit fsync.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us017_fail_next_group_commit_fsync(&self) {}
+
+    /// Hidden US-017 test hook: pause the next leader after closing a cohort.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us017_pause_next_group_commit_after_close(&self) -> Us017GroupCommitPauseGuard;
+
+    /// Hidden US-017 test hook: snapshot group-commit observations.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us017_group_commit_observations(&self) -> Us017GroupCommitObservations {
+        Us017GroupCommitObservations::default()
+    }
+
+    /// Hidden US-008 test hook: reset committed overlay leaf-byte accounting.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us008_reset_overlay_observations(&self) {}
+
+    /// Hidden US-008 test hook: committed overlay leaf bytes since reset.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us008_committed_overlay_leaf_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Hidden US-011 hook: install one pending unique email secondary entry.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us011_install_pending_unique_email(
+        &self,
+        _ns: &str,
+        _index_name: &str,
+        _id: Bson,
+        _email: &str,
+        _txn_id: u64,
+    ) -> Result<()> {
+        Err(crate::error::Error::Internal(
+            "us011 pending unique probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-011 hook: compute unique-prefix sibling pages on a probe leaf.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us011_unique_prefix_sibling_pages(&self) -> Result<Vec<u32>> {
+        Err(crate::error::Error::Internal(
+            "us011 sibling-prefix probe is unsupported by this engine".into(),
+        ))
+    }
 
     /// Hidden Phase 0 probe for integration tests that must pin the current
     /// write-envelope ordering without adding runtime hooks to normal CRUD.
@@ -344,5 +600,78 @@ pub trait StorageEngine: Send + Sync {
         Err(crate::error::Error::Internal(
             "phase0 probe is unsupported by this engine".into(),
         ))
+    }
+
+    /// Hidden US-022 hook: stage two inserts in one storage write txn.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us022_insert_two_docs_one_txn(
+        &self,
+        _ns: &str,
+        _left: Document,
+        _right: Document,
+    ) -> Result<()> {
+        Err(crate::error::Error::Internal(
+            "us022 multi-insert probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-036 hook: poison the live engine with `reason`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us036_test_poison_engine(&self, _reason: crate::error::EngineFatalReason) {}
+
+    /// Hidden US-036 hook: read the current poison reason.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us036_test_poisoned_reason(&self) -> Option<crate::error::EngineFatalReason> {
+        None
+    }
+
+    /// Hidden US-036 hook: register a publish slot. Returns
+    /// [`crate::Error::EngineFatal`] when the sequencer is poisoned.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us036_test_register_publish_slot(
+        &self,
+    ) -> Result<crate::storage::paged_engine::us036_test_probe::Us036PublishSlot> {
+        Err(crate::error::Error::Internal(
+            "us036 publish-slot probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-036 hook: admit a writer ticket on `ns_id`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us036_test_admit_writer(
+        &self,
+        _ns_id: i64,
+        _timeout_ms: u64,
+    ) -> Result<crate::storage::paged_engine::us036_test_probe::Us036WriterTicket> {
+        Err(crate::error::Error::Internal(
+            "us036 writer-admit probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-036 hook: close-and-drain a namespace lane.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us036_test_close_and_drain(&self, _ns_id: i64, _timeout_ms: u64) -> Result<()> {
+        Err(crate::error::Error::Internal(
+            "us036 drain probe is unsupported by this engine".into(),
+        ))
+    }
+
+    /// Hidden US-036 hook: resolve the durable `ns_id` for `ns`.
+    ///
+    /// AC #7: fail-closed once the engine is poisoned.
+    ///
+    /// # Errors
+    /// Returns [`crate::Error::EngineFatal`] when the live engine is
+    /// poisoned.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn us036_test_namespace_id(&self, _ns: &str) -> crate::error::Result<Option<i64>> {
+        Ok(None)
     }
 }

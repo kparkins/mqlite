@@ -7,7 +7,7 @@
 //!
 //! On commit the overlay is drained and the staged bytes are copied onto
 //! the real shared buffer-pool frames via
-//! [`BufferPoolPageStore::write_internal`] / `write_leaf`. On rollback the
+//! [`BufferPoolPageStore::write_internal`] / `write_leaf_structural`. On rollback the
 //! overlay is dropped and the shared frames are left untouched — the
 //! failing writer no longer pollutes other writers' dirty state.
 //!
@@ -25,10 +25,12 @@
 //!   need.
 //!
 //! Concurrency: a `TxnPageStore` and its backing [`TxnOverlay`] are
-//! single-threaded per write-txn — the per-lane mutex already serializes
-//! every writer. The overlay is owned exclusively by the write path for
-//! the duration of a transaction and passed to helpers by `&mut` reference.
-//! No `Arc`, `Mutex`, or `RefCell` wrapping is needed.
+//! single-threaded per write-txn. The overlay is owned exclusively by the
+//! write path for the duration of a transaction and passed to helpers by
+//! `&mut` reference. Structural bytes commit under the Phase 5
+//! `journal_mutex` envelope via [`TxnOverlay::commit_structural_only`], while
+//! resident MVCC entries publish through page-local chain mutation. No `Arc`,
+//! `Mutex`, or `RefCell` wrapping is needed.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -36,7 +38,10 @@ use std::sync::Arc;
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
-use crate::storage::btree::{empty_internal_page_bytes, empty_leaf_page_bytes, BTreePageStore};
+use crate::storage::btree::reconcile::{decode_folded_leaf, encode_folded_leaf, FoldedLeafLinks};
+use crate::storage::btree::{
+    empty_internal_page_bytes, empty_leaf_page_bytes, BTreePageStore, LeafPageImage,
+};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
@@ -162,21 +167,54 @@ impl TxnOverlay {
         Self::default()
     }
 
+    /// Borrow a staged 32 KiB leaf image for `page`, when this txn has one.
+    pub(crate) fn overlay_leaf_bytes(&self, page: u32) -> Option<&[u8; LEAF_SIZE]> {
+        self.overlay_32k.get(&page).map(Box::as_ref)
+    }
+
     /// Apply every staged page to the shared buffer-pool frames via
     /// `base`.
     ///
-    /// Called at commit time while the writer still holds the
-    /// `commit_seq` mutex. Consumes the overlay.
+    /// Called at commit time while the writer still holds the journal
+    /// envelope mutex. Consumes the overlay.
     ///
     /// `base` is a fresh `BufferPoolPageStore` pointing at the same
     /// `BufferPoolHandle` the txn used — passing it in rather than
     /// re-creating one inside here keeps the commit free of any handle
     /// lookup; the caller already has one handy.
     pub(crate) fn commit(
-        mut self,
+        self,
         base: &mut BufferPoolPageStore,
         handle: &BufferPoolHandle,
     ) -> Result<()> {
+        self.commit_impl(base, handle, false)
+    }
+
+    /// Apply only the structural part of the overlay to shared frames.
+    ///
+    /// Ordinary CRUD installs logical row bytes through resident MVCC
+    /// delta chains. This commit path preserves overlay authority for
+    /// internal-page rewrites and newly allocated leaf/overflow pages
+    /// while discarding existing-leaf images that were only scratch state
+    /// for B-tree duplicate checks and root-neutral CRUD bookkeeping. The
+    /// caller runs this split inside the Phase 5 `journal_mutex` envelope
+    /// after the logical transaction frame is staged and before publish.
+    pub(crate) fn commit_structural_only(
+        self,
+        base: &mut BufferPoolPageStore,
+        handle: &BufferPoolHandle,
+    ) -> Result<()> {
+        self.commit_impl(base, handle, true)
+    }
+
+    fn commit_impl(
+        mut self,
+        base: &mut BufferPoolPageStore,
+        handle: &BufferPoolHandle,
+        structural_only: bool,
+    ) -> Result<()> {
+        let structural_leaf_pages =
+            structural_only.then(|| self.structural_leaf_pages_for_commit());
         // Internal first, then leaf. Within each size, honor insertion
         // order to keep replay deterministic.
         let touched_4k = std::mem::take(&mut self.touched_4k);
@@ -187,8 +225,21 @@ impl TxnOverlay {
         }
         let touched_32k = std::mem::take(&mut self.touched_32k);
         for page in touched_32k {
+            if let Some(pages) = &structural_leaf_pages {
+                if !pages.contains(&page) {
+                    let Some(buf) = self.overlay_32k.remove(&page) else {
+                        continue;
+                    };
+                    self.commit_existing_leaf_links_only(base, page, &buf)?;
+                    continue;
+                }
+            }
             if let Some(buf) = self.overlay_32k.remove(&page) {
-                base.write_leaf(page, &buf)?;
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::storage::txn_page_store_us008_probe::record_committed_overlay_leaf_bytes(
+                    buf.len(),
+                );
+                base.write_leaf_structural(page, &buf)?;
             }
         }
         // At commit time, DeferredFree reservations transition from
@@ -204,6 +255,48 @@ impl TxnOverlay {
             }
         }
         Ok(())
+    }
+
+    fn commit_existing_leaf_links_only(
+        &self,
+        base: &mut BufferPoolPageStore,
+        page: u32,
+        overlay_buf: &[u8; LEAF_SIZE],
+    ) -> Result<()> {
+        let (base_buf, _) = base.read_leaf(page)?;
+        let base_image = match decode_folded_leaf(&base_buf[..]) {
+            Ok(image) => image,
+            Err(_) => return Ok(()),
+        };
+        let overlay_image = match decode_folded_leaf(&overlay_buf[..]) {
+            Ok(image) => image,
+            Err(_) => return Ok(()),
+        };
+        let overlay_links = FoldedLeafLinks {
+            next_leaf_page: overlay_image.links.next_leaf_page,
+            prev_leaf_page: overlay_image.links.prev_leaf_page,
+        };
+        if overlay_links == base_image.links {
+            return Ok(());
+        }
+        let linked = encode_folded_leaf(&base_image.cells, overlay_links)?;
+        let mut linked_buf = [0u8; LEAF_SIZE];
+        linked_buf.copy_from_slice(&linked);
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::storage::txn_page_store_us008_probe::record_committed_overlay_leaf_bytes(
+            linked_buf.len(),
+        );
+        base.write_leaf_structural(page, &linked_buf)
+    }
+
+    fn structural_leaf_pages_for_commit(&self) -> Vec<u32> {
+        self.reservations
+            .iter()
+            .filter(|res| {
+                res.size == PageSize::Large32k && matches!(res.origin, PageOrigin::NewAlloc)
+            })
+            .map(|res| res.page)
+            .collect()
     }
 
     /// Roll back this txn's side effects on allocator / header / buffer pool.
@@ -306,6 +399,11 @@ impl<'a> TxnPageStore<'a> {
 }
 
 impl<'a> BTreePageStore for TxnPageStore<'a> {
+    type SharedReadGuard<'g>
+        = ()
+    where
+        Self: 'g;
+
     // ---- Reads: overlay first, fall back to base.
 
     fn read_internal(&self, page: u32) -> Result<Box<[u8; INTERNAL_SIZE]>> {
@@ -315,16 +413,24 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
         self.base.read_internal(page)
     }
 
-    fn read_leaf(&self, page: u32) -> Result<(Box<[u8; LEAF_SIZE]>, Option<ChainSnapshot>)> {
+    fn read_leaf(&self, page: u32) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
         if let Some(buf) = self.overlay.overlay_32k.get(&page).cloned() {
             // The chain snapshot lives on the shared frame; a txn-local
             // byte overlay doesn't duplicate chains. Pin-and-snapshot
             // against the real frame so MVCC visibility logic keeps
             // working for in-flight reads by this writer.
             let (_disk, snap) = self.base.read_leaf(page)?;
-            return Ok((buf, snap));
+            return Ok((LeafPageImage::owned(buf), snap));
         }
         self.base.read_leaf(page)
+    }
+
+    fn pin_shared_for_read<'g>(
+        &'g self,
+        _page: u32,
+        _size: PageSize,
+    ) -> Result<Self::SharedReadGuard<'g>> {
+        Ok(())
     }
 
     // ---- Writes: stage into the overlay. NEVER touch the shared frame.
@@ -338,7 +444,7 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
         Ok(())
     }
 
-    fn write_leaf(&mut self, page: u32, data: &[u8; LEAF_SIZE]) -> Result<()> {
+    fn write_leaf_structural(&mut self, page: u32, data: &[u8; LEAF_SIZE]) -> Result<()> {
         let existed = self.overlay.overlay_32k.contains_key(&page);
         self.overlay.overlay_32k.insert(page, Box::new(*data));
         if !existed {
@@ -474,3 +580,7 @@ impl<'a> BTreePageStore for TxnPageStore<'a> {
 #[cfg(test)]
 #[path = "txn_page_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "txn_page_store_us035_tests.rs"]
+mod us035_tests;

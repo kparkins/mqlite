@@ -295,6 +295,8 @@ impl BufferPoolHandle {
     ///    dirty (this re-marks page 0 as dirty in the pool).
     /// 4. Flush the pool again to write the freshly dirtied header page.
     pub(crate) fn flush(&self) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::journal::us039_test_probe::record_handle_flush();
         // Pass 1 — flush dirty data pages.
         self.pool.flush()?;
         self.history_pool.flush()?;
@@ -495,12 +497,19 @@ impl BufferPoolHandle {
         let guard = journal
             .lock()
             .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        guard.sync_journal()
+        guard.sync_journal()?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::journal::us039_test_probe::record_handle_journal_sync();
+        Ok(())
     }
 
     /// Fsync the logical-transaction journal tail after appending a
     /// `LogicalTxnFrame`. This names the S6 durability point while reusing
     /// the same journal sync primitive as the rest of the handle.
+    #[allow(
+        dead_code,
+        reason = "phase0 test probe still uses this hook; production US-012 path no longer does"
+    )]
     pub(crate) fn fsync_logical_tail(&self) -> Result<()> {
         self.journal_sync()
     }

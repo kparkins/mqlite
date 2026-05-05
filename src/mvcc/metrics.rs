@@ -458,11 +458,9 @@ pub fn reset_force_expire_spin_stalls() {
 // ===========================================================================
 // Phase-0 observability counters (5 signals)
 //
-// Each counter below is observation only — must not be read or written while
-// holding either the lane mutex or commit_seq mutex in a way that extends the
-// critical section. Writes are lock-free atomic fetch_add/store calls; reads
-// (`_snapshot` / `_reset`) are test-only and must not race with active
-// writers.
+// Each counter below is observation only. Write-side updates are lock-free
+// atomic fetch_add/store calls; reads (`_snapshot` / `_reset`) are
+// test/admin surfaces and must not race with active writers.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -475,8 +473,8 @@ pub fn reset_force_expire_spin_stalls() {
 /// exposes this via `published_catalog_rebuild_count`; the two
 /// counters tick in lock-step.
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
 pub static PUBLISHED_SNAPSHOT_REBUILDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one published-snapshot rebuild.
@@ -501,8 +499,8 @@ pub fn reset_published_snapshot_rebuilds() {
 /// CRUD commits whose body did NOT persist updated tree-root metadata
 /// (no `sync_catalog_root_overlay` call during the txn).
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
 pub static CRUD_COMMITS_ROOT_NEUTRAL_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one root-neutral CRUD commit.
@@ -527,8 +525,8 @@ pub fn reset_crud_commits_root_neutral() {
 /// CRUD commits whose body DID persist updated tree-root metadata (the
 /// `sync_catalog_root_overlay` path fired at least once during the txn).
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
 pub static CRUD_COMMITS_ROOT_CHANGING_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one root-changing CRUD commit.
@@ -555,8 +553,8 @@ pub fn reset_crud_commits_root_changing() {
 /// the critical section; the write-side record call is a lock-free atomic
 /// add that does not extend the critical section.
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
 pub static LANE_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record N nanoseconds of lane-acquisition wait.
@@ -577,33 +575,33 @@ pub fn reset_lane_wait_ns() {
 }
 
 // ---------------------------------------------------------------------------
-// P3b — commit_seq_wait_ns_total  (counter, cumulative nanoseconds)
+// P3b — journal_mutex_wait_ns_total  (counter, cumulative nanoseconds)
 // ---------------------------------------------------------------------------
 
 /// Cumulative nanoseconds CRUD writers spent waiting to acquire the global
-/// `commit_seq` mutex. Timed with `Instant::now()` reads taken OUTSIDE the
-/// critical section; the write-side record call is a lock-free atomic add
-/// that does not extend the critical section.
+/// `journal_mutex`. The caller samples `Instant::now()` before lock
+/// acquisition, then records the elapsed wait immediately after acquiring the
+/// guard with one lock-free atomic add.
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
-pub static COMMIT_SEQ_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
+pub static JOURNAL_MUTEX_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Record N nanoseconds of commit_seq-acquisition wait.
-pub fn record_commit_seq_wait_ns(ns: u64) {
+/// Record N nanoseconds of journal_mutex-acquisition wait.
+pub fn record_journal_mutex_wait_ns(ns: u64) {
     if ns > 0 {
-        COMMIT_SEQ_WAIT_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
+        JOURNAL_MUTEX_WAIT_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
     }
 }
 
-/// Snapshot the commit_seq-wait cumulative-nanoseconds counter.
-pub fn commit_seq_wait_ns_snapshot() -> u64 {
-    COMMIT_SEQ_WAIT_NS_TOTAL.load(Ordering::Relaxed)
+/// Snapshot the journal_mutex-wait cumulative-nanoseconds counter.
+pub fn journal_mutex_wait_ns_snapshot() -> u64 {
+    JOURNAL_MUTEX_WAIT_NS_TOTAL.load(Ordering::Relaxed)
 }
 
-/// Reset the commit_seq-wait counter.
-pub fn reset_commit_seq_wait_ns() {
-    COMMIT_SEQ_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+/// Reset the journal_mutex-wait counter.
+pub fn reset_journal_mutex_wait_ns() {
+    JOURNAL_MUTEX_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -613,8 +611,8 @@ pub fn reset_commit_seq_wait_ns() {
 /// Total number of legacy page-replay frames processed by the recovery loop
 /// (`JournalFrameHeader` frames — non-commit and commit).
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
 pub static RECOVERY_LEGACY_PAGE_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one legacy page-frame seen by recovery.
@@ -638,8 +636,8 @@ pub fn reset_recovery_legacy_page_frames() {
 
 /// Total number of `ChainCommit` frames processed by the recovery loop.
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
 pub static RECOVERY_CHAIN_COMMIT_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one ChainCommit frame seen by recovery.
@@ -664,8 +662,8 @@ pub fn reset_recovery_chain_commit_frames() {
 /// Total number of times the engine's emergency-checkpoint path fired after
 /// `commit_txn` reported the journal-index hot threshold was reached.
 ///
-/// Observation only — must not be read or written while holding either the
-/// lane mutex or commit_seq mutex in a way that extends the critical section.
+/// Observation only — write-side updates are lock-free atomics; snapshot/reset
+/// calls are test/admin surfaces and must not race with active writers.
 pub static EMERGENCY_CHECKPOINT_TRIGGERS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one emergency-checkpoint trigger.
@@ -1082,8 +1080,8 @@ pub fn reset_logical_txn_append_bytes() {
 //      slot. O(1).
 //   2. `recompute_logical_txn_append_percentiles()` sorts the 64-slot
 //      ring and stores p50/p95/p99 into the gauge atomics. Called
-//      OUTSIDE the commit_seq critical section by an RAII guard
-//      declared before the commit_seq mutex guard so Rust's LIFO
+//      OUTSIDE the journal critical section by an RAII guard
+//      declared before the journal_mutex guard so Rust's LIFO
 //      drop order makes recompute run with no mutex held (US-024
 //      AC#3 / §7 guardrail).
 //
@@ -1109,7 +1107,7 @@ static APPEND_SAMPLE_RING_INDEX: AtomicU64 = AtomicU64::new(0);
 /// Push one `append_logical_txn` duration sample (in milliseconds) into
 /// the ring buffer. Cheap — only an atomic increment + atomic store.
 /// Safe to call inside the commit-envelope critical section (§7
-/// guardrail: keep work inside the commit_seq mutex minimal).
+/// guardrail: keep work inside the journal_mutex minimal).
 ///
 /// The percentile gauges are NOT updated by this function. The caller
 /// MUST call [`recompute_logical_txn_append_percentiles`] OUTSIDE the
@@ -1126,7 +1124,7 @@ pub fn record_logical_txn_append_duration_ms(ms: u64) {
 /// Recompute the p50/p95/p99 gauges from the ring buffer. Sorts a
 /// 64-element u64 array in place — a few microseconds of work that
 /// MUST run outside the commit-envelope critical section so the
-/// commit_seq lock holders do not pay for percentile maintenance
+/// journal_mutex holders do not pay for percentile maintenance
 /// (§7 guardrail / US-024 AC#3).
 ///
 /// Idempotent. Safe to call from any thread; lock-free recompute.
@@ -1480,13 +1478,13 @@ mod tests {
     }
 
     #[test]
-    fn commit_seq_wait_ns_counter_unit() {
-        reset_commit_seq_wait_ns();
-        record_commit_seq_wait_ns(1000);
-        record_commit_seq_wait_ns(0);
-        assert_eq!(commit_seq_wait_ns_snapshot(), 1000);
-        reset_commit_seq_wait_ns();
-        assert_eq!(commit_seq_wait_ns_snapshot(), 0);
+    fn journal_mutex_wait_ns_counter_unit() {
+        reset_journal_mutex_wait_ns();
+        record_journal_mutex_wait_ns(1000);
+        record_journal_mutex_wait_ns(0);
+        assert_eq!(journal_mutex_wait_ns_snapshot(), 1000);
+        reset_journal_mutex_wait_ns();
+        assert_eq!(journal_mutex_wait_ns_snapshot(), 0);
     }
 
     #[test]

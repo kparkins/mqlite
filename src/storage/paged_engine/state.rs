@@ -1,16 +1,16 @@
 //! Shared + metadata state for the PagedEngine.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU8;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use parking_lot::Mutex as PlMutex;
 
-use crate::error::{Error, Result};
+use crate::error::{EngineFatalReason, Error, Result};
 use crate::journal::log_file::{LogicalOpKind, LogicalTxnFrame};
 use crate::journal::ParsedLogicalFrames;
 use crate::mvcc::metrics::{
@@ -25,11 +25,14 @@ use crate::storage::reconcile::plan::{DirtyReason, LeafState, TreeIdent};
 use crate::storage::root_snapshot::PublishedEpoch;
 
 use super::catalog_ops::catalog_lock;
+use super::group_commit::GroupCommitManager;
 use super::publish::build_published_catalog;
+use super::publish_sequencer::PublishSequencer;
 use super::recovery_apply::{
     apply_parsed_logical_frames, check_recovery_replay_pool_bound,
     install_recovered_published_epoch,
 };
+use super::writer_registry::NsWriterRegistry;
 
 // ---------------------------------------------------------------------------
 // SharedState — fields shared by read path (no mutex) and writer (mutex held)
@@ -47,12 +50,53 @@ pub(crate) struct SharedState {
     /// Readers load one `Arc<PublishedEpoch>` and observe the full
     /// visibility tuple through the same guard.
     pub published: ArcSwap<PublishedEpoch>,
-    /// Engine-fatal poison flag for post-durable unrecoverable live-state
-    /// failures. Once set, new operations return [`Error::EngineFatal`]
-    /// until the database is reopened.
-    pub engine_poisoned: AtomicBool,
+    /// Engine-fatal poison reason for post-durable unrecoverable live
+    /// state failures. `Some(reason)` once set; preserves the first
+    /// reason for diagnosis. New operations return
+    /// [`Error::EngineFatal`] with this reason until the database is
+    /// reopened (Phase 5 §10.19.0 C-2 / US-036).
+    pub engine_poisoned: PlMutex<Option<EngineFatalReason>>,
+    /// Phase 5 §10.19 publish-slot sequencer used for ordered live
+    /// publish under the dense-slot protocol. US-036 ships the minimal
+    /// poison-aware skeleton (register / wait / mark_ready / poison);
+    /// US-005 extends it with the full publish-slot/commit-ts protocol
+    /// owned by `register_with_oracle`, `mark_ready` closures, and the
+    /// `published_frontier` AtomicTs.
+    pub(crate) publish_sequencer: Arc<PublishSequencer>,
+    /// Per-collection writer admission lanes (§10.1, §10.6.6).
+    /// CRUD writers `admit` against the lane keyed by the durable
+    /// `CollectionEntry.id`; existing-namespace DDL paths
+    /// `close_and_drain_guard` to gate new admits and drain in-flight
+    /// writers before mutating the catalog.
+    #[allow(
+        dead_code,
+        reason = "US-004 wires the registry; CRUD/DDL call sites land in US-005+"
+    )]
+    pub(crate) ns_writers: Arc<NsWriterRegistry>,
+    /// Phase 5 journal-envelope mutex. Namespace-create DDL paths use
+    /// this instead of the retired commit-sequence field so bootstrap and
+    /// standalone create can reserve a sequencer slot, complete the
+    /// durable envelope, release journal serialization, and only then
+    /// publish the catalog generation through `mark_ready`.
+    pub(crate) journal_mutex: parking_lot::Mutex<()>,
+    /// Phase 5 §10.30 FullSync group-commit coordinator. Ordinary CRUD
+    /// writers append their durable journal records under `journal_mutex`,
+    /// then join a short fsync cohort before any Pending entry can flip to
+    /// Committed or publish.
+    pub(crate) group_commit: GroupCommitManager,
+    /// Phase 5 §10.24 stale-SMO classification retry cap.
+    pub(crate) smo_classification_retry_cap: u32,
     /// Monotonic transaction identifier source shared by readers and writers.
     pub txn_counter: AtomicU64,
+    /// Phase 5 §10.17.1 DDL reservation counter. Mutated ONLY by DDL
+    /// paths (`create_namespace`, `drop_namespace`, `create_index_*`,
+    /// `drop_index`, `bootstrap_namespace`) under `metadata.write()` via
+    /// `fetch_add(1, AcqRel) + 1`. The reserved value is the
+    /// `PublishedEpoch.catalog_generation` stamped by the DDL's publish
+    /// closure. Ordinary CRUD MUST NOT load or mutate this field.
+    /// Initialized to the live `PublishedEpoch.catalog_generation` so a
+    /// later DDL's first reservation produces a strictly larger value.
+    pub(crate) next_catalog_gen: AtomicU64,
     /// §10.8 #19 publish-pause rendezvous hook. Per-engine (NOT
     /// process-global) so parallel tests using independent engines
     /// cannot consume each other's barriers. Under `#[cfg(test)]`
@@ -70,6 +114,31 @@ pub(crate) struct SharedState {
     /// Test-only S9 primary-install attempt counter for US-019.
     #[cfg(any(test, feature = "test-hooks"))]
     pub us019_primary_install_attempts: AtomicU64,
+    /// Test-only US-009 event order counter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us009_event_order_counter: AtomicU64,
+    /// Test-only order at which Pending entries flipped to Committed.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us009_committed_flip_order: AtomicU64,
+    /// Test-only order at which the CRUD publish step became ready.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us009_publish_ready_order: AtomicU64,
+    /// Test-only one-shot failure after committed flip and before publish.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us009_fail_after_committed_flip: AtomicU8,
+    /// Test-only US-026 one-shot post-register cleanup failpoint.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us026_post_register_failpoint: AtomicU8,
+    /// Test-only US-026 flag that forces cleanup rollback to report a
+    /// failure after the real rollback work runs.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us026_force_cleanup_rollback_failure: AtomicU8,
+    /// Test-only US-026 cleanup rollback attempts.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us026_cleanup_rollback_attempts: AtomicU64,
+    /// Test-only US-026 forced rollback failure returns.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us026_forced_rollback_failures: AtomicU64,
     /// Test-only namespace-keyed write-body entry rendezvous hooks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub write_body_entry_hooks: std::sync::Mutex<
@@ -78,9 +147,22 @@ pub(crate) struct SharedState {
             std::collections::VecDeque<super::test_accessors::WriteBodyEntryHook>,
         >,
     >,
+    /// Test-only create-index build-scan rendezvous hooks.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub create_index_build_hooks: std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            std::collections::VecDeque<super::test_accessors::CreateIndexBuildHook>,
+        >,
+    >,
     /// Monotonic ids for test-only write-body entry hooks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub write_body_entry_hook_next_id: AtomicU64,
+    /// Test-only hooks consumed after `begin_txn` while `journal_mutex`
+    /// is held.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub us007_journal_begin_hooks:
+        std::sync::Mutex<std::collections::VecDeque<super::test_accessors::Us007JournalBeginHook>>,
 }
 
 impl SharedState {
@@ -101,6 +183,37 @@ impl SharedState {
             EPOCH_LOAD_COUNT.with(|c| c.set(c.get() + 1));
         }
         self.published.load_full()
+    }
+
+    /// Load a coherent `(PublishedEpoch, PublishSequencer.published_frontier)`
+    /// pair (§10.19 C-1, US-037). The publisher stores the new epoch
+    /// first and the live frontier second; readers MUST retry the pair
+    /// when `published_frontier < epoch.visible_ts`, otherwise a foreign
+    /// `Pending` entry whose `start_ts == epoch.visible_ts` could be
+    /// evaluated against a stale frontier and incorrectly hidden.
+    ///
+    /// `ReadView::sequencer_frontier()` keeps the live-load semantics
+    /// the PRD requires; this helper closes the inter-store window at
+    /// view-open time so subsequent live loads are guaranteed
+    /// `>= epoch.visible_ts` (the sequencer frontier is monotonic).
+    ///
+    /// Returns immediately for the steady state `frontier >= visible_ts`;
+    /// otherwise spins with `spin_loop`. Bounded in practice by the two
+    /// adjacent atomic stores in `publish_commit` /
+    /// `PublishSequencer::mark_ready`.
+    pub(crate) fn load_published_coherent(&self) -> Arc<PublishedEpoch> {
+        loop {
+            let epoch = self.load_published();
+            if self
+                .publish_sequencer
+                .published_frontier
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= epoch.visible_ts
+            {
+                return epoch;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Record that a leaf has resident versions eligible for checkpoint
@@ -134,18 +247,53 @@ impl SharedState {
         }
     }
 
-    /// Return [`Error::EngineFatal`] if this live engine has been poisoned.
+    /// Return [`Error::EngineFatal`] if this live engine has been
+    /// poisoned. The first poison reason is preserved for diagnosis;
+    /// subsequent poison attempts do not overwrite it.
     pub(crate) fn check_engine_not_poisoned(&self) -> Result<()> {
-        if self.engine_poisoned.load(Ordering::Acquire) {
-            return Err(Error::EngineFatal);
+        if let Some(reason) = self.engine_poisoned.lock().clone() {
+            return Err(Error::EngineFatal { reason });
         }
         Ok(())
     }
 
-    /// Poison the live engine after a post-durable unrecoverable failure.
-    pub(crate) fn poison_engine(&self) {
-        self.engine_poisoned.store(true, Ordering::Release);
+    /// Poison the live engine after a post-durable unrecoverable
+    /// failure. Preserves the first reason if called more than once;
+    /// later attempts notify the sequencer but do not overwrite the
+    /// stored reason (§10.19.0 C-2 / US-036).
+    pub(crate) fn poison_engine(&self, reason: EngineFatalReason) {
+        let mut guard = self.engine_poisoned.lock();
+        if guard.is_none() {
+            *guard = Some(reason);
+        }
     }
+}
+
+/// Poison the live engine after a post-`journal_mutex` failure and
+/// return [`Error::EngineFatal`] with `reason`.
+///
+/// §10.19.0 C-2 / US-036 escalation helper:
+///
+/// 1. Records `reason` in `SharedState.engine_poisoned`. Preserves the
+///    first reason if called more than once for diagnosis.
+/// 2. Calls the sequencer's poison hook so every blocked successor
+///    waiting in `register` / `wait_until_predecessors_complete` /
+///    `mark_ready` wakes and returns `Error::EngineFatal` instead of
+///    publishing its own slot or marking a durable slot `Aborted`.
+/// 3. Returns the constructed `Error::EngineFatal { reason }` so the
+///    caller can `?`-propagate without re-reading the poison state.
+///
+/// Callers MUST NOT use this helper before the durable journal commit
+/// completes; pre-durable failures route through the cleanup matrix
+/// owned by US-026 / US-009 (mark Pending → Aborted, mark sequencer
+/// slot aborted, drop ticket).
+pub(crate) fn poison_after_durable_commit(
+    shared: &SharedState,
+    reason: EngineFatalReason,
+) -> Error {
+    shared.poison_engine(reason.clone());
+    shared.publish_sequencer.poison(reason.clone());
+    Error::EngineFatal { reason }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +354,14 @@ impl Drop for ReadOpScope {
 /// guard (shared with other CRUD writers) and mutate the catalog via
 /// the interior `Mutex<Catalog>`.
 ///
-/// CRUD lock order: `ns_lanes` mutex -> `metadata.read()` -> `commit_seq`
-/// mutex -> `catalog` Mutex. DO NOT grab `metadata.write()` while
-/// holding the catalog mutex — that would invert the order relative to
-/// a reader that already holds `metadata.read()` and is waiting for the
-/// catalog mutex.
+/// Phase 5 CRUD order: `metadata.read()` is held only for id-capture and
+/// writer admission, page latches protect resident-chain mutation,
+/// `journal_mutex` owns the durable envelope, `PublishSequencer` publishes
+/// slots in order, and the `NsWriterRegistry` ticket fences DDL until the
+/// writer drops it after publish. DO NOT grab `metadata.write()` while
+/// holding the catalog mutex — that would invert the order relative to a
+/// reader that already holds `metadata.read()` and is waiting for the catalog
+/// mutex.
 pub(crate) struct MetadataState {
     /// Catalog B+ tree for collection/index metadata.
     ///
@@ -332,6 +483,7 @@ impl MetadataState {
         handle: Arc<BufferPoolHandle>,
         catalog_root_page: u32,
         catalog_root_level: u8,
+        smo_classification_retry_cap: u32,
     ) -> Result<(Self, Arc<SharedState>)> {
         let store = BufferPoolPageStore::new(Arc::clone(&handle));
         let (
@@ -418,7 +570,6 @@ impl MetadataState {
             visible_ts: crate::mvcc::Ts::default(),
             catalog: initial_catalog,
             catalog_generation: 1,
-            sequencer_frontier: crate::mvcc::Ts::default(),
         };
 
         let shared = Arc::new(SharedState {
@@ -427,8 +578,26 @@ impl MetadataState {
             dirty_leaves: DashMap::new(),
             oracle,
             published: ArcSwap::from_pointee(initial_epoch),
-            engine_poisoned: AtomicBool::new(false),
+            engine_poisoned: PlMutex::new(None),
+            // §10.29 rule 3 / §10.19 C-1: reopen recovery initializes
+            // the lock-free `published_frontier` with the recovered HLC
+            // floor while leaving the dense `publish_seq` window fresh
+            // (`next_seq = 1`, `last_published = 0`, empty `pending`).
+            // A fresh DB passes `Ts::default()` here.
+            publish_sequencer: PublishSequencer::new_from(
+                recovered_max_commit_ts.unwrap_or_default(),
+            ),
+            ns_writers: Arc::new(NsWriterRegistry::new()),
+            journal_mutex: parking_lot::Mutex::new(()),
+            group_commit: GroupCommitManager::new(),
+            smo_classification_retry_cap,
             txn_counter: AtomicU64::new(1),
+            // §10.17.1 — start the DDL reservation counter at the live
+            // `PublishedEpoch.catalog_generation` (1 on fresh open). The
+            // first DDL `fetch_add(1) + 1` reserves a strictly larger
+            // generation. Reopen recovery bumps this to the recovered
+            // published value via `install_recovered_published_epoch`.
+            next_catalog_gen: AtomicU64::new(1),
             #[cfg(test)]
             publish_pause_hook: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -438,9 +607,29 @@ impl MetadataState {
             #[cfg(any(test, feature = "test-hooks"))]
             us019_primary_install_attempts: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
+            us009_event_order_counter: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us009_committed_flip_order: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us009_publish_ready_order: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us009_fail_after_committed_flip: AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us026_post_register_failpoint: AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us026_force_cleanup_rollback_failure: AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us026_cleanup_rollback_attempts: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us026_forced_rollback_failures: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
             write_body_entry_hooks: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(any(test, feature = "test-hooks"))]
+            create_index_build_hooks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(any(test, feature = "test-hooks"))]
             write_body_entry_hook_next_id: AtomicU64::new(1),
+            #[cfg(any(test, feature = "test-hooks"))]
+            us007_journal_begin_hooks: std::sync::Mutex::new(std::collections::VecDeque::new()),
         });
 
         let md = Self {
@@ -471,69 +660,6 @@ impl MetadataState {
         }
         install_recovered_published_epoch(&shared, &md, recovered_max_commit_ts)?;
         Ok((md, shared))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OwnedLaneGuard — parking_lot ArcMutexGuard; owns both lock + Arc so the
-// guard can be returned from functions with no lifetime restriction.
-// ---------------------------------------------------------------------------
-
-/// An owned guard for a per-namespace lane mutex.
-///
-/// `parking_lot::ArcMutexGuard` holds the `Arc` internally, so it is
-/// `Send` and has no lifetime parameter — no `unsafe` needed.
-pub(super) type OwnedLaneGuard = parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>;
-
-/// Resolve the per-namespace lane mutex, creating one if needed.
-pub(super) fn lane_for(engine: &super::PagedEngine, ns: &str) -> Arc<parking_lot::Mutex<()>> {
-    if let Some(entry) = engine.ns_lanes.get(ns) {
-        return Arc::clone(entry.value());
-    }
-    engine
-        .ns_lanes
-        .entry(ns.to_string())
-        .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-        .clone()
-}
-
-/// Acquire the namespace lane with busy-timeout / busy-handler semantics.
-///
-/// Uses `parking_lot::Mutex` which never poisons, so all poisoned-error
-/// branches from the previous `std::sync::Mutex` implementation are gone.
-pub(super) fn acquire_lane(
-    engine: &super::PagedEngine,
-    lane: Arc<parking_lot::Mutex<()>>,
-) -> Result<OwnedLaneGuard> {
-    // Fast path — uncontended case; no syscall overhead.
-    if let Some(g) = lane.try_lock_arc() {
-        return Ok(g);
-    }
-
-    let timeout = engine.busy_timeout;
-
-    // busy_handler path: spin with 1 ms sleeps until handler gives up.
-    if let Some(handler) = &engine.busy_handler {
-        let mut attempts: u32 = 0;
-        loop {
-            std::thread::sleep(Duration::from_millis(1));
-            if let Some(g) = lane.try_lock_arc() {
-                return Ok(g);
-            }
-            if !handler.0(attempts) {
-                return Err(Error::WriterBusy);
-            }
-            attempts = attempts.saturating_add(1);
-        }
-    }
-
-    // Timed wait path — use parking_lot's built-in timeout.
-    if timeout.is_zero() {
-        return Err(Error::WriterBusy);
-    }
-    match lane.try_lock_arc_for(timeout) {
-        Some(g) => Ok(g),
-        None => Err(Error::WriterBusy),
     }
 }
 

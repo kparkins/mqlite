@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::mvcc::timestamp::Ts;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::Catalog;
@@ -132,37 +132,77 @@ pub(crate) fn build_published_catalog(
 ///   - otherwise (metadata-only DDL): pass `shared.oracle.commit()?`
 ///     — NEVER `oracle.now()`; that peek can return equal Ts across two
 ///     sub-millisecond calls, violating strict visible-ts monotonicity.
+///
+/// `reserved_catalog_gen` (Phase 5 §10.17.1, US-006):
+///   - DDL paths reserve `SharedState.next_catalog_gen.fetch_add(1, AcqRel) + 1`
+///     under `metadata.write()` BEFORE the durable envelope and pass
+///     `Some(reserved)` here. The published epoch's
+///     `catalog_generation` is stamped with that exact reservation.
+///   - Ordinary CRUD paths pass `None`. The published epoch's
+///     `catalog_generation` is stamped with the prior published value
+///     (the CRUD publish closure NEVER advances the DDL identity
+///     counter, even when the reader-visible Arc is rebuilt because a
+///     data root moved). §10.21 CV-5 forbids the CRUD publish closure
+///     from loading `next_catalog_gen` or returning `WriteConflict`.
 pub(crate) fn publish_commit(
     shared: &SharedState,
     catalog: &Catalog<BufferPoolPageStore>,
     visible_ts: Ts,
     dirty: PublishDirty,
+    reserved_catalog_gen: Option<u64>,
 ) -> Result<Arc<PublishedEpoch>> {
     let prev = shared.published.load_full();
     debug_assert!(
         visible_ts > prev.visible_ts,
         "visible_ts must be strictly monotonic; caller must use commit_ts or oracle.commit()"
     );
-    let (catalog_arc, catalog_generation) = if dirty.published_catalog_dirty {
-        let next_generation = prev
-            .catalog_generation
-            .checked_add(1)
-            .ok_or_else(|| Error::Internal("published catalog generation overflow".into()))?;
-        (Arc::new(build_published_catalog(catalog)?), next_generation)
+    let catalog_arc = if dirty.published_catalog_dirty {
+        Arc::new(build_published_catalog(catalog)?)
     } else {
-        (Arc::clone(&prev.catalog), prev.catalog_generation)
+        Arc::clone(&prev.catalog)
+    };
+    let catalog_generation = match reserved_catalog_gen {
+        // DDL: stamp the reserved generation. The reservation was the
+        // result of `next_catalog_gen.fetch_add(1, AcqRel) + 1` inside
+        // `metadata.write()`, so it is strictly greater than the prior
+        // published generation.
+        Some(reserved) => {
+            debug_assert!(
+                reserved > prev.catalog_generation,
+                "DDL-reserved catalog_generation must advance beyond prior published"
+            );
+            reserved
+        }
+        // CRUD: inherit the prior published generation. The Arc may be
+        // rebuilt (data_root_page moved, etc.) but the DDL identity
+        // counter is unchanged so the §10.17.1 captured-identity gate
+        // does not trip on concurrent CRUDs.
+        None => prev.catalog_generation,
     };
     let new_epoch = Arc::new(PublishedEpoch {
         visible_ts,
         catalog: catalog_arc,
         catalog_generation,
-        sequencer_frontier: visible_ts,
     });
     #[cfg(any(test, feature = "test-hooks"))]
     super::test_accessors::phase3_abort_if_armed(
         super::test_accessors::Phase3CommitFailpoint::DuringPublishBeforeStore,
     );
     shared.published.store(Arc::clone(&new_epoch));
+    // §10.19 C-1 / US-037: store the new epoch first, then the live
+    // sequencer frontier with `Release`. This is the legacy
+    // (Phase 3/4) producer of `published_frontier`; the Phase 5
+    // sequencer-driven path will route the same store through
+    // `PublishSequencer::mark_ready` (US-012). `AtomicTs::store` is
+    // single-producer; both paths are mutually exclusive per commit and
+    // each is serialized by its own mutex (the legacy path runs under
+    // the writer serialization, the sequencer path runs under the
+    // sequencer mutex), so the seqlock invariant is preserved during
+    // the transitional state when only the legacy path stores.
+    shared
+        .publish_sequencer
+        .published_frontier
+        .store(visible_ts, std::sync::atomic::Ordering::Release);
     // Phase 1 §10.10 counters (US-012). Ticked after the atomic
     // publish so readers observing them cannot see a state where a
     // publish "has happened" according to the counter but not the

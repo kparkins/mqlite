@@ -15,7 +15,7 @@
 //! The rule: every `publish_commit` call must supply a `visible_ts`
 //! that is strictly greater than the previous `PublishedEpoch.visible_ts`.
 //! For txns with primary writes, the allocated `commit_ts` meets that
-//! (commit_seq + oracle.commit() are serialized). For metadata-only
+//! (the journal envelope + oracle.commit() are serialized). For metadata-only
 //! DDL / bootstrap commits the caller MUST use `oracle.commit()` — not
 //! `oracle.now()`, which only peeks at the HLC and can return equal
 //! Ts across two sub-ms calls.

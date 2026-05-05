@@ -41,19 +41,21 @@ impl PagedEngine {
         doc: Document,
         cut: Phase0ProbeCut,
     ) -> Result<Phase0ProbeReport> {
-        let md_read = self
-            .metadata
-            .read()
-            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        let ns_missing = catalog_lock(&md_read).get_collection(ns)?.is_none();
-        if ns_missing {
-            return Err(Error::CollectionNotFound {
-                name: ns.to_owned(),
-            });
-        }
-
-        let lane = self.lane_for(ns);
-        let _lane_guard = self.acquire_lane(lane)?;
+        let _writer_ticket = {
+            let _md_read = self
+                .metadata
+                .read()
+                .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+            let ns_id = match catalog_lock(&self.metadata_state).get_collection(ns)? {
+                Some(collection) => collection.id,
+                None => {
+                    return Err(Error::CollectionNotFound {
+                        name: ns.to_owned(),
+                    });
+                }
+            };
+            self.shared.ns_writers.admit(ns_id, self.busy_timeout)?
+        };
         let vis = WriteVisibility::new(&self.shared, ns)?;
         let mark = self.shared.handle.begin_txn()?;
         let mut overlay = TxnOverlay::new();
@@ -74,7 +76,7 @@ impl PagedEngine {
 
         let body_result = doc_ops::stage_insert_body(
             &self.shared,
-            &md_read,
+            &self.metadata_state,
             &mut overlay,
             &mut txn,
             &vis,
@@ -91,10 +93,7 @@ impl PagedEngine {
         };
         let root_changing = overlay.has_header_update();
 
-        let _commit = self
-            .commit_seq
-            .lock()
-            .map_err(|_| Error::Internal("commit_seq mutex poisoned".into()))?;
+        let _journal = self.lock_journal_mutex();
 
         let sec_writes = std::mem::take(&mut txn.pending_sec_index);
         let primary_writes = std::mem::take(&mut txn.pending_primary);
@@ -163,7 +162,7 @@ impl PagedEngine {
 
         install_pending_sec_index(
             &self.shared,
-            &md_read,
+            &self.metadata_state,
             &mut overlay,
             sec_writes.to_vec(),
             &vis,
@@ -173,7 +172,7 @@ impl PagedEngine {
 
         install_pending_primary(
             &self.shared,
-            &md_read,
+            &self.metadata_state,
             &mut overlay,
             primary_writes.to_vec(),
             &vis,
@@ -205,7 +204,7 @@ impl PagedEngine {
             return Ok(report);
         }
 
-        self.shared.handle.flush()?;
+        self.flush_under_journal_mutex()?;
         if root_changing {
             self.commit_legacy_header_frame()?;
         }
@@ -223,12 +222,21 @@ impl PagedEngine {
         // dirty flags into the publish helper. A root-neutral probe
         // insert will reuse the existing Arc<PublishedCatalog>. `dirty`
         // was captured above before `commit_chain_commit()` consumed the txn.
-        rebuild_and_publish_locked(&self.shared, &md_read, commit_ts, dirty)?;
-        commit_pending_sec_index_states(&self.shared, &md_read, &sec_writes, commit_ts, txn_id)?;
+        // Phase 5 §10.17.1 / US-006 — phase0_probe simulates the ordinary
+        // CRUD commit path: pass `reserved_catalog_gen=None` so the new
+        // published epoch inherits the prior `catalog_generation`.
+        rebuild_and_publish_locked(&self.shared, &self.metadata_state, commit_ts, dirty, None)?;
+        commit_pending_sec_index_states(
+            &self.shared,
+            &self.metadata_state,
+            &sec_writes,
+            commit_ts,
+            txn_id,
+        )?;
         if let Some(overlay) = root_neutral_overlay.as_mut() {
             commit_pending_primary_states_with_overlay(
                 &self.shared,
-                &md_read,
+                &self.metadata_state,
                 overlay,
                 &primary_writes,
                 commit_ts,
@@ -237,7 +245,7 @@ impl PagedEngine {
         } else {
             commit_pending_primary_states(
                 &self.shared,
-                &md_read,
+                &self.metadata_state,
                 &primary_writes,
                 commit_ts,
                 txn_id,
@@ -248,7 +256,7 @@ impl PagedEngine {
         if let Some(overlay) = root_neutral_overlay {
             let mut base_store = new_store(&self.shared);
             overlay.commit(&mut base_store, &self.shared.handle)?;
-            self.shared.handle.flush()?;
+            self.flush_under_journal_mutex()?;
             self.commit_legacy_header_frame()?;
         }
         if root_changing {

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::mvcc::version::{VersionData, VersionEntry, VersionState};
+use crate::storage::paged_engine::publish_sequencer::PublishSequencer;
 use crate::storage::root_snapshot::{PublishedCatalog, PublishedEpoch};
 
 use super::{ChainSnapshot, ReadView};
@@ -31,9 +32,9 @@ fn view(read_ts: crate::mvcc::Ts, txn_id: u64, frontier: crate::mvcc::Ts) -> Rea
             visible_ts: read_ts,
             catalog: empty_catalog(),
             catalog_generation: 1,
-            sequencer_frontier: frontier,
         }),
         txn_id,
+        PublishSequencer::new_from(frontier),
     )
 }
 

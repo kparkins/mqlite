@@ -2,9 +2,11 @@
 //!
 //! The per-key delta chains live on the 32 KB leaf partition's frames.
 //! This module extends [`BufferPool`] with the take / put / snapshot /
-//! clear / drain helpers the MVCC writer and reader lanes use to manipulate
-//! those chains, plus the test-only [`BufferPool::reconcile`] compatibility
-//! wrapper over [`BufferPool::replace_leaf_and_chains`].
+//! clear / drain helpers used by legacy single-writer and structural paths.
+//! Phase 5 reconcile and CRUD callers that already hold page latches must use
+//! [`super::LatchedPinnedPage`] helpers instead: resident chain mutation
+//! requires `PageLatch::Exclusive`, while snapshots require
+//! `LatchedPinnedPage::Shared` and copy/clone only.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -39,7 +41,7 @@ impl BufferPool {
     //
     // Chains are stored on the 32 KB partition's frames (leaf pages). The
     // caller is responsible for having pinned the page (via `read_leaf` or
-    // `write_leaf`) recently enough that the frame is still resident — the
+    // `write_leaf_structural`) recently enough that the frame is still resident — the
     // MVCC writer lane sequences these calls synchronously after a leaf
     // read / write, so the frame has not yet been eligible for eviction.
     // -----------------------------------------------------------------------
@@ -65,6 +67,7 @@ impl BufferPool {
 
     /// Return the delta chain for `key` on leaf page `page`, creating an
     /// empty caller-owned chain when no resident chain exists yet.
+    #[allow(dead_code)]
     pub(crate) fn get_or_create_chain(
         &self,
         page: u32,
@@ -123,6 +126,7 @@ impl BufferPool {
     /// mutex and the overflow refcount atomics are orthogonal: the CAS
     /// loop touches an `AtomicU32` off the `AllocatorHandle::overflow_refcounts`
     /// table, never the partition mutex itself.
+    #[allow(dead_code)]
     pub(crate) fn snapshot_chains(
         &self,
         page: u32,
@@ -304,11 +308,9 @@ impl BufferPool {
                     ReplaceLeafError::NotLeaf => {
                         Error::Internal("buffer pool reconcile: target frame is not a leaf".into())
                     }
-                    ReplaceLeafError::FrameCoWRefused(_) => {
-                        Error::Internal("buffer pool reconcile: unexpected CoW refusal".into())
-                    }
                 })?;
-            self.replace_leaf_and_chains(pin, new_base, retained_chains)
+            let mut pin = pin;
+            self.replace_leaf_and_chains(&mut pin, new_base, retained_chains)
                 .map_err(|err| match err {
                     ReplaceLeafError::NotResident => {
                         Error::Internal("buffer pool reconcile: resident frame disappeared".into())
@@ -316,9 +318,6 @@ impl BufferPool {
                     ReplaceLeafError::NotLeaf => Error::Internal(
                         "buffer pool reconcile: replacement frame is not a leaf".into(),
                     ),
-                    ReplaceLeafError::FrameCoWRefused(_) => {
-                        Error::Internal("buffer pool reconcile: unexpected CoW refusal".into())
-                    }
                 })?;
         }
 

@@ -115,3 +115,98 @@ fn reconcile_snapshots_registry_before_partition_lock() {
          BEFORE inner_32k partition acquisition in BufferPool::reconcile"
     );
 }
+
+/// US-015: `pin_then_latch` must release the partition mutex before it
+/// acquires the resident page latch. The source shape is intentionally
+/// audited because the failure mode is a lock-order inversion, not an
+/// output-value bug.
+#[test]
+fn test_pin_before_latch_no_partition_under_page_latch() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir
+        .join("src")
+        .join("storage")
+        .join("buffer_pool")
+        .join("mod.rs");
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("cannot read {}: {e}", path.display());
+    });
+
+    let fn_start = body
+        .find("pub(super) fn pin_then_latch(")
+        .expect("pin_then_latch function not found in buffer_pool/mod.rs");
+    let fn_slice = &body[fn_start..fn_start.saturating_add(4096).min(body.len())];
+
+    let partition_lock = fn_slice
+        .find("let mut guard = lock")
+        .expect("pin_then_latch must acquire a partition mutex");
+    let partition_release = fn_slice
+        .find("};\n\n        // Step 5: acquire the latch")
+        .expect("pin_then_latch must end the partition-mutex block before Step 5");
+    let latch_acquire = fn_slice
+        .find("latch_ref.lock_exclusive()")
+        .expect("pin_then_latch must acquire the page latch after pinning");
+
+    assert!(
+        partition_lock < partition_release && partition_release < latch_acquire,
+        "pin_then_latch must pin under the partition mutex, release it, \
+         then acquire the PageLatch"
+    );
+}
+
+/// US-015: the Phase 5 lock-order table puts the read-view registry below
+/// partition/page-latch positions and the publish sequencer below that,
+/// before writer-registry admission and the catalog mutex.
+#[test]
+fn test_lock_order_publish_sequencer_below_registry() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join("src").join("mvcc").join("read_view.rs");
+    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("cannot read {}: {e}", path.display());
+    });
+
+    let history = body
+        .find("1.   history-store partition mutex")
+        .expect("lock-order table must include position 1");
+    let lifetime_queue = body
+        .find("1.5. PageLifetimeQueue::pending mutex")
+        .expect("lock-order table must include position 1.5");
+    let allocator = body
+        .find("2.   AllocatorHandle::state mutex")
+        .expect("lock-order table must include position 2");
+    let partition_32k = body
+        .find("3.   32 KB main partition mutex")
+        .expect("lock-order table must include position 3");
+    let page_latch = body
+        .find("3a.  PageLatch")
+        .expect("lock-order table must include position 3a");
+    let partition_4k = body
+        .find("3b.  4 KB main partition mutex")
+        .expect("lock-order table must include position 3b");
+    let registry = body
+        .find("5.   ReadViewRegistry mutex")
+        .expect("lock-order table must include position 5");
+    let sequencer = body
+        .find("6.   PublishSequencer mutex")
+        .expect("lock-order table must include position 6");
+    let writers = body
+        .find("7.   NsWriterRegistry admission mutex")
+        .expect("lock-order table must include position 7");
+    let catalog = body
+        .find("8.   catalog Mutex")
+        .expect("lock-order table must include position 8");
+
+    assert!(
+        history < lifetime_queue
+            && lifetime_queue < allocator
+            && allocator < partition_32k
+            && partition_32k < page_latch
+            && page_latch < partition_4k
+            && partition_4k < registry
+            && registry < sequencer
+            && sequencer < writers
+            && writers < catalog,
+        "Phase 5 lock-order table must preserve positions 1, 1.5, 2, 3, \
+         3a, 3b, 5, 6, 7, and 8 in order"
+    );
+}

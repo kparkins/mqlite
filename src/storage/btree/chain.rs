@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::storage::buffer_pool::PageSize;
 use crate::storage::page::{
     overflow_page_checksum, OverflowPageHeader, OVERFLOW_HEADER_SIZE, PAGE_SIZE_LEAF,
     PAGE_TYPE_OVERFLOW,
@@ -47,7 +48,7 @@ pub(super) fn write_overflow_chain<S: BTreePageStore>(store: &mut S, data: &[u8]
         // Post-T3 checksum field is at bytes 8..12 (Format Lock §A.1).
         buf[8..12].copy_from_slice(&cs.to_le_bytes());
 
-        store.write_leaf(pages[i], &buf)?;
+        store.write_leaf_structural(pages[i], &buf)?;
     }
 
     Ok(pages[0])
@@ -90,6 +91,49 @@ pub(super) fn free_overflow_chain<S: BTreePageStore>(store: &mut S, first_page: 
         store.clear_chains(cur)?;
         store.free_leaf(cur)?;
         cur = next;
+    }
+    Ok(())
+}
+
+pub(super) fn collect_overflow_pages<S: BTreePageStore>(
+    store: &mut S,
+    first_page: u32,
+    pages: &mut Vec<(u32, PageSize)>,
+) -> Result<()> {
+    let mut cur = first_page;
+    while cur != 0 {
+        let (buf, _) = store.read_leaf(cur)?;
+        let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
+        pages.push((cur, PageSize::Large32k));
+        cur = hdr.next_overflow_page;
+    }
+    Ok(())
+}
+
+pub(super) fn collect_subtree_pages<S: BTreePageStore>(
+    store: &mut S,
+    page: u32,
+    level: u8,
+    pages: &mut Vec<(u32, PageSize)>,
+) -> Result<()> {
+    use super::InternalNode;
+    if level == 0 {
+        let (buf, _) = store.read_leaf(page)?;
+        let node = LeafNode::parse(&buf[..])?;
+        for cell in &node.cells {
+            if let CellValue::Overflow { first_page, .. } = cell.value {
+                collect_overflow_pages(store, first_page, pages)?;
+            }
+        }
+        pages.push((page, PageSize::Large32k));
+    } else {
+        let buf = store.read_internal(page)?;
+        let node = InternalNode::parse(&buf[..])?;
+        for &(_, child) in &node.entries {
+            collect_subtree_pages(store, child, level - 1, pages)?;
+        }
+        collect_subtree_pages(store, node.rightmost_child, level - 1, pages)?;
+        pages.push((page, PageSize::Small4k));
     }
     Ok(())
 }
