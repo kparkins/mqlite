@@ -5,10 +5,11 @@ use std::sync::atomic::AtomicU64;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use parking_lot::Mutex as PlMutex;
+use parking_lot::{Condvar, Mutex as PlMutex};
 
 use crate::error::{EngineFatalReason, Error, Result};
 use crate::journal::log_file::{LogicalOpKind, LogicalTxnFrame};
@@ -37,6 +38,139 @@ use super::writer_registry::NsWriterRegistry;
 // ---------------------------------------------------------------------------
 // SharedState — fields shared by read path (no mutex) and writer (mutex held)
 // ---------------------------------------------------------------------------
+
+/// Engine-wide writer-admission gate used by checkpoint freeze windows.
+///
+/// The namespace writer registry remains per-collection. This gate sits
+/// before that namespace admission point so a checkpoint can close all new
+/// writer admission, wait for already-admitted writers to publish or abort,
+/// then run the mutation-free planning / freeze window without relying on
+/// metadata-write exclusion.
+pub(crate) struct CheckpointAdmissionGate {
+    inner: PlMutex<CheckpointAdmissionInner>,
+    cvar: Condvar,
+}
+
+#[derive(Default)]
+struct CheckpointAdmissionInner {
+    admits: u64,
+    releases: u64,
+    close_count: u32,
+    poisoned_reason: Option<EngineFatalReason>,
+}
+
+impl CheckpointAdmissionGate {
+    /// Construct an open checkpoint admission gate.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: PlMutex::new(CheckpointAdmissionInner::default()),
+            cvar: Condvar::new(),
+        }
+    }
+
+    /// Close writer admission and wait until every admitted writer exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WriterBusy`] when already-admitted writers do not
+    /// drain within `timeout`. Returns [`Error::EngineFatal`] when the live
+    /// engine is already poisoned.
+    pub(crate) fn close_and_drain_all(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> Result<CheckpointAdmissionGuard> {
+        let guard = CheckpointAdmissionGuard {
+            gate: Arc::clone(self),
+        };
+        let start = Instant::now();
+        let mut inner = self.inner.lock();
+        inner.close_count = inner.close_count.saturating_add(1);
+        loop {
+            if let Some(reason) = inner.poisoned_reason.clone() {
+                return Err(Error::EngineFatal { reason });
+            }
+            if inner.admits == inner.releases {
+                return Ok(guard);
+            }
+            let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
+            if remaining.is_zero() {
+                return Err(Error::WriterBusy);
+            }
+            let wait = self.cvar.wait_for(&mut inner, remaining);
+            if wait.timed_out() && inner.admits != inner.releases {
+                return Err(Error::WriterBusy);
+            }
+        }
+    }
+
+    /// Admit one writer unless a checkpoint has closed admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EngineFatal`] when the live engine has been poisoned.
+    pub(crate) fn admit_writer(self: &Arc<Self>) -> Result<CheckpointWriterAdmission> {
+        let mut inner = self.inner.lock();
+        loop {
+            if let Some(reason) = inner.poisoned_reason.clone() {
+                return Err(Error::EngineFatal { reason });
+            }
+            if inner.close_count == 0 {
+                inner.admits = inner.admits.saturating_add(1);
+                return Ok(CheckpointWriterAdmission {
+                    gate: Arc::clone(self),
+                });
+            }
+            self.cvar.wait(&mut inner);
+        }
+    }
+
+    fn reopen(&self) {
+        let mut inner = self.inner.lock();
+        if inner.poisoned_reason.is_none() {
+            inner.close_count = inner.close_count.saturating_sub(1);
+            if inner.close_count == 0 {
+                self.cvar.notify_all();
+            }
+        }
+    }
+
+    fn poison(&self, reason: EngineFatalReason) {
+        let mut inner = self.inner.lock();
+        inner.close_count = inner.close_count.saturating_add(1);
+        if inner.poisoned_reason.is_none() {
+            inner.poisoned_reason = Some(reason);
+        }
+        self.cvar.notify_all();
+    }
+}
+
+/// RAII guard returned by [`CheckpointAdmissionGate::close_and_drain_all`].
+#[must_use = "CheckpointAdmissionGuard reopens checkpoint writer admission on drop"]
+pub(crate) struct CheckpointAdmissionGuard {
+    gate: Arc<CheckpointAdmissionGate>,
+}
+
+impl Drop for CheckpointAdmissionGuard {
+    fn drop(&mut self) {
+        self.gate.reopen();
+    }
+}
+
+/// Writer admission token released after the writer publishes or aborts.
+#[must_use = "dropping CheckpointWriterAdmission releases the admitted writer"]
+pub(crate) struct CheckpointWriterAdmission {
+    gate: Arc<CheckpointAdmissionGate>,
+}
+
+impl Drop for CheckpointWriterAdmission {
+    fn drop(&mut self) {
+        let mut inner = self.gate.inner.lock();
+        inner.releases = inner.releases.saturating_add(1);
+        if inner.admits == inner.releases {
+            self.gate.cvar.notify_all();
+        }
+    }
+}
 
 /// State shared by the read path (no mutex) and the writer inside
 /// `Mutex<BpBackend>`.
@@ -73,6 +207,10 @@ pub(crate) struct SharedState {
         reason = "US-004 wires the registry; CRUD/DDL call sites land in US-005+"
     )]
     pub(crate) ns_writers: Arc<NsWriterRegistry>,
+    /// Engine-wide checkpoint admission gate. Checkpoint closes this
+    /// before taking the freeze window; CRUD writers enter here before
+    /// namespace admission and drop the token after publish or abort.
+    pub(crate) checkpoint_admission: Arc<CheckpointAdmissionGate>,
     /// Phase 5 journal-envelope mutex. Namespace-create DDL paths use
     /// this instead of the retired commit-sequence field so bootstrap and
     /// standalone create can reserve a sequencer slot, complete the
@@ -266,6 +404,9 @@ impl SharedState {
         if guard.is_none() {
             *guard = Some(reason);
         }
+        let reason = guard.clone().expect("engine poison reason recorded");
+        drop(guard);
+        self.checkpoint_admission.poison(reason);
     }
 }
 
@@ -450,6 +591,19 @@ where
     Ok(())
 }
 
+fn validate_phase7_case_c_candidates(parsed: &ParsedLogicalFrames) -> Result<()> {
+    if let Some(candidate) = parsed.case_c_candidates.first() {
+        return Err(Error::Recovery {
+            detail: format!(
+                "chain_commit_offset={}: ChainCommit without matching \
+                 LogicalTxnFrame commit_ts={:?}",
+                candidate.chain_commit_offset, candidate.commit_ts
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// §3.4 invariant: op_ordinal values form a dense sequence
 /// `0..ops.len()-1` with no gaps and no duplicates. Pass 1 should
 /// already have enforced this via `LogicalTxnFrame::decode`; we re-check
@@ -522,6 +676,7 @@ impl MetadataState {
         // tolerance: unresolved ids are log-and-proceed. The validation
         // pass itself does not mutate durable state.
         let parsed_logical = handle.take_parsed_logical_frames();
+        validate_phase7_case_c_candidates(&parsed_logical)?;
         validate_parsed_logical_frames_against_catalog(&catalog, &parsed_logical)?;
         check_recovery_replay_pool_bound(&handle, &catalog, &parsed_logical)?;
         // T7 — journal-tail HLC oracle recovery: floor the oracle above
@@ -588,6 +743,7 @@ impl MetadataState {
                 recovered_max_commit_ts.unwrap_or_default(),
             ),
             ns_writers: Arc::new(NsWriterRegistry::new()),
+            checkpoint_admission: Arc::new(CheckpointAdmissionGate::new()),
             journal_mutex: parking_lot::Mutex::new(()),
             group_commit: GroupCommitManager::new(),
             smo_classification_retry_cap,
@@ -631,6 +787,15 @@ impl MetadataState {
             #[cfg(any(test, feature = "test-hooks"))]
             us007_journal_begin_hooks: std::sync::Mutex::new(std::collections::VecDeque::new()),
         });
+        let weak_shared = Arc::downgrade(&shared);
+        shared
+            .handle
+            .allocator()
+            .install_freeze_violation_poisoner(move || {
+                if let Some(shared) = weak_shared.upgrade() {
+                    shared.poison_engine(EngineFatalReason::CheckpointPostMutationFailure);
+                }
+            })?;
 
         let md = Self {
             catalog: std::sync::Mutex::new(catalog),

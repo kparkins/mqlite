@@ -76,6 +76,26 @@ pub enum WriteConflictReason {
     },
 }
 
+/// Why a live buffer-pool pin could not find an evictable frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PoolExhaustedReason {
+    /// Every frame in the target pool partition is pinned.
+    AllFramesPinned,
+    /// Every available eviction candidate carries resident deltas that
+    /// cannot be dropped without first reconciling them.
+    DeltaBearingFrames,
+}
+
+impl std::fmt::Display for PoolExhaustedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AllFramesPinned => f.write_str("all frames pinned"),
+            Self::DeltaBearingFrames => f.write_str("delta-bearing frames"),
+        }
+    }
+}
+
 /// The primary error type for mqlite operations.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -383,6 +403,40 @@ pub enum Error {
     )]
     RecoveryPoolExhausted,
 
+    /// A live CRUD or reader path could not find an evictable buffer-pool
+    /// frame. Checkpoint frontier pressure is reported separately as
+    /// [`Error::CheckpointIncomplete`].
+    #[error(
+        "pool exhausted: {reason}; close or expire readers or pins, wait for \
+         checkpoint relief, or increase buffer_pool_size"
+    )]
+    PoolExhausted {
+        /// Why the pool could not make room for the requested page.
+        reason: PoolExhaustedReason,
+    },
+
+    /// Open-time recovery found durable evidence that cannot be replayed
+    /// safely.
+    #[error("recovery error: {detail}")]
+    Recovery {
+        /// Stable operator-facing recovery detail.
+        detail: String,
+    },
+
+    /// A checkpoint cannot advance the durable frontier without losing
+    /// checkpoint-visible resident state.
+    #[error(
+        "checkpoint incomplete: first_blocking_page={first_blocking_page}, reason={reason}; \
+         close or expire long readers or pins, enable overflow spill if blocking, \
+         raise pool or cap limits, then retry checkpoint"
+    )]
+    CheckpointIncomplete {
+        /// First dirty leaf that blocked checkpoint planning.
+        first_blocking_page: u32,
+        /// Why the dirty leaf could not be included in this checkpoint.
+        reason: CheckpointIncompleteReason,
+    },
+
     /// The engine reached a post-durable state that requires reopening.
     ///
     /// Phase 5 §10.19.0 C-2 / US-036 — once the `journal_mutex` durability
@@ -427,6 +481,57 @@ pub enum EngineFatalReason {
     /// DDL envelope has already completed when this is raised
     /// (§10.8.1, §10.8.2, §10.8.3).
     PostDurableDdlPublishFailure,
+    /// A checkpoint failed after its mutation phase began. The live
+    /// engine is poisoned; close and reopen to recover from the last
+    /// durable checkpoint boundary.
+    CheckpointPostMutationFailure,
+}
+
+/// Why [`Error::CheckpointIncomplete`] blocked a checkpoint.
+///
+/// Phase 7 US-010 keeps these reasons distinct from live
+/// [`Error::PoolExhausted`] so checkpoint callers can tell whether retrying
+/// requires pool relief, history-cap changes, or reachability repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CheckpointIncompleteReason {
+    /// The dirty leaf was pinned by another reader or writer, so in-place
+    /// checkpoint install would require forbidden frame CoW.
+    FrameCoWRefused,
+    /// A checkpoint-visible overflow value needs spill ownership transfer, but
+    /// the overflow-spill path is not wired for that page.
+    OverflowSpillNotWired,
+    /// Checkpoint-visible winners alone exceed the folded leaf page budget.
+    VisibleWinnerExceedsPageBudget,
+    /// Retained tombstone predecessors or sidecar chains keep the folded leaf
+    /// over budget until readers or pins move forward.
+    TombstonePredecessorPressure,
+    /// Buffer-pool pressure prevented the checkpoint from making the dirty
+    /// leaf resident or keeping it resident before mutation.
+    PoolExhausted(PoolExhaustedReason),
+    /// A history-store spill key already exists with different bytes.
+    HistoryDuplicateConflict,
+    /// The per-key history duplicate disambiguator reached its cap.
+    HistoryDuplicateCapExceeded,
+    /// Dirty-leaf reachability no longer matches the catalog or resident tree.
+    ReachabilityRepairRequired,
+}
+
+impl std::fmt::Display for CheckpointIncompleteReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameCoWRefused => f.write_str("frame CoW refused"),
+            Self::OverflowSpillNotWired => f.write_str("overflow spill not wired"),
+            Self::VisibleWinnerExceedsPageBudget => {
+                f.write_str("visible winner exceeds page budget")
+            }
+            Self::TombstonePredecessorPressure => f.write_str("tombstone predecessor pressure"),
+            Self::PoolExhausted(reason) => write!(f, "pool exhausted: {reason}"),
+            Self::HistoryDuplicateConflict => f.write_str("history duplicate conflict"),
+            Self::HistoryDuplicateCapExceeded => f.write_str("history duplicate cap exceeded"),
+            Self::ReachabilityRepairRequired => f.write_str("reachability repair required"),
+        }
+    }
 }
 
 impl Error {

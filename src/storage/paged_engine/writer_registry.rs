@@ -41,6 +41,8 @@ struct NsWriterLaneInner {
     admits: u64,
     /// Monotonic count of released writers (via `NsWriteTicket::drop`).
     releases: u64,
+    /// True while one writer is executing its namespace write body.
+    body_active: bool,
     /// True when a DDL caller has closed the lane to new admits.
     closed: bool,
 }
@@ -50,13 +52,33 @@ struct NsWriterLaneInner {
 /// has fully drained.
 pub(crate) struct NsWriteTicket {
     lane: Arc<NsWriterLane>,
+    body_active: bool,
+}
+
+impl NsWriteTicket {
+    /// Release the same-namespace body-entry mutex while retaining the DDL
+    /// drain ticket through the durability and publish envelope.
+    pub(crate) fn finish_body(&mut self) {
+        if !self.body_active {
+            return;
+        }
+        let mut g = self.lane.inner.lock();
+        if g.body_active {
+            g.body_active = false;
+        }
+        self.body_active = false;
+        self.lane.cvar.notify_all();
+    }
 }
 
 impl Drop for NsWriteTicket {
     fn drop(&mut self) {
         let mut g = self.lane.inner.lock();
+        if self.body_active && g.body_active {
+            g.body_active = false;
+        }
         g.releases = g.releases.saturating_add(1);
-        if g.admits == g.releases {
+        if !g.body_active || g.admits == g.releases {
             self.lane.cvar.notify_all();
         }
     }
@@ -77,13 +99,14 @@ impl NsWriterRegistry {
         }
     }
 
-    /// Register the calling thread as an active writer on the namespace
+    /// Register the calling thread as the active writer on the namespace
     /// identified by `ns_id`. Returns `Err(WriterBusy)` if the lane stays
-    /// closed past `timeout`.
+    /// closed or occupied past `timeout`.
     ///
     /// # Errors
     /// - [`Error::WriterBusy`] if a DDL `close_and_drain_guard` keeps the
-    ///   lane closed for the full `timeout`.
+    ///   lane closed, or another same-namespace writer keeps the lane occupied,
+    ///   for the full `timeout`.
     pub(crate) fn admit(&self, ns_id: i64, timeout: Duration) -> Result<NsWriteTicket> {
         let lane = self
             .lanes
@@ -93,6 +116,7 @@ impl NsWriterRegistry {
                     inner: Mutex::new(NsWriterLaneInner {
                         admits: 0,
                         releases: 0,
+                        body_active: false,
                         closed: false,
                     }),
                     cvar: Condvar::new(),
@@ -104,19 +128,28 @@ impl NsWriterRegistry {
         let start = Instant::now();
         let mut g = lane.inner.lock();
         loop {
-            if g.closed {
+            if g.closed || g.body_active {
                 let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
                 if remaining.is_zero() {
+                    let waited_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    crate::mvcc::metrics::record_lane_wait_ns(waited_ns);
                     return Err(Error::WriterBusy);
                 }
                 let wr = lane.cvar.wait_for(&mut g, remaining);
-                if wr.timed_out() && g.closed {
+                if wr.timed_out() && (g.closed || g.body_active) {
+                    let waited_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    crate::mvcc::metrics::record_lane_wait_ns(waited_ns);
                     return Err(Error::WriterBusy);
                 }
                 continue;
             }
             g.admits = g.admits.saturating_add(1);
-            return Ok(NsWriteTicket { lane: lane.clone() });
+            let waited_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            crate::mvcc::metrics::record_lane_wait_ns(waited_ns);
+            return Ok(NsWriteTicket {
+                lane: lane.clone(),
+                body_active: true,
+            });
         }
     }
 
@@ -265,18 +298,21 @@ mod tests {
     #[test]
     fn test_admit_and_release_counters_balance() {
         let reg = Arc::new(NsWriterRegistry::new());
-        let t1 = reg.admit(NS_ID, ADMIT_TIMEOUT).expect("admit 1");
-        let t2 = reg.admit(NS_ID, ADMIT_TIMEOUT).expect("admit 2");
-        let t3 = reg.admit(NS_ID, ADMIT_TIMEOUT).expect("admit 3");
+        let mut t1 = reg.admit(NS_ID, ADMIT_TIMEOUT).expect("admit 1");
         let (admits, releases, closed) = lane_counters(&reg, NS_ID);
-        assert_eq!(admits, 3, "admits bumped per admit");
+        assert_eq!(admits, 1, "admits bumped per admit");
         assert_eq!(releases, 0, "no releases yet");
         assert!(!closed);
-        drop(t2);
+        t1.finish_body();
+        let mut t2 = reg.admit(NS_ID, ADMIT_TIMEOUT).expect("admit 2");
+        t2.finish_body();
+        let mut t3 = reg.admit(NS_ID, ADMIT_TIMEOUT).expect("admit 3");
+        t3.finish_body();
+        drop(t1);
         let (admits, releases, _) = lane_counters(&reg, NS_ID);
         assert_eq!(admits, 3);
         assert_eq!(releases, 1, "one release after first drop");
-        drop(t1);
+        drop(t2);
         drop(t3);
         let (admits, releases, _) = lane_counters(&reg, NS_ID);
         assert_eq!(admits, releases, "all tickets released");

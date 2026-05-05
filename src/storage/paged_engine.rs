@@ -62,6 +62,22 @@ mod visibility;
 pub(crate) mod writer_registry;
 
 #[cfg(test)]
+mod phase7_us002_tests;
+#[cfg(test)]
+mod phase7_us003_tests;
+#[cfg(test)]
+mod phase7_us004_tests;
+#[cfg(test)]
+mod phase7_us005_tests;
+#[cfg(test)]
+mod phase7_us007_tests;
+#[cfg(test)]
+mod phase7_us008_tests;
+#[cfg(test)]
+mod phase7_us009_tests;
+#[cfg(test)]
+mod phase7_us010_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod us002_tests;
@@ -482,7 +498,8 @@ impl PagedEngine {
         ) -> Result<R>,
     {
         self.shared.check_engine_not_poisoned()?;
-        let (captured_ns_id, captured_catalog_gen, captured_catalog_identity, writer_ticket) =
+        let _checkpoint_writer_admission = self.shared.checkpoint_admission.admit_writer()?;
+        let (captured_ns_id, captured_catalog_gen, captured_catalog_identity, mut writer_ticket) =
             if let Some(ns_id) = bootstrapped_ns_id {
                 // US-030: the bootstrap path admits the allocated durable id
                 // directly after the namespace-create publish. It does not
@@ -528,8 +545,9 @@ impl PagedEngine {
                 // §10.1 / §10.27 — the writer ticket is the post-§10.17
                 // anti-deadlock fence between this CRUD body and a later
                 // DDL `close_and_drain`. The ticket is held across body,
-                // install, `journal_mutex` envelope, and publish; DDL
-                // drains the lane after taking `metadata.write()` so
+                // install, `journal_mutex` envelope, and publish; its
+                // body-entry mutex is released after the closure returns.
+                // DDL drains the lane after taking `metadata.write()` so
                 // existing CRUD bodies finish without re-acquiring the
                 // metadata read guard.
                 let ticket = match captured_ns_id_opt {
@@ -572,10 +590,11 @@ impl PagedEngine {
         // S3: execute the write body without `metadata.read()`. The
         // catalog itself is behind `Mutex<Catalog>`, so mutations
         // happen inside the closure under the catalog mutex; the
-        // §10.17 fence against DDL is provided by the writer ticket
-        // admitted in S1. Other CRUD writers on different namespaces
-        // hold their own tickets concurrently and their own lanes;
-        // `journal_mutex` serializes only the durability envelope.
+        // §10.17 fence against DDL is provided by the writer ticket admitted
+        // in S1. The same-namespace body-entry mutex is released immediately
+        // after this closure returns; the DDL drain ticket remains held across
+        // install, durability, and publish. `journal_mutex` serializes only
+        // the durability envelope.
         #[cfg(any(test, feature = "test-hooks"))]
         self::test_accessors::write_body_entry_if_installed(&self.shared, ns);
         let body_result = f(
@@ -585,15 +604,17 @@ impl PagedEngine {
             &mut txn,
             &vis,
         );
+        if let Some(ticket) = writer_ticket.as_mut() {
+            ticket.finish_body();
+        }
 
         match body_result {
             Ok(value) => {
-                // Root-neutral vs root-changing classification: if the body
-                // called `sync_catalog_root_overlay` (because a tree root moved
-                // or the catalog root changed), the overlay captured the file
-                // header pre-image. Observed OUTSIDE the journal critical
-                // section — reading `overlay.has_header_update()` takes no locks.
-                let root_changing = overlay.has_header_update();
+                // Root-neutral vs root-changing classification. Header sync
+                // still captures catalog-root movement; Phase 7 logical-chain
+                // installs can also make primary B-tree structural progress
+                // without forcing a fresh catalog header.
+                let mut root_changing = overlay.has_header_update() || txn.structural_tree_change();
 
                 // §7 / US-024 AC#3 — refresh the logical-txn append-duration
                 // percentiles after the journal envelope releases.
@@ -682,15 +703,16 @@ impl PagedEngine {
                     }
                 };
 
-                let primary_pages = match self.install_pending_primary_with_retry(
+                let primary_install = self.install_pending_primary_with_retry(
                     &self.metadata_state,
                     &mut overlay,
                     &primary_writes,
                     &vis,
                     commit_ts,
                     txn_id,
-                ) {
-                    Ok(pages) => pages,
+                );
+                let (primary_pages, primary_structural_tree_change) = match primary_install {
+                    Ok(result) => result,
                     Err(e) => {
                         drop(txn);
                         return Err(self.cleanup_registered_pre_durable_failure(
@@ -703,6 +725,7 @@ impl PagedEngine {
                         ));
                     }
                 };
+                root_changing |= primary_structural_tree_change;
                 let mut pending_pages = sec_pages;
                 pending_pages.extend(primary_pages);
 
@@ -988,7 +1011,8 @@ impl PagedEngine {
                 .commit_txn(0, PageSize::Small4k, &header_data, db_page_count)?;
         if emergency {
             crate::mvcc::metrics::record_emergency_checkpoint_trigger();
-            let _ = self.shared.handle.emergency_checkpoint();
+            // Defer the legacy page-frame checkpoint until checkpoint
+            // materialization has folded the logical row tail.
         }
         Ok(())
     }
@@ -1093,9 +1117,9 @@ impl PagedEngine {
         vis: &WriteVisibility<'_>,
         commit_ts: crate::mvcc::Ts,
         txn_id: u64,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<(Vec<u32>, bool)> {
         if writes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         #[cfg(any(test, feature = "test-hooks"))]
         let first_attempt = self::test_accessors::us019_maybe_fail_primary_install(&self.shared)
@@ -1421,7 +1445,9 @@ impl StorageEngine for PagedEngine {
                         Err(e) => return Err(e),
                     };
                     if emergency {
-                        let _ = self.shared.handle.emergency_checkpoint();
+                        // Defer the legacy page-frame checkpoint until
+                        // checkpoint materialization has folded the logical
+                        // row tail.
                     }
                     Ok(())
                 }
@@ -1893,7 +1919,9 @@ impl PagedEngine {
                     self.flush_under_journal_mutex()?;
                     if emergency {
                         crate::mvcc::metrics::record_emergency_checkpoint_trigger();
-                        let _ = self.shared.handle.emergency_checkpoint();
+                        // Defer the legacy page-frame checkpoint until
+                        // checkpoint materialization has folded the logical
+                        // row tail.
                     }
                     Ok(value)
                 }

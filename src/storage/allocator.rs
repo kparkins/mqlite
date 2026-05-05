@@ -39,11 +39,14 @@
 //! [`Error::DiskFull`] is returned with `available_bytes: 0`.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Error, Result};
-use crate::mvcc::deferred_free::{PageLifetimeKind, PageLifetimeQueue};
+use crate::journal::BoundaryAppended;
+use crate::mvcc::deferred_free::{CheckpointLifetimeDrain, PageLifetimeKind, PageLifetimeQueue};
 use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 
@@ -255,7 +258,10 @@ impl<'a> PageAllocator<'a> {
 struct AllocatorState {
     header: FileHeader,
     header_dirty: bool,
+    frozen: bool,
 }
+
+type FreezeViolationPoisoner = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Inner state of an [`AllocatorHandle`], shared via a single `Arc`.
 struct AllocatorInner {
@@ -275,6 +281,8 @@ struct AllocatorInner {
     page_lifetime_queue: PageLifetimeQueue,
     /// Monotonic in-memory checkpoint fence for page-lifetime drains.
     page_lifetime_checkpoint_fence: AtomicU64,
+    /// Live-engine poison hook invoked when mutation is attempted while frozen.
+    freeze_violation_poisoner: Mutex<Option<FreezeViolationPoisoner>>,
 }
 
 /// A `Clone`-able, `Arc`-wrapped allocator handle that owns the
@@ -292,6 +300,40 @@ pub(crate) struct AllocatorHandle {
     inner: Arc<AllocatorInner>,
 }
 
+/// RAII guard for the checkpoint allocator freeze window.
+#[allow(
+    dead_code,
+    reason = "Phase 7 US-004 lands the freeze primitive before the checkpoint driver consumes it"
+)]
+#[must_use = "AllocatorFreezeGuard must live until the boundary commit consumes it"]
+pub(crate) struct AllocatorFreezeGuard {
+    inner: Arc<AllocatorInner>,
+    active: bool,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl AllocatorFreezeGuard {
+    #[allow(
+        dead_code,
+        reason = "Phase 7 US-004 lands the freeze primitive before the checkpoint driver consumes it"
+    )]
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.frozen = false;
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for AllocatorFreezeGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl AllocatorHandle {
     /// Create an `AllocatorHandle` from an existing [`FileHeader`].
     ///
@@ -304,12 +346,81 @@ impl AllocatorHandle {
                 state: Mutex::new(AllocatorState {
                     header,
                     header_dirty: false,
+                    frozen: false,
                 }),
                 overflow_refcounts: Mutex::new(HashMap::new()),
                 page_lifetime_queue: PageLifetimeQueue::new(),
                 page_lifetime_checkpoint_fence: AtomicU64::new(0),
+                freeze_violation_poisoner: Mutex::new(None),
             }),
         }
+    }
+
+    /// Install the live-engine poison hook used for freeze-window violations.
+    pub(crate) fn install_freeze_violation_poisoner<F>(&self, poisoner: F) -> Result<()>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let mut guard = self
+            .inner
+            .freeze_violation_poisoner
+            .lock()
+            .map_err(|_| Error::Internal("allocator poison hook mutex poisoned".into()))?;
+        *guard = Some(Arc::new(poisoner));
+        Ok(())
+    }
+
+    fn lock_state(&self) -> Result<MutexGuard<'_, AllocatorState>> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))
+    }
+
+    fn lock_mutable_state(&self) -> Result<MutexGuard<'_, AllocatorState>> {
+        let state = self.lock_state()?;
+        if state.frozen {
+            drop(state);
+            return Err(self.freeze_violation_error());
+        }
+        Ok(state)
+    }
+
+    fn ensure_not_frozen(&self) -> Result<()> {
+        let state = self.lock_state()?;
+        if state.frozen {
+            drop(state);
+            return Err(self.freeze_violation_error());
+        }
+        Ok(())
+    }
+
+    fn freeze_violation_error(&self) -> Error {
+        if let Ok(guard) = self.inner.freeze_violation_poisoner.lock() {
+            if let Some(poisoner) = guard.clone() {
+                poisoner();
+            }
+        }
+        Error::Internal("allocator is frozen; mutation rejected".into())
+    }
+
+    /// Close the allocator mutation window until a boundary token is consumed.
+    #[allow(
+        dead_code,
+        reason = "Phase 7 US-004 lands the freeze primitive before the checkpoint driver consumes it"
+    )]
+    pub(crate) fn freeze_guard(&self) -> Result<AllocatorFreezeGuard> {
+        let mut state = self.lock_state()?;
+        if state.frozen {
+            drop(state);
+            return Err(self.freeze_violation_error());
+        }
+        state.frozen = true;
+        Ok(AllocatorFreezeGuard {
+            inner: Arc::clone(&self.inner),
+            active: true,
+            _not_send: PhantomData,
+        })
     }
 
     /// Borrow the page-lifetime queue used by `OverflowRef::drop` and drain paths.
@@ -494,6 +605,7 @@ impl AllocatorHandle {
     ///
     /// Returns the number of pages actually freed.
     pub(crate) fn drain_free_queue(&self, io: &dyn PageSource) -> Result<usize> {
+        self.ensure_not_frozen()?;
         let entries = self
             .inner
             .page_lifetime_queue
@@ -505,11 +617,7 @@ impl AllocatorHandle {
             return Ok(0);
         }
 
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut state = self.lock_mutable_state()?;
         let mut freed = 0usize;
         let mut requeue = Vec::new();
 
@@ -620,11 +728,7 @@ impl AllocatorHandle {
     /// caller must call [`flush_header`](Self::flush_header) (or flush the
     /// buffer pool) to persist the change to disk.
     pub(crate) fn alloc_4k(&self, io: &dyn PageSource) -> Result<u32> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut state = self.lock_mutable_state()?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
         let page_no = alloc.allocate_4k()?;
         state.header_dirty = true;
@@ -635,11 +739,7 @@ impl AllocatorHandle {
     ///
     /// Updates the in-memory free list and marks the header dirty.
     pub(crate) fn alloc_32k(&self, io: &dyn PageSource) -> Result<u32> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut state = self.lock_mutable_state()?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
         let page_no = alloc.allocate_32k()?;
         state.header_dirty = true;
@@ -655,11 +755,7 @@ impl AllocatorHandle {
     /// Marks the header dirty.  The freed page's first 4 bytes are
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_4k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut state = self.lock_mutable_state()?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
         alloc.free_4k(page_number)?;
         state.header_dirty = true;
@@ -671,11 +767,7 @@ impl AllocatorHandle {
     /// Marks the header dirty.  The freed page's first 4 bytes are
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_32k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut state = self.lock_mutable_state()?;
         let mut alloc = PageAllocator::new(&mut state.header, io);
         alloc.free_32k(page_number)?;
         state.header_dirty = true;
@@ -695,11 +787,7 @@ impl AllocatorHandle {
     where
         F: FnOnce(&FileHeader) -> R,
     {
-        let state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let state = self.lock_state()?;
         Ok(f(&state.header))
     }
 
@@ -711,14 +799,43 @@ impl AllocatorHandle {
     where
         F: FnOnce(&mut FileHeader),
     {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut state = self.lock_mutable_state()?;
         f(&mut state.header);
         state.header_dirty = true;
         Ok(())
+    }
+
+    /// Commit a staged checkpoint header after the durable boundary exists.
+    #[allow(
+        dead_code,
+        reason = "Phase 7 US-004 lands the staged-header primitive before the checkpoint driver consumes it"
+    )]
+    pub(crate) fn commit_staged_header_after_boundary(
+        &self,
+        mut freeze: AllocatorFreezeGuard,
+        staged_header: FileHeader,
+        boundary: BoundaryAppended,
+        checkpoint_lifetime_drain: CheckpointLifetimeDrain,
+    ) -> Result<()> {
+        let boundary_page_count = boundary.db_page_count();
+        let result = if staged_header.total_page_count != boundary_page_count {
+            Err(Error::Internal(format!(
+                "boundary page count {boundary_page_count} does not match staged header {}",
+                staged_header.total_page_count
+            )))
+        } else {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+            state.header = staged_header;
+            state.header_dirty = false;
+            checkpoint_lifetime_drain.publish();
+            Ok(())
+        };
+        freeze.release();
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -733,11 +850,7 @@ impl AllocatorHandle {
     /// Typically called after all B+ tree operations in a transaction are
     /// complete, before the WAL commit frame is written.
     pub(crate) fn flush_header(&self, io: &dyn PageSource) -> Result<()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
+        let mut state = self.lock_mutable_state()?;
         if state.header_dirty {
             let bytes = state.header.to_bytes();
             io.write_page(0, PageSize::Small4k, &bytes)?;

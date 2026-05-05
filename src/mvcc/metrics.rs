@@ -1,4 +1,4 @@
-//! MVCC counters — 12 mandatory + 5 diagnostic.
+//! MVCC counters — 12 mandatory + 6 diagnostic.
 //!
 //! Each counter is a process-global atomic exposed through
 //! `record()` / `snapshot()` / `reset()` primitives (or `set()` for gauges).
@@ -29,6 +29,7 @@
 //! - `mvcc.hlc.advance_events_total` — counter
 //! - `mvcc.journal.chain_commit_frames_total` — counter
 //! - `mvcc.force_expire_spin_stalls_total` — counter
+//! - `mvcc.checkpoint.frontier_blocked_total` — counter
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,6 +79,29 @@ pub fn reconcile_entries_dropped_snapshot() -> u64 {
 /// Reset the reconcile-dropped counter.
 pub fn reset_reconcile_entries_dropped() {
     RECONCILE_ENTRIES_DROPPED_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ===========================================================================
+// mvcc.checkpoint.frontier_blocked_total (counter)
+// ===========================================================================
+
+/// Number of checkpoint attempts blocked before mutation because at least one
+/// checkpoint-visible dirty leaf could not safely advance the durable frontier.
+pub static CHECKPOINT_FRONTIER_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one mutation-free checkpoint frontier blocker.
+pub fn record_checkpoint_frontier_blocked() {
+    CHECKPOINT_FRONTIER_BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot the checkpoint-frontier-blocked counter.
+pub fn checkpoint_frontier_blocked_snapshot() -> u64 {
+    CHECKPOINT_FRONTIER_BLOCKED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Reset the checkpoint-frontier-blocked counter.
+pub fn reset_checkpoint_frontier_blocked() {
+    CHECKPOINT_FRONTIER_BLOCKED_TOTAL.store(0, Ordering::Relaxed);
 }
 
 // ===========================================================================
@@ -959,10 +983,9 @@ pub fn reset_logical_txn_pass1_unmatched_chain_commit() {
 // logical_txn_pass1_pre_boundary_dropped_total (counter) — §3.11
 // ---------------------------------------------------------------------------
 
-/// Total logical frames discarded by the Pass 1 checkpoint-boundary cull
-/// (§3.11). Each tick corresponds to a logical frame whose `commit_ts <=`
-/// the highest observed `covers_commit_ts_hi` — i.e. already fully
-/// reconciled to the main file by a prior checkpoint.
+/// Total logical frames discarded by the Pass 1 checkpoint-boundary cull.
+/// Each tick corresponds to a logical frame whose `commit_ts <=` the
+/// recovered page-0 header's `last_checkpoint_ts`.
 pub static LOGICAL_TXN_PASS1_PRE_BOUNDARY_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record one pre-boundary logical frame dropped by Pass 1.
@@ -981,53 +1004,25 @@ pub fn reset_logical_txn_pass1_pre_boundary_dropped() {
 }
 
 // ---------------------------------------------------------------------------
-// recovery_checkpoint_boundary_frames_total (counter) — §3.11
+// recovery_page0_boundary_frames_total (counter)
 // ---------------------------------------------------------------------------
 
-/// Total valid `CheckpointCommitBoundaryFrame`s parsed by Pass 1 (§3.11).
-/// Torn/truncated boundary frames are treated as absent and do NOT tick
-/// this counter.
-pub static RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total valid page-0 checkpoint boundary frames parsed by recovery.
+pub static RECOVERY_PAGE0_BOUNDARY_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Record one valid boundary frame seen by recovery.
-pub fn record_recovery_checkpoint_boundary_frame() {
-    RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+/// Record one valid page-0 boundary frame seen by recovery.
+pub fn record_recovery_page0_boundary_frame() {
+    RECOVERY_PAGE0_BOUNDARY_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Snapshot the boundary-frames recovery counter.
-pub fn recovery_checkpoint_boundary_frames_snapshot() -> u64 {
-    RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL.load(Ordering::Relaxed)
+/// Snapshot the page-0 boundary recovery counter.
+pub fn recovery_page0_boundary_frames_snapshot() -> u64 {
+    RECOVERY_PAGE0_BOUNDARY_FRAMES_TOTAL.load(Ordering::Relaxed)
 }
 
-/// Reset the boundary-frames recovery counter.
-pub fn reset_recovery_checkpoint_boundary_frames() {
-    RECOVERY_CHECKPOINT_BOUNDARY_FRAMES_TOTAL.store(0, Ordering::Relaxed);
-}
-
-// ---------------------------------------------------------------------------
-// recovery_torn_checkpoint_boundary_total (counter) — §3.11 point 4
-// ---------------------------------------------------------------------------
-
-/// Total torn `CheckpointCommitBoundaryFrame`s observed by Pass 1 — bytes
-/// at the offset have the boundary kind discriminant `0x04` but the frame
-/// failed CRC or was truncated. Each tick corresponds to a scan that
-/// halted at the torn boundary and resumed from the previous valid
-/// boundary's `covers_commit_ts_hi` (§3.11 point 4).
-pub static RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Record one torn boundary observed by recovery.
-pub fn record_recovery_torn_checkpoint_boundary() {
-    RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Snapshot the torn-boundary recovery counter.
-pub fn recovery_torn_checkpoint_boundary_snapshot() -> u64 {
-    RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL.load(Ordering::Relaxed)
-}
-
-/// Reset the torn-boundary recovery counter.
-pub fn reset_recovery_torn_checkpoint_boundary() {
-    RECOVERY_TORN_CHECKPOINT_BOUNDARY_TOTAL.store(0, Ordering::Relaxed);
+/// Reset the page-0 boundary recovery counter.
+pub fn reset_recovery_page0_boundary_frames() {
+    RECOVERY_PAGE0_BOUNDARY_FRAMES_TOTAL.store(0, Ordering::Relaxed);
 }
 
 // ===========================================================================

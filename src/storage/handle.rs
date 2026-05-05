@@ -32,12 +32,16 @@
 //! Concurrent access is managed at the `PagedEngine` level via per-namespace
 //! write lanes (`ns_lanes`) and a metadata `RwLock`.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::journal::log_file::JournalPageSize;
-use crate::journal::JournalManager;
+use crate::journal::log_file::{JournalPageSize, PageId};
+use crate::journal::{
+    CheckpointBatchCursor, CheckpointBatchId, CheckpointFlushSet, CheckpointPoolKind,
+    JournalManager,
+};
 use crate::mvcc::read_view::ReadViewRegistry;
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::buffer_pool::{BufferPool, PageSize, PageSource, PinnedPage};
@@ -83,6 +87,38 @@ impl PageSource for BufferPoolPageSource {
         page.data_mut().copy_from_slice(buf);
         Ok(())
     }
+}
+
+#[allow(
+    dead_code,
+    reason = "US-005 lands flush_journal_durable before the full checkpoint driver consumes it"
+)]
+fn journal_page_size(size: PageSize) -> JournalPageSize {
+    match size {
+        PageSize::Small4k => JournalPageSize::Small4k,
+        PageSize::Large32k => JournalPageSize::Large32k,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "US-005 lands flush_journal_durable before the full checkpoint driver consumes it"
+)]
+fn validate_dirty_subset(
+    dirty_pages: &BTreeSet<PageId>,
+    owned_pages: &BTreeSet<PageId>,
+    excluded_pages: &BTreeSet<PageId>,
+    pool_name: &str,
+) -> Result<()> {
+    for page in dirty_pages {
+        if !owned_pages.contains(page) && !excluded_pages.contains(page) {
+            return Err(Error::Internal(format!(
+                "checkpoint flush set rejected {pool_name} foreign dirty frame {}",
+                page.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +430,41 @@ impl BufferPoolHandle {
         Ok(true)
     }
 
+    /// Copy the post-boundary checkpoint batch into the main file.
+    ///
+    /// This Phase 7 primitive runs only after the page-0 boundary has become
+    /// durable. It fdatasyncs the main file before journal truncation and never
+    /// mutates allocator header state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if no journal/main-file pair is attached, no
+    /// durable page-0 checkpoint boundary exists, or the boundary page count
+    /// differs from `expected_total_page_count`.
+    pub(crate) fn emergency_checkpoint_after_boundary(
+        &self,
+        expected_total_page_count: u32,
+    ) -> Result<()> {
+        let Some(file_mutex) = self.journal_main_file.as_ref() else {
+            return Err(Error::Internal(
+                "post-boundary checkpoint requires an attached main file".into(),
+            ));
+        };
+        let Some(journal) = &self.journal else {
+            return Err(Error::Internal(
+                "post-boundary checkpoint requires an attached journal".into(),
+            ));
+        };
+        let mut file_guard = file_mutex
+            .lock()
+            .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
+        let mut journal_guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        journal_guard
+            .emergency_checkpoint_after_boundary(&mut file_guard, expected_total_page_count)
+    }
+
     /// Checkpoint all journal frames into `main_file` and reset the journal.
     ///
     /// Reads the current [`FileHeader`] from the allocator, passes it to
@@ -484,6 +555,126 @@ impl BufferPoolHandle {
             .lock()
             .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
         Ok(guard.recovered_max_commit_ts())
+    }
+
+    /// Return the batch id that the next checkpoint flush should carry.
+    #[allow(
+        dead_code,
+        reason = "US-005 lands checkpoint batch ids before the full driver consumes them"
+    )]
+    pub(crate) fn next_checkpoint_batch_id(&self) -> Result<CheckpointBatchId> {
+        let Some(journal) = &self.journal else {
+            return Err(Error::Internal(
+                "checkpoint flush requires an attached journal".into(),
+            ));
+        };
+        let guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        Ok(guard.next_checkpoint_batch_id())
+    }
+
+    /// Flush only checkpoint-owned dirty frames to the journal and sync it.
+    ///
+    /// The allocator header is intentionally not flushed here; Phase 7 stages
+    /// page-0 authority separately at the boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when the flush set has ambiguous pool
+    /// ownership, a foreign dirty frame, or no attached journal.
+    #[allow(
+        dead_code,
+        reason = "US-005 lands durable checkpoint flushing before the full driver consumes it"
+    )]
+    pub(crate) fn flush_journal_durable(
+        &self,
+        checkpoint_flush_set: CheckpointFlushSet,
+    ) -> Result<CheckpointBatchCursor> {
+        let Some(journal) = &self.journal else {
+            return Err(Error::Internal(
+                "checkpoint flush requires an attached journal".into(),
+            ));
+        };
+        self.validate_checkpoint_flush_set(&checkpoint_flush_set)?;
+        let main_frames = self.pool.checkpoint_dirty_frame_snapshots(
+            checkpoint_flush_set.main_pages(),
+            checkpoint_flush_set.excluded_future_dirty_pages(),
+        )?;
+        let history_frames = self.history_pool.checkpoint_dirty_frame_snapshots(
+            checkpoint_flush_set.history_pages(),
+            &BTreeSet::new(),
+        )?;
+
+        let mut guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        let cursor = guard.begin_checkpoint_batch()?;
+        if cursor.batch_id() != checkpoint_flush_set.batch_id() {
+            guard.abort_empty_checkpoint_batch(&cursor);
+            return Err(Error::Internal(
+                "checkpoint flush set batch id does not match journal cursor".into(),
+            ));
+        }
+
+        for (page, size, data) in main_frames {
+            guard.append_checkpoint_frame(
+                cursor.batch_id(),
+                CheckpointPoolKind::Main,
+                page,
+                journal_page_size(size),
+                &data,
+            )?;
+        }
+        for (page, size, data) in history_frames {
+            guard.append_checkpoint_frame(
+                cursor.batch_id(),
+                CheckpointPoolKind::History,
+                page,
+                journal_page_size(size),
+                &data,
+            )?;
+        }
+        guard.sync_journal()?;
+        Ok(cursor)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "US-005 lands durable checkpoint flushing before the full driver consumes it"
+    )]
+    fn validate_checkpoint_flush_set(&self, flush_set: &CheckpointFlushSet) -> Result<()> {
+        if let Some(page) = flush_set
+            .main_pages()
+            .intersection(flush_set.history_pages())
+            .next()
+        {
+            return Err(Error::Internal(format!(
+                "checkpoint flush set page {} is owned by both pools",
+                page.0
+            )));
+        }
+
+        let main_dirty = self.pool.dirty_page_ids()?;
+        let history_dirty = self.history_pool.dirty_page_ids()?;
+        if let Some(page) = main_dirty.intersection(&history_dirty).next() {
+            return Err(Error::Internal(format!(
+                "dirty page {} is resident in both checkpoint pools",
+                page.0
+            )));
+        }
+        validate_dirty_subset(
+            &main_dirty,
+            flush_set.main_pages(),
+            flush_set.excluded_future_dirty_pages(),
+            "main",
+        )?;
+        validate_dirty_subset(
+            &history_dirty,
+            flush_set.history_pages(),
+            &BTreeSet::new(),
+            "history",
+        )
     }
 
     /// fsync the journal file — make all committed-but-unsynced frames durable.

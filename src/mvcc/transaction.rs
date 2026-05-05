@@ -253,6 +253,9 @@ pub(crate) struct WriteTxn {
     /// the staged state on abort (§10.9 "Failed commit path"). See
     /// `src/storage/paged_engine/publish.rs`.
     pub(crate) publish_dirty: PublishDirty,
+    /// True when this CRUD body had to perform structural primary B-tree
+    /// work even if the published catalog root stayed stable.
+    structural_tree_change: bool,
     /// True after `commit()` has transferred `pending` ownership into the
     /// durable chain. `Drop` checks this to avoid decrementing refcounts
     /// that now belong to installed chains.
@@ -275,6 +278,7 @@ impl WriteTxn {
             pending_sec_index: SmallVec::new(),
             pending_primary: SmallVec::new(),
             publish_dirty: PublishDirty::default(),
+            structural_tree_change: false,
             finalized: false,
         }
     }
@@ -295,6 +299,17 @@ impl WriteTxn {
     /// Triggers `sync_catalog_root_overlay` independently of publish.
     pub(crate) fn mark_header(&mut self) {
         self.publish_dirty.mark_header();
+    }
+
+    /// Mark that the writer crossed a primary-tree structural boundary.
+    pub(crate) fn mark_structural_tree_change(&mut self) {
+        self.structural_tree_change = true;
+    }
+
+    /// Return whether this writer crossed a primary-tree structural boundary.
+    #[must_use]
+    pub(crate) fn structural_tree_change(&self) -> bool {
+        self.structural_tree_change
     }
 
     /// Begin a new write transaction.

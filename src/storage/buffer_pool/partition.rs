@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PoolExhaustedReason, Result};
 use crate::mvcc::timestamp::Ts;
 use crate::mvcc::version::{VersionEntry, VersionState};
 
@@ -184,12 +184,8 @@ impl Partition {
         }
 
         // Cache miss — find a victim
-        let idx = self.find_victim().ok_or_else(|| {
-            Error::Internal(
-                "buffer pool exhausted: all frames are pinned; \
-                 unpin unused pages or increase buffer_pool_size"
-                    .into(),
-            )
+        let idx = self.find_victim().ok_or(Error::PoolExhausted {
+            reason: PoolExhaustedReason::AllFramesPinned,
         })?;
 
         // Evict current occupant (if any)
@@ -236,12 +232,8 @@ impl Partition {
             return Ok((idx, 0));
         }
 
-        let idx = self.find_victim().ok_or_else(|| {
-            Error::Internal(
-                "buffer pool exhausted: all frames are pinned; \
-                 unpin unused pages or increase buffer_pool_size"
-                    .into(),
-            )
+        let idx = self.find_victim().ok_or(Error::PoolExhausted {
+            reason: PoolExhaustedReason::AllFramesPinned,
         })?;
 
         if let Some(frame_ref) = self.frames[idx].as_ref() {
@@ -356,6 +348,26 @@ impl Partition {
             }
         }
         Ok(())
+    }
+
+    /// Return copied snapshots of dirty resident frames in this partition.
+    #[allow(
+        dead_code,
+        reason = "US-005 lands checkpoint-owned frame snapshots before the full driver consumes them"
+    )]
+    pub(super) fn dirty_frame_snapshots(&self, size: PageSize) -> Vec<(u32, PageSize, Vec<u8>)> {
+        self.frames
+            .iter()
+            .flatten()
+            .filter(|frame| frame.dirty)
+            .map(|frame| {
+                (
+                    frame.page_number,
+                    size,
+                    frame.data.load_full().as_ref().clone(),
+                )
+            })
+            .collect()
     }
 
     /// Return occupancy counts for resident frames in this partition.

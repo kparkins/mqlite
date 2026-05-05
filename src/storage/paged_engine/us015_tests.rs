@@ -156,19 +156,24 @@ fn checkpoint_keeps_not_installable_leaf_dirty_and_reports_stats() -> Result<()>
             &engine,
             &md,
             ident.clone(),
+            &[leaf],
             checkpoint_ts,
             engine
                 .shared
                 .handle
                 .read_view_registry()
                 .oldest_required_ts(),
+            false,
         )?
     };
     assert_eq!(stats.dirty_leaves, 1);
     assert_eq!(stats.installed, 0);
     assert_eq!(stats.not_installable, 1);
 
-    engine.checkpoint()?;
+    let err = engine
+        .checkpoint()
+        .expect_err("US-003 blocks checkpoint before not-installable residue mutates");
+    assert!(matches!(err, Error::CheckpointIncomplete { .. }));
 
     assert_dirty_leaf(&engine, &ident, leaf);
     let chain = engine

@@ -79,7 +79,7 @@ pub(super) fn stage_insert_body(
         entry.data_root_page,
         entry.data_root_level,
     );
-    let (id, key, bson_bytes, _tree_root) = btree_insert_doc(
+    let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
         &mut tree,
         &mut doc,
         &[],
@@ -99,6 +99,9 @@ pub(super) fn stage_insert_body(
         // synced, so both flags are set.
         txn.mark_published();
         txn.mark_header();
+    }
+    if structural_split {
+        txn.mark_structural_tree_change();
     }
     txn.stage_primary_insert(entry_id, ns_arc, key, bson_bytes, None);
     maintain_secondary_on_insert(shared, md, overlay, ns, &doc, &id, vis, txn)?;
@@ -527,7 +530,7 @@ pub(super) fn do_upsert_update(
             entry.data_root_page,
             entry.data_root_level,
         );
-        let (id, key, bson_bytes, _tree_root) = btree_insert_doc(
+        let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
             &mut tree,
             &mut new_doc,
             &[],
@@ -545,6 +548,9 @@ pub(super) fn do_upsert_update(
             // Phase 1 §10.3 — data-tree root moved on upsert-style write.
             txn.mark_published();
             txn.mark_header();
+        }
+        if structural_split {
+            txn.mark_structural_tree_change();
         }
         txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
@@ -576,7 +582,7 @@ pub(super) fn fam_upsert_update(
             entry.data_root_page,
             entry.data_root_level,
         );
-        let (id, key, bson_bytes, _tree_root) = btree_insert_doc(
+        let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
             &mut tree,
             &mut new_doc,
             &[],
@@ -594,6 +600,9 @@ pub(super) fn fam_upsert_update(
             // Phase 1 §10.3 — data-tree root moved on upsert-style write.
             txn.mark_published();
             txn.mark_header();
+        }
+        if structural_split {
+            txn.mark_structural_tree_change();
         }
         txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
@@ -622,7 +631,7 @@ pub(super) fn fam_upsert_replace(
             entry.data_root_page,
             entry.data_root_level,
         );
-        let (id, key, bson_bytes, _tree_root) = btree_insert_doc(
+        let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
             &mut tree,
             &mut new_doc,
             &[],
@@ -640,6 +649,9 @@ pub(super) fn fam_upsert_replace(
             // Phase 1 §10.3 — data-tree root moved on upsert-style write.
             txn.mark_published();
             txn.mark_header();
+        }
+        if structural_split {
+            txn.mark_structural_tree_change();
         }
         txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
         maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;

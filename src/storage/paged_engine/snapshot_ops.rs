@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bson::{Bson, Document};
 
-use crate::error::{Error, Result};
+use crate::error::{EngineFatalReason, Error, Result};
 use crate::keys::{encode_compound_key, encode_key, COMPOUND_SEP};
 use crate::mvcc::read_view::ReadView;
 use crate::options::FindOptions;
@@ -18,7 +18,9 @@ use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::IndexState;
 use crate::storage::history_store::HistoryStore;
-use crate::storage::reconcile::driver::reconcile_tree_dirty_set;
+use crate::storage::reconcile::driver::{
+    build_checkpoint_reconcile_plan, reconcile_tree_dirty_set, CheckpointReconcilePlan,
+};
 use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedEpoch, PublishedIndex};
 
 use super::btree_ops::btree_collscan;
@@ -361,6 +363,10 @@ fn execute_plan_from_snap(
 // ---------------------------------------------------------------------------
 
 pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()> {
+    let _checkpoint_admission = engine
+        .shared
+        .checkpoint_admission
+        .close_and_drain_all(engine.busy_timeout)?;
     let _md_w = engine
         .metadata
         .write()
@@ -373,12 +379,31 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         .read_view_registry()
         .oldest_required_ts();
 
+    let checkpoint_plan = build_checkpoint_reconcile_plan(engine, md, checkpoint_ts, ort)?;
+
+    if let Err(err) =
+        checkpoint_after_reconcile_plan(engine, md, checkpoint_ts, ort, checkpoint_plan)
+    {
+        return Err(poison_checkpoint_post_mutation(engine, err));
+    }
+    Ok(())
+}
+
+fn checkpoint_after_reconcile_plan(
+    engine: &super::PagedEngine,
+    md: &super::state::MetadataState,
+    checkpoint_ts: crate::mvcc::Ts,
+    ort: crate::mvcc::Ts,
+    checkpoint_plan: CheckpointReconcilePlan,
+) -> Result<()> {
     let mut overlay = crate::storage::txn_page_store::TxnOverlay::new();
-    let primary_catalog_dirty =
+    let (primary_catalog_dirty, mut materialized_trees, primary_requires_logical_tail) =
         materialize_primary_deltas_for_checkpoint(&engine.shared, md, &mut overlay)?;
-    let secondary_catalog_dirty =
+    let (secondary_catalog_dirty, secondary_materialized_trees, secondary_requires_logical_tail) =
         materialize_ready_secondary_deltas_for_checkpoint(&engine.shared, md, &mut overlay)?;
+    materialized_trees.extend(secondary_materialized_trees);
     let published_catalog_dirty = primary_catalog_dirty || secondary_catalog_dirty;
+    let requires_logical_tail = primary_requires_logical_tail || secondary_requires_logical_tail;
     let mut base_store = super::catalog_ops::new_store(&engine.shared);
     overlay.commit(&mut base_store, &engine.shared.handle)?;
     if published_catalog_dirty {
@@ -409,14 +434,25 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         h.catalog_root_backup = root_page;
     })?;
 
-    let dirty_idents = engine
-        .shared
-        .dirty_leaves
-        .iter()
-        .map(|entry| entry.key().clone())
-        .collect::<Vec<_>>();
-    for ident in dirty_idents {
-        reconcile_tree_dirty_set(engine, md, ident, checkpoint_ts, ort)?;
+    for tree in checkpoint_plan.trees() {
+        let stats = reconcile_tree_dirty_set(
+            engine,
+            md,
+            tree.ident().clone(),
+            tree.mutation_ready_pages(),
+            checkpoint_ts,
+            ort,
+            materialized_trees.contains(tree.ident()),
+        )?;
+        if stats.not_installable > 0 {
+            return Err(Error::Internal(
+                "checkpoint reconcile plan allowed a non-installable dirty leaf".into(),
+            ));
+        }
+        debug_assert!(
+            !tree.excluded_future_dirty_pages().is_empty()
+                || !tree.mutation_ready_pages().is_empty()
+        );
     }
 
     {
@@ -455,12 +491,25 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
     {
         let _journal = engine.lock_journal_mutex();
         engine.flush_under_journal_mutex()?;
+        if requires_logical_tail {
+            engine.sync_journal_under_journal_mutex()?;
+            return Ok(());
+        }
     }
     let checkpointed_journal = engine.shared.handle.emergency_checkpoint()?;
     if !checkpointed_journal {
         engine.shared.handle.advance_page_lifetime_checkpoint()?;
     }
     Ok(())
+}
+
+fn poison_checkpoint_post_mutation(engine: &super::PagedEngine, err: Error) -> Error {
+    if matches!(err, Error::EngineFatal { .. }) {
+        return err;
+    }
+    let reason = EngineFatalReason::CheckpointPostMutationFailure;
+    engine.shared.poison_engine(reason.clone());
+    Error::EngineFatal { reason }
 }
 
 pub(super) fn close(engine: &super::PagedEngine) -> crate::error::Result<()> {

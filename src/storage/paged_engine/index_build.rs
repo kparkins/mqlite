@@ -184,7 +184,9 @@ impl PagedEngine {
                         db_page_count,
                     )?;
                     if emergency {
-                        let _ = self.shared.handle.emergency_checkpoint();
+                        // Defer the legacy page-frame checkpoint until
+                        // checkpoint materialization has folded the logical
+                        // row tail.
                     }
                     Ok(())
                 }
@@ -421,7 +423,8 @@ impl PagedEngine {
                     db_page_count,
                 )?;
                 if emergency {
-                    let _ = self.shared.handle.emergency_checkpoint();
+                    // Defer the legacy page-frame checkpoint until checkpoint
+                    // materialization has folded the logical row tail.
                 }
                 Ok(())
             }
@@ -568,7 +571,9 @@ impl PagedEngine {
                         Err(e) => return Err(e),
                     };
                     if emergency {
-                        let _ = self.shared.handle.emergency_checkpoint();
+                        // Defer the legacy page-frame checkpoint until
+                        // checkpoint materialization has folded the logical
+                        // row tail.
                     }
                     Ok(())
                 }
@@ -845,7 +850,9 @@ impl PagedEngine {
                         Err(e) => return Err(e),
                     };
                     if emergency {
-                        let _ = self.shared.handle.emergency_checkpoint();
+                        // Defer the legacy page-frame checkpoint until
+                        // checkpoint materialization has folded the logical
+                        // row tail.
                     }
                     Ok(())
                 }

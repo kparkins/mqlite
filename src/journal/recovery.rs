@@ -10,11 +10,12 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
+use crate::storage::header::FileHeader;
 
 use super::log_file::{
-    try_skip_chain_commit, try_skip_checkpoint_commit_boundary, BoundaryScan, JournalFrameHeader,
-    JournalHeader, JournalPageSize, LogicalTxnFrame, JOURNAL_FRAME_HEADER_SIZE,
-    JOURNAL_HEADER_SIZE,
+    try_skip_chain_commit, JournalFrameHeader, JournalHeader, JournalPageSize, LogicalTxnFrame,
+    Page0BoundaryRecord, JOURNAL_FORMAT_VERSION, JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
+    JOURNAL_MAGIC, RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
 };
 use super::shm::JournalIndex;
 use super::{write_page_to_main, JournalManager};
@@ -32,6 +33,15 @@ use super::{write_page_to_main, JournalManager};
 /// semantics — any duplicate `commit_ts` is dropped with a tracing warning.
 /// Pass 2 (US-014) post-processes this further (ChainCommit-only HLC floor,
 /// orphan-logical sweep).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct RecoveryCaseCCandidate {
+    /// Commit timestamp carried by the orphan `ChainCommit`.
+    pub(crate) commit_ts: Ts,
+    /// Starting byte offset of the orphan `ChainCommit` in the journal.
+    pub(crate) chain_commit_offset: u64,
+}
+
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct ParsedLogicalFrames {
@@ -39,6 +49,9 @@ pub(crate) struct ParsedLogicalFrames {
     pub(crate) frames: Vec<(u64, LogicalTxnFrame)>,
     /// Commit-ts values already seen — first-wins dedup set.
     pub(crate) seen_commit_ts: HashSet<Ts>,
+    /// Phase 7 case-c candidates: durable `ChainCommit` frames that have
+    /// no matching `LogicalTxnFrame` after Pass 1 matching and frontier cull.
+    pub(crate) case_c_candidates: Vec<RecoveryCaseCCandidate>,
 }
 
 // Compile-time guard: ParsedLogicalFrames must be Send so it can cross the
@@ -58,10 +71,11 @@ impl JournalManager {
     /// case where the journal had no committed frames).
     pub(super) fn recover_existing(
         journal_path: &Path,
-        salt1: u32,
-        salt2: u32,
+        main_header: &FileHeader,
         main_file: &mut File,
     ) -> Result<Option<JournalManager>> {
+        let salt1 = main_header.wal_salt1;
+        let salt2 = main_header.wal_salt2;
         let mut journal_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -83,7 +97,20 @@ impl JournalManager {
 
         let journal_header = match JournalHeader::from_bytes(&header_buf) {
             Ok(h) => h,
-            Err(_) => {
+            Err(err) => {
+                let magic: [u8; 4] = header_buf[0..4].try_into().expect("4 bytes");
+                let format_version =
+                    u32::from_le_bytes(header_buf[4..8].try_into().expect("4 bytes"));
+                if magic == JOURNAL_MAGIC
+                    && RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS.contains(&format_version)
+                {
+                    drop(journal_file);
+                    let _ = std::fs::remove_file(journal_path);
+                    return Ok(None);
+                }
+                if magic == JOURNAL_MAGIC && format_version != JOURNAL_FORMAT_VERSION {
+                    return Err(err);
+                }
                 // Corrupt journal header — treat as stale and delete.
                 drop(journal_file);
                 let _ = std::fs::remove_file(journal_path);
@@ -110,6 +137,7 @@ impl JournalManager {
         // On recovery we apply each committed batch to the main file.
         let mut index = JournalIndex::new();
         let mut pending: Vec<(u32, JournalPageSize, Vec<u8>, u64)> = Vec::new(); // (page_num, size, data, offset)
+        let mut pending_start_offset: Option<u64> = None;
         let mut write_cursor = JOURNAL_HEADER_SIZE as u64;
         let mut last_committed_db_page_count: Option<u32> = None;
         // Fold every ChainCommit frame's `commit_ts` into a running max.
@@ -127,16 +155,15 @@ impl JournalManager {
         // orphan-logical sweep: any logical frame whose commit_ts is not
         // in this set has no matching ChainCommit and is dropped (case (b)).
         let mut seen_chain_commit_ts: HashSet<Ts> = HashSet::new();
-        // Phase 2 §3.11 — highest `covers_commit_ts_hi` observed across all
-        // VALID CheckpointCommitBoundaryFrames. After the main walk plus the
-        // HLC-floor/orphan-logical sweep, logical frames with
-        // `commit_ts <= covers_commit_ts_hi` are removed (they are already
-        // fully reconciled to the main file). Torn/truncated boundary frames
-        // are treated as absent per §3.11 point 4: the skip helper returns
-        // `None` for them, and recovery resumes from the previous valid
-        // boundary's `covers_commit_ts_hi` because only valid boundaries
-        // update this running max.
-        let mut highest_covers_commit_ts_hi: Option<Ts> = None;
+        let mut chain_commit_candidates: Vec<RecoveryCaseCCandidate> = Vec::new();
+        // Phase 7 recovered page-0 frontier. The main-file header is the
+        // baseline; valid page-0 checkpoint boundaries in the journal can
+        // advance the recovered image. Logical frames at or below the final
+        // frontier are already reconciled to the main file.
+        let mut highest_checkpoint_ts: Option<Ts> = (main_header.last_checkpoint_ts
+            != Ts::default())
+        .then_some(main_header.last_checkpoint_ts);
+        let mut durable_checkpoint_page_count: Option<u32> = None;
 
         loop {
             let frame_offset = write_cursor;
@@ -149,7 +176,9 @@ impl JournalManager {
             journal_file
                 .seek(SeekFrom::Start(frame_offset))
                 .map_err(Error::Io)?;
-            if let Some((n, commit_ts)) = try_skip_chain_commit(&mut journal_file, salt1, salt2)? {
+            if let Some((n, commit_ts, chain_commit_offset)) =
+                try_skip_chain_commit(&mut journal_file, salt1, salt2)?
+            {
                 // ChainCommit frame replay is a no-op for the page-replay
                 // loop (it carries no single page_number). Version-chain
                 // state is rebuilt on demand; the only recovery-critical
@@ -160,61 +189,12 @@ impl JournalManager {
                 // §3.10 / §3.8(b) — record the commit_ts for the
                 // orphan-logical sweep run after the main scan.
                 seen_chain_commit_ts.insert(commit_ts);
+                chain_commit_candidates.push(RecoveryCaseCCandidate {
+                    commit_ts,
+                    chain_commit_offset,
+                });
                 crate::mvcc::metrics::record_recovery_chain_commit_frame();
                 continue;
-            }
-
-            // Phase 2 §3.11: dispatch on `BoundaryScan` tri-state.
-            // - `Valid` → fold `covers_commit_ts_hi` into the running max
-            //   and assert monotonicity (release-active hard error on
-            //   regression — Phase 2 cannot tolerate a backward boundary
-            //   because it would silently un-cull frames that a prior
-            //   checkpoint had already reconciled).
-            // - `Torn` → §3.11 point 4: scan MUST halt at this offset.
-            //   Boundary bytes overlap with legacy-frame bytes (kind
-            //   0x04 maps to legacy `page_number=4`); falling through
-            //   would risk a hard `CorruptDatabase` from the legacy
-            //   `page_size` parse. `highest_covers_commit_ts_hi` keeps
-            //   its prior value, so recovery resumes from the previous
-            //   valid boundary's cutoff.
-            // - `NotBoundary` → fall through to logical / legacy dispatch.
-            match try_skip_checkpoint_commit_boundary(&mut journal_file, salt1, salt2)? {
-                BoundaryScan::Valid(n, frame) => {
-                    if let Some(prev) = highest_covers_commit_ts_hi {
-                        if frame.covers_commit_ts_hi < prev {
-                            return Err(Error::CorruptDatabase {
-                                path: journal_path.to_path_buf(),
-                                detail: format!(
-                                    "CheckpointCommitBoundaryFrame covers_commit_ts_hi \
-                                     monotonicity violated (§3.11): prev={prev:?}, \
-                                     new={:?}",
-                                    frame.covers_commit_ts_hi
-                                ),
-                                recoverable: false,
-                            });
-                        }
-                    }
-                    highest_covers_commit_ts_hi = Some(
-                        highest_covers_commit_ts_hi.map_or(frame.covers_commit_ts_hi, |prev| {
-                            prev.max(frame.covers_commit_ts_hi)
-                        }),
-                    );
-                    write_cursor += n;
-                    crate::mvcc::metrics::record_recovery_checkpoint_boundary_frame();
-                    continue;
-                }
-                BoundaryScan::Torn => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(
-                        target: "mqlite",
-                        offset = frame_offset,
-                        "torn CheckpointCommitBoundaryFrame — scan halts here, \
-                         resuming from previous valid boundary (§3.11 point 4)"
-                    );
-                    crate::mvcc::metrics::record_recovery_torn_checkpoint_boundary();
-                    break;
-                }
-                BoundaryScan::NotBoundary => {}
             }
 
             // Phase 2 §5.1: parse `LogicalTxnFrame` frames and collect them
@@ -284,8 +264,38 @@ impl JournalManager {
             let next_frame_offset = data_offset + page_size_bytes as u64;
             write_cursor = next_frame_offset;
 
+            let page0_boundary = Page0BoundaryRecord::from_page_frame_parts(
+                frame_hdr.page_number,
+                frame_hdr.db_page_count,
+                frame_hdr.salt1,
+                frame_hdr.salt2,
+                frame_hdr.page_size,
+                &page_data,
+            )?;
+            if let Some(boundary) = page0_boundary.as_ref() {
+                let checkpoint_ts = boundary.checkpoint_ts();
+                if let Some(prev) = highest_checkpoint_ts {
+                    if checkpoint_ts < prev {
+                        return Err(Error::CorruptDatabase {
+                            path: journal_path.to_path_buf(),
+                            detail: format!(
+                                "page-0 checkpoint boundary last_checkpoint_ts regressed: \
+                                 prev={prev:?}, new={checkpoint_ts:?}"
+                            ),
+                            recoverable: false,
+                        });
+                    }
+                }
+                highest_checkpoint_ts = Some(
+                    highest_checkpoint_ts.map_or(checkpoint_ts, |prev| prev.max(checkpoint_ts)),
+                );
+                durable_checkpoint_page_count = Some(boundary.db_page_count());
+                crate::mvcc::metrics::record_recovery_page0_boundary_frame();
+            }
+
             if frame_hdr.db_page_count == 0 {
                 // Non-commit frame — add to pending.
+                pending_start_offset.get_or_insert(frame_offset);
                 pending.push((
                     frame_hdr.page_number,
                     frame_hdr.page_size,
@@ -302,6 +312,12 @@ impl JournalManager {
                 ));
 
                 let db_page_count = frame_hdr.db_page_count;
+                if page0_boundary.is_some() {
+                    last_committed_db_page_count = Some(db_page_count);
+                    pending.clear();
+                    pending_start_offset = None;
+                    continue;
+                }
                 for (pn, ps, data, off) in &pending {
                     // Write page to main file.
                     write_page_to_main(main_file, *pn, ps.bytes(), data)?;
@@ -314,6 +330,7 @@ impl JournalManager {
                     _frames_replayed += pending.len() as u64;
                 }
                 pending.clear();
+                pending_start_offset = None;
 
                 // Seek back to after this commit frame for next iteration.
                 journal_file
@@ -322,8 +339,14 @@ impl JournalManager {
             }
         }
 
-        // Discard pending non-committed frames (already past write_cursor point).
-        // write_cursor now points to the start of the first bad/missing frame.
+        // Discard pending non-committed page frames. They are not durable
+        // authority without a following commit frame / page-0 boundary.
+        if !pending.is_empty() {
+            if let Some(start) = pending_start_offset {
+                write_cursor = start;
+            }
+            pending.clear();
+        }
 
         // §3.8(b) — orphan-logical sweep: any logical frame whose commit_ts
         // has no matching durable ChainCommit is dropped. Phase 2 tolerates
@@ -369,16 +392,36 @@ impl JournalManager {
             }
         }
 
-        // Phase 2 §3.11 — checkpoint-boundary cull. After the orphan sweep
+        parsed_logical.case_c_candidates = chain_commit_candidates
+            .into_iter()
+            .filter(|candidate| !logical_ts_pre_sweep.contains(&candidate.commit_ts))
+            .collect();
+
+        let unmatched_chain_commits = parsed_logical.case_c_candidates.len();
+        for _ in 0..unmatched_chain_commits {
+            crate::mvcc::metrics::record_logical_txn_pass1_unmatched_chain_commit();
+        }
+        #[cfg(feature = "tracing")]
+        if unmatched_chain_commits > 0 {
+            tracing::warn!(
+                target: "mqlite",
+                unmatched = unmatched_chain_commits,
+                "ChainCommit frames without matching LogicalTxnFrame (§3.7 envelope violation; \
+                 Phase 7 validates post-frontier candidates as hard errors)"
+            );
+        }
+
+        // Phase 7 page-0 boundary cull. After the orphan sweep
         // (above) and the HLC-floor ChainCommit fold (below), any logical
-        // frame whose `commit_ts <= highest_covers_commit_ts_hi` has already
+        // frame whose `commit_ts <= highest_checkpoint_ts` has already
         // been reconciled to the main file by a prior checkpoint and must
-        // NOT be handed to Pass 2 for validation. Pass 2 is for
-        // not-yet-checkpointed frames only (§3.11). Runs unconditionally —
-        // if `highest_covers_commit_ts_hi` is `None` (no valid boundary
-        // frame observed), the retain is a no-op. Also rebuilds the
-        // `seen_commit_ts` dedup set so the two views stay consistent.
-        if let Some(hi) = highest_covers_commit_ts_hi {
+        // NOT be handed to Pass 2 for validation. Case-c candidates at or
+        // below the same frontier are also safe because the corresponding
+        // ChainCommit is checkpoint-covered. Runs unconditionally — if
+        // `highest_checkpoint_ts` is `None`, the retain is a no-op. Also
+        // rebuilds the `seen_commit_ts` dedup set so the two views stay
+        // consistent.
+        if let Some(hi) = highest_checkpoint_ts {
             let before_boundary = parsed_logical.frames.len();
             parsed_logical
                 .frames
@@ -393,35 +436,17 @@ impl JournalManager {
                 tracing::debug!(
                     target: "mqlite",
                     dropped = boundary_dropped,
-                    covers_commit_ts_hi = ?hi,
-                    "pre-boundary logical frames culled by Pass 1 (§3.11)"
+                    last_checkpoint_ts = ?hi,
+                    "pre-boundary logical frames culled by Pass 1"
                 );
                 for _ in 0..boundary_dropped {
                     crate::mvcc::metrics::record_logical_txn_pass1_pre_boundary_dropped();
                     crate::mvcc::metrics::record_logical_txn_recovery_discarded_frame();
                 }
             }
-        }
-
-        // Case (c) tolerance, §3.7 envelope violation: every ChainCommit
-        // SHOULD have had a paired LogicalTxnFrame at the same commit_ts.
-        // Phase 2 only logs + ticks a counter; Phase 4 §8.13.3 promotes
-        // to a hard error (covered by `test_phase4_case_c_is_hard_error`).
-        let unmatched_chain_commits: usize = seen_chain_commit_ts
-            .iter()
-            .filter(|ts| !logical_ts_pre_sweep.contains(ts))
-            .count();
-        for _ in 0..unmatched_chain_commits {
-            crate::mvcc::metrics::record_logical_txn_pass1_unmatched_chain_commit();
-        }
-        #[cfg(feature = "tracing")]
-        if unmatched_chain_commits > 0 {
-            tracing::warn!(
-                target: "mqlite",
-                unmatched = unmatched_chain_commits,
-                "ChainCommit frames without matching LogicalTxnFrame (§3.7 envelope violation; \
-                 Phase 2 tolerance, Phase 4 §8.13.3 promotes to hard error)"
-            );
+            parsed_logical
+                .case_c_candidates
+                .retain(|candidate| candidate.commit_ts > hi);
         }
 
         // §7 / US-024 — `parsed_logical_frames_len` is a per-open
@@ -439,6 +464,11 @@ impl JournalManager {
         // to persist (the journal itself is the only durable artifact).
 
         // Reposition journal file at write cursor for new appends.
+        let journal_len = journal_file.metadata().map_err(Error::Io)?.len();
+        if write_cursor < journal_len {
+            journal_file.set_len(write_cursor).map_err(Error::Io)?;
+            journal_file.sync_data().map_err(Error::Io)?;
+        }
         journal_file
             .seek(SeekFrom::Start(write_cursor))
             .map_err(Error::Io)?;
@@ -454,7 +484,7 @@ impl JournalManager {
             );
         }
 
-        Ok(Some(JournalManager {
+        let mut manager = JournalManager {
             journal_path: journal_path.to_path_buf(),
             journal_file,
             index,
@@ -465,6 +495,16 @@ impl JournalManager {
             last_committed_db_page_count,
             recovered_max_commit_ts: max_commit_ts,
             parsed_logical_frames: parsed_logical,
-        }))
+            legacy_pending_start_offset: None,
+            last_legacy_commit_end_offset: write_cursor,
+            checkpoint_batch_active: None,
+            next_checkpoint_batch_id: 1,
+            checkpoint_frame_tags: std::collections::BTreeMap::new(),
+        };
+        if let Some(expected_total_page_count) = durable_checkpoint_page_count {
+            manager.emergency_checkpoint_after_boundary(main_file, expected_total_page_count)?;
+        }
+
+        Ok(Some(manager))
     }
 }

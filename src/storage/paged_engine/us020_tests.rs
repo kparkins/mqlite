@@ -72,15 +72,10 @@ fn primary_chain_for_key(
     leaf: u32,
     key: &[u8],
 ) -> Result<Option<Vec<VersionEntry>>> {
-    let Some(chain) = engine.shared.handle.pool().take_chain(leaf, key)? else {
+    let entries = engine.shared.handle.pool().us009_chain_entries(leaf, key)?;
+    if entries.is_empty() {
         return Ok(None);
-    };
-    let entries = chain.iter().cloned().collect();
-    engine
-        .shared
-        .handle
-        .pool()
-        .put_chain(leaf, key.to_vec(), chain)?;
+    }
     Ok(Some(entries))
 }
 

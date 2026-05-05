@@ -2,6 +2,8 @@ use super::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::error::PoolExhaustedReason;
+
 // -----------------------------------------------------------------------
 // Mock I/O backend
 // -----------------------------------------------------------------------
@@ -394,13 +396,10 @@ fn all_pinned_returns_error_not_panic() {
         "pinning when all frames are occupied must return Err"
     );
     match result {
-        Err(Error::Internal(msg)) => {
-            assert!(
-                msg.contains("pinned"),
-                "error message should mention 'pinned'"
-            );
-        }
-        Err(e) => panic!("expected Error::Internal, got: {e}"),
+        Err(Error::PoolExhausted {
+            reason: PoolExhaustedReason::AllFramesPinned,
+        }) => {}
+        Err(e) => panic!("expected Error::PoolExhausted, got: {e}"),
         Ok(_) => panic!("expected error but got Ok"),
     }
 }

@@ -61,13 +61,16 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PoolExhaustedReason, Result};
+use crate::journal::log_file::PageId;
 use crate::mvcc::metrics;
 use crate::mvcc::read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
-use crate::mvcc::version::{VersionEntry, VersionState};
+use crate::mvcc::version::{VersionData, VersionEntry, VersionState};
 use crate::mvcc::{ExpectedHead, Ts};
 use crate::storage::allocator::AllocatorHandle;
-use crate::storage::page::PAGE_TYPE_LEAF;
+use crate::storage::btree::reconcile::{predict_encoded_leaf_size, FoldedLeafCell, RetainedChains};
+use crate::storage::btree::OVERFLOW_THRESHOLD;
+use crate::storage::page::{PAGE_SIZE_LEAF, PAGE_TYPE_LEAF};
 use crate::storage::reconcile::plan::TreeIdent;
 
 use page_latch::{LatchMode, PageLatch, PageLatchExclusive, PageLatchShared};
@@ -466,6 +469,42 @@ impl<'pool> LatchedPinnedPage<'pool> {
         let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
         frame.deltas.insert(key, chain);
         Ok(())
+    }
+
+    /// Return true when live resident deltas no longer fit one folded leaf.
+    pub(crate) fn live_delta_payload_exceeds_leaf_budget(&self) -> Result<bool> {
+        self.require_exclusive("live_delta_payload_exceeds_leaf_budget")?;
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The exclusive page latch serializes delta-map access.
+        let frame = unsafe { &*self.frame_ptr };
+        let mut cells = Vec::with_capacity(frame.deltas.len());
+        for (key, chain) in &frame.deltas {
+            let Some(entry) = chain.iter().find(|entry| {
+                entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted)
+            }) else {
+                continue;
+            };
+            if entry.is_tombstone {
+                continue;
+            }
+            let cell = match &entry.data {
+                VersionData::Inline(bytes) if bytes.len() > OVERFLOW_THRESHOLD => {
+                    let total_length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                    FoldedLeafCell::overflow(key.clone(), 0, total_length)
+                }
+                VersionData::Inline(bytes) => FoldedLeafCell::inline(key.clone(), bytes.clone()),
+                VersionData::Overflow(oref) => FoldedLeafCell::overflow(
+                    key.clone(),
+                    oref.first_page(),
+                    u32::try_from(oref.total_length()).unwrap_or(u32::MAX),
+                ),
+            };
+            cells.push(cell);
+            if predict_encoded_leaf_size(&cells, &RetainedChains::new()) > PAGE_SIZE_LEAF as usize {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Flip every pending entry for `txn_id` on this page.
@@ -995,12 +1034,9 @@ impl BufferPool {
                             "mqlite::eviction_candidate_blocked"
                         );
                         if blocked >= guard.capacity {
-                            return Err(Error::Internal(
-                                "buffer pool exhausted: all frames are pinned or \
-                                 delta-bearing; unpin unused pages, wait for \
-                                 Phase 4 reconcile, or increase buffer_pool_size"
-                                    .into(),
-                            ));
+                            return Err(Error::PoolExhausted {
+                                reason: PoolExhaustedReason::DeltaBearingFrames,
+                            });
                         }
                     }
                     Err(err) => return Err(err),
@@ -1252,6 +1288,86 @@ impl BufferPool {
             .flush_all(self.io.as_ref(), PageSize::Large32k)?;
 
         Ok(())
+    }
+
+    /// Return dirty resident page ids across both size partitions.
+    #[allow(
+        dead_code,
+        reason = "US-005 lands flush-set validation before the full checkpoint driver consumes it"
+    )]
+    pub(crate) fn dirty_page_ids(&self) -> Result<BTreeSet<PageId>> {
+        let mut pages = BTreeSet::new();
+        {
+            let guard = self
+                .inner_32k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            for (page, _size, _data) in guard.dirty_frame_snapshots(PageSize::Large32k) {
+                pages.insert(PageId(page));
+            }
+        }
+        {
+            let guard = self
+                .inner_4k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            for (page, _size, _data) in guard.dirty_frame_snapshots(PageSize::Small4k) {
+                pages.insert(PageId(page));
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Snapshot checkpoint-owned dirty frames without clearing dirty bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if a dirty frame is neither owned by the
+    /// checkpoint batch nor explicitly excluded as future-dirty residue.
+    #[allow(
+        dead_code,
+        reason = "US-005 lands checkpoint-owned frame snapshots before the full driver consumes them"
+    )]
+    pub(crate) fn checkpoint_dirty_frame_snapshots(
+        &self,
+        owned_pages: &BTreeSet<PageId>,
+        excluded_future_dirty_pages: &BTreeSet<PageId>,
+    ) -> Result<Vec<(u32, PageSize, Vec<u8>)>> {
+        let mut frames = Vec::new();
+        {
+            let guard = self
+                .inner_32k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            frames.extend(guard.dirty_frame_snapshots(PageSize::Large32k));
+        }
+        {
+            let guard = self
+                .inner_4k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            frames.extend(guard.dirty_frame_snapshots(PageSize::Small4k));
+        }
+
+        let mut checkpoint_frames = Vec::new();
+        for (page, size, data) in frames {
+            let page_id = PageId(page);
+            if owned_pages.contains(&page_id) {
+                checkpoint_frames.push((page, size, data));
+            } else if !excluded_future_dirty_pages.contains(&page_id) {
+                return Err(Error::Internal(format!(
+                    "checkpoint flush set rejected foreign dirty frame {page}"
+                )));
+            }
+        }
+        checkpoint_frames.sort_by_key(|(page, size, _data)| {
+            let size_order = match size {
+                PageSize::Small4k => 0u8,
+                PageSize::Large32k => 1u8,
+            };
+            (*page, size_order)
+        });
+        Ok(checkpoint_frames)
     }
 
     /// Discard all dirty, unpinned frames in both partitions without writing

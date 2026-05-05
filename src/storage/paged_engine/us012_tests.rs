@@ -74,14 +74,10 @@ fn primary_chain_for_id(
         coll.data_root_level,
     );
     let leaf = tree.find_leaf(&key)?;
-    let chain = engine
-        .shared
-        .handle
-        .pool()
-        .take_chain(leaf, &key)?
-        .ok_or_else(|| Error::Internal("primary delta chain missing".into()))?;
-    let entries: Vec<VersionEntry> = chain.iter().cloned().collect();
-    engine.shared.handle.pool().put_chain(leaf, key, chain)?;
+    let entries = engine.shared.handle.pool().us009_chain_entries(leaf, &key)?;
+    if entries.is_empty() {
+        return Err(Error::Internal("primary delta chain missing".into()));
+    }
     Ok(entries)
 }
 

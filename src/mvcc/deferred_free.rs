@@ -61,6 +61,29 @@ impl PageLifetimeEntry {
     }
 }
 
+/// Checkpoint-owned lifetime drain staged before the durable boundary.
+///
+/// The contained entries stay quarantined until the boundary token is
+/// consumed by the allocator. Publishing consumes the drain, making it
+/// impossible for callers to apply the same staged lifetime delta twice.
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointLifetimeDrain {
+    entries: Vec<PageLifetimeEntry>,
+}
+
+impl CheckpointLifetimeDrain {
+    /// Create a staged drain from checkpoint-safe lifetime entries.
+    #[must_use]
+    pub(crate) fn new(entries: Vec<PageLifetimeEntry>) -> Self {
+        Self { entries }
+    }
+
+    /// Publish the staged lifetime-free deltas by consuming this drain.
+    pub(crate) fn publish(self) {
+        drop(self.entries);
+    }
+}
+
 /// FIFO-ish queue of pages whose lifetime cannot end until a checkpoint
 /// advances past the enqueue fence.
 ///

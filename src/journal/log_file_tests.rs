@@ -293,13 +293,17 @@ fn try_skip_chain_commit_advances_past_valid_frame() {
     let frame = sample_chain_commit();
     let expected_ts = frame.commit_ts;
     let bytes = frame.encode().unwrap();
-    let mut cursor = std::io::Cursor::new(bytes.clone());
-    let (n, ts) = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2)
+    let mut prefixed = vec![0xAA; 13];
+    prefixed.extend_from_slice(&bytes);
+    let mut cursor = std::io::Cursor::new(prefixed);
+    cursor.set_position(13);
+    let (n, ts, offset) = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2)
         .unwrap()
         .expect("valid frame must be skipped");
     assert_eq!(n as usize, bytes.len());
-    assert_eq!(cursor.position() as usize, bytes.len());
+    assert_eq!(cursor.position() as usize, 13 + bytes.len());
     assert_eq!(ts, expected_ts, "commit_ts must be carried out of the scan");
+    assert_eq!(offset, 13, "start offset must be carried out of the scan");
 }
 
 #[test]
@@ -409,7 +413,6 @@ fn chain_commit_inflated_delta_count_returns_none() {
 #[test]
 fn logical_txn_constants_have_expected_values() {
     assert_eq!(FRAME_KIND_LOGICAL_TXN, 0x03_u8);
-    assert_eq!(FRAME_KIND_CHECKPOINT_COMMIT_BOUNDARY, 0x04_u8);
     assert_eq!(LOGICAL_TXN_FIXED_HEADER_LEN, 48_usize);
     assert_eq!(LOGICAL_TXN_MAX_FRAME_SIZE, 67_108_864_usize);
     assert_eq!(LOGICAL_TXN_MIN_FRAME_SIZE, 52_usize);
@@ -1593,210 +1596,71 @@ fn try_skip_logical_txn_followed_by_try_skip_chain_commit_legacy() {
 }
 
 // ---------------------------------------------------------------------------
-// CheckpointCommitBoundaryFrame — US-008 (§3.11)
+// Page-0 checkpoint boundary codec
 // ---------------------------------------------------------------------------
 
-fn sample_checkpoint_boundary(epoch: u64) -> CheckpointCommitBoundaryFrame {
-    CheckpointCommitBoundaryFrame {
+fn sample_page0_boundary(ts: Ts) -> Page0BoundaryRecord {
+    let mut header = crate::storage::header::FileHeader::new_now();
+    header.total_page_count = 37;
+    header.last_checkpoint_ts = ts;
+    Page0BoundaryRecord::new(0xDEAD_BEEF, 0xCAFE_BABE, header)
+}
+
+#[test]
+fn page0_boundary_record_roundtrip() {
+    let boundary = sample_page0_boundary(Ts {
+        physical_ms: 200,
+        logical: 7,
+    });
+    let mut bytes = Vec::new();
+    boundary.write(&mut bytes).unwrap();
+    assert_eq!(bytes.len(), PAGE0_BOUNDARY_RECORD_WIRE_SIZE);
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    let decoded = Page0BoundaryRecord::read(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE)
+        .unwrap()
+        .expect("page-0 boundary must decode");
+    assert_eq!(decoded.db_page_count(), boundary.db_page_count());
+    assert_eq!(decoded.checkpoint_ts(), boundary.checkpoint_ts());
+    assert_eq!(decoded.header(), boundary.header());
+}
+
+#[test]
+fn page0_boundary_record_returns_none_for_non_boundary_page_frame() {
+    let frame = JournalFrameHeader {
+        page_number: 3,
+        db_page_count: 37,
         salt1: 0xDEAD_BEEF,
         salt2: 0xCAFE_BABE,
-        checkpoint_epoch: epoch,
-        covers_commit_ts_lo: Ts {
-            physical_ms: 100,
-            logical: 0,
-        },
-        covers_commit_ts_hi: Ts {
-            physical_ms: 200,
-            logical: 7,
-        },
-        overflow_cutoff_page: 4242,
-    }
-}
-
-#[test]
-fn checkpoint_boundary_roundtrip() {
-    // Round-trips arbitrary { epoch, lo, hi, cutoff } tuples and asserts every
-    // field equals on decode, plus that the encoded length matches the fixed
-    // 56-byte §3.11 layout.
-    let cases: Vec<(u64, Ts, Ts, u32)> = vec![
-        (
-            1,
-            Ts {
-                physical_ms: 0,
-                logical: 0,
-            },
-            Ts {
-                physical_ms: 0,
-                logical: 1,
-            },
-            0,
-        ),
-        (
-            42,
-            Ts {
-                physical_ms: 1_000,
-                logical: 5,
-            },
-            Ts {
-                physical_ms: 2_000,
-                logical: 9,
-            },
-            4096,
-        ),
-        (
-            u64::MAX,
-            Ts {
-                physical_ms: 0x0011_2233_4455_6677,
-                logical: 0x89AB_CDEF,
-            },
-            Ts::MAX,
-            u32::MAX,
-        ),
-    ];
-    for (epoch, lo, hi, cutoff) in cases {
-        let frame = CheckpointCommitBoundaryFrame {
-            salt1: 0xDEAD_BEEF,
-            salt2: 0xCAFE_BABE,
-            checkpoint_epoch: epoch,
-            covers_commit_ts_lo: lo,
-            covers_commit_ts_hi: hi,
-            overflow_cutoff_page: cutoff,
-        };
-        let bytes = frame.encode().expect("encode");
-        assert_eq!(bytes.len(), CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE);
-
-        // Fixed-header discipline: frame_kind, reserved_a = [0;3],
-        // total_frame_bytes, salts at canonical offsets.
-        assert_eq!(bytes[0], FRAME_KIND_CHECKPOINT_COMMIT_BOUNDARY);
-        assert_eq!(&bytes[1..4], &[0u8, 0u8, 0u8]);
-        assert_eq!(
-            u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize,
-            CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            0xDEAD_BEEF
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            0xCAFE_BABE
-        );
-        // CRC32C covers bytes [0 .. total-4).
-        let expected_crc = crc32c::crc32c(&bytes[..52]);
-        assert_eq!(
-            u32::from_le_bytes(bytes[52..56].try_into().unwrap()),
-            expected_crc
-        );
-
-        let decoded = CheckpointCommitBoundaryFrame::decode(&bytes, frame.salt1, frame.salt2)
-            .expect("decode ok")
-            .expect("decode some");
-        assert_eq!(decoded.salt1, frame.salt1);
-        assert_eq!(decoded.salt2, frame.salt2);
-        assert_eq!(decoded.checkpoint_epoch, frame.checkpoint_epoch);
-        assert_eq!(decoded.covers_commit_ts_lo, frame.covers_commit_ts_lo);
-        assert_eq!(decoded.covers_commit_ts_hi, frame.covers_commit_ts_hi);
-        assert_eq!(decoded.overflow_cutoff_page, frame.overflow_cutoff_page);
-        assert_eq!(decoded, frame);
-    }
-}
-
-#[test]
-fn checkpoint_boundary_encode_rejects_zero_epoch() {
-    // §3.11: zero is reserved; the encoder bails before producing any byte.
-    let frame = sample_checkpoint_boundary(0);
-    let err = frame.encode().expect_err("zero epoch must reject");
-    assert!(matches!(err, Error::Internal(_)), "got {err:?}");
-}
-
-#[test]
-fn checkpoint_boundary_decode_rejects_zero_epoch() {
-    // Build a CRC-valid, salt-matching frame with checkpoint_epoch = 0 by
-    // hand (bypassing the encoder's zero-rejection) and assert that decode
-    // treats it as absent per §3.11.
-    let salt1 = 0xDEAD_BEEFu32;
-    let salt2 = 0xCAFE_BABEu32;
-    let lo = Ts {
-        physical_ms: 1,
-        logical: 2,
+        page_size: JournalPageSize::Small4k,
     };
-    let hi = Ts {
-        physical_ms: 3,
-        logical: 4,
+    let page_data = vec![0xA5; PAGE_SIZE_INTERNAL as usize];
+    let mut bytes = Vec::new();
+    frame.write(&mut bytes, &page_data).unwrap();
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    let start = cursor.position();
+    let decoded = Page0BoundaryRecord::read(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
+    assert!(decoded.is_none());
+    assert_eq!(cursor.position(), start);
+}
+
+#[test]
+fn checkpoint_batch_page_record_rejects_commit_frame() {
+    let frame = JournalFrameHeader {
+        page_number: 3,
+        db_page_count: 37,
+        salt1: 0xDEAD_BEEF,
+        salt2: 0xCAFE_BABE,
+        page_size: JournalPageSize::Small4k,
     };
-    let cutoff = 77u32;
+    let page_data = vec![0xA5; PAGE_SIZE_INTERNAL as usize];
+    let mut bytes = Vec::new();
+    frame.write(&mut bytes, &page_data).unwrap();
 
-    let mut bytes = Vec::with_capacity(CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE);
-    bytes.push(FRAME_KIND_CHECKPOINT_COMMIT_BOUNDARY);
-    bytes.extend_from_slice(&[0u8; 3]);
-    bytes.extend_from_slice(&(CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE as u32).to_le_bytes());
-    bytes.extend_from_slice(&salt1.to_le_bytes());
-    bytes.extend_from_slice(&salt2.to_le_bytes());
-    bytes.extend_from_slice(&0u64.to_le_bytes()); // reserved zero epoch
-    bytes.extend_from_slice(&lo.to_le_bytes());
-    bytes.extend_from_slice(&hi.to_le_bytes());
-    bytes.extend_from_slice(&cutoff.to_le_bytes());
-    let cs = crc32c::crc32c(&bytes);
-    bytes.extend_from_slice(&cs.to_le_bytes());
-    assert_eq!(bytes.len(), CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE);
-
-    let res = CheckpointCommitBoundaryFrame::decode(&bytes, salt1, salt2).unwrap();
-    assert!(
-        res.is_none(),
-        "CRC-valid zero-epoch frame must decode as absent (§3.11)"
-    );
-}
-
-#[test]
-fn checkpoint_boundary_salt_mismatch_returns_none() {
-    let frame = sample_checkpoint_boundary(7);
-    let bytes = frame.encode().unwrap();
-    assert!(
-        CheckpointCommitBoundaryFrame::decode(&bytes, 0, frame.salt2)
-            .unwrap()
-            .is_none(),
-        "wrong salt1 must return None"
-    );
-    assert!(
-        CheckpointCommitBoundaryFrame::decode(&bytes, frame.salt1, 0)
-            .unwrap()
-            .is_none(),
-        "wrong salt2 must return None"
-    );
-}
-
-#[test]
-fn checkpoint_boundary_truncation_returns_none() {
-    let frame = sample_checkpoint_boundary(7);
-    let bytes = frame.encode().unwrap();
-    for n in 0..bytes.len() {
-        let res =
-            CheckpointCommitBoundaryFrame::decode(&bytes[..n], frame.salt1, frame.salt2).unwrap();
-        assert!(res.is_none(), "prefix of length {n} must be truncated");
-    }
-}
-
-#[test]
-fn checkpoint_boundary_bad_frame_kind_returns_none() {
-    let frame = sample_checkpoint_boundary(7);
-    let mut bytes = frame.encode().unwrap();
-    bytes[0] = 0xFF;
-    assert!(
-        CheckpointCommitBoundaryFrame::decode(&bytes, frame.salt1, frame.salt2)
-            .unwrap()
-            .is_none(),
-        "wrong frame_kind must not parse as boundary"
-    );
-}
-
-#[test]
-fn checkpoint_boundary_corrupt_checksum_returns_none() {
-    let frame = sample_checkpoint_boundary(7);
-    let mut bytes = frame.encode().unwrap();
-    // Flip a body byte — CRC must now reject.
-    bytes[20] ^= 0xFF;
-    let res = CheckpointCommitBoundaryFrame::decode(&bytes, frame.salt1, frame.salt2).unwrap();
-    assert!(res.is_none(), "corrupt body must fail CRC and return None");
+    let mut cursor = std::io::Cursor::new(bytes);
+    let decoded = CheckpointBatchPageRecord::read(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
+    assert!(decoded.is_none());
 }
 
 // ===========================================================================
@@ -1810,7 +1674,7 @@ fn checkpoint_boundary_corrupt_checksum_returns_none() {
 #[cfg(test)]
 mod prop_tests {
     use super::*;
-    use ::proptest::prelude::*;
+    use proptest::prelude::*;
 
     /// Strategy that produces an arbitrary, well-formed `LogicalOp` with
     /// no overflow. Sizes are bounded so encoded frames stay well under

@@ -16,7 +16,7 @@ use crate::{
         engine::StorageEngine,
         file_io::FilePageSource,
         handle::BufferPoolHandle,
-        header::{FileHeader, HEADER_PAGE_SIZE},
+        header::HEADER_PAGE_SIZE,
         lock::{self, AnyFileLock, FileLock},
         paged_engine::PagedEngine,
     },
@@ -155,17 +155,11 @@ impl Client {
         // to avoid the POSIX advisory-lock footgun.  OpenOptions::buffer_pool_size
         // controls the total byte budget split between 4 KB and 32 KB partitions.
         //
-        // For an existing file, the catalog root page is read from the file header.
-        // For a new file, catalog_root_page == 0 means a fresh catalog is created.
-        // Read the initial file header (used to set salt values for the journal
-        // and to locate the catalog B+ tree root page).
-        let file_header = if file_size == 0 {
-            FileHeader::new_now()
-        } else {
-            let mut hdr_buf = [0u8; HEADER_PAGE_SIZE];
-            file_lock.read_exact_at(0, &mut hdr_buf)?;
-            FileHeader::from_bytes(&hdr_buf).unwrap_or_else(|_| FileHeader::new_now())
-        };
+        // Read the baseline file header after initialization. Journal recovery
+        // may replace page 0 with a recovered image; final engine construction
+        // below re-reads and validates that post-replay header before any
+        // allocator, buffer-pool, history-store, or metadata state is created.
+        let baseline_header = read_and_validate_header(file_lock.as_ref(), &path)?;
 
         // Open a dedicated file handle for journal checkpoint I/O.  This fd is
         // never used for advisory locking — only for writing checkpointed
@@ -178,34 +172,12 @@ impl Client {
             .map_err(Error::Io)?;
 
         let journal_mgr =
-            JournalManager::open_or_create(&path, &file_header, &mut journal_io_file)?;
+            JournalManager::open_or_create(&path, &baseline_header, &mut journal_io_file)?;
 
-        // Re-read the file header after journal recovery — but ONLY when
-        // recovery actually wrote committed page frames to the main file.
-        // `open_or_create` may have replayed journal frames into the main file
-        // (including page 0), making the catalog_root_page / catalog_root_level
-        // we read before recovery stale.  Re-reading via `journal_io_file` gives
-        // us the post-recovery header.
-        //
-        // When no pages were replayed (clean close, empty journal, or no journal)
-        // the pre-recovery header is already correct — and for NEW files
-        // (file_size == 0) re-reading would return the header written by
-        // `write_initial_header` (a different `FileHeader::new_now()` call with
-        // different random salts), breaking the journal's salt check on the very
-        // next open.
-        let file_header = if journal_mgr.did_recover_pages() {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut hdr_buf = [0u8; HEADER_PAGE_SIZE];
-            journal_io_file
-                .seek(SeekFrom::Start(0))
-                .map_err(Error::Io)?;
-            journal_io_file
-                .read_exact(&mut hdr_buf)
-                .map_err(Error::Io)?;
-            FileHeader::from_bytes(&hdr_buf).unwrap_or(file_header)
-        } else {
-            file_header
-        };
+        // Read and validate the recovered page-0 image unconditionally. When
+        // recovery copied a checkpoint boundary, this is the replayed header;
+        // otherwise it is the same image as `baseline_header`.
+        let file_header = read_and_validate_header(file_lock.as_ref(), &path)?;
         let catalog_root_page = file_header.catalog_root_page;
         let catalog_root_level = file_header.catalog_root_level;
 

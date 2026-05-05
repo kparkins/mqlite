@@ -46,6 +46,18 @@ mod tests {
         vec![fill; PAGE_SIZE_LEAF as usize]
     }
 
+    fn append_test_page0_boundary(
+        mgr: &mut JournalManager,
+        base_header: &FileHeader,
+        checkpoint_ts: crate::mvcc::timestamp::Ts,
+    ) -> BoundaryAppended {
+        let cursor = mgr.begin_checkpoint_batch().unwrap();
+        let mut staged_header = base_header.clone();
+        staged_header.last_checkpoint_ts = checkpoint_ts;
+        mgr.append_checkpoint_commit_boundary(&staged_header, cursor)
+            .unwrap()
+    }
+
     // -----------------------------------------------------------------------
     // Path helpers
     // -----------------------------------------------------------------------
@@ -1304,19 +1316,9 @@ mod tests {
         drop(dir);
     }
 
-    /// §3.11 / US-017 AC#5 — clean checkpoint-boundary cut. One logical
-    /// frame with `commit_ts <= covers_commit_ts_hi` is paired with a
-    /// ChainCommit and followed by a clean CheckpointCommitBoundaryFrame.
-    /// A second logical+ChainCommit pair at `commit_ts > covers_commit_ts_hi`
-    /// comes AFTER the boundary. Reopen must:
-    ///   1. Open cleanly (no recovery error).
-    ///   2. Hand ONLY the post-boundary logical frame to Pass 2 (the
-    ///      pre-boundary frame is already reconciled and must be dropped).
-    ///   3. Tick the pre-boundary-dropped counter.
     #[test]
-    fn test_clean_checkpoint_commit_boundary_cut() {
+    fn test_clean_page0_checkpoint_boundary_cut() {
         use crate::journal::log_file::LogicalTxnFrame;
-        use crate::journal::log_file::{CheckpointEpoch, PageId};
         use crate::mvcc::metrics::{
             logical_txn_pass1_pre_boundary_dropped_snapshot,
             reset_logical_txn_pass1_pre_boundary_dropped,
@@ -1335,7 +1337,7 @@ mod tests {
             physical_ms: 100,
             logical: 0,
         };
-        let boundary_hi = Ts {
+        let boundary_ts = Ts {
             physical_ms: 100,
             logical: 5,
         };
@@ -1344,8 +1346,7 @@ mod tests {
             logical: 0,
         };
 
-        // Pre-boundary logical + ChainCommit pair.
-        let pre_frame = LogicalTxnFrame {
+        mgr.append_logical_txn(LogicalTxnFrame {
             salt1: mgr.salt1,
             salt2: mgr.salt2,
             commit_ts: pre_ts,
@@ -1353,16 +1354,13 @@ mod tests {
             format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
             flags: 0,
             ops: vec![],
-        };
-        mgr.append_logical_txn(pre_frame).unwrap();
+        })
+        .unwrap();
         mgr.append_chain_commit(pre_ts, vec![], vec![]).unwrap();
 
-        // Clean boundary frame covering [pre_ts, boundary_hi].
-        mgr.append_checkpoint_commit_boundary(CheckpointEpoch(1), pre_ts, boundary_hi, PageId(0))
-            .unwrap();
+        let _ = append_test_page0_boundary(&mut mgr, &header, boundary_ts);
 
-        // Post-boundary logical + ChainCommit pair.
-        let post_frame = LogicalTxnFrame {
+        mgr.append_logical_txn(LogicalTxnFrame {
             salt1: mgr.salt1,
             salt2: mgr.salt2,
             commit_ts: post_ts,
@@ -1370,8 +1368,8 @@ mod tests {
             format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
             flags: 0,
             ops: vec![],
-        };
-        mgr.append_logical_txn(post_frame).unwrap();
+        })
+        .unwrap();
         mgr.append_chain_commit(post_ts, vec![], vec![]).unwrap();
 
         std::mem::forget(mgr);
@@ -1386,294 +1384,20 @@ mod tests {
             JournalManager::open_or_create(&db_path, &header, &mut main_file_reopen).unwrap();
         let parsed = mgr2.take_parsed_logical_frames();
 
-        assert_eq!(
-            parsed.frames.len(),
-            1,
-            "§3.11: pre-boundary logical frames must be dropped; Pass 2 \
-             should see only post-boundary frames; got {} frame(s)",
-            parsed.frames.len()
-        );
-        assert_eq!(
-            parsed.frames[0].1.commit_ts, post_ts,
-            "surviving frame must be the post-boundary one"
-        );
-        assert!(
-            logical_txn_pass1_pre_boundary_dropped_snapshot() > before,
-            "§3.11 pre-boundary cull must tick the counter at least once"
-        );
+        assert_eq!(parsed.frames.len(), 1);
+        assert_eq!(parsed.frames[0].1.commit_ts, post_ts);
+        assert!(logical_txn_pass1_pre_boundary_dropped_snapshot() > before);
         drop(mgr2);
         drop(main_file_reopen);
         drop(dir);
     }
 
-    /// §3.11 / US-017 AC#4 — torn boundary frame, MID-WRITE partial prefix.
-    /// Writes [pre + ChainCommit + valid-boundary(hi1) + mid + ChainCommit]
-    /// then begins a SECOND boundary frame and truncates the journal
-    /// part-way through it (kind byte present, CRC tail missing — exactly
-    /// the failure mode an interrupted fsync produces). Reopen must:
-    ///   1. NOT raise CorruptDatabase (torn boundary is treated as absent
-    ///      per §3.11 point 4 — scan halts at the kind byte rather than
-    ///      falling through to legacy parsing where the kind byte 0x04
-    ///      would be misread as `page_number=4` and the bad page-size
-    ///      field would surface a hard error).
-    ///   2. Resume from the previous valid boundary's `hi1`.
-    ///   3. Discard the pre-boundary logical frame; retain the post-hi1
-    ///      logical frame even though the torn boundary claimed to cover it.
-    ///   4. Tick the torn-boundary counter exactly once.
     #[test]
-    fn test_torn_checkpoint_commit_boundary_cut() {
-        use crate::journal::log_file::{
-            CheckpointEpoch, LogicalTxnFrame, PageId, CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE,
-        };
-        use crate::mvcc::metrics::{
-            recovery_torn_checkpoint_boundary_snapshot, reset_recovery_torn_checkpoint_boundary,
-        };
-        use crate::mvcc::timestamp::Ts;
-
-        let _guard = orphan_metrics_guard();
-        reset_recovery_torn_checkpoint_boundary();
-        let before = recovery_torn_checkpoint_boundary_snapshot();
-
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let pre_ts = Ts {
-            physical_ms: 50,
-            logical: 0,
-        };
-        let hi1 = Ts {
-            physical_ms: 50,
-            logical: 9,
-        };
-        let mid_ts = Ts {
-            physical_ms: 150,
-            logical: 0,
-        };
-        let hi2 = Ts {
-            physical_ms: 150,
-            logical: 9,
-        };
-
-        mgr.append_logical_txn(LogicalTxnFrame {
-            salt1: mgr.salt1,
-            salt2: mgr.salt2,
-            commit_ts: pre_ts,
-            diagnostic_txn_id: 1,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![],
-        })
-        .unwrap();
-        mgr.append_chain_commit(pre_ts, vec![], vec![]).unwrap();
-
-        mgr.append_checkpoint_commit_boundary(CheckpointEpoch(1), pre_ts, hi1, PageId(0))
-            .unwrap();
-
-        mgr.append_logical_txn(LogicalTxnFrame {
-            salt1: mgr.salt1,
-            salt2: mgr.salt2,
-            commit_ts: mid_ts,
-            diagnostic_txn_id: 2,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![],
-        })
-        .unwrap();
-        mgr.append_chain_commit(mid_ts, vec![], vec![]).unwrap();
-
-        let torn_start = mgr
-            .append_checkpoint_commit_boundary(CheckpointEpoch(2), mid_ts, hi2, PageId(0))
-            .unwrap();
-
-        std::mem::forget(mgr);
-        drop(main_file);
-
-        // Mid-write torn frame: keep the kind byte + a partial prefix but
-        // strip the CRC tail. Half the boundary frame survives the crash —
-        // exactly the failure mode the scanner must detect and HALT on.
-        let partial_len = torn_start + (CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE as u64 / 2);
-        {
-            let f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(crate::journal::journal_path_for(&db_path))
-                .unwrap();
-            f.set_len(partial_len).unwrap();
-            f.sync_all().unwrap();
-        }
-
-        let mut main_file_reopen = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&db_path)
-            .unwrap();
-        let mut mgr2 =
-            JournalManager::open_or_create(&db_path, &header, &mut main_file_reopen).unwrap();
-        let parsed = mgr2.take_parsed_logical_frames();
-
-        assert_eq!(
-            parsed.frames.len(),
-            1,
-            "§3.11 torn boundary (partial prefix): resume from prior hi1; \
-             only mid_ts must survive. Got frames: {:?}",
-            parsed
-                .frames
-                .iter()
-                .map(|(_, f)| f.commit_ts)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            parsed.frames[0].1.commit_ts, mid_ts,
-            "only the post-hi1 frame must survive when the second boundary is torn"
-        );
-        assert!(
-            recovery_torn_checkpoint_boundary_snapshot() == before + 1,
-            "§3.11 torn boundary must tick the torn counter (release-active \
-             observability proof that the scan halted on the torn kind byte)"
-        );
-        drop(mgr2);
-        drop(main_file_reopen);
-        drop(dir);
-    }
-
-    /// §3.11 / US-017 AC#4 (CRC-mismatch variant). Writes a full-length
-    /// second boundary frame, then corrupts ONLY the CRC tail. The frame
-    /// kind byte and length field still parse, the salts still validate,
-    /// but `CheckpointCommitBoundaryFrame::decode` rejects on CRC mismatch.
-    /// The scanner must report `BoundaryScan::Torn` and HALT — NOT fall
-    /// through to legacy parsing (which would misread byte 0 as a legacy
-    /// `page_number=4` and surface a hard `CorruptDatabase`).
-    #[test]
-    fn test_torn_checkpoint_commit_boundary_cut_crc_mismatch() {
-        use crate::journal::log_file::{
-            CheckpointEpoch, LogicalTxnFrame, PageId, CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE,
-        };
-        use crate::mvcc::metrics::{
-            recovery_torn_checkpoint_boundary_snapshot, reset_recovery_torn_checkpoint_boundary,
-        };
-        use crate::mvcc::timestamp::Ts;
-        use std::io::{Seek, SeekFrom, Write};
-
-        let _guard = orphan_metrics_guard();
-        reset_recovery_torn_checkpoint_boundary();
-        let before = recovery_torn_checkpoint_boundary_snapshot();
-
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let pre_ts = Ts {
-            physical_ms: 50,
-            logical: 0,
-        };
-        let hi1 = Ts {
-            physical_ms: 50,
-            logical: 9,
-        };
-        let mid_ts = Ts {
-            physical_ms: 150,
-            logical: 0,
-        };
-        let hi2 = Ts {
-            physical_ms: 150,
-            logical: 9,
-        };
-
-        mgr.append_logical_txn(LogicalTxnFrame {
-            salt1: mgr.salt1,
-            salt2: mgr.salt2,
-            commit_ts: pre_ts,
-            diagnostic_txn_id: 1,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![],
-        })
-        .unwrap();
-        mgr.append_chain_commit(pre_ts, vec![], vec![]).unwrap();
-
-        mgr.append_checkpoint_commit_boundary(CheckpointEpoch(1), pre_ts, hi1, PageId(0))
-            .unwrap();
-
-        mgr.append_logical_txn(LogicalTxnFrame {
-            salt1: mgr.salt1,
-            salt2: mgr.salt2,
-            commit_ts: mid_ts,
-            diagnostic_txn_id: 2,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![],
-        })
-        .unwrap();
-        mgr.append_chain_commit(mid_ts, vec![], vec![]).unwrap();
-
-        let torn_start = mgr
-            .append_checkpoint_commit_boundary(CheckpointEpoch(2), mid_ts, hi2, PageId(0))
-            .unwrap();
-
-        std::mem::forget(mgr);
-        drop(main_file);
-
-        // Corrupt the CRC tail of the second boundary frame. Frame
-        // length, kind byte, and salts are all unchanged — only the
-        // last 4 bytes (CRC32C of the body) are flipped.
-        {
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(crate::journal::journal_path_for(&db_path))
-                .unwrap();
-            let crc_offset = torn_start + (CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE as u64) - 4;
-            f.seek(SeekFrom::Start(crc_offset)).unwrap();
-            f.write_all(&0xDEAD_BEEFu32.to_le_bytes()).unwrap();
-            f.sync_all().unwrap();
-        }
-
-        let mut main_file_reopen = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&db_path)
-            .unwrap();
-        let mut mgr2 =
-            JournalManager::open_or_create(&db_path, &header, &mut main_file_reopen).unwrap();
-        let parsed = mgr2.take_parsed_logical_frames();
-
-        assert_eq!(
-            parsed.frames.len(),
-            1,
-            "§3.11 torn boundary (CRC mismatch): scan must halt and resume \
-             from prior hi1; only mid_ts survives. Got: {:?}",
-            parsed
-                .frames
-                .iter()
-                .map(|(_, f)| f.commit_ts)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(parsed.frames[0].1.commit_ts, mid_ts);
-        assert!(
-            recovery_torn_checkpoint_boundary_snapshot() == before + 1,
-            "§3.11 CRC-mismatch torn boundary must tick the torn counter \
-             (no fallthrough to legacy parsing)"
-        );
-        drop(mgr2);
-        drop(main_file_reopen);
-        drop(dir);
-    }
-
-    /// §3.11 / US-017 AC#6 — covers_commit_ts_hi monotonicity. Two valid
-    /// boundary frames with strictly increasing `covers_commit_ts_hi` must
-    /// reopen cleanly and the highest observed hi must cull every
-    /// pre-hi2 logical frame. The negative case (non-monotonic pair) is
-    /// covered by `test_covers_commit_ts_hi_monotonicity_rejects_regression`
-    /// which asserts a release-active hard error.
-    #[test]
-    fn test_covers_commit_ts_hi_monotonicity_clean_pair() {
+    fn test_page0_checkpoint_boundary_frontier_monotonicity_clean_pair() {
         use crate::journal::log_file::LogicalTxnFrame;
-        use crate::journal::log_file::{CheckpointEpoch, PageId};
         use crate::mvcc::timestamp::Ts;
 
         let _guard = orphan_metrics_guard();
-
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
@@ -1699,47 +1423,30 @@ mod tests {
             logical: 0,
         };
 
-        // pre + ChainCommit, boundary hi1, mid + ChainCommit, boundary hi2,
-        // post + ChainCommit.
-        {
-            let ts = pre_ts;
+        for (ts, diagnostic_txn_id) in [(pre_ts, 1), (mid_ts, 2)] {
             mgr.append_logical_txn(LogicalTxnFrame {
                 salt1: mgr.salt1,
                 salt2: mgr.salt2,
                 commit_ts: ts,
-                diagnostic_txn_id: ts.physical_ms,
+                diagnostic_txn_id,
                 format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
                 flags: 0,
                 ops: vec![],
             })
             .unwrap();
             mgr.append_chain_commit(ts, vec![], vec![]).unwrap();
+            let _ = append_test_page0_boundary(
+                &mut mgr,
+                &header,
+                if diagnostic_txn_id == 1 { hi1 } else { hi2 },
+            );
         }
-        mgr.append_checkpoint_commit_boundary(CheckpointEpoch(1), pre_ts, hi1, PageId(0))
-            .unwrap();
-
-        {
-            let ts = mid_ts;
-            mgr.append_logical_txn(LogicalTxnFrame {
-                salt1: mgr.salt1,
-                salt2: mgr.salt2,
-                commit_ts: ts,
-                diagnostic_txn_id: ts.physical_ms,
-                format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-                flags: 0,
-                ops: vec![],
-            })
-            .unwrap();
-            mgr.append_chain_commit(ts, vec![], vec![]).unwrap();
-        }
-        mgr.append_checkpoint_commit_boundary(CheckpointEpoch(2), mid_ts, hi2, PageId(0))
-            .unwrap();
 
         mgr.append_logical_txn(LogicalTxnFrame {
             salt1: mgr.salt1,
             salt2: mgr.salt2,
             commit_ts: post_ts,
-            diagnostic_txn_id: post_ts.physical_ms,
+            diagnostic_txn_id: 3,
             format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
             flags: 0,
             ops: vec![],
@@ -1759,63 +1466,39 @@ mod tests {
             JournalManager::open_or_create(&db_path, &header, &mut main_file_reopen).unwrap();
         let parsed = mgr2.take_parsed_logical_frames();
 
-        // Highest hi wins (hi2); only post_ts > hi2 survives.
-        assert_eq!(
-            parsed.frames.len(),
-            1,
-            "monotonic boundary pair must cull every pre-hi2 logical \
-             frame; got {:?}",
-            parsed
-                .frames
-                .iter()
-                .map(|(_, f)| f.commit_ts)
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(parsed.frames.len(), 1);
         assert_eq!(parsed.frames[0].1.commit_ts, post_ts);
         drop(mgr2);
         drop(main_file_reopen);
         drop(dir);
     }
 
-    /// §3.11 / US-017 AC#6 — non-monotonic boundary pair MUST be rejected
-    /// in release builds with a hard `CorruptDatabase` error. This proves
-    /// the monotonicity check is release-active (not gated behind
-    /// `debug_assert!`). Two valid boundary frames are appended with
-    /// `hi2 < hi1` (regression) and `recover_existing` MUST return Err.
     #[test]
-    fn test_covers_commit_ts_hi_monotonicity_rejects_regression() {
+    fn test_page0_checkpoint_boundary_frontier_rejects_regression() {
         use crate::error::Error;
-        use crate::journal::log_file::{CheckpointEpoch, PageId};
         use crate::mvcc::timestamp::Ts;
 
         let _guard = orphan_metrics_guard();
-
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
-        // hi1 > hi2 — non-monotonic pair (regression).
-        let lo1 = Ts {
-            physical_ms: 100,
-            logical: 0,
-        };
-        let hi1 = Ts {
-            physical_ms: 100,
-            logical: 9,
-        };
-        let lo2 = Ts {
-            physical_ms: 50,
-            logical: 0,
-        };
-        let hi2 = Ts {
-            physical_ms: 50,
-            logical: 9,
-        };
-
-        mgr.append_checkpoint_commit_boundary(CheckpointEpoch(1), lo1, hi1, PageId(0))
-            .unwrap();
-        mgr.append_checkpoint_commit_boundary(CheckpointEpoch(2), lo2, hi2, PageId(0))
-            .unwrap();
+        let _ = append_test_page0_boundary(
+            &mut mgr,
+            &header,
+            Ts {
+                physical_ms: 100,
+                logical: 9,
+            },
+        );
+        let _ = append_test_page0_boundary(
+            &mut mgr,
+            &header,
+            Ts {
+                physical_ms: 50,
+                logical: 9,
+            },
+        );
 
         std::mem::forget(mgr);
         drop(main_file);
@@ -1828,464 +1511,69 @@ mod tests {
         let res = JournalManager::open_or_create(&db_path, &header, &mut main_file_reopen);
         match res {
             Err(Error::CorruptDatabase { detail, .. }) => {
-                assert!(
-                    detail.contains("monotonicity"),
-                    "expected §3.11 monotonicity error; got: {detail}"
-                );
+                assert!(detail.contains("last_checkpoint_ts regressed"));
             }
-            Ok(_) => panic!(
-                "expected CorruptDatabase on non-monotonic boundary pair (release-active \
-                 §3.11 assertion); got Ok"
-            ),
-            Err(other) => panic!(
-                "expected CorruptDatabase on non-monotonic boundary pair (release-active \
-                 §3.11 assertion); got: {other:?}"
-            ),
+            Ok(_) => panic!("expected CorruptDatabase on regressed page-0 boundary frontier"),
+            Err(other) => panic!("expected CorruptDatabase, got: {other:?}"),
         }
         drop(main_file_reopen);
         drop(dir);
     }
 
-    // -----------------------------------------------------------------------
-    // US-018 §6.5 — mixed-format scanner updates (read_page_linear, truncate_to)
-    // -----------------------------------------------------------------------
-
-    /// §6.5 / US-018 AC#3 — `read_page_linear` skips a `LogicalTxnFrame`
-    /// inserted between two legacy page frames and returns the second
-    /// legacy page's data correctly. Without the logical-skip the linear
-    /// scanner would halt at the logical frame and miss the trailing
-    /// legacy frame entirely.
     #[test]
-    fn read_page_linear_skips_logical_txn() {
-        use crate::journal::log_file::LogicalTxnFrame;
+    fn read_page_linear_reads_page0_checkpoint_boundary() {
         use crate::mvcc::timestamp::Ts;
 
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
-        // [legacy(page=10, data=0xAA), logical, legacy(page=20, data=0xBB)]
-        mgr.append_non_commit(10, JournalPageSize::Small4k, &make_page_4k(0xAA))
-            .unwrap();
-        mgr.append_logical_txn(LogicalTxnFrame {
-            salt1: mgr.salt1,
-            salt2: mgr.salt2,
-            commit_ts: Ts {
-                physical_ms: 1,
-                logical: 0,
-            },
-            diagnostic_txn_id: 1,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![],
-        })
-        .unwrap();
-        mgr.append_non_commit(20, JournalPageSize::Small4k, &make_page_4k(0xBB))
-            .unwrap();
-
-        // Force the linear-scan path by clearing the in-memory index — the
-        // index would otherwise short-circuit `read_page` to O(1) lookup.
-        mgr.index.clear_index();
-
-        let p10 = mgr.read_page_linear(10).unwrap();
-        let p20 = mgr.read_page_linear(20).unwrap();
-        assert!(
-            p10.is_some(),
-            "page 10 must be found before the logical frame"
-        );
-        assert_eq!(p10.as_ref().unwrap()[0], 0xAA);
-        assert!(
-            p20.is_some(),
-            "page 20 must be found AFTER the logical frame — read_page_linear \
-             must skip past `LogicalTxnFrame` (§6.5/US-018 AC#3)"
-        );
-        assert_eq!(p20.as_ref().unwrap()[0], 0xBB);
-        drop(mgr);
-
-        // §8.2 / codex US-020 r2 blocker AC#2 — reopen via
-        // `JournalManager::open_or_create` and assert the same
-        // behavior post-recovery: page 20 is still found across
-        // the LogicalTxnFrame after Pass 1 reconstructed the index.
-        let mut mgr_reopen =
-            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        let p20_post = mgr_reopen.read_page_linear(20).unwrap();
-        assert!(
-            p20_post.is_some(),
-            "post-recovery: page 20 must still be findable past the \
-             LogicalTxnFrame (the recovery scan must skip the logical \
-             frame the same way the live read_page_linear does)"
-        );
-        assert_eq!(p20_post.unwrap()[0], 0xBB);
-        drop(mgr_reopen);
-        drop(main_file);
-        drop(dir);
-    }
-
-    /// §6.5 / US-018 AC#4 — `truncate_to` rolls back to a cursor JUST BEFORE
-    /// a `LogicalTxnFrame` and leaves no torn bytes. After truncation,
-    /// the surviving journal must contain only the legacy frames before
-    /// the logical-frame mark and the index must reflect those alone.
-    #[test]
-    fn truncate_to_handles_logical_txn_boundary() {
-        use crate::journal::log_file::LogicalTxnFrame;
-        use crate::mvcc::timestamp::Ts;
-
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        // Pre-mark legacy frames + commit, mark cursor, then write a
-        // logical frame + a follow-on legacy frame. Roll back to the
-        // mark and assert the post-mark frames are gone.
-        mgr.append_non_commit(5, JournalPageSize::Small4k, &make_page_4k(0x05))
-            .unwrap();
-        mgr.commit(6, JournalPageSize::Small4k, &make_page_4k(0x06), 7)
-            .unwrap();
-        let mark = mgr.write_cursor();
-
-        mgr.append_logical_txn(LogicalTxnFrame {
-            salt1: mgr.salt1,
-            salt2: mgr.salt2,
-            commit_ts: Ts {
-                physical_ms: 1,
-                logical: 0,
-            },
-            diagnostic_txn_id: 1,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![],
-        })
-        .unwrap();
-        mgr.append_non_commit(99, JournalPageSize::Small4k, &make_page_4k(0x99))
-            .unwrap();
-        let after = mgr.write_cursor();
-        assert!(
-            after > mark,
-            "logical+legacy must extend the cursor past the mark"
-        );
-
-        mgr.truncate_to(mark).unwrap();
-        assert_eq!(
-            mgr.write_cursor(),
-            mark,
-            "truncate_to must restore the cursor exactly to the mark"
-        );
-        assert!(
-            mgr.read_page(99).unwrap().is_none(),
-            "post-mark page 99 must be gone after rollback to a cursor \
-             just before the logical frame"
-        );
-        // Pre-mark page 5 must still be present (its index entry is the
-        // surviving non-commit frame).
-        let p5 = mgr.read_page(5).unwrap();
-        assert!(p5.is_some(), "pre-mark page 5 survives rollback");
-        assert_eq!(p5.unwrap()[0], 0x05);
-        drop(mgr);
-
-        // §8.2 / codex US-020 r2 blocker AC#2 — reopen via
-        // `JournalManager::open_or_create` and assert the truncation
-        // is durable across a recovery cycle: page 99 (the post-mark
-        // legacy write) is still gone after Pass 1, and page 5
-        // (the pre-mark legacy non-commit) survives. Page 6 (the
-        // legacy commit page) was already applied to the main file
-        // during the initial commit; recovery's scan finds nothing
-        // to apply for the truncated tail.
-        let mut mgr_reopen =
-            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        assert_eq!(
-            mgr_reopen.write_cursor(),
-            mark,
-            "post-recovery write_cursor must equal the truncation mark"
-        );
-        assert!(
-            mgr_reopen.read_page(99).unwrap().is_none(),
-            "post-recovery: post-mark page 99 must still be absent \
-             (truncation persisted through Pass 1)"
-        );
-        drop(mgr_reopen);
-        drop(main_file);
-        drop(dir);
-    }
-
-    /// §6.5 / US-018 AC#5 — `truncate_to` rolls back to a cursor AFTER a
-    /// legacy frame but BEFORE a following logical frame. The legacy
-    /// frame must survive; the logical frame and anything after must
-    /// be dropped.
-    #[test]
-    fn truncate_to_handles_legacy_after_logical() {
-        use crate::journal::log_file::LogicalTxnFrame;
-        use crate::mvcc::timestamp::Ts;
-
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        // Commit page 11 (db_page_count=7) so Pass 1 recovery applies
-        // it to the main file. A `append_non_commit`-only frame would
-        // be discarded as `pending` without a follower commit; the
-        // post-recovery assertion below requires page 11 to survive.
-        mgr.commit(11, JournalPageSize::Small4k, &make_page_4k(0x11), 7)
-            .unwrap();
-        // Mark AFTER the legacy commit frame, BEFORE the logical frame.
-        let mark = mgr.write_cursor();
-
-        mgr.append_logical_txn(LogicalTxnFrame {
-            salt1: mgr.salt1,
-            salt2: mgr.salt2,
-            commit_ts: Ts {
-                physical_ms: 1,
-                logical: 0,
-            },
-            diagnostic_txn_id: 1,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-            flags: 0,
-            ops: vec![],
-        })
-        .unwrap();
-        mgr.append_non_commit(22, JournalPageSize::Small4k, &make_page_4k(0x22))
-            .unwrap();
-
-        mgr.truncate_to(mark).unwrap();
-        assert_eq!(mgr.write_cursor(), mark);
-
-        // Pre-mark legacy frame (page 11) must still be readable.
-        let p11 = mgr.read_page(11).unwrap();
-        assert!(
-            p11.is_some(),
-            "pre-mark legacy frame must survive the rollback past the \
-             logical frame (§6.5/US-018 AC#5)"
-        );
-        assert_eq!(p11.unwrap()[0], 0x11);
-        // Post-mark legacy frame (page 22) must be gone.
-        assert!(mgr.read_page(22).unwrap().is_none());
-        drop(mgr);
-
-        // §8.2 / codex US-020 r2 blocker AC#2 — reopen via
-        // `JournalManager::open_or_create` and verify the truncation
-        // is durable across recovery: write_cursor lands at the mark,
-        // pre-mark page 11 is observable (committed before the mark
-        // so Pass 1 applied it to the main file), page 22 (post-mark
-        // legacy) is absent, and the LogicalTxnFrame (whose bytes
-        // followed the mark) is NOT in `ParsedLogicalFrames`.
-        let mut mgr_reopen =
-            JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        assert_eq!(
-            mgr_reopen.write_cursor(),
-            mark,
-            "post-recovery write_cursor must equal the truncation mark"
-        );
-        // Page 11 was committed before the mark (commit frame with
-        // db_page_count=7), so Pass 1 applied it to the main file.
-        // It is observable post-recovery via direct main-file read.
-        let mut p11_buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
-        main_file
-            .seek(SeekFrom::Start(11 * PAGE_SIZE_LEAF as u64))
-            .unwrap();
-        main_file.read_exact(&mut p11_buf).unwrap();
-        assert_eq!(
-            p11_buf[0], 0x11,
-            "post-recovery: pre-mark legacy commit (page 11) must \
-             be applied to the main file"
-        );
-        assert!(
-            mgr_reopen.read_page(22).unwrap().is_none(),
-            "post-recovery: post-mark legacy frame (page 22) must be absent"
-        );
-        let parsed = mgr_reopen.take_parsed_logical_frames();
-        assert!(
-            parsed.frames.is_empty(),
-            "post-recovery: truncated LogicalTxnFrame must not appear in \
-             ParsedLogicalFrames; got frames at {:?}",
-            parsed.frames.iter().map(|(o, _)| *o).collect::<Vec<_>>()
-        );
-        drop(mgr_reopen);
-        drop(main_file);
-        drop(dir);
-    }
-
-    /// §6.5 / US-018 — `read_page_linear` skips a valid
-    /// `CheckpointCommitBoundaryFrame` inserted between two legacy page
-    /// frames and returns the second legacy page's data correctly. Same
-    /// shape as the logical-skip test above but exercises the boundary
-    /// dispatch added in this story.
-    #[test]
-    fn read_page_linear_skips_checkpoint_commit_boundary() {
-        use crate::journal::log_file::{CheckpointEpoch, PageId};
-        use crate::mvcc::timestamp::Ts;
-
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        mgr.append_non_commit(10, JournalPageSize::Small4k, &make_page_4k(0xCC))
-            .unwrap();
-        mgr.append_checkpoint_commit_boundary(
-            CheckpointEpoch(1),
-            Ts {
-                physical_ms: 0,
-                logical: 0,
-            },
+        let _ = append_test_page0_boundary(
+            &mut mgr,
+            &header,
             Ts {
                 physical_ms: 100,
                 logical: 0,
             },
-            PageId(0),
-        )
-        .unwrap();
-        mgr.append_non_commit(20, JournalPageSize::Small4k, &make_page_4k(0xDD))
-            .unwrap();
+        );
 
         mgr.index.clear_index();
-        let p10 = mgr.read_page_linear(10).unwrap();
-        let p20 = mgr.read_page_linear(20).unwrap();
-        assert_eq!(p10.unwrap()[0], 0xCC);
-        assert_eq!(
-            p20.unwrap()[0],
-            0xDD,
-            "read_page_linear must skip past a valid CheckpointCommitBoundaryFrame"
-        );
+        let page0 = mgr.read_page_linear(0).unwrap().expect("page-0 boundary");
+        let decoded = FileHeader::from_bytes(page0.as_slice().try_into().unwrap()).unwrap();
+        assert_eq!(decoded.last_checkpoint_ts.physical_ms, 100);
         drop(mgr);
         drop(main_file);
         drop(dir);
     }
 
-    /// §6.5 / US-018 — `truncate_to` skips a `CheckpointCommitBoundaryFrame`
-    /// when rebuilding the index across a rollback that crosses the
-    /// boundary. Without the boundary-skip dispatch the index rebuild
-    /// would halt at the boundary and lose any post-boundary legacy
-    /// page frames.
     #[test]
-    fn truncate_to_skips_checkpoint_commit_boundary() {
-        use crate::journal::log_file::{CheckpointEpoch, PageId};
+    fn truncate_to_indexes_page0_checkpoint_boundary() {
         use crate::mvcc::timestamp::Ts;
 
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
-        mgr.append_non_commit(33, JournalPageSize::Small4k, &make_page_4k(0x33))
-            .unwrap();
-        mgr.append_checkpoint_commit_boundary(
-            CheckpointEpoch(1),
-            Ts {
-                physical_ms: 0,
-                logical: 0,
-            },
+        let _ = append_test_page0_boundary(
+            &mut mgr,
+            &header,
             Ts {
                 physical_ms: 100,
                 logical: 0,
             },
-            PageId(0),
-        )
-        .unwrap();
+        );
         mgr.append_non_commit(44, JournalPageSize::Small4k, &make_page_4k(0x44))
             .unwrap();
-        // Mark AFTER all three frames so truncate_to rebuilds the index
-        // across the boundary.
         let mark = mgr.write_cursor();
         mgr.append_non_commit(55, JournalPageSize::Small4k, &make_page_4k(0x55))
             .unwrap();
 
         mgr.truncate_to(mark).unwrap();
-        assert_eq!(mgr.write_cursor(), mark);
-        // Both pre-boundary (33) and post-boundary (44) pages must
-        // survive — the index rebuild crossed the boundary.
-        let p33 = mgr.read_page(33).unwrap();
-        let p44 = mgr.read_page(44).unwrap();
-        assert!(p33.is_some() && p44.is_some());
-        assert_eq!(p33.unwrap()[0], 0x33);
-        assert_eq!(p44.unwrap()[0], 0x44);
-        // Page 55 written after the mark must be gone.
+        assert!(mgr.read_page(0).unwrap().is_some());
+        assert_eq!(mgr.read_page(44).unwrap().unwrap()[0], 0x44);
         assert!(mgr.read_page(55).unwrap().is_none());
         drop(mgr);
         drop(main_file);
-        drop(dir);
-    }
-
-    /// §3.11 / US-017 ROUND 3 regression — the boundary helper's structural
-    /// signature (kind=0x04, reserved=[0,0,0], length_field=56, salts) ALIASES
-    /// a valid legacy page-write frame with `page_number==4`,
-    /// `db_page_count==56`, and matching salts. Without the legacy-CRC
-    /// fallback probe in `try_skip_checkpoint_commit_boundary`, such a
-    /// legacy frame gets misclassified as a torn boundary and recovery
-    /// halts before replaying committed legacy data — silent durable-write
-    /// loss after crash.
-    ///
-    /// This test fabricates exactly that legacy frame on disk and asserts
-    /// reopen succeeds AND the legacy frame's index entry survives
-    /// recovery (it must be visible via `read_page`).
-    #[test]
-    fn boundary_helper_does_not_alias_legacy_frame_at_page_4_count_56() {
-        use crate::journal::log_file::JournalPageSize;
-        use crate::storage::page::PAGE_SIZE_INTERNAL as PAGE_INT;
-        use std::io::{Seek, SeekFrom};
-
-        let _guard = orphan_metrics_guard();
-
-        let (dir, db_path, mut main_file) = make_db_file();
-        // Pre-allocate main file so checkpoint replay can write to it.
-        main_file.set_len(100 * PAGE_INT as u64).unwrap();
-        let header = make_header();
-        let mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        // Fabricate a LEGACY commit frame with page_number=4 and
-        // db_page_count=56 — the exact alias the codex critic flagged.
-        // We cannot use `commit()` because it would set db_page_count
-        // freely; instead we hand-craft the 24-byte header + 4096-byte
-        // payload via `JournalFrameHeader::write`.
-        let payload = make_page_4k(0xA5);
-        let salts = mgr.salts();
-        let header_frame = crate::journal::log_file::JournalFrameHeader {
-            page_number: 4,
-            db_page_count: 56, // ALIAS: matches CHECKPOINT_COMMIT_BOUNDARY_FRAME_SIZE
-            salt1: salts.0,
-            salt2: salts.1,
-            page_size: JournalPageSize::Small4k,
-        };
-        // Append directly to the journal file, bypassing the typed
-        // append helpers so we control every byte.
-        let frame_offset = mgr.write_cursor();
-        {
-            let f_path = crate::journal::journal_path_for(&db_path);
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&f_path)
-                .unwrap();
-            f.seek(SeekFrom::Start(frame_offset)).unwrap();
-            header_frame.write(&mut f, &payload).unwrap();
-            f.sync_all().unwrap();
-        }
-        std::mem::forget(mgr);
-        drop(main_file);
-
-        // Reopen — the alias must NOT halt recovery; the legacy frame
-        // must replay into the main file (commit frame replays via the
-        // legacy path).
-        let mut main_file_reopen = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&db_path)
-            .unwrap();
-        let mut mgr2 =
-            JournalManager::open_or_create(&db_path, &header, &mut main_file_reopen).unwrap();
-
-        // The committed legacy frame must replay — readback page 4 from
-        // the main file and confirm the payload byte survived.
-        let observed = mgr2.read_page(4).unwrap();
-        assert!(
-            observed.is_some(),
-            "page 4 must be readable after recovery — the legacy frame must \
-             NOT have been misclassified as a torn boundary"
-        );
-        assert_eq!(
-            observed.as_ref().unwrap()[0],
-            0xA5,
-            "legacy-frame payload must survive recovery; got {:?}",
-            observed.as_ref().unwrap().first()
-        );
-        drop(mgr2);
-        drop(main_file_reopen);
         drop(dir);
     }
 

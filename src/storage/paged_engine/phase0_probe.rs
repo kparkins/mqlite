@@ -41,6 +41,7 @@ impl PagedEngine {
         doc: Document,
         cut: Phase0ProbeCut,
     ) -> Result<Phase0ProbeReport> {
+        let _checkpoint_writer_admission = self.shared.checkpoint_admission.admit_writer()?;
         let _writer_ticket = {
             let _md_read = self
                 .metadata

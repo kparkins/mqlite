@@ -7,7 +7,7 @@ use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
 use crate::mvcc::PrimaryWrite;
 use crate::query::eval_filter;
-use crate::storage::btree::{BTree, BTreePageStore, HistoryProbe};
+use crate::storage::btree::{leaf_can_insert_value, BTree, BTreePageStore, HistoryProbe};
 use crate::validation::validate_document;
 
 use super::doc_helpers::{check_unique_constraints_mvcc, ensure_id};
@@ -19,10 +19,10 @@ use super::visibility::WriteVisibility;
 /// indexes; violated constraints return [`Error::DuplicateKey`] before the
 /// tree is modified.
 ///
-/// Returns `(id_bson, encoded_key, bson_bytes, tree_root_page)` so callers
-/// can stage the MVCC primary-chain entry via `WriteTxn::stage_primary_insert`
-/// after the on-disk cell lands. `tree_root_page` is sampled AFTER the insert
-/// so any root split is reflected.
+/// Returns `(id_bson, encoded_key, bson_bytes, tree_root_page, structural_split)`
+/// so callers can stage the MVCC primary-chain entry via
+/// `WriteTxn::stage_primary_insert` after the on-disk cell lands.
+/// `tree_root_page` is sampled AFTER the insert so any root split is reflected.
 pub(super) fn btree_insert_doc<S: BTreePageStore>(
     tree: &mut BTree<S>,
     doc: &mut Document,
@@ -30,7 +30,7 @@ pub(super) fn btree_insert_doc<S: BTreePageStore>(
     vis: &WriteVisibility<'_>,
     pending: &[PrimaryWrite],
     ns: &str,
-) -> Result<(Bson, Vec<u8>, Vec<u8>, u32)> {
+) -> Result<(Bson, Vec<u8>, Vec<u8>, u32, bool)> {
     validate_document(doc)?;
     let id_bson = ensure_id(doc);
     // Check declared unique constraints before touching the tree.
@@ -54,7 +54,15 @@ pub(super) fn btree_insert_doc<S: BTreePageStore>(
         });
     }
     let bson_bytes = bson::to_vec(doc).map_err(Error::BsonSerialization)?;
-    if tree.search(&key)?.is_none() {
+    let absent = tree.search(&key)?.is_none();
+    let structural_split = if absent {
+        let leaf = tree.find_leaf(&key)?;
+        let (leaf_bytes, _) = tree.store.read_leaf(leaf)?;
+        !leaf_can_insert_value(&leaf_bytes[..], key.len(), bson_bytes.len())?
+    } else {
+        false
+    };
+    if absent {
         tree.insert(&key, &bson_bytes).map_err(|e| match e {
             Error::DuplicateKey { .. } => Error::DuplicateKey {
                 detail: "document with _id already exists".to_string(),
@@ -63,7 +71,7 @@ pub(super) fn btree_insert_doc<S: BTreePageStore>(
         })?;
     }
     let tree_root = tree.root_page;
-    Ok((id_bson, key, bson_bytes, tree_root))
+    Ok((id_bson, key, bson_bytes, tree_root, structural_split))
 }
 
 /// MVCC-aware collection scan. For each key visible at `view.read_ts` (or

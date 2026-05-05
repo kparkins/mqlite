@@ -13,6 +13,7 @@ use crate::storage::btree::reconcile::{
     decode_folded_leaf, encode_folded_leaf, predict_encoded_leaf_size, FoldedLeafCell,
     RetainedChains,
 };
+use crate::storage::btree::OVERFLOW_THRESHOLD;
 use crate::storage::page::PAGE_SIZE_LEAF;
 
 use super::plan::TreeIdent;
@@ -133,6 +134,38 @@ pub(crate) fn synthesize_page(
     })
 }
 
+/// Return true when checkpoint-visible winners can each fit after B-tree
+/// materialization is allowed to split leaf contents and spill large values.
+///
+/// # Errors
+///
+/// Returns [`NotInstallable`] when a visible winner cannot be converted into a
+/// folded cell for budget checking.
+pub(crate) fn visible_winners_fit_individual_leaf_pages(
+    chains: &BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+    checkpoint_ts: Ts,
+) -> Result<bool, NotInstallable> {
+    let mut visible_winners = 0usize;
+    for (key, chain) in chains {
+        let Some(index) = checkpoint_winner_index(chain, checkpoint_ts) else {
+            return Ok(false);
+        };
+        if chain.len() != 1 {
+            return Ok(false);
+        }
+        let entry = &chain[index];
+        if entry.is_tombstone {
+            continue;
+        }
+        visible_winners += 1;
+        let cell = materialized_cell_for_budget(key, entry)?;
+        if predict_encoded_leaf_size(&[cell], &RetainedChains::new()) > PAGE_SIZE_LEAF as usize {
+            return Ok(false);
+        }
+    }
+    Ok(visible_winners > 1)
+}
+
 fn checkpoint_winner_index(chain: &VecDeque<VersionEntry>, checkpoint_ts: Ts) -> Option<usize> {
     chain
         .iter()
@@ -174,5 +207,19 @@ fn folded_cell_from_entry(
                 total_length,
             ))
         }
+    }
+}
+
+fn materialized_cell_for_budget(
+    key: &[u8],
+    entry: &VersionEntry,
+) -> Result<FoldedLeafCell, NotInstallable> {
+    match &entry.data {
+        VersionData::Inline(bytes) if bytes.len() > OVERFLOW_THRESHOLD => {
+            let total_length = u32::try_from(bytes.len())
+                .map_err(|_| NotInstallable::FoldedLeafExceedsPageByteBudget)?;
+            Ok(FoldedLeafCell::overflow(key.to_vec(), 0, total_length))
+        }
+        _ => folded_cell_from_entry(key, entry),
     }
 }

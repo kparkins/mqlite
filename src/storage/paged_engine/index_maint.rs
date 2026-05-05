@@ -1,6 +1,6 @@
 //! Secondary-index maintenance + pending-write installation helpers.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use bson::{Bson, Document};
@@ -552,12 +552,12 @@ pub(super) fn install_pending_primary(
     _vis: &WriteVisibility<'_>,
     commit_ts: crate::mvcc::Ts,
     txn_id: u64,
-) -> Result<Vec<u32>> {
+) -> Result<(Vec<u32>, bool)> {
     #[cfg(test)]
     super::us009_tests::record_install_pending_primary_call();
 
     if writes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     use crate::mvcc::{PrimaryOp, Ts, VersionData, VersionEntry, VersionState};
 
@@ -577,6 +577,7 @@ pub(super) fn install_pending_primary(
     }
     let mut smo_latches = acquire_smo_latches(shared, overlay, &targets)?;
     let mut installed_pages = Vec::with_capacity(writes.len());
+    let mut structural_tree_change = false;
 
     let mut target_idx = 0usize;
     for write in writes {
@@ -621,6 +622,7 @@ pub(super) fn install_pending_primary(
             });
         }
         page.put_chain(write.key, chain_arc)?;
+        structural_tree_change |= page.live_delta_payload_exceeds_leaf_budget()?;
         shared.mark_leaf_dirty(
             TreeIdent {
                 collection_id: coll.id,
@@ -631,7 +633,7 @@ pub(super) fn install_pending_primary(
         );
         installed_pages.push(leaf_page);
     }
-    Ok(installed_pages)
+    Ok((installed_pages, structural_tree_change))
 }
 
 /// Flip pending entries installed by `txn_id` to Committed.
@@ -851,7 +853,7 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
     shared: &SharedState,
     md: &MetadataState,
     overlay: &mut TxnOverlay,
-) -> Result<bool> {
+) -> Result<(bool, HashSet<TreeIdent>, bool)> {
     let entries = {
         let cat = catalog_lock(md);
         let collections = cat.list_collections()?;
@@ -859,7 +861,7 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
         for coll in &collections {
             for entry in cat.list_indexes(&coll.name)? {
                 if matches!(entry.state, IndexState::Ready) {
-                    entries.push(entry);
+                    entries.push((coll.id, entry));
                 }
             }
         }
@@ -867,10 +869,12 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
     };
 
     if entries.is_empty() {
-        return Ok(false);
+        return Ok((false, HashSet::new(), false));
     }
 
     let mut published_catalog_dirty = false;
+    let mut materialized_trees = HashSet::new();
+    let mut requires_logical_tail = false;
     // §10.19 C-1 / US-037: coherent (epoch, frontier) load so
     // visibility checks through `view.sequencer_frontier()` cannot see
     // the gap between the publisher's two stores.
@@ -880,12 +884,20 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
         0,
         Arc::clone(&shared.publish_sequencer),
     );
-    for entry in entries {
+    for (collection_id, entry) in entries {
+        let ident = TreeIdent {
+            collection_id,
+            kind: TreeKind::Secondary { index_id: entry.id },
+        };
         let read_tree = BTree::open(new_store(shared), entry.root_page, entry.root_level);
         let deltas = read_tree.visible_delta_entries(&view)?;
         if deltas.is_empty() {
+            if shared.dirty_leaves.contains_key(&ident) {
+                requires_logical_tail = true;
+            }
             continue;
         }
+        materialized_trees.insert(ident);
 
         let mut tree = BTree::open(
             new_txn_store(shared, overlay),
@@ -912,7 +924,11 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
         }
     }
 
-    Ok(published_catalog_dirty)
+    Ok((
+        published_catalog_dirty,
+        materialized_trees,
+        requires_logical_tail,
+    ))
 }
 
 /// Fold committed primary resident deltas into the primary B+ tree during
@@ -929,13 +945,13 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
     shared: &SharedState,
     md: &MetadataState,
     overlay: &mut TxnOverlay,
-) -> Result<bool> {
+) -> Result<(bool, HashSet<TreeIdent>, bool)> {
     let collections = {
         let cat = catalog_lock(md);
         cat.list_collections()?
     };
     if collections.is_empty() {
-        return Ok(false);
+        return Ok((false, HashSet::new(), false));
     }
 
     let epoch = shared.load_published_coherent();
@@ -945,6 +961,8 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
         Arc::clone(&shared.publish_sequencer),
     );
     let mut published_catalog_dirty = false;
+    let mut materialized_trees = HashSet::new();
+    let mut requires_logical_tail = false;
 
     for coll in collections {
         let ident = TreeIdent {
@@ -958,8 +976,10 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
         let read_tree = BTree::open(new_store(shared), coll.data_root_page, coll.data_root_level);
         let deltas = read_tree.visible_delta_entries(&view)?;
         if deltas.is_empty() {
+            requires_logical_tail = true;
             continue;
         }
+        materialized_trees.insert(ident);
 
         let mut tree = BTree::open(
             new_txn_store(shared, overlay),
@@ -986,7 +1006,11 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
         }
     }
 
-    Ok(published_catalog_dirty)
+    Ok((
+        published_catalog_dirty,
+        materialized_trees,
+        requires_logical_tail,
+    ))
 }
 
 fn apply_secondary_checkpoint_delta<S: BTreePageStore>(
@@ -1226,7 +1250,8 @@ pub(super) fn drop_index(
                     Err(e) => return Err(e),
                 };
                 if emergency {
-                    let _ = engine.shared.handle.emergency_checkpoint();
+                    // Defer the legacy page-frame checkpoint until checkpoint
+                    // materialization has folded the logical row tail.
                 }
                 Ok(())
             }
