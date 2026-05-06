@@ -1014,8 +1014,15 @@ pub(super) fn drop_index(
         match body {
             Ok(()) => {
                 let mut base_store = new_store(&engine.shared);
-                batch.commit(&mut base_store, &engine.shared.handle)?;
-                engine.flush_under_journal_mutex()?;
+                let commit_result = batch.commit(&mut base_store, &engine.shared.handle);
+                commit_result.map_err(|_| {
+                    engine
+                        .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)
+                })?;
+                engine.flush_under_journal_mutex().map_err(|_| {
+                    engine
+                        .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)
+                })?;
                 durable = true;
                 Ok(())
             }
@@ -1029,6 +1036,7 @@ pub(super) fn drop_index(
 
     match drop_result {
         Ok(()) => {}
+        Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
         Err(_e) if durable => {
             return Err(
                 engine.engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)

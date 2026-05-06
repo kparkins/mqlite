@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 use bson::doc;
 
-use crate::error::Result;
+use crate::error::{EngineFatalReason, Error, Result, WriteConflictReason};
 use crate::index::IndexModel;
 use crate::options::FindOptions;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
-use crate::storage::catalog::IndexEntry;
+use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
+use crate::storage::paged_engine::test_accessors::Us026PostRegisterFailpoint;
 use crate::storage::test_support::{ArcIo, MockIo};
 
 const NS: &str = "test.us018c.docs";
@@ -105,6 +106,72 @@ fn test_failed_build_catalog_update_restores_original_entry() {
         after, original,
         "failed build must not leave a live catalog root/multikey update"
     );
+}
+
+#[test]
+fn building_index_name_does_not_report_idempotent_success() {
+    let engine = buffered_engine().expect("engine");
+    engine.create_namespace(NS).expect("create namespace");
+
+    let outcome = engine
+        .create_index_reserve(NS, &tag_index_model(), TAG_INDEX)
+        .expect("reserve Building index");
+    assert!(matches!(
+        outcome,
+        super::index_maint::ReserveOutcome::Reserved(_)
+    ));
+
+    let err = engine
+        .create_index(NS, &tag_index_model())
+        .expect_err("Building index must not report create_index success");
+    assert!(matches!(
+        err,
+        Error::WriteConflict {
+            reason: WriteConflictReason::CatalogGenerationChanged
+        }
+    ));
+    assert_eq!(
+        tag_index_entry(&engine).expect("Building entry").state,
+        IndexState::Building
+    );
+}
+
+#[test]
+fn build_flush_failure_after_structural_commit_poisons_engine() {
+    let engine = buffered_engine().expect("engine");
+    engine.create_namespace(NS).expect("create namespace");
+    engine
+        .insert(NS, doc! { "_id": 1, "tag": ["tag-3"], "payload": "array" })
+        .expect("insert multikey doc");
+
+    let outcome = engine
+        .create_index_reserve(NS, &tag_index_model(), TAG_INDEX)
+        .expect("reserve Building index");
+    assert!(matches!(
+        outcome,
+        super::index_maint::ReserveOutcome::Reserved(_)
+    ));
+
+    engine.test_us026_arm_post_register_failpoint(Us026PostRegisterFailpoint::Flush);
+    let err = engine
+        .create_index_build(NS, TAG_INDEX)
+        .expect_err("post-structural-commit flush failure must poison the engine");
+    assert!(matches!(
+        err,
+        Error::EngineFatal {
+            reason: EngineFatalReason::PostDurableDdlPublishFailure
+        }
+    ));
+
+    let rejected = engine
+        .insert(NS, doc! { "_id": 2, "tag": "tag-3" })
+        .expect_err("poisoned engine rejects later writes");
+    assert!(matches!(
+        rejected,
+        Error::EngineFatal {
+            reason: EngineFatalReason::PostDurableDdlPublishFailure
+        }
+    ));
 }
 
 #[test]

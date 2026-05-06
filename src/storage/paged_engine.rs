@@ -1143,8 +1143,17 @@ impl StorageEngine for PagedEngine {
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    batch.commit(&mut base_store, &self.shared.handle)?;
-                    self.flush_under_journal_mutex()?;
+                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
+                    commit_result.map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
+                    self.flush_under_journal_mutex().map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
                     durable = true;
                     Ok(())
                 }
@@ -1158,6 +1167,7 @@ impl StorageEngine for PagedEngine {
 
         match drop_result {
             Ok(()) => {}
+            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_e) if durable => {
                 return Err(self
                     .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));
@@ -1575,10 +1585,18 @@ impl PagedEngine {
                 Ok(value) => {
                     let mut base_store = new_store(&self.shared);
                     if let Err(e) = batch.commit(&mut base_store, &self.shared.handle) {
-                        let _ = self.shared.handle.rollback_txn(mark);
-                        return Err(e);
+                        return Err(match e {
+                            Error::EngineFatal { reason } => Error::EngineFatal { reason },
+                            _ => self.engine_fatal(
+                                crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                            ),
+                        });
                     }
-                    self.flush_under_journal_mutex()?;
+                    self.flush_under_journal_mutex().map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
                     durable = true;
                     Ok(value)
                 }
@@ -1592,6 +1610,7 @@ impl PagedEngine {
 
         let value = match journal_result {
             Ok(value) => value,
+            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_e) if durable => {
                 return Err(self
                     .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));

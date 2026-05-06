@@ -1,4 +1,4 @@
-//! Three-phase `create_index` lifecycle (extracted from paged_engine.rs).
+//! `create_index` lifecycle (extracted from paged_engine.rs).
 //!
 //! Phases:
 //! - [`PagedEngine::create_index_reserve`] — allocate a root page, write an
@@ -8,7 +8,7 @@
 //! - [`PagedEngine::create_index_commit`] — flip `state: Ready` under
 //!   `metadata.write()` and publish.
 //! - [`PagedEngine::create_index_cleanup`] — drop an orphan Building entry
-//!   on Phase-2 failure.
+//!   on build failure.
 
 use crate::error::{Error, Result, WriteConflictReason};
 use crate::index::IndexModel;
@@ -145,17 +145,18 @@ impl PagedEngine {
                     })?;
                 }
 
-                // Idempotent: if an index with this name already exists we
-                // treat the call as a no-op.
-                // We do NOT re-check state here — a caller seeing an
-                // in-progress Building entry from a prior failed build is
-                // reported as "exists"; the prior build's cleanup will have
-                // removed it if it failed. If cleanup itself failed and an
-                // orphan Building entry remains, callers can drop_index and
-                // retry.
-                if cat.get_index(ns, name)?.is_some() {
-                    already_exists = true;
-                    return Ok(());
+                // Idempotence only applies once the existing index is
+                // planner-visible. A live Building entry still has an owner:
+                // another create/resume path must finish or clean it up before
+                // this caller can report success.
+                if let Some(existing) = cat.get_index(ns, name)? {
+                    if existing.state == IndexState::Ready {
+                        already_exists = true;
+                        return Ok(());
+                    }
+                    return Err(Error::WriteConflict {
+                        reason: WriteConflictReason::CatalogGenerationChanged,
+                    });
                 }
 
                 // Allocate a durable index id.
@@ -197,8 +198,17 @@ impl PagedEngine {
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    batch.commit(&mut base_store, &self.shared.handle)?;
-                    self.flush_under_journal_mutex()?;
+                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
+                    commit_result.map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
+                    self.flush_under_journal_mutex().map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
                     Ok(())
                 }
                 Err(e) => {
@@ -210,6 +220,9 @@ impl PagedEngine {
         })();
 
         if let Err(e) = reserve_result {
+            if matches!(e, Error::EngineFatal { .. }) {
+                return Err(e);
+            }
             self.shared.publish_sequencer.mark_aborted(slot);
             return Err(e);
         }
@@ -408,18 +421,22 @@ impl PagedEngine {
                 // same rollback/persist exclusion.
                 let mut base = new_store(&self.shared);
                 if let Err(e) = batch.commit(&mut base, &self.shared.handle) {
-                    if let Some((original, updated)) = &catalog_update_rollback {
-                        self.rollback_build_catalog_update(ns, name, original, updated);
-                    }
-                    return Err(e);
+                    return Err(match e {
+                        Error::EngineFatal { reason } => Error::EngineFatal { reason },
+                        _ => self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        ),
+                    });
                 }
                 {
                     let _journal = self.lock_journal_mutex();
                     if let Err(e) = self.flush_under_journal_mutex() {
-                        if let Some((original, updated)) = &catalog_update_rollback {
-                            self.rollback_build_catalog_update(ns, name, original, updated);
-                        }
-                        return Err(e);
+                        return Err(match e {
+                            Error::EngineFatal { reason } => Error::EngineFatal { reason },
+                            _ => self.engine_fatal(
+                                crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                            ),
+                        });
                     }
                 }
                 Ok(())
@@ -534,8 +551,17 @@ impl PagedEngine {
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    batch.commit(&mut base_store, &self.shared.handle)?;
-                    self.flush_under_journal_mutex()?;
+                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
+                    commit_result.map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
+                    self.flush_under_journal_mutex().map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
                     durable = true;
                     Ok(())
                 }
@@ -549,6 +575,7 @@ impl PagedEngine {
 
         match commit_result {
             Ok(()) => {}
+            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_e) if durable => {
                 return Err(self
                     .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));
@@ -777,8 +804,17 @@ impl PagedEngine {
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    batch.commit(&mut base_store, &self.shared.handle)?;
-                    self.flush_under_journal_mutex()?;
+                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
+                    commit_result.map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
+                    self.flush_under_journal_mutex().map_err(|_| {
+                        self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        )
+                    })?;
                     durable = true;
                     Ok(())
                 }
@@ -792,6 +828,7 @@ impl PagedEngine {
 
         match cleanup_result {
             Ok(()) => {}
+            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_e) if durable => {
                 return Err(self
                     .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));
