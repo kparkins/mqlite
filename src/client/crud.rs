@@ -15,8 +15,8 @@ use crate::{
     error::{Error, Result},
     index::{IndexInfo, IndexModel},
     options::{
-        DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
-        FindOptions, InsertManyOptions, UpdateOptions,
+        FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
+        InsertManyOptions, UpdateOptions,
     },
     results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
 };
@@ -42,9 +42,6 @@ impl ClientInner {
             // original `_id`.  This is a pre-existing limitation.
             _ => crate::storage::oid::ObjectIdGenerator::generate(),
         };
-        // MF-5: FullSync guarantees data survives a process crash after this
-        // call returns. The storage engine owns the sync boundary.
-        self.flush_and_sync_if_fullsync()?;
         Ok(InsertOneResult { inserted_id: oid })
     }
 
@@ -99,10 +96,6 @@ impl ClientInner {
             }
         }
 
-        // MF-5: FullSync guarantees all successfully inserted documents
-        // survive a process crash after this call returns. The storage
-        // engine owns each committed write's sync boundary.
-        self.flush_and_sync_if_fullsync()?;
         Ok(InsertManyResult {
             inserted_ids,
             errors,
@@ -279,18 +272,6 @@ impl ClientInner {
         }
 
         self.engine.checkpoint()
-    }
-
-    /// Preserve the old client-layer durability hook.
-    ///
-    /// FullSync is now enforced by the storage engine before a write
-    /// publishes. Keeping this method as a no-op avoids a second client-side
-    /// fsync after group commit has already covered the write's ticket.
-    fn flush_and_sync_if_fullsync(&self) -> Result<()> {
-        if self.opts.durability == DurabilityMode::FullSync {
-            return Ok(());
-        }
-        Ok(())
     }
 
     pub(crate) fn backup(&self, dest: &Path) -> Result<()> {

@@ -1,11 +1,11 @@
-//! Bench US-010: insert throughput across payload size classes (~256B, ~4KiB, ~32KiB).
+//! Insert throughput across payload size classes (~256B, ~4KiB, ~32KiB).
 //!
 //! Single writer, single namespace. Measures how serialized insert throughput
 //! scales with document payload size. The actual byte count of each payload
 //! class is printed so "approximately" is auditable.
 //!
 //! Run:
-//!   cargo bench --bench payload_sizes -- --save-baseline phase0
+//!   cargo bench --bench payload_sizes -- --save-baseline current
 
 #![allow(
     clippy::unwrap_used,

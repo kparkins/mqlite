@@ -1,14 +1,14 @@
-//! Phase 1 US-017 / §10.8 #28 — root-neutral CRUD bench.
+//! Root-neutral CRUD bench.
 //!
 //! Exercises 1/2/4 concurrent writers on a single already-bootstrapped
 //! namespace performing root-neutral CRUD. Compared against the
-//! phase0 baseline the publish-path CPU should drop proportionally
+//! baseline the publish-path CPU should drop proportionally
 //! to the rebuild-elision rate (catalog Arc reused on root-neutral
 //! commits, §4.1 / §10.3).
 //!
 //! Run:
-//!   cargo bench --bench read_epoch_root_neutral -- --save-baseline phase1
-//!   cargo bench --bench read_epoch_root_neutral -- --baseline phase0
+//!   cargo bench --bench read_epoch_root_neutral -- --save-baseline current
+//!   cargo bench --bench read_epoch_root_neutral -- --baseline current
 
 #![allow(
     clippy::unwrap_used,

@@ -1,11 +1,11 @@
-//! Bench US-009: different-namespace writers (2, 4 writers across distinct namespaces).
+//! Different-namespace writers (2, 4 writers across distinct namespaces).
 //!
 //! Writers on separate namespaces do NOT share a lane, so lane contention is
 //! near-zero. The remaining serialization point is the global `journal_mutex`.
 //! This isolates journal-envelope overhead from lane overhead.
 //!
 //! Run:
-//!   cargo bench --bench writers_diff_ns -- --save-baseline phase0
+//!   cargo bench --bench writers_diff_ns -- --save-baseline current
 
 #![allow(
     clippy::unwrap_used,

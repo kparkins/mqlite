@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::index::IndexModel;
 use crate::options::FindOptions;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::catalog::IndexEntry;
 use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
@@ -50,6 +51,16 @@ fn tag_index_model() -> IndexModel {
     IndexModel::builder().keys(doc! { "tag": 1 }).build()
 }
 
+fn tag_index_entry(engine: &PagedEngine) -> Result<IndexEntry> {
+    let _md = engine
+        .metadata
+        .read()
+        .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+    super::catalog_ops::catalog_lock(&engine.metadata_state)
+        .get_index(NS, TAG_INDEX)?
+        .ok_or_else(|| Error::Internal("tag index missing".into()))
+}
+
 fn assert_tag_index_covers(engine: &PagedEngine, expected: usize) {
     let (docs, explain) = engine
         .find(NS, &doc! { "tag": "tag-3" }, &FindOptions::default())
@@ -64,6 +75,36 @@ fn assert_tag_index_covers(engine: &PagedEngine, expected: usize) {
         "query must not use COLLSCAN after resume"
     );
     assert_eq!(docs.len(), expected);
+}
+
+#[test]
+fn test_failed_build_catalog_update_restores_original_entry() {
+    let engine = buffered_engine().expect("engine");
+    engine.create_namespace(NS).expect("create namespace");
+    engine
+        .insert(NS, doc! { "_id": 1, "tag": ["tag-3"], "payload": "array" })
+        .expect("insert multikey doc");
+
+    let outcome = engine
+        .create_index_reserve(NS, &tag_index_model(), TAG_INDEX)
+        .expect("reserve Building index");
+    assert!(matches!(
+        outcome,
+        super::index_maint::ReserveOutcome::Reserved(_)
+    ));
+    let original = tag_index_entry(&engine).expect("original Building entry");
+    assert!(!original.multikey);
+
+    engine.test_fail_after_build_catalog_update_once();
+    engine
+        .create_index_build(NS, TAG_INDEX)
+        .expect_err("injected post-catalog-update failure");
+
+    let after = tag_index_entry(&engine).expect("rolled-back Building entry");
+    assert_eq!(
+        after, original,
+        "failed build must not leave a live catalog root/multikey update"
+    );
 }
 
 #[test]

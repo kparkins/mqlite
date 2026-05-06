@@ -1,4 +1,4 @@
-//! Bench US-013: reopen latency under two scenarios.
+//! Reopen latency under two scenarios.
 //!
 //! Group 1 – reopen-after-journal: seed N docs with FullSync, then
 //! `std::mem::forget` the client (prevents the Drop checkpoint, leaving the
@@ -18,7 +18,7 @@
 //! survives for the timed loop.
 //!
 //! Run:
-//!   cargo bench --bench reopen -- --save-baseline phase0
+//!   cargo bench --bench reopen -- --save-baseline current
 
 #![allow(
     clippy::unwrap_used,

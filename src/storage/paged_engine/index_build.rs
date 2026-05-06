@@ -29,7 +29,49 @@ use super::publish::PublishDirty;
 use super::snapshot_ops::{open_snapshot_read_view, primary_history_probe};
 use super::PagedEngine;
 
+#[cfg(test)]
+static FAIL_AFTER_BUILD_CATALOG_UPDATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 impl PagedEngine {
+    #[cfg(test)]
+    pub(super) fn test_fail_after_build_catalog_update_once(&self) {
+        FAIL_AFTER_BUILD_CATALOG_UPDATE.store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn test_fail_after_build_catalog_update_if_armed(&self) -> Result<()> {
+        if FAIL_AFTER_BUILD_CATALOG_UPDATE.swap(0, std::sync::atomic::Ordering::AcqRel) == 1 {
+            return Err(Error::Internal(
+                "injected failure after create-index build catalog update".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn rollback_build_catalog_update(
+        &self,
+        ns: &str,
+        name: &str,
+        original: &IndexEntry,
+        updated: &IndexEntry,
+    ) {
+        let Ok(_md_read) = self
+            .metadata
+            .read()
+            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))
+        else {
+            return;
+        };
+        let mut cat = catalog_lock(&self.metadata_state);
+        let Ok(Some(current)) = cat.get_index(ns, name) else {
+            return;
+        };
+        if current == *updated {
+            let _ = cat.update_index(original);
+        }
+    }
+
     /// Reserve step of `create_index`: reserve an index slot.
     ///
     /// Allocates a root page for the index's B+ tree, writes an
@@ -86,7 +128,7 @@ impl PagedEngine {
             let body = (|| {
                 let mut cat = catalog_lock(&self.metadata_state);
                 if cat.get_collection(ns)?.is_none() {
-                    // Phase 1 §10.7 — allocate durable namespace id.
+                    // Allocate a durable namespace id.
                     let ns_id = cat.allocate_namespace_id();
                     let data_root =
                         cat.create_collection(ns, ns_id, bson::doc! {}, now_millis())?;
@@ -116,7 +158,7 @@ impl PagedEngine {
                     return Ok(());
                 }
 
-                // Phase 1 §10.7 — allocate durable index id.
+                // Allocate a durable index id.
                 let ns_id = cat
                     .get_collection(ns)?
                     .ok_or_else(|| {
@@ -276,6 +318,7 @@ impl PagedEngine {
         // not captured during the body because no journal frames are appended
         // here, and other namespaces may commit while this long build runs.
         let mut batch = StructuralPageBatch::new(&self.shared.handle);
+        let mut catalog_update_rollback = None;
 
         let body: Result<()> = (|| {
             // The data tree is read-only during index build — we use a
@@ -346,8 +389,12 @@ impl PagedEngine {
                 if !cat.update_index(&updated)? {
                     return Err(stale_target());
                 }
+                catalog_update_rollback = Some((idx_entry.clone(), updated));
                 drop(cat);
                 sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
+
+                #[cfg(test)]
+                self.test_fail_after_build_catalog_update_if_armed()?;
             }
             Ok(())
         })();
@@ -358,12 +405,22 @@ impl PagedEngine {
                 // build step has no primary writes), and no publish is
                 // performed. The data flush still runs under
                 // `journal_mutex` so all page-store flush paths share the
-                // same Phase 5 rollback/persist exclusion.
+                // same rollback/persist exclusion.
                 let mut base = new_store(&self.shared);
-                batch.commit(&mut base, &self.shared.handle)?;
+                if let Err(e) = batch.commit(&mut base, &self.shared.handle) {
+                    if let Some((original, updated)) = &catalog_update_rollback {
+                        self.rollback_build_catalog_update(ns, name, original, updated);
+                    }
+                    return Err(e);
+                }
                 {
                     let _journal = self.lock_journal_mutex();
-                    self.flush_under_journal_mutex()?;
+                    if let Err(e) = self.flush_under_journal_mutex() {
+                        if let Some((original, updated)) = &catalog_update_rollback {
+                            self.rollback_build_catalog_update(ns, name, original, updated);
+                        }
+                        return Err(e);
+                    }
                 }
                 Ok(())
             }
@@ -371,14 +428,17 @@ impl PagedEngine {
                 // The build body has not appended any journal frames yet. Do
                 // not truncate to `mark`: other namespaces may have committed
                 // since this build transaction began.
+                if let Some((original, updated)) = &catalog_update_rollback {
+                    self.rollback_build_catalog_update(ns, name, original, updated);
+                }
                 let _ = batch.abort(&self.shared.handle);
                 Err(e)
             }
         }
     }
 
-    /// Phase 3 of `create_index`: flip `state: Ready` under metadata.write
-    /// and publish the final snapshot.
+    /// Commit step of `create_index`: flip `state: Ready` under
+    /// metadata.write and publish the final snapshot.
     pub(super) fn create_index_commit(
         &self,
         ns: &str,

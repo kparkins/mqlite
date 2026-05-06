@@ -188,47 +188,40 @@ pub(crate) struct SharedState {
     /// state failures. `Some(reason)` once set; preserves the first
     /// reason for diagnosis. New operations return
     /// [`Error::EngineFatal`] with this reason until the database is
-    /// reopened (Phase 5 §10.19.0 C-2 / US-036).
+    /// reopened.
     pub engine_poisoned: PlMutex<Option<EngineFatalReason>>,
-    /// Phase 5 §10.19 publish-slot sequencer used for ordered live
-    /// publish under the dense-slot protocol. US-036 ships the minimal
-    /// poison-aware skeleton (register / wait / mark_ready / poison);
-    /// US-005 extends it with the full publish-slot/commit-ts protocol
-    /// owned by `register_with_oracle`, `mark_ready` closures, and the
-    /// `published_frontier` AtomicTs.
+    /// Publish-slot sequencer used for ordered live publish under the
+    /// dense-slot protocol. It owns commit timestamp registration,
+    /// `mark_ready` closures, and the `published_frontier` AtomicTs.
     pub(crate) publish_sequencer: Arc<PublishSequencer>,
-    /// Per-collection writer admission lanes (§10.1, §10.6.6).
-    /// CRUD writers `admit` against the lane keyed by the durable
-    /// `CollectionEntry.id`; existing-namespace DDL paths
-    /// `close_and_drain_guard` to gate new admits and drain in-flight
-    /// writers before mutating the catalog.
+    /// Per-collection DDL/probe admission lanes keyed by durable
+    /// `CollectionEntry.id`. Ordinary CRUD is fenced by `metadata.read()`
+    /// and does not admit through this registry.
     #[allow(
         dead_code,
-        reason = "US-004 wires the registry; CRUD/DDL call sites land in US-005+"
+        reason = "admission tickets are retained for DDL/probe paths and unit coverage"
     )]
     pub(crate) ns_writers: Arc<NsWriterRegistry>,
     /// Engine-wide checkpoint admission gate. Checkpoint closes this
     /// before taking the freeze window; CRUD writers enter here before
     /// namespace admission and drop the token after publish or abort.
     pub(crate) checkpoint_admission: Arc<CheckpointAdmissionGate>,
-    /// Phase 5 journal-envelope mutex. Namespace-create DDL paths use
-    /// this instead of the retired commit-sequence field so bootstrap and
-    /// standalone create can reserve a sequencer slot, complete the
-    /// durable envelope, release journal serialization, and only then
+    /// Journal-envelope mutex. Namespace-create DDL paths use this so
+    /// bootstrap and standalone create can reserve a sequencer slot, complete
+    /// the durable envelope, release journal serialization, and only then
     /// publish the catalog generation through `mark_ready`.
     pub(crate) journal_mutex: parking_lot::Mutex<()>,
-    /// Phase 5 §10.30 FullSync group-commit coordinator. Ordinary CRUD
-    /// writers append their durable journal records under `journal_mutex`,
-    /// then join a short fsync cohort before any Pending entry can flip to
-    /// Committed or publish.
+    /// FullSync group-commit coordinator. Ordinary CRUD writers append their
+    /// durable journal records under `journal_mutex`, then join a short fsync
+    /// cohort before any Pending entry can flip to Committed or publish.
     pub(crate) group_commit: GroupCommitManager,
-    /// Phase 5 §10.24 stale-SMO classification retry cap.
+    /// Stale-SMO classification retry cap.
     pub(crate) smo_classification_retry_cap: u32,
     /// Monotonic transaction identifier source shared by readers and writers.
     pub txn_counter: AtomicU64,
-    /// Phase 5 §10.17.1 DDL reservation counter. Mutated ONLY by DDL
-    /// paths (`create_namespace`, `drop_namespace`, `create_index_*`,
-    /// `drop_index`, `bootstrap_namespace`) under `metadata.write()` via
+    /// DDL reservation counter. Mutated ONLY by DDL paths
+    /// (`create_namespace`, `drop_namespace`, `create_index_*`, `drop_index`,
+    /// `bootstrap_namespace`) under `metadata.write()` via
     /// `fetch_add(1, AcqRel) + 1`. The reserved value is the
     /// `PublishedEpoch.catalog_generation` stamped by the DDL's publish
     /// closure. Ordinary CRUD MUST NOT load or mutate this field.
@@ -508,19 +501,18 @@ impl Drop for ReadOpScope {
 // MetadataState — catalog wrapped in metadata RwLock
 // ---------------------------------------------------------------------------
 
-/// Per-engine catalog state protected by an `RwLock`. DDL ops take the
-/// write guard to gain exclusive access; CRUD writers take the read
-/// guard (shared with other CRUD writers) and mutate the catalog via
-/// the interior `Mutex<Catalog>`.
+/// Per-engine catalog state guarded by `PagedEngine::metadata`. DDL ops take
+/// the write guard to gain exclusive access; CRUD writers take the read guard
+/// (shared with other CRUD writers) and mutate the catalog via the interior
+/// `Mutex<Catalog>`.
 ///
-/// Phase 5 CRUD order: `metadata.read()` is held only for id-capture and
-/// writer admission, page latches protect resident-chain mutation,
-/// `journal_mutex` owns the durable envelope, `PublishSequencer` publishes
-/// slots in order, and the `NsWriterRegistry` ticket fences DDL until the
-/// writer drops it after publish. DO NOT grab `metadata.write()` while
-/// holding the catalog mutex — that would invert the order relative to a
-/// reader that already holds `metadata.read()` and is waiting for the catalog
-/// mutex.
+/// CRUD order: `metadata.read()` is held across the private write body,
+/// resident-chain mutation, durable envelope, and ordered publish. Page latches
+/// protect resident-chain mutation, `journal_mutex` owns the durable envelope,
+/// and `PublishSequencer` publishes slots in order. DO NOT grab
+/// `metadata.write()` while holding the catalog mutex; that would invert the
+/// order relative to a reader that already holds `metadata.read()` and is
+/// waiting for the catalog mutex.
 pub(crate) struct MetadataState {
     /// Catalog B+ tree for collection/index metadata.
     ///
@@ -532,10 +524,10 @@ pub(crate) struct MetadataState {
     pub catalog: std::sync::Mutex<Catalog<BufferPoolPageStore>>,
 }
 
-/// Read guard over [`MetadataState`] used by future writer-visibility plumbing.
+/// Read guard over [`MetadataState`] retained for writer-visibility plumbing.
 #[allow(
     dead_code,
-    reason = "Phase 5 writer visibility will hold metadata.read() across identity resolution"
+    reason = "writer visibility uses this shape across identity resolution"
 )]
 pub(in crate::storage::paged_engine) type MetadataReadGuard<'a> =
     std::sync::RwLockReadGuard<'a, MetadataState>;
@@ -676,7 +668,7 @@ impl MetadataState {
         // Phase 1 §10.7 — propagate the persisted `next_*` counters to the
         // in-memory catalog. Fresh DB uses the defaults (1) from
         // `Catalog::create`.
-        let (catalog, used_backup) = catalog_open_with_fallback(
+        let (catalog, _) = catalog_open_with_fallback(
             store,
             catalog_root_page,
             catalog_root_level,
@@ -686,7 +678,6 @@ impl MetadataState {
             header_next_index_id,
             |_page| true,
         )?;
-        let _ = used_backup; // noted for tracing/logging if needed
 
         // Phase 2 §5.2 — Pass 2 post-open validation of logical frames.
         // Runs exactly once immediately after `catalog_open_with_fallback`

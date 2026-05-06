@@ -1,10 +1,11 @@
 # mqlite Concurrency Guide
 
 mqlite is **MWMR in-process**: reads are mutex-free (atomic snapshot load),
-and writers on different namespaces run concurrently. Every read operation
-opens a `ReadView` that pins a point-in-time snapshot; concurrent writes
-do not disturb an in-progress read. Writers on the same namespace serialize
-on a per-namespace lane mutex.
+and ordinary writer bodies can overlap while DDL waits behind a shared
+metadata read fence. Every read operation opens a `ReadView` that pins a
+point-in-time snapshot; concurrent writes do not disturb an in-progress read.
+The durable commit envelope is globally ordered so commit timestamps, journal
+append order, and published snapshots agree.
 
 ---
 
@@ -64,7 +65,7 @@ println!("{:?}", result2.unwrap().get("status")); // "inactive"
 # Ok::<(), mqlite::Error>(())
 ```
 
-### Writers: `WriteTxn` + per-namespace lanes
+### Writers: `WriteTxn` + ordered publish
 
 Each write operation creates a `WriteTxn` that stages primary-key
 updates, secondary-index updates, and refcount deltas under a single
@@ -73,17 +74,15 @@ new `ReadView`s.
 
 **Lock acquisition on the write path** (see `src/storage/paged_engine.rs`):
 
-1. `PagedEngine::metadata: RwLock<MetadataState>` — shared read-guard, released before the lane is acquired.
-2. `PagedEngine::ns_lanes[ns]: Mutex<()>` — per-namespace lane. Writers on **different** namespaces run concurrently; writers on the **same** namespace serialize here.
-3. `PagedEngine::commit_seq: Mutex<()>` — held around `commit_ts` allocation → primary install → journal append → snapshot publish, so `commit_ts`, journal-append order, and `publish_ts` always agree across concurrent commits.
+1. `PagedEngine::metadata: RwLock<()>` — shared read guard held across the private write body, resident Pending install, durable journal envelope, and ordered publish. This blocks DDL while allowing ordinary CRUD writers to overlap.
+2. Page latches — protect resident per-leaf version chains and structural mutation windows.
+3. `journal_mutex` plus `PublishSequencer` — serialize the durable envelope and publish slots so `commit_ts`, journal-append order, and `publish_ts` always agree across concurrent commits.
 
 **Reads take none of the above locks.** A read loads `shared.published:
 ArcSwap<PublishedSnapshot>` atomically, opens B-trees at the snapshot's
 root pages, and opens a `ReadView`. Reads and writes never block each
-other; writers on different namespaces never block each other.
+other.
 
-The historical engine-global writer mutex (`PagedEngine::inner:
-Mutex<BpBackend>`) was retired in v1 MWMR (see [ADR 0002](adr/0002-mwmr.md)).
 DDL operations (`create_collection`, `drop_collection`, `drop_index`,
 `checkpoint`, `backup`) still take `metadata.write()` exclusively and
 block all concurrent writers for their duration.
@@ -97,8 +96,7 @@ file lock acquired at `Client::open()` time:
 This prevents two separate **processes** from writing simultaneously.
 
 > **Important:** POSIX advisory locks are **per-process**, not per-thread.
-> The engine-level mutex handles cross-thread serialization within a
-> single process.
+> mqlite's in-process locks and latches handle cross-thread coordination.
 
 ### `drop_collection` force-expire barrier
 
@@ -184,9 +182,10 @@ the busy handler takes precedence.
 
 ## Multi-Threaded Write Patterns
 
-Writers on different namespaces (collections) run concurrently. Writers on
-the **same** namespace serialize on that namespace's lane mutex. The two
-patterns below are useful when same-namespace write throughput matters:
+Ordinary writers can overlap, but the durable commit envelope remains globally
+ordered. The two patterns below are useful when an application needs stronger
+ordering, batching, or cross-document atomicity than a single mqlite write
+operation provides:
 
 ### Pattern 1: Dedicated Writer Thread with Channel
 

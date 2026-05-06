@@ -7,7 +7,10 @@ use bson::{doc, Bson};
 use crate::error::Result;
 use crate::index::IndexModel;
 use crate::keys::{encode_compound_key, encode_key};
-use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
+use crate::mvcc::transaction::Ns;
+use crate::mvcc::{
+    PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite, Ts, VersionData, VersionEntry, VersionState,
+};
 use crate::options::{FindOptions, IndexOptions};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -151,6 +154,10 @@ fn assert_inline(entry: &VersionEntry, expected: &[u8]) -> Result<()> {
     }
 }
 
+fn doc_bytes(doc: &bson::Document) -> Result<Vec<u8>> {
+    bson::to_vec(doc).map_err(Error::BsonSerialization)
+}
+
 fn persisted_header(io: &Arc<MockIo>) -> Result<FileHeader> {
     let pages = io
         .pages
@@ -268,6 +275,96 @@ fn test_primary_and_secondary_share_single_commit_ts() -> Result<()> {
     assert_eq!(primary_chain.len(), 1);
     assert_eq!(secondary_chain.len(), 1);
     assert_eq!(primary_chain[0].start_ts, secondary_chain[0].start_ts);
+    Ok(())
+}
+
+#[test]
+fn test_replayed_same_txn_pending_install_does_not_duplicate_delta_heads() -> Result<()> {
+    const TXN_ID: u64 = 7;
+    let engine = buffered_engine()?;
+    let index = create_ready_email_index(&engine, READY_NS)?;
+    let coll = collection_entry(&engine, READY_NS)?;
+    let commit_ts = Ts {
+        physical_ms: 50_000,
+        logical: 0,
+    };
+    let id = Bson::Int32(91);
+    let doc = doc! { "_id": 91, "email": "retry-idempotent@example.test" };
+    let primary_key = encode_key(&id);
+    let secondary_key = secondary_key("retry-idempotent@example.test", &id);
+    let vis = super::visibility::WriteVisibility::new(&engine.shared, READY_NS)?;
+
+    let primary = PrimaryWrite {
+        ns_id: coll.id,
+        ns: Ns::from(READY_NS),
+        key: primary_key.clone(),
+        expected_head: None,
+        op: PrimaryOp::Insert {
+            data: doc_bytes(&doc)?,
+        },
+    };
+    let secondary = SecIndexWrite {
+        index_id: index.id,
+        index_root_page: index.root_page,
+        key: secondary_key.clone(),
+        expected_head: None,
+        op: SecIndexOp::Insert {
+            id_bytes: bson::to_vec(&doc! { "_id": 91 }).map_err(Error::BsonSerialization)?,
+        },
+    };
+
+    super::index_maint::install_pending_primary(
+        &engine.shared,
+        &engine.metadata_state,
+        vec![primary.clone()],
+        &vis,
+        commit_ts,
+        TXN_ID,
+    )?;
+    super::index_maint::install_pending_primary(
+        &engine.shared,
+        &engine.metadata_state,
+        vec![primary],
+        &vis,
+        commit_ts,
+        TXN_ID,
+    )?;
+    super::index_maint::install_pending_sec_index(
+        &engine.shared,
+        &engine.metadata_state,
+        vec![secondary.clone()],
+        &vis,
+        commit_ts,
+        TXN_ID,
+    )?;
+    super::index_maint::install_pending_sec_index(
+        &engine.shared,
+        &engine.metadata_state,
+        vec![secondary],
+        &vis,
+        commit_ts,
+        TXN_ID,
+    )?;
+
+    let (_, primary_chain) = take_chain(
+        &engine,
+        coll.data_root_page,
+        coll.data_root_level,
+        &primary_key,
+    )?;
+    let (_, secondary_chain) =
+        take_chain(&engine, index.root_page, index.root_level, &secondary_key)?;
+
+    assert_eq!(primary_chain.len(), 1);
+    assert_eq!(secondary_chain.len(), 1);
+    assert!(matches!(
+        primary_chain[0].state,
+        VersionState::Pending { txn_id: TXN_ID }
+    ));
+    assert!(matches!(
+        secondary_chain[0].state,
+        VersionState::Pending { txn_id: TXN_ID }
+    ));
     Ok(())
 }
 

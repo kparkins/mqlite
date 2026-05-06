@@ -1,10 +1,10 @@
-//! Bench US-011: same workload under FullSync and Interval(100ms) durability modes.
+//! Same workload under FullSync and Interval(100ms) durability modes.
 //!
 //! Fixed writer shape: 1 writer, 1 namespace, ~256B payload.
 //! This isolates the fsync cost from all other variables.
 //!
 //! Run:
-//!   cargo bench --bench durability_modes -- --save-baseline phase0
+//!   cargo bench --bench durability_modes -- --save-baseline current
 
 #![allow(
     clippy::unwrap_used,

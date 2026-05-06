@@ -225,12 +225,14 @@ pub use storage::btree::reader_latch_scope_test_probe::{
     reset as __us016_reset_probe, Us016RangeScanPauseGuard, Us016ReadLatchSample,
 };
 
+#[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use storage::buffer_pool::page_latch_fairness_test_probe::{
     us020_upgrade_loser_backoff_progress, us020_writer_preference_bounds_reader_starvation,
     Us020UpgradeRaceProgress,
 };
 
+#[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use storage::paged_engine::publish_registry_test_probe::{
     Us020PublishSequencer, Us020PublishSlot, Us020WriterRegistry, Us020WriterTicket,
@@ -290,7 +292,7 @@ pub fn fuzz_logical_txn_decode_scanning(buf: &[u8], salt1: u32, salt2: u32) -> R
 #[cfg(feature = "fuzz")]
 pub fn fuzz_try_skip_logical_txn(buf: &[u8], salt1: u32, salt2: u32) -> Result<()> {
     use crate::journal::log_file::try_skip_logical_txn;
-    use std::io::{Cursor, Seek, SeekFrom};
+    use std::io::{Cursor, Seek};
     let mut cursor = Cursor::new(buf);
     let start = cursor.stream_position().map_err(crate::error::Error::Io)?;
     match try_skip_logical_txn(&mut cursor, salt1, salt2)? {
@@ -305,7 +307,6 @@ pub fn fuzz_try_skip_logical_txn(buf: &[u8], salt1: u32, salt2: u32) -> Result<(
             assert_eq!(pos, start, "rewind contract");
         }
     }
-    let _ = SeekFrom::Start(0); // keep import alive
     Ok(())
 }
 

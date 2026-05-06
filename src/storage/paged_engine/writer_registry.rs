@@ -1,23 +1,16 @@
-//! `NsWriterRegistry` — per-collection writer admission lanes (§10.1).
+//! `NsWriterRegistry` — per-collection DDL admission barrier.
 //!
-//! Phase 5 §10.1 / §10.27. Hot-path CRUD writers `admit` against the lane
-//! identified by the Phase 1 durable `CollectionEntry.id: i64`; DDL paths
-//! `close_and_drain_guard` to gate new admits and drain in-flight writers
-//! before mutating the catalog.
+//! The current CRUD path is fenced by `PagedEngine::metadata.read()` and does
+//! not admit through these lanes. The registry remains as a narrow DDL/probe
+//! primitive for code paths that explicitly need close-and-drain semantics by
+//! durable `CollectionEntry.id: i64`.
 //!
 //! Keys are `i64` `ns_id` values from the durable catalog. The registry
-//! never keys by namespace name (§10.1.2).
-//!
-//! US-004 ships the primitive in isolation. The CRUD callers in
-//! `run_write_existing` (US-012) and the DDL callers in
-//! `drop_namespace` / `create_index_*` / `drop_index` (US-008, US-013,
-//! US-023, US-024) wire `admit`, `close_and_drain_guard`, `mark_dropped`,
-//! and `commit` from later Phase 5 stories. Until then the methods are
-//! exercised only by the `#[cfg(test)]` unit tests below.
+//! never keys by namespace name.
 
 #![allow(
     dead_code,
-    reason = "US-004 ships the registry primitive; call sites land in US-005+"
+    reason = "admission tickets are retained for DDL/probe paths and unit coverage"
 )]
 
 use std::sync::Arc;
@@ -28,7 +21,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::error::{Error, Result};
 
-/// One entry per namespace. Populated lazily on first writer admit.
+/// One entry per namespace. Populated lazily on first explicit admit.
 ///
 /// Tests use `(admits - releases) == active_writers` to assert balance.
 pub(crate) struct NsWriterLane {
@@ -41,7 +34,7 @@ struct NsWriterLaneInner {
     admits: u64,
     /// Monotonic count of released writers (via `NsWriteTicket::drop`).
     releases: u64,
-    /// True while one writer is executing its namespace write body.
+    /// True while an admitted probe or specialized path is active.
     body_active: bool,
     /// True when a DDL caller has closed the lane to new admits.
     closed: bool,
@@ -99,14 +92,14 @@ impl NsWriterRegistry {
         }
     }
 
-    /// Register the calling thread as the active writer on the namespace
-    /// identified by `ns_id`. Returns `Err(WriterBusy)` if the lane stays
-    /// closed or occupied past `timeout`.
+    /// Register the calling thread as active on the namespace identified by
+    /// `ns_id`. Returns `Err(WriterBusy)` if the lane stays closed or
+    /// occupied past `timeout`.
     ///
     /// # Errors
     /// - [`Error::WriterBusy`] if a DDL `close_and_drain_guard` keeps the
-    ///   lane closed, or another same-namespace writer keeps the lane occupied,
-    ///   for the full `timeout`.
+    ///   lane closed, or another explicit admit keeps the lane occupied, for
+    ///   the full `timeout`.
     pub(crate) fn admit(&self, ns_id: i64, timeout: Duration) -> Result<NsWriteTicket> {
         let lane = self
             .lanes

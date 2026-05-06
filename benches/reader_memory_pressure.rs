@@ -1,11 +1,11 @@
-//! Phase 5 US-034/US-035: reader memory-pressure benchmark.
+//! Reader memory-pressure benchmark for snapshot reads during concurrent writes.
 //!
 //! Run:
-//!   cargo bench --profile release-test --bench phase5_memory_pressure
+//!   cargo bench --profile release-test --bench reader_memory_pressure
 //!
-//! After US-035, `BufferPoolPageStore::read_leaf` carries the pinned
-//! `ArcSwap<Vec<u8>>` page image as a shared immutable `Arc`, so the hot
-//! buffer-pool reader path does not clone 32 KiB of leaf bytes per reader.
+//! `BufferPoolPageStore::read_leaf` carries the pinned `ArcSwap<Vec<u8>>`
+//! page image as a shared immutable `Arc`, so the hot buffer-pool reader path
+//! does not clone 32 KiB of leaf bytes per reader.
 
 #![allow(
     clippy::unwrap_used,
@@ -37,9 +37,10 @@ const PAYLOAD_BYTES: usize = 256;
 const DEFAULT_READ_LEAF_COPY_BYTES_PER_READ: u64 = 0;
 const DEFAULT_READER_STACK_BYTES: usize = 64 * 1024;
 const REMEDIATION_RSS_THRESHOLD_PCT: f64 = 20.0;
-const DEFAULT_ARTIFACT: &str = ".omc/artifacts/phase5-memory-pressure.txt";
-const DEFAULT_BASELINE_ARTIFACT: &str = ".omc/artifacts/phase5-memory-pressure-phase4-baseline.txt";
-const DEFAULT_ALLOCATION_OWNER: &str = "US-035 remediated path: BufferPoolPageStore::read_leaf carries the pinned ArcSwap<Vec<u8>> page image as a shared immutable Arc; no per-reader 32KB leaf clone on the buffer-pool reader path.";
+const DEFAULT_ARTIFACT: &str = "target/bench-artifacts/reader-memory-pressure.txt";
+const DEFAULT_BASELINE_ARTIFACT: &str =
+    "target/bench-artifacts/reader-memory-pressure-baseline.txt";
+const DEFAULT_ALLOCATION_OWNER: &str = "BufferPoolPageStore::read_leaf carries the pinned ArcSwap<Vec<u8>> page image as a shared immutable Arc; no per-reader 32KB leaf clone on the buffer-pool reader path.";
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -119,7 +120,6 @@ struct Baseline {
 
 #[derive(Clone, Debug)]
 struct Config {
-    story: String,
     reader_count: usize,
     reader_threads: usize,
     reader_stack_bytes: usize,
@@ -134,7 +134,7 @@ struct Config {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("phase5_memory_pressure failed: {err}");
+        eprintln!("reader_memory_pressure failed: {err}");
         std::process::exit(1);
     }
 }
@@ -146,7 +146,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     write_artifact(&config, metrics, &baseline)?;
 
     eprintln!(
-        "phase5_memory_pressure readers={} reader_threads={} reader_stack={} writers={} \
+        "reader_memory_pressure readers={} reader_threads={} reader_stack={} writers={} \
          peak_rss_bytes={} allocator_churn_bytes={} throughput={:.2}/s",
         config.reader_count,
         config.reader_threads,
@@ -161,31 +161,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 impl Config {
     fn from_env() -> Self {
-        let reader_count = env_usize("MQLITE_PHASE5_MEMORY_READERS", DEFAULT_READER_COUNT).max(1);
-        let reader_threads = env_usize("MQLITE_PHASE5_MEMORY_READER_THREADS", reader_count).max(1);
+        let reader_count = env_usize("MQLITE_READER_MEMORY_READERS", DEFAULT_READER_COUNT).max(1);
+        let reader_threads = env_usize("MQLITE_READER_MEMORY_READER_THREADS", reader_count).max(1);
         let reader_stack_bytes = env_usize(
-            "MQLITE_PHASE5_MEMORY_READER_STACK_BYTES",
+            "MQLITE_READER_MEMORY_READER_STACK_BYTES",
             DEFAULT_READER_STACK_BYTES,
         )
         .max(DEFAULT_READER_STACK_BYTES);
-        let writer_count = env_usize("MQLITE_PHASE5_MEMORY_WRITERS", DEFAULT_WRITER_COUNT).max(1);
+        let writer_count = env_usize("MQLITE_READER_MEMORY_WRITERS", DEFAULT_WRITER_COUNT).max(1);
         let read_leaf_copy_bytes_per_read = env_u64(
-            "MQLITE_PHASE5_MEMORY_READ_LEAF_COPY_BYTES_PER_READ",
+            "MQLITE_READER_MEMORY_READ_LEAF_COPY_BYTES_PER_READ",
             DEFAULT_READ_LEAF_COPY_BYTES_PER_READ,
         );
-        let artifact_path = env_path("MQLITE_PHASE5_MEMORY_ARTIFACT", DEFAULT_ARTIFACT);
+        let artifact_path = env_path("MQLITE_READER_MEMORY_ARTIFACT", DEFAULT_ARTIFACT);
         let baseline_artifact = baseline_artifact_path(&artifact_path);
-        let story =
-            std::env::var("MQLITE_PHASE5_MEMORY_STORY").unwrap_or_else(|_| "US-034".to_owned());
-        let command = std::env::var("MQLITE_PHASE5_MEMORY_COMMAND")
+        let command = std::env::var("MQLITE_READER_MEMORY_COMMAND")
             .unwrap_or_else(|_| std::env::args().collect::<Vec<_>>().join(" "));
-        let baseline_source = std::env::var("MQLITE_PHASE5_MEMORY_BASELINE_SOURCE")
-            .unwrap_or_else(|_| "no external Phase 4 artifact supplied".to_owned());
-        let allocation_owner = std::env::var("MQLITE_PHASE5_MEMORY_ALLOCATION_OWNER")
+        let baseline_source = std::env::var("MQLITE_READER_MEMORY_BASELINE_SOURCE")
+            .unwrap_or_else(|_| "no external baseline artifact supplied".to_owned());
+        let allocation_owner = std::env::var("MQLITE_READER_MEMORY_ALLOCATION_OWNER")
             .unwrap_or_else(|_| DEFAULT_ALLOCATION_OWNER.to_owned());
 
         Self {
-            story,
             reader_count,
             reader_threads: reader_threads.min(reader_count),
             reader_stack_bytes,
@@ -201,10 +198,10 @@ impl Config {
 }
 
 fn baseline_artifact_path(artifact_path: &Path) -> Option<PathBuf> {
-    if std::env::var_os("MQLITE_PHASE5_MEMORY_NO_BASELINE").is_some() {
+    if std::env::var_os("MQLITE_READER_MEMORY_NO_BASELINE").is_some() {
         return None;
     }
-    if let Some(path) = std::env::var_os("MQLITE_PHASE5_MEMORY_BASELINE_ARTIFACT") {
+    if let Some(path) = std::env::var_os("MQLITE_READER_MEMORY_BASELINE_ARTIFACT") {
         return Some(PathBuf::from(path));
     }
 
@@ -258,7 +255,7 @@ fn run_workload(config: &Config) -> Result<Metrics, Box<dyn std::error::Error>> 
     for handle in handles {
         handle
             .join()
-            .map_err(|_| "phase5 memory-pressure worker panicked")??;
+            .map_err(|_| "reader memory-pressure worker panicked")??;
     }
 
     let elapsed = started.elapsed();
@@ -280,7 +277,7 @@ fn run_workload(config: &Config) -> Result<Metrics, Box<dyn std::error::Error>> 
 }
 
 fn open_client(dir: &TempDir) -> mqlite::Result<Client> {
-    let path = dir.path().join("phase5-memory-pressure.mqlite");
+    let path = dir.path().join("reader-memory-pressure.mqlite");
     let opts = OpenOptions::new().durability(DurabilityMode::Interval(Duration::from_millis(100)));
     Client::open_with_options(&path, opts)
 }
@@ -296,7 +293,7 @@ fn seed_hot_collection(client: &Client) -> mqlite::Result<()> {
 }
 
 fn hot_collection(client: &Client) -> mqlite::Collection<Document> {
-    client.database("phase5_memory").collection("hot")
+    client.database("reader_memory").collection("hot")
 }
 
 fn spawn_reader(
@@ -308,7 +305,7 @@ fn spawn_reader(
     reader_stack_bytes: usize,
 ) -> std::io::Result<thread::JoinHandle<Result<(), String>>> {
     thread::Builder::new()
-        .name("phase5-memory-reader".to_owned())
+        .name("reader-memory-reader".to_owned())
         .stack_size(reader_stack_bytes)
         .spawn(move || {
             let coll = hot_collection(&client);
@@ -336,7 +333,7 @@ fn spawn_writer(
     writer_id: usize,
 ) -> std::io::Result<thread::JoinHandle<Result<(), String>>> {
     thread::Builder::new()
-        .name("phase5-memory-writer".to_owned())
+        .name("reader-memory-writer".to_owned())
         .spawn(move || {
             let coll = hot_collection(&client);
             let payload = "w".repeat(PAYLOAD_BYTES);
@@ -421,8 +418,7 @@ fn write_artifact(
     let baseline_writer_count = artifact_value_or_unknown(baseline.writer_count);
 
     let artifact = format!(
-        "story={}\n\
-         command={}\n\
+        "command={}\n\
          source_commit={}\n\
          working_tree_state={}\n\
          baseline_source={}\n\
@@ -458,7 +454,6 @@ fn write_artifact(
          remediation_rule=required_remediation is true iff peak_rss_delta_pct > 20.0\n\
          page_data_representation_changed=false\n\
         allocation_owner={}\n",
-        config.story,
         config.command,
         source_commit,
         working_tree_state,

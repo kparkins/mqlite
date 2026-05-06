@@ -1,10 +1,10 @@
-//! Bench US-008: same-namespace writers (1, 2, 4 concurrent writers, one namespace).
+//! Same-namespace writers (1, 2, 4 concurrent writers, one namespace).
 //!
 //! Captures the lane-bottleneck baseline: all writers serialize through a single
 //! namespace lane, so contention scales with writer count.
 //!
 //! Run:
-//!   cargo bench --bench writers_same_ns -- --save-baseline phase0
+//!   cargo bench --bench writers_same_ns -- --save-baseline current
 
 #![allow(
     clippy::unwrap_used,

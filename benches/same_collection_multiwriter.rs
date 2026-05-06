@@ -1,11 +1,11 @@
-//! Phase 5 US-021: same-collection multi-writer benchmark harness.
+//! Same-collection multi-writer benchmark harness.
 //!
 //! Exercises one pre-split collection with 1/2/4/8/16 concurrent root-neutral
 //! update writers. Writers use disjoint key bands so the workload targets
 //! separate leaf ranges after the pre-split seed step.
 //!
 //! Run:
-//!   cargo bench --bench phase5_multiwriter -- --save-baseline phase5
+//!   cargo bench --bench same_collection_multiwriter -- --save-baseline current
 
 #![allow(
     clippy::unwrap_used,
@@ -29,7 +29,7 @@ use criterion::{
 use mqlite::{Client, DurabilityMode, OpenOptions};
 use tempfile::TempDir;
 
-const DATABASE_NAME: &str = "phase5";
+const DATABASE_NAME: &str = "multiwriter_bench";
 const COLLECTION_NAME: &str = "multiwriter";
 const EXPECTED_NAMESPACE_ID: i64 = 1;
 const OPS_PER_WRITER: i32 = 1;
@@ -133,7 +133,7 @@ fn core_count() -> usize {
 }
 
 fn open_client(dir: &TempDir, mode: DurabilityMode) -> Client {
-    let path = dir.path().join("phase5-multiwriter.mqlite");
+    let path = dir.path().join("same-collection-multiwriter.mqlite");
     let opts = OpenOptions::new()
         .durability(mode)
         .busy_timeout(Duration::from_secs(30));
@@ -212,7 +212,7 @@ fn run_writer_batch(client: Client, writer_count: usize, payload: Arc<String>, b
                             },
                         )
                         .run()
-                        .expect("phase5 multiwriter update must succeed");
+                        .expect("same-collection multiwriter update must succeed");
                 }
             })
         })
@@ -223,8 +223,8 @@ fn run_writer_batch(client: Client, writer_count: usize, payload: Arc<String>, b
     }
 }
 
-fn bench_phase5_multiwriter(c: &mut Criterion) {
-    let mut group = c.benchmark_group("phase5_multiwriter");
+fn bench_same_collection_multiwriter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("same_collection_multiwriter");
     group.sample_size(10);
     group.measurement_time(Duration::from_millis(100));
     group.warm_up_time(Duration::from_millis(50));
@@ -237,7 +237,7 @@ fn bench_phase5_multiwriter(c: &mut Criterion) {
                 group.throughput(Throughput::Elements(total_ops));
 
                 eprintln!(
-                    "[phase5_multiwriter] {}",
+                    "[same_collection_multiwriter] {}",
                     metadata(writer_count, *payload, durability.label)
                 );
 
@@ -265,5 +265,5 @@ fn bench_phase5_multiwriter(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_phase5_multiwriter);
+criterion_group!(benches, bench_same_collection_multiwriter);
 criterion_main!(benches);

@@ -1,4 +1,4 @@
-//! Bench US-012: secondary index build on a non-trivial collection.
+//! Secondary index build on a non-trivial collection.
 //!
 //! Measures the end-to-end time of `create_index` on a collection seeded with
 //! 10 000 documents.  Index is non-unique on the "category" field (int).
@@ -8,7 +8,7 @@
 //! to keep the measurement stable across samples.
 //!
 //! Run:
-//!   cargo bench --bench index_build -- --save-baseline phase0
+//!   cargo bench --bench index_build -- --save-baseline current
 
 #![allow(
     clippy::unwrap_used,

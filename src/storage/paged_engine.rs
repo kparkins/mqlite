@@ -34,9 +34,8 @@ mod crash_cut_test_probe;
 mod doc_helpers;
 mod doc_ops;
 /// Test-only engine-fatal probe — engine-fatal poison + sequencer + writer
-/// ticket handles. Isolated per the Phase 5 PRD guardrail "Intrusive
-/// test code must live in a separate file from the production code
-/// it exercises".
+/// ticket handles. Kept in a separate module so intrusive test plumbing stays
+/// out of production paths.
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod engine_fatal_test_probe;
 mod group_commit;
@@ -45,6 +44,7 @@ pub mod group_commit_test_probe;
 mod index_build;
 mod index_maint;
 pub(crate) mod publish;
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod publish_registry_test_probe;
 pub(crate) mod publish_sequencer;
 mod recovery_apply;
@@ -175,29 +175,25 @@ const FULLSYNC_GROUP_COMMIT_MAX_WAIT_MS: u64 = 2;
 ///
 /// - **Reads**: mutex-free — load `shared.published` (`ArcSwap`) and open
 ///   B-trees at the snapshot's root pages. No engine-level lock taken.
-/// - **Writes on CRUD paths**: briefly take `metadata.read()` for durable
-///   namespace id capture and writer-registry admission. The body, resident
-///   install, journal envelope, and publish run without the metadata guard.
+/// - **Writes on CRUD paths**: take `metadata.read()` across the private
+///   write body, resident Pending install, journal envelope, and ordered
+///   publish. The guard is shared by CRUD writers, so it blocks DDL without
+///   serializing ordinary writes against each other.
 /// - **DDL** (`create_namespace`, `drop_namespace`, `create_index`,
 ///   `drop_index`, `checkpoint`, `close`, `backup`): takes `metadata.write()`
 ///   exclusively, blocking all writers globally for the duration.
 pub(crate) struct PagedEngine {
     /// Shared state accessible by the mutex-free read path and every writer.
     pub(crate) shared: Arc<SharedState>,
-    /// Coarse DDL/CRUD fence (Phase 5 §10.17). DDL paths take
-    /// `metadata.write()` to gain exclusive access during catalog
-    /// mutation; ordinary CRUD takes `metadata.read()` ONLY for the
-    /// short id-capture + `NsWriterRegistry::admit` scope at the top of
-    /// `run_write_existing`. The CRUD body runs WITHOUT this fence — it
-    /// holds the writer ticket from the registry instead, which DDL
-    /// drains via `close_and_drain` before mutating the catalog
-    /// (§10.17 step 3, §10.21 CV-5).
+    /// Coarse DDL/CRUD fence. DDL paths take `metadata.write()` to gain
+    /// exclusive access during catalog mutation; ordinary CRUD takes
+    /// `metadata.read()` across its full private write lifecycle. Because
+    /// read guards are shared, CRUD writers can still overlap while DDL waits
+    /// for all in-flight writers to finish before mutating catalog identity.
     pub(crate) metadata: RwLock<()>,
     /// Catalog state. Protected internally by `Mutex<Catalog>`; the
-    /// direct field placement (no `RwLock` wrapping) is what lets the
-    /// CRUD body call `catalog_lock(&engine.metadata_state)` without
-    /// holding any `metadata.read()` guard. Same for the post-body
-    /// install / publish / flip steps.
+    /// direct field placement (no `RwLock` wrapping) lets CRUD paths mutate
+    /// catalog internals while holding only the shared DDL/CRUD read fence.
     pub(crate) metadata_state: Arc<MetadataState>,
     /// Writer busy-timeout applied on lane contention.
     pub(crate) busy_timeout: Duration,
@@ -227,11 +223,10 @@ struct IndexCatalogIdentity {
     state: IndexState,
 }
 
-/// RAII guard that records the §7 / US-024 logical-frame-append
-/// duration sample AND recomputes the percentile gauges (p50/p95/p99)
-/// from the ring buffer.
+/// RAII guard that records the logical-frame-append duration sample and
+/// recomputes the percentile gauges (p50/p95/p99) from the ring buffer.
 ///
-/// AC#3 demands `Instant::now()` reads OUTSIDE the journal critical
+/// Duration sampling reads `Instant::now()` outside the journal critical
 /// section. This guard:
 ///
 ///   - Captures `start = Instant::now()` at construction (BEFORE
@@ -272,10 +267,9 @@ impl Drop for LogicalTxnAppendPercentileRefresh {
 }
 
 impl PagedEngine {
-    /// Escalate a post-durable failure to engine-fatal poison
-    /// (§10.19.0 C-2 / US-036). Routes through
-    /// [`state::poison_after_durable_commit`] so the live sequencer's
-    /// blocked successors wake with `Error::EngineFatal`.
+    /// Escalate a post-durable failure to engine-fatal poison. Routes through
+    /// [`state::poison_after_durable_commit`] so the live sequencer's blocked
+    /// successors wake with `Error::EngineFatal`.
     fn engine_fatal(&self, reason: crate::error::EngineFatalReason) -> Error {
         state::poison_after_durable_commit(&self.shared, reason)
     }
@@ -472,13 +466,13 @@ impl PagedEngine {
     /// Internal form of `run_write` that assumes the namespace already exists
     /// (or the write path tolerates its absence — `update`/`delete` do).
     ///
-    /// US-003 metadata-guard protocol: there is exactly one
-    /// `metadata.read()` acquisition in this function. It is held across
-    /// ordinary CRUD's full private-logical lifecycle so DDL cannot mutate
-    /// the catalog identity while the writer installs resident Pending deltas,
-    /// appends logical durability records, and publishes through the
-    /// sequencer. `NsWriterRegistry` is no longer ordinary CRUD's
-    /// same-namespace serialization authority.
+    /// Metadata-guard protocol: there is exactly one `metadata.read()`
+    /// acquisition in this function. It is held across ordinary CRUD's full
+    /// private-logical lifecycle so DDL cannot mutate the catalog identity
+    /// while the writer installs resident Pending deltas, appends logical
+    /// durability records, and publishes through the sequencer.
+    /// `NsWriterRegistry` is no longer ordinary CRUD's same-namespace
+    /// serialization authority.
     ///
     /// AC #4 captured-identity gate (§10.17.1): immediately before the
     /// durable journal envelope this function compares the
@@ -537,13 +531,13 @@ impl PagedEngine {
         match body_result {
             Ok(value) => {
                 // Root-neutral vs root-changing classification. Header sync
-                // still captures catalog-root movement; Phase 7 logical-chain
-                // installs can also make primary B-tree structural progress
-                // without forcing a fresh catalog header.
+                // still captures catalog-root movement; logical-chain installs
+                // can also make primary B-tree structural progress without
+                // forcing a fresh catalog header.
                 let mut root_changing = txn.structural_tree_change();
 
-                // §7 / US-024 AC#3 — refresh the logical-txn append-duration
-                // percentiles after the journal envelope releases.
+                // Refresh the logical-txn append-duration percentiles after
+                // the journal envelope releases.
                 // `LogicalTxnAppendPercentileRefresh::drop` runs the
                 // sort+store work outside the critical section.
                 let _logical_txn_append_pct_refresh = LogicalTxnAppendPercentileRefresh::new();
@@ -551,20 +545,19 @@ impl PagedEngine {
                 let sec_writes = std::mem::take(&mut txn.pending_sec_index);
                 let primary_writes = std::mem::take(&mut txn.pending_primary);
 
-                // S3.5 — Phase 5 §10.17.1 / US-006 AC #4: captured-identity
-                // gate. Compare the `catalog_generation` we snapshotted in
-                // the S1 metadata-read scope against the live published
-                // generation. A DDL that completed between admit and now
+                // S3.5 captured-identity gate. Compare the
+                // `catalog_generation` we snapshotted in the S1 metadata-read
+                // scope against the live published generation. A DDL that
+                // completed between capture and now
                 // bumped `PublishedEpoch.catalog_generation` via the
                 // `next_catalog_gen` reservation; ordinary CRUD never
                 // bumps it. Because the generation is global, a mismatch is
                 // only a signal to revalidate the target namespace/index
                 // identity, not an automatic conflict for unrelated DDL.
                 //
-                // This gate runs BEFORE `register_with_oracle` (will land
-                // in US-012), BEFORE any Pending install at S8/S9, and
-                // BEFORE `journal_mutex` durability begins at S6. Rollback
-                // is purely in-memory.
+                // This gate runs before `register_with_oracle`, before any
+                // Pending install, and before `journal_mutex` durability
+                // begins. Rollback is purely in-memory.
                 {
                     // Write-path direct load (§10.5 single-load gate is
                     // read-path only); see the matching note at the S1
@@ -595,7 +588,7 @@ impl PagedEngine {
                 let prev_published = self.shared.published.load_full();
                 assert!(
                     commit_ts > prev_published.visible_ts,
-                    "US-012 commit_ts must advance beyond previous PublishedEpoch"
+                    "commit_ts must advance beyond previous PublishedEpoch"
                 );
                 drop(prev_published);
 
@@ -730,9 +723,9 @@ impl PagedEngine {
                         Phase3CommitFailpoint::AfterChainCommitBeforeLegacyCommit,
                     );
 
-                    // US-039: FullSync owns the final data flush at the
-                    // explicit sync boundary; non-FullSync preserves the
-                    // existing per-writer flush-before-publish behavior.
+                    // FullSync owns the final data flush at the explicit sync
+                    // boundary; non-FullSync preserves the existing
+                    // per-writer flush-before-publish behavior.
                     if !matches!(self.durability_mode, DurabilityMode::FullSync) {
                         if let Err(e) = self.flush_under_journal_mutex() {
                             return Err(self.cleanup_registered_pre_durable_failure(
@@ -1544,13 +1537,11 @@ impl StorageEngine for PagedEngine {
 // ---------------------------------------------------------------------------
 
 impl PagedEngine {
-    /// Drive the two namespace-create paths with Phase 5's bootstrap
-    /// DDL envelope.
+    /// Drive the two namespace-create paths with the bootstrap DDL envelope.
     ///
-    /// This helper is intentionally narrower than `run_ddl`: US-030
-    /// only moves standalone `create_namespace` and write-path
-    /// bootstrap onto allocated-id publication. Existing-namespace DDL
-    /// drains remain owned by their later Phase 5 stories.
+    /// This helper is intentionally narrower than `run_ddl`: it handles
+    /// standalone `create_namespace` and write-path bootstrap on allocated-id
+    /// publication, while existing-namespace DDL drains remain separate.
     fn run_namespace_create_ddl<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&SharedState, &MetadataState, &mut StructuralPageBatch) -> Result<R>,

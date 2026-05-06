@@ -2,8 +2,8 @@
 //! explicit main-file checkpoint.
 //!
 //! The durability model: writers append a `ChainCommit` frame to the journal
-//! inline. `flush_and_sync_if_fullsync` calls `journal_sync` (fdatasync) —
-//! not `checkpoint_through_journal` — so the journal is the durability point.
+//! inline and FullSync paths synchronize the journal before publish, so the
+//! journal is the durability point.
 //! On the next open, `JournalManager::open_or_create` replays the journal into
 //! the main file automatically.
 //!

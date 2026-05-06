@@ -283,29 +283,34 @@ fn unique_prefix_preview(prefix_start: &[u8]) -> Vec<u8> {
     key_preview(prefix)
 }
 
+enum DeltaInstallAction {
+    Install,
+    AlreadyInstalled,
+}
+
 fn classify_delta_install(
     chain: &VecDeque<crate::mvcc::VersionEntry>,
     expected_head: Option<crate::mvcc::ExpectedHead>,
     scope: InstallConflictScope,
     key: &[u8],
     txn_id: u64,
-) -> Result<()> {
+) -> Result<DeltaInstallAction> {
     let Some(head) = live_head(chain) else {
-        return Ok(());
+        return Ok(DeltaInstallAction::Install);
     };
 
     if same_txn_pending(head, txn_id) {
-        return Ok(());
+        return Ok(DeltaInstallAction::AlreadyInstalled);
     }
 
     match expected_head {
-        Some(expected) if head_identity(head) == expected => Ok(()),
+        Some(expected) if head_identity(head) == expected => Ok(DeltaInstallAction::Install),
         Some(_) => Err(Error::WriteConflict {
             reason: WriteConflictReason::StaleSnapshot,
         }),
         None if scope == InstallConflictScope::Primary => {
             if matches!(head.state, crate::mvcc::VersionState::Committed) && head.is_tombstone {
-                Ok(())
+                Ok(DeltaInstallAction::Install)
             } else {
                 Err(Error::WriteConflict {
                     reason: WriteConflictReason::SameKeyConflict {
@@ -314,7 +319,7 @@ fn classify_delta_install(
                 })
             }
         }
-        None => Ok(()),
+        None => Ok(DeltaInstallAction::Install),
     }
 }
 
@@ -436,25 +441,33 @@ pub(super) fn install_pending_sec_index(
                 write.index_id
             ))
         })?;
+        let mut chain_arc = {
+            let page = smo_latches.page_mut(leaf_page).ok_or_else(|| {
+                Error::Internal(format!(
+                    "missing US-010 secondary latch for page {leaf_page}"
+                ))
+            })?;
+            page.get_or_create_chain(&write.key)?
+        };
+        if matches!(
+            classify_delta_install(
+                chain_arc.as_ref(),
+                write.expected_head,
+                InstallConflictScope::Secondary,
+                &write.key,
+                txn_id,
+            )?,
+            DeltaInstallAction::AlreadyInstalled
+        ) {
+            installed_pages.push(leaf_page);
+            continue;
+        }
         if entry.unique && matches!(write.op, SecIndexOp::Insert { .. }) {
             let directions = index_field_directions(entry);
             let (start, end) =
                 compound_prefix_range_excluding_trailing_id(&write.key, &directions)?;
             check_unique_prefix_install(&mut smo_latches, leaf_page, &write.key, &start, &end)?;
         }
-        let page = smo_latches.page_mut(leaf_page).ok_or_else(|| {
-            Error::Internal(format!(
-                "missing US-010 secondary latch for page {leaf_page}"
-            ))
-        })?;
-        let mut chain_arc = page.get_or_create_chain(&write.key)?;
-        classify_delta_install(
-            chain_arc.as_ref(),
-            write.expected_head,
-            InstallConflictScope::Secondary,
-            &write.key,
-            txn_id,
-        )?;
         {
             let chain_mut = Arc::make_mut(&mut chain_arc);
             if let Some(prev_head) = chain_mut.iter_mut().find(|entry| {
@@ -475,6 +488,11 @@ pub(super) fn install_pending_sec_index(
                 is_tombstone,
             });
         }
+        let page = smo_latches.page_mut(leaf_page).ok_or_else(|| {
+            Error::Internal(format!(
+                "missing US-010 secondary latch for page {leaf_page}"
+            ))
+        })?;
         page.put_chain(write.key, chain_arc)?;
         shared.mark_leaf_dirty(ident, leaf_page, DirtyReason::SecondaryWrite);
         installed_pages.push(leaf_page);
@@ -547,13 +565,19 @@ pub(super) fn install_pending_primary(
             Error::Internal(format!("missing US-010 primary latch for page {leaf_page}"))
         })?;
         let mut chain_arc = page.get_or_create_chain(&write.key)?;
-        classify_delta_install(
-            chain_arc.as_ref(),
-            write.expected_head,
-            InstallConflictScope::Primary,
-            &write.key,
-            txn_id,
-        )?;
+        if matches!(
+            classify_delta_install(
+                chain_arc.as_ref(),
+                write.expected_head,
+                InstallConflictScope::Primary,
+                &write.key,
+                txn_id,
+            )?,
+            DeltaInstallAction::AlreadyInstalled
+        ) {
+            installed_pages.push(leaf_page);
+            continue;
+        }
         {
             let chain_mut = std::sync::Arc::make_mut(&mut chain_arc);
             if let Some(prev_head) = chain_mut.iter_mut().find(|entry| {

@@ -94,8 +94,8 @@ lto = "thin"
 
 # Fast inner-loop test profile: keeps optimization (inherits release) but
 # drops fat LTO and re-enables parallel codegen so per-binary link time is
-# minutes shorter. Use for ralph iteration; the canonical `cargo test
-# --release --tests` gate is unchanged.
+# minutes shorter. The canonical `cargo test --release --tests` gate is
+# unchanged.
 [profile.release-test]
 inherits = "release"
 lto = "off"
@@ -137,11 +137,11 @@ name = "read_epoch_root_neutral"
 harness = false
 
 [[bench]]
-name = "phase5_memory_pressure"
+name = "reader_memory_pressure"
 harness = false
 
 [[bench]]
-name = "phase5_multiwriter"
+name = "same_collection_multiwriter"
 harness = false
 
 [lints.rust]

@@ -1,8 +1,7 @@
-# Phase 0 Benchmark Suite
+# Benchmark Suite
 
-Release-profile Criterion benchmarks that establish a reusable baseline for the
-Storage Upgrade Phase 0 work. Later phases claim improvement only against the
-same workload shape.
+Release-profile Criterion benchmarks that establish reusable baselines for
+core storage workloads. Compare results only against the same workload shape.
 
 All benches run under `[profile.bench]` (inherits `release`: `opt-level=3`,
 `lto="thin"`, `debug=true`).
@@ -11,10 +10,10 @@ All benches run under `[profile.bench]` (inherits `release`: `opt-level=3`,
 
 ## Invocation commands
 
-### US-008 — same-namespace writers
+### Same-Namespace Writers
 
 ```
-cargo bench --bench writers_same_ns -- --save-baseline phase0
+cargo bench --bench writers_same_ns -- --save-baseline current
 ```
 
 Workload: 1, 2, and 4 concurrent writers on a **single namespace**. Each writer
@@ -23,22 +22,21 @@ per-namespace lane bottleneck. Durability: `Interval(100ms)`.
 
 ---
 
-### US-009 — different-namespace writers
+### Different-Namespace Writers
 
 ```
-cargo bench --bench writers_diff_ns -- --save-baseline phase0
+cargo bench --bench writers_diff_ns -- --save-baseline current
 ```
 
 Workload: 2 and 4 concurrent writers, each on a **distinct namespace**. Same
-insert count and payload as US-008. No lane sharing; remaining serialization
-point is the global `commit_seq`. Durability: `Interval(100ms)`.
+insert count and payload as `writers_same_ns`. Durability: `Interval(100ms)`.
 
 ---
 
-### US-010 — payload size matrix
+### Payload Size Matrix
 
 ```
-cargo bench --bench payload_sizes -- --save-baseline phase0
+cargo bench --bench payload_sizes -- --save-baseline current
 ```
 
 Workload: single writer, single namespace, 10 inserts per iteration across
@@ -48,10 +46,10 @@ Actual byte counts are printed alongside each measurement. Durability:
 
 ---
 
-### US-011 — durability modes
+### Durability Modes
 
 ```
-cargo bench --bench durability_modes -- --save-baseline phase0
+cargo bench --bench durability_modes -- --save-baseline current
 ```
 
 Workload: single writer, single namespace, ~256 B payload, 10 inserts per
@@ -60,10 +58,10 @@ iteration under two modes: `FullSync` (fdatasync after every commit) and
 
 ---
 
-### US-012 — secondary index build
+### Secondary Index Build
 
 ```
-cargo bench --bench index_build -- --save-baseline phase0
+cargo bench --bench index_build -- --save-baseline current
 ```
 
 Workload: 10 000 documents (~64 B payload each) pre-seeded outside the timed
@@ -73,33 +71,33 @@ ascending). Uses the public `create_index` API only. Durability:
 
 ---
 
-### Phase 1 US-017 — root-neutral CRUD
+### Root-Neutral CRUD
 
 ```
-cargo bench --bench read_epoch_root_neutral -- --save-baseline phase1
+cargo bench --bench read_epoch_root_neutral -- --save-baseline current
 ```
 
 Workload: 1, 2, and 4 concurrent writers on a **single already-
 bootstrapped** namespace doing root-neutral CRUD (20 inserts per
 writer per iteration, ~256 B payload, `Interval(100ms)`). Identical
-shape to US-008's `writers_same_ns` so the two baselines are
-directly comparable. Each iteration also prints
+shape to `writers_same_ns` so the two baselines are directly comparable.
+Each iteration also prints
 `read_epoch_publish_count` / `published_catalog_rebuild_count`
-deltas and the computed rebuild-elision rate, so Phase 1's catalog-
-reuse win is auditable from the bench output.
+deltas and the computed rebuild-elision rate, so catalog-reuse behavior is
+auditable from the bench output.
 
-Compare against phase0 without overwriting:
+Compare against an existing baseline without overwriting:
 
 ```
-cargo bench --bench read_epoch_root_neutral -- --baseline phase0
+cargo bench --bench read_epoch_root_neutral -- --baseline current
 ```
 
 ---
 
-### Phase 5 US-021 — same-collection multi-writer CRUD
+### Same-Collection Multi-Writer CRUD
 
 ```
-cargo bench --bench phase5_multiwriter -- --save-baseline phase5
+cargo bench --bench same_collection_multiwriter -- --save-baseline current
 ```
 
 Workload: one pre-split collection, 1, 2, 4, 8, and 16 concurrent root-neutral
@@ -108,25 +106,24 @@ separate leaf ranges without measuring structural split work. Each measured
 iteration updates one document per writer. Payload classes are exactly 256B,
 4KiB, and 32KiB. Each case runs under both
 `DurabilityMode::Interval(Duration::from_millis(100))` and
-`DurabilityMode::FullSync`. The benchmark prints Phase 0-style metadata for
+`DurabilityMode::FullSync`. The benchmark prints run metadata for
 each case: writer count, namespace id, payload class and bytes, durability
-mode, rustc version, CPU model, core count, OS/arch, and git commit. The Phase
-0 baseline materialization and pass/fail comparison are separate Phase 5
-stories; this command saves the Phase 5 Criterion baseline under
+mode, rustc version, CPU model, core count, OS/arch, and git commit. This
+command saves the Criterion baseline under
 `target/criterion/`.
 
-Compare against phase0 after US-032 materializes the baseline:
+Compare against an existing baseline:
 
 ```
-cargo bench --bench phase5_multiwriter -- --baseline phase0
+cargo bench --bench same_collection_multiwriter -- --baseline current
 ```
 
 ---
 
-### US-013 — reopen latency
+### Reopen Latency
 
 ```
-cargo bench --bench reopen -- --save-baseline phase0
+cargo bench --bench reopen -- --save-baseline current
 ```
 
 Two Criterion groups:
@@ -152,16 +149,16 @@ public API and are recorded as `n/a`; this is a known limitation.
 cargo bench --bench <name> -- --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 
-## Rerun without overwriting the phase0 baseline
+## Rerun without overwriting the saved baseline
 
 ```
-cargo bench --bench writers_same_ns -- --baseline phase0 --sample-size 10 --measurement-time 1 --warm-up-time 1
-cargo bench --bench writers_diff_ns -- --baseline phase0 --sample-size 10 --measurement-time 1 --warm-up-time 1
-cargo bench --bench payload_sizes -- --baseline phase0 --sample-size 10 --measurement-time 1 --warm-up-time 1
-cargo bench --bench durability_modes -- --baseline phase0 --sample-size 10 --measurement-time 1 --warm-up-time 1
-cargo bench --bench index_build -- --baseline phase0 --sample-size 10 --measurement-time 1 --warm-up-time 1
-cargo bench --bench reopen -- --baseline phase0 --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench writers_same_ns -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench writers_diff_ns -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench payload_sizes -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench durability_modes -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench index_build -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench reopen -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 
-These commands compare against the canonical `phase0` baseline without using
-`--save-baseline phase0`, so they cannot overwrite the saved baseline.
+These commands compare against the saved `current` baseline without using
+`--save-baseline current`, so they cannot overwrite the saved baseline.

@@ -24,8 +24,8 @@
 //!    cannot mutate the bytes they are reading.
 //!
 //! Callers must ensure that at most one [`PinnedPage`] for a given page number
-//! calls [`data_mut`](PinnedPage::data_mut) at a time. The database-level
-//! single-writer lock enforces this at a higher level.
+//! calls [`data_mut`](PinnedPage::data_mut) at a time. Higher-level write paths
+//! use page latches and ordered publish protocols to enforce this.
 //
 // LOCK-ORDER (CRITICAL-1): this file owns positions **3** (32 KB
 // partition mutex, `BufferPool::inner_32k`), **3a** (`PageLatch`), and
@@ -42,13 +42,12 @@
 // (position 5) BEFORE acquiring a partition mutex or page latch.
 
 mod chains;
-// US-029 wires `PageLatch` into `Frame` and produces `LatchedPinnedPage`,
-// but production CRUD call sites that consume those handles ship in
-// later Phase 5 stories (US-024 / US-025). The primitive APIs in
-// `page_latch.rs` therefore look unused to the lib-only dead-code lint
-// despite being exercised by the buffer-pool unit tests.
+// `PageLatch` is consumed by higher-level write, reconciliation, and test
+// paths. Some primitive APIs still look unused to the lib-only dead-code lint
+// despite being exercised by buffer-pool and integration coverage.
 #[allow(dead_code)]
 mod page_latch;
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod page_latch_fairness_test_probe;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod page_latch_upgrade_test_probe;
@@ -231,7 +230,7 @@ impl std::fmt::Debug for ReplaceLeafError {
 }
 
 // ---------------------------------------------------------------------------
-// LatchedPinnedPage (Phase 5 §10.18 — pin-plus-latch RAII handle)
+// LatchedPinnedPage — pin-plus-latch RAII handle
 // ---------------------------------------------------------------------------
 
 /// Internal latch hold for [`LatchedPinnedPage`]. The variant chosen on
@@ -281,7 +280,7 @@ impl Drop for LatchHoldRecorder<'_> {
     }
 }
 
-/// Pin-plus-latch RAII handle (Phase 5 §10.18).
+/// Pin-plus-latch RAII handle.
 ///
 /// The sole legal way to hold both a buffer-pool pin and a `PageLatch`
 /// simultaneously. Construction is via [`BufferPool::pin_for_read`] or
@@ -339,7 +338,7 @@ impl<'pool> LatchedPinnedPage<'pool> {
     /// page-local latch.
     #[allow(
         dead_code,
-        reason = "US-010 public classifier uses this narrow latch read path"
+        reason = "public classifier uses this narrow latch read path"
     )]
     pub(crate) fn data_snapshot(&self) -> Arc<Vec<u8>> {
         // SAFETY: this handle owns a live pin, so the frame slot cannot be
@@ -393,7 +392,7 @@ impl<'pool> LatchedPinnedPage<'pool> {
     pub(crate) fn expected_head(&self, key: &[u8]) -> Option<ExpectedHead> {
         // SAFETY: this handle owns a live pin, so the frame slot cannot be
         // evicted. The page latch held by this handle serializes access to
-        // the frame-local delta map for US-009 callers.
+        // the frame-local delta map for latch-aware callers.
         let frame = unsafe { &*self.frame_ptr };
         frame.deltas.get(key).and_then(|chain| {
             chain
@@ -837,12 +836,12 @@ impl BufferPool {
 
     /// Pin all planned reconcile leaf pages, then acquire exclusive latches.
     ///
-    /// US-028 requires two-phase acquisition: all planned pages are pinned
-    /// while holding the 32 KiB partition mutex, then that mutex is released,
-    /// then `PageLatch::Exclusive` is acquired in the caller's ascending
-    /// `page_id` order. If any planned page is unavailable, no partial
-    /// acquisition is returned and any prior pins are released before the
-    /// recoverable error is surfaced.
+    /// Reconciliation requires two-phase acquisition: all planned pages are
+    /// pinned while holding the 32 KiB partition mutex, then that mutex is
+    /// released, then `PageLatch::Exclusive` is acquired in the caller's
+    /// ascending `page_id` order. If any planned page is unavailable, no
+    /// partial acquisition is returned and any prior pins are released before
+    /// the recoverable error is surfaced.
     pub(crate) fn pin_leaf_set_for_reconcile(
         &self,
         _ident: TreeIdent,
@@ -850,7 +849,7 @@ impl BufferPool {
     ) -> std::result::Result<Vec<LatchedPinnedPage<'_>>, ReplaceLeafError> {
         debug_assert!(
             planned_pages.windows(2).all(|pair| pair[0] < pair[1]),
-            "US-028 reconcile planned page set must be sorted and unique"
+            "reconcile planned page set must be sorted and unique"
         );
 
         let pinned = {
@@ -941,7 +940,7 @@ impl BufferPool {
 
     /// Atomically replace a resident leaf page image and retained chains.
     ///
-    /// US-028 requires the caller to pass a [`LatchedPinnedPage`] that holds
+    /// Requires the caller to pass a [`LatchedPinnedPage`] that holds
     /// `PageLatch::Exclusive` for the reconcile target. No partition mutex is
     /// acquired by this helper; the page-local latch is the resident chain
     /// mutation authority for checkpoint reconcile and CRUD writers.
@@ -1066,16 +1065,14 @@ impl BufferPool {
         })
     }
 
-    /// Pin `page_id` and acquire its page-local latch in **exclusive** mode
-    /// (Phase 5 §10.18). Returns the sole legal pin-plus-latch RAII handle.
+    /// Pin `page_id` and acquire its page-local latch in **exclusive** mode.
+    /// Returns the sole legal pin-plus-latch RAII handle.
     ///
-    /// This is the canonical 1-argument API spelled out in
-    /// `.omc/phase-05-prd.json` US-029. It defers to
-    /// [`BufferPool::pin_then_latch`] with the page size resolved by
-    /// [`BufferPool::detect_page_size`] (32 KiB by default for cache
-    /// misses; resident pages route to whichever partition currently
-    /// holds them). Phase 5 CRUD targets leaf pages (32 KiB), so the
-    /// default is correct for the first-class call sites.
+    /// This defers to [`BufferPool::pin_then_latch`] with the page size
+    /// resolved by [`BufferPool::detect_page_size`] (32 KiB by default for
+    /// cache misses; resident pages route to whichever partition currently
+    /// holds them). CRUD targets leaf pages (32 KiB), so the default is
+    /// correct for the first-class call sites.
     ///
     /// **Lock-order contract (§10.18 — partition mutex and latch are never
     /// nested):**
@@ -1110,12 +1107,11 @@ impl BufferPool {
         self.pin_then_latch(page_id, size, LatchMode::Exclusive)
     }
 
-    /// Pin `page_id` and acquire its page-local latch in **shared** mode
-    /// (Phase 5 §10.18). Returns the sole legal pin-plus-latch RAII handle.
+    /// Pin `page_id` and acquire its page-local latch in **shared** mode.
+    /// Returns the sole legal pin-plus-latch RAII handle.
     ///
-    /// Canonical 1-argument API per US-029 (size resolved via
-    /// [`BufferPool::detect_page_size`]). Same lock-order contract as
-    /// [`BufferPool::pin_for_write`].
+    /// The page size is resolved via [`BufferPool::detect_page_size`]. Same
+    /// lock-order contract as [`BufferPool::pin_for_write`].
     ///
     /// # Errors
     ///
@@ -1143,7 +1139,7 @@ impl BufferPool {
     /// The 32 KiB partition is checked first per the lock-order rule in
     /// `src/mvcc/read_view.rs` (position 3 before position 4); residency
     /// hits in either partition route to that partition. A cache miss
-    /// defaults to 32 KiB, matching Phase 5's leaf-focused CRUD.
+    /// defaults to 32 KiB, matching leaf-focused CRUD.
     fn detect_page_size(&self, page_id: u32) -> PageSize {
         if let Ok(g) = self.inner_32k.lock() {
             if g.page_map.contains_key(&page_id) {
@@ -1297,7 +1293,7 @@ impl BufferPool {
     /// Return dirty resident page ids across both size partitions.
     #[allow(
         dead_code,
-        reason = "US-005 lands flush-set validation before the full checkpoint driver consumes it"
+        reason = "flush-set validation exists before the full checkpoint driver consumes it"
     )]
     pub(crate) fn dirty_page_ids(&self) -> Result<BTreeSet<PageId>> {
         let mut pages = BTreeSet::new();
@@ -1330,7 +1326,7 @@ impl BufferPool {
     /// checkpoint batch nor explicitly excluded as future-dirty residue.
     #[allow(
         dead_code,
-        reason = "US-005 lands checkpoint-owned frame snapshots before the full driver consumes them"
+        reason = "checkpoint-owned frame snapshots exist before the full driver consumes them"
     )]
     pub(crate) fn checkpoint_dirty_frame_snapshots(
         &self,
