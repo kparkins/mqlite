@@ -4,7 +4,7 @@
 //! - [`PagedEngine::create_index_reserve`] — allocate a root page, write an
 //!   `IndexEntry { state: Building }`, publish.
 //! - [`PagedEngine::create_index_build`] — populate the index from the data
-//!   tree under the DDL admission/drain fence.
+//!   tree while same-namespace writers dual-write to the Building index.
 //! - [`PagedEngine::create_index_commit`] — flip `state: Ready` under
 //!   `metadata.write()` and publish.
 //! - [`PagedEngine::create_index_cleanup`] — drop an orphan Building entry
@@ -79,7 +79,7 @@ impl PagedEngine {
     /// the leaf page, and publishes a fresh snapshot so writers on the
     /// target namespace dual-write to it while the build is in flight.
     ///
-    /// Returns [`ReserveOutcome::AlreadyExists`] if an index of that
+    /// Returns [`ReserveOutcome::AlreadyExists`] if a Ready index of that
     /// name already exists (idempotent call), otherwise
     /// [`ReserveOutcome::Reserved`].
     pub(super) fn create_index_reserve(
@@ -93,8 +93,22 @@ impl PagedEngine {
             .metadata
             .write()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+
+        {
+            let cat = catalog_lock(&self.metadata_state);
+            if cat.get_collection(ns)?.is_some() {
+                if let Some(existing) = cat.get_index(ns, name)? {
+                    if existing.state == IndexState::Ready {
+                        return Ok(ReserveOutcome::AlreadyExists);
+                    }
+                    return Err(Error::WriteConflict {
+                        reason: WriteConflictReason::CatalogGenerationChanged,
+                    });
+                }
+            }
+        }
+
         let mut reservation = None;
-        let mut already_exists = false;
 
         let ns_id_to_drain = {
             let cat = catalog_lock(&self.metadata_state);
@@ -143,20 +157,6 @@ impl PagedEngine {
                             ns
                         ))
                     })?;
-                }
-
-                // Idempotence only applies once the existing index is
-                // planner-visible. A live Building entry still has an owner:
-                // another create/resume path must finish or clean it up before
-                // this caller can report success.
-                if let Some(existing) = cat.get_index(ns, name)? {
-                    if existing.state == IndexState::Ready {
-                        already_exists = true;
-                        return Ok(());
-                    }
-                    return Err(Error::WriteConflict {
-                        reason: WriteConflictReason::CatalogGenerationChanged,
-                    });
                 }
 
                 // Allocate a durable index id.
@@ -256,13 +256,9 @@ impl PagedEngine {
         if let Some(guard) = ddl_guard {
             guard.commit();
         }
-        if already_exists {
-            Ok(ReserveOutcome::AlreadyExists)
-        } else {
-            reservation
-                .map(ReserveOutcome::Reserved)
-                .ok_or_else(|| Error::Internal("missing create-index reservation".into()))
-        }
+        reservation
+            .map(ReserveOutcome::Reserved)
+            .ok_or_else(|| Error::Internal("missing create-index reservation".into()))
     }
 
     /// Build step of `create_index`: populate the index from the data tree.

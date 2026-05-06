@@ -137,6 +137,27 @@ fn building_index_name_does_not_report_idempotent_success() {
 }
 
 #[test]
+fn ready_index_create_is_noop_without_new_catalog_publish() {
+    let engine = buffered_engine().expect("engine");
+    engine.create_namespace(NS).expect("create namespace");
+    engine
+        .create_index(NS, &tag_index_model())
+        .expect("create index");
+    let published_after_create = engine.shared.load_published();
+
+    let name = engine
+        .create_index(NS, &tag_index_model())
+        .expect("idempotent create_index");
+
+    assert_eq!(name, TAG_INDEX);
+    assert_eq!(
+        engine.shared.load_published().catalog_generation,
+        published_after_create.catalog_generation,
+        "idempotent Ready create_index must not publish a new catalog generation"
+    );
+}
+
+#[test]
 fn build_flush_failure_after_structural_commit_poisons_engine() {
     let engine = buffered_engine().expect("engine");
     engine.create_namespace(NS).expect("create namespace");

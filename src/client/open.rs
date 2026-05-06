@@ -226,12 +226,7 @@ impl Client {
             opts.smo_classification_retry_cap,
             opts.durability.clone(),
         )?);
-        let inner = Arc::new(ClientInner::new(
-            Some(path.clone()),
-            opts,
-            file_lock,
-            engine,
-        ));
+        let inner = Arc::new(ClientInner::new(Some(path.clone()), file_lock, engine));
         let _ = file_size; // used above, suppress warning
         #[cfg(feature = "tracing")]
         tracing::info!(

@@ -3,10 +3,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{
-    options::OpenOptions,
-    storage::{engine::StorageEngine, lock::AnyFileLock},
-};
+use crate::storage::{engine::StorageEngine, lock::AnyFileLock};
 
 /// Internal shared state for a [`super::Client`].
 ///
@@ -30,8 +27,6 @@ use crate::{
 pub(crate) struct ClientInner {
     /// Path to the database file.
     pub path: Option<PathBuf>,
-    /// Configuration options.
-    pub opts: OpenOptions,
     /// OS advisory file lock.
     ///
     /// Stored as `Arc` so the same fd can be shared with the `FilePageSource`
@@ -44,13 +39,11 @@ pub(crate) struct ClientInner {
 impl ClientInner {
     pub(super) fn new(
         path: Option<PathBuf>,
-        opts: OpenOptions,
         file_lock: Arc<AnyFileLock>,
         engine: Box<dyn StorageEngine>,
     ) -> Self {
         ClientInner {
             path,
-            opts,
             file_lock,
             engine,
         }

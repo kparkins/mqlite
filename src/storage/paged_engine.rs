@@ -240,12 +240,11 @@ struct IndexCatalogIdentity {
 ///
 /// Both `Instant::now()` reads happen with NO journal mutex held.
 ///
-/// The recorded duration spans the full journal critical section
-/// rather than just the journal-file I/O. Per §7 ("approximate
-/// latest-value gauge"), this is an acceptable approximation: the
-/// critical section is dominated by the logical+legacy+ChainCommit
-/// journal writes, so the envelope duration tracks the append
-/// duration to within a few microseconds of overhead.
+/// The recorded duration spans the full journal critical section rather than
+/// just the journal-file I/O. Per §7 ("approximate latest-value gauge"), this
+/// is an acceptable approximation: the critical section is dominated by the
+/// logical transaction and ChainCommit journal writes, so the envelope duration
+/// tracks the append duration to within a few microseconds of overhead.
 struct LogicalTxnAppendPercentileRefresh {
     start: std::time::Instant,
 }

@@ -458,12 +458,10 @@ pub enum Error {
 
 /// Why an [`Error::EngineFatal`] was raised.
 ///
-/// Phase 5 §10.19.0 C-2 / US-036 — distinguishes the post-durable
-/// in-memory failure that escalated to engine poison. The discriminants
-/// are part of the public contract and are matched directly by US-036
-/// tests. New variants are not added by later Phase 5 stories; the three
-/// listed here cover every post-durable failure site (CRUD publish,
-/// Pending→Committed flip, DDL publish).
+/// Distinguishes post-durable in-memory failures that escalate to engine
+/// poison. The discriminants are part of the public contract and cover every
+/// post-durable failure boundary: CRUD publish, Pending→Committed flip, DDL
+/// publish, and checkpoint post-mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineFatalReason {
     /// A post-durable failure during the ordinary CRUD `mark_ready`
