@@ -1,11 +1,11 @@
-//! Journal file format — header, frame header, and I/O helpers.
+//! Journal file format — header, checkpoint page records, and I/O helpers.
 //!
 //! ## Journal File Layout
 //!
 //! ```text
 //! [Journal Header — 32 bytes]
-//! [Frame 0 Header — 24 bytes][Frame 0 Page Data — 4KB or 32KB]
-//! [Frame 1 Header — 24 bytes][Frame 1 Page Data — 4KB or 32KB]
+//! [Record 0 Header — 24 bytes][Record 0 Page Data — 4KB or 32KB]
+//! [Record 1 Header — 24 bytes][Record 1 Page Data — 4KB or 32KB]
 //! ...
 //! ```
 //!
@@ -23,7 +23,7 @@
 //!  28      4    Header checksum: CRC32C of bytes 0–27
 //! ```
 //!
-//! ## Journal Frame Header (24 bytes)
+//! ## Checkpoint Page Record Header (24 bytes)
 //!
 //! ```text
 //! Offset  Size  Field
@@ -98,11 +98,8 @@ pub(crate) const PAGE0_BOUNDARY_RECORD_WIRE_SIZE: usize =
 
 /// Discriminant byte at offset 0 of a legacy page-write commit frame.
 ///
-/// Legacy page-write frames do not carry this byte at a known position — they
-/// are identified by position within the journal and by the length/salt
-/// fields of `JournalFrameHeader`. The `ChainCommit` discriminant is chosen
-/// to be distinct from any plausible high-order byte of a `page_number` field
-/// in the legacy frame format so a mixed journal can be recovered.
+/// Retired page-write records do not carry this byte at a known position. The
+/// `ChainCommit` discriminant remains distinct from ordinary page identifiers.
 #[allow(dead_code)]
 pub(crate) const FRAME_KIND_LEGACY_COMMIT: u8 = 0x01;
 
@@ -967,95 +964,36 @@ fn dispose<T>(ctx: &DecodeCtx, recoverable: bool, detail: String) -> Result<Opti
 // Checkpoint page-frame codecs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PageFrameRecord {
+fn page_record_checksum(header_prefix: &[u8; 20], page_data: &[u8]) -> u32 {
+    let mut digest = crc32c::crc32c(header_prefix);
+    digest = crc32c::crc32c_append(digest, page_data);
+    digest
+}
+
+pub(super) fn write_page_frame_record<W: Write>(
+    w: &mut W,
     page_number: u32,
     db_page_count: u32,
     salt1: u32,
     salt2: u32,
     page_size: JournalPageSize,
-}
+    page_data: &[u8],
+) -> io::Result<()> {
+    debug_assert_eq!(page_data.len(), page_size.bytes());
 
-impl PageFrameRecord {
-    fn compute_checksum(header_prefix: &[u8; 20], page_data: &[u8]) -> u32 {
-        let mut digest = crc32c::crc32c(header_prefix);
-        digest = crc32c::crc32c_append(digest, page_data);
-        digest
-    }
+    let mut buf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
+    buf[0..4].copy_from_slice(&page_number.to_le_bytes());
+    buf[4..8].copy_from_slice(&db_page_count.to_le_bytes());
+    buf[8..12].copy_from_slice(&salt1.to_le_bytes());
+    buf[12..16].copy_from_slice(&salt2.to_le_bytes());
+    buf[16..20].copy_from_slice(&page_size.as_u32().to_le_bytes());
+    let prefix: [u8; 20] = buf[..20].try_into().expect("20 bytes");
+    let checksum = page_record_checksum(&prefix, page_data);
+    buf[20..24].copy_from_slice(&checksum.to_le_bytes());
 
-    fn write<W: Write>(&self, w: &mut W, page_data: &[u8]) -> io::Result<()> {
-        debug_assert_eq!(page_data.len(), self.page_size.bytes());
-
-        let mut buf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
-        buf[0..4].copy_from_slice(&self.page_number.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.db_page_count.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.salt1.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.salt2.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.page_size.as_u32().to_le_bytes());
-        let prefix: [u8; 20] = buf[..20].try_into().expect("20 bytes");
-        let checksum = Self::compute_checksum(&prefix, page_data);
-        buf[20..24].copy_from_slice(&checksum.to_le_bytes());
-
-        w.write_all(&buf)?;
-        w.write_all(page_data)?;
-        Ok(())
-    }
-
-    fn read<R: Read>(
-        r: &mut R,
-        expected_salt1: u32,
-        expected_salt2: u32,
-    ) -> Result<Option<(Self, Vec<u8>)>> {
-        let mut buf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
-        match r.read_exact(&mut buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
-        }
-
-        let page_number = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
-        let db_page_count = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
-        let salt1 = u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
-        let salt2 = u32::from_le_bytes(buf[12..16].try_into().expect("4 bytes"));
-        let page_size_u32 = u32::from_le_bytes(buf[16..20].try_into().expect("4 bytes"));
-        let stored_checksum = u32::from_le_bytes(buf[20..24].try_into().expect("4 bytes"));
-
-        if salt1 != expected_salt1 || salt2 != expected_salt2 {
-            return Ok(None);
-        }
-
-        let page_size = match JournalPageSize::from_u32(page_size_u32) {
-            Ok(ps) => ps,
-            Err(_) => return Ok(None),
-        };
-        let mut page_data = vec![0u8; page_size.bytes()];
-        match r.read_exact(&mut page_data) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
-        }
-
-        let prefix: [u8; 20] = buf[..20].try_into().expect("20 bytes");
-        let computed = Self::compute_checksum(&prefix, &page_data);
-        if computed != stored_checksum {
-            return Ok(None);
-        }
-
-        Ok(Some((
-            Self {
-                page_number,
-                db_page_count,
-                salt1,
-                salt2,
-                page_size,
-            },
-            page_data,
-        )))
-    }
-
-    fn total_size(&self) -> usize {
-        JOURNAL_FRAME_HEADER_SIZE + self.page_size.bytes()
-    }
+    w.write_all(&buf)?;
+    w.write_all(page_data)?;
+    Ok(())
 }
 
 /// Checkpoint-batch page-frame codec for checkpoint-owned dirty pages.
@@ -1087,7 +1025,7 @@ pub(crate) struct CheckpointBatchPageRecord {
 impl CheckpointBatchPageRecord {
     /// Compute the shared page-frame CRC32C.
     pub(crate) fn compute_checksum(header_prefix: &[u8; 20], page_data: &[u8]) -> u32 {
-        PageFrameRecord::compute_checksum(header_prefix, page_data)
+        page_record_checksum(header_prefix, page_data)
     }
 
     /// Write a checkpoint-owned non-commit page frame.
@@ -1096,14 +1034,15 @@ impl CheckpointBatchPageRecord {
     ///
     /// Returns any I/O error raised by the target writer.
     pub(crate) fn write<W: Write>(&self, w: &mut W, page_data: &[u8]) -> io::Result<()> {
-        PageFrameRecord {
-            page_number: self.page_number,
-            db_page_count: 0,
-            salt1: self.salt1,
-            salt2: self.salt2,
-            page_size: self.page_size,
-        }
-        .write(w, page_data)
+        write_page_frame_record(
+            w,
+            self.page_number,
+            0,
+            self.salt1,
+            self.salt2,
+            self.page_size,
+            page_data,
+        )
     }
 
     /// Read a checkpoint-owned non-commit page frame.
@@ -1111,36 +1050,89 @@ impl CheckpointBatchPageRecord {
     /// # Errors
     ///
     /// Returns I/O errors from the reader.
-    pub(crate) fn read<R: Read>(
+    pub(crate) fn read<R: Read + Seek>(
         r: &mut R,
         expected_salt1: u32,
         expected_salt2: u32,
     ) -> Result<Option<Self>> {
-        let Some((record, _page_data)) = PageFrameRecord::read(r, expected_salt1, expected_salt2)?
+        let Some((record, _page_data)) = Self::read_with_data(r, expected_salt1, expected_salt2)?
         else {
             return Ok(None);
         };
-        if record.db_page_count != 0 {
+        Ok(Some(record))
+    }
+
+    /// Read a checkpoint-owned non-commit page frame and return its payload.
+    ///
+    /// The reader is rewound when the cursor does not contain a checkpoint
+    /// batch record so callers can try a page-0 boundary at the same offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from the reader.
+    pub(crate) fn read_with_data<R: Read + Seek>(
+        r: &mut R,
+        expected_salt1: u32,
+        expected_salt2: u32,
+    ) -> Result<Option<(Self, Vec<u8>)>> {
+        let start = r.stream_position().map_err(Error::Io)?;
+        let mut buf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
+        match r.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+
+        let page_number = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
+        let db_page_count = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
+        let salt1 = u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
+        let salt2 = u32::from_le_bytes(buf[12..16].try_into().expect("4 bytes"));
+        let page_size_u32 = u32::from_le_bytes(buf[16..20].try_into().expect("4 bytes"));
+        let stored_checksum = u32::from_le_bytes(buf[20..24].try_into().expect("4 bytes"));
+
+        if db_page_count != 0 || salt1 != expected_salt1 || salt2 != expected_salt2 {
+            r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
             return Ok(None);
         }
-        Ok(Some(Self {
-            page_number: record.page_number,
-            salt1: record.salt1,
-            salt2: record.salt2,
-            page_size: record.page_size,
-        }))
+        let page_size = match JournalPageSize::from_u32(page_size_u32) {
+            Ok(page_size) => page_size,
+            Err(_) => {
+                r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+                return Ok(None);
+            }
+        };
+        let mut page_data = vec![0u8; page_size.bytes()];
+        match r.read_exact(&mut page_data) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+        let prefix: [u8; 20] = buf[..20].try_into().expect("20 bytes");
+        if page_record_checksum(&prefix, &page_data) != stored_checksum {
+            r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+            return Ok(None);
+        }
+
+        Ok(Some((
+            Self {
+                page_number,
+                salt1,
+                salt2,
+                page_size,
+            },
+            page_data,
+        )))
     }
 
     /// Return the total serialized byte size for this page frame.
     pub(crate) fn total_size(&self) -> usize {
-        PageFrameRecord {
-            page_number: self.page_number,
-            db_page_count: 0,
-            salt1: self.salt1,
-            salt2: self.salt2,
-            page_size: self.page_size,
-        }
-        .total_size()
+        JOURNAL_FRAME_HEADER_SIZE + self.page_size.bytes()
     }
 }
 
@@ -1197,14 +1189,15 @@ impl Page0BoundaryRecord {
     ///
     /// Returns any I/O error raised by the target writer.
     pub(crate) fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        PageFrameRecord {
-            page_number: 0,
-            db_page_count: self.header.total_page_count,
-            salt1: self.salt1,
-            salt2: self.salt2,
-            page_size: JournalPageSize::Small4k,
-        }
-        .write(w, &self.header.to_bytes())
+        write_page_frame_record(
+            w,
+            0,
+            self.header.total_page_count,
+            self.salt1,
+            self.salt2,
+            JournalPageSize::Small4k,
+            &self.header.to_bytes(),
+        )
     }
 
     /// Probe the current cursor for a page-0 boundary and rewind on absence.
@@ -1219,17 +1212,53 @@ impl Page0BoundaryRecord {
         expected_salt2: u32,
     ) -> Result<Option<Self>> {
         let start = r.stream_position().map_err(Error::Io)?;
-        let Some((record, page_data)) = PageFrameRecord::read(r, expected_salt1, expected_salt2)?
-        else {
+        let mut buf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
+        match r.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+
+        let page_number = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
+        let db_page_count = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
+        let salt1 = u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
+        let salt2 = u32::from_le_bytes(buf[12..16].try_into().expect("4 bytes"));
+        let page_size_u32 = u32::from_le_bytes(buf[16..20].try_into().expect("4 bytes"));
+        let stored_checksum = u32::from_le_bytes(buf[20..24].try_into().expect("4 bytes"));
+
+        if page_number != 0
+            || db_page_count == 0
+            || salt1 != expected_salt1
+            || salt2 != expected_salt2
+            || page_size_u32 != JournalPageSize::Small4k.as_u32()
+        {
             r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
             return Ok(None);
-        };
+        }
+        let mut page_data = vec![0u8; PAGE_SIZE_INTERNAL as usize];
+        match r.read_exact(&mut page_data) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+        let prefix: [u8; 20] = buf[..20].try_into().expect("20 bytes");
+        if page_record_checksum(&prefix, &page_data) != stored_checksum {
+            r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
+            return Ok(None);
+        }
+
         match Self::from_page_frame_parts(
-            record.page_number,
-            record.db_page_count,
-            record.salt1,
-            record.salt2,
-            record.page_size,
+            page_number,
+            db_page_count,
+            salt1,
+            salt2,
+            JournalPageSize::Small4k,
             &page_data,
         )? {
             Some(boundary) => Ok(Some(boundary)),
@@ -1390,10 +1419,6 @@ impl JournalHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// JournalFrameHeader
-// ---------------------------------------------------------------------------
-
 /// Page size indicator used inside a journal frame header.
 ///
 /// This tells the recovery algorithm how many bytes of page data follow the
@@ -1434,81 +1459,6 @@ impl JournalPageSize {
     }
 }
 
-/// Parsed representation of a journal frame header (24 bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JournalFrameHeader {
-    /// Page number this frame contains an image of.
-    pub page_number: u32,
-    /// Non-zero → commit frame: total database page count after this commit.
-    /// Zero → non-commit (intermediate write within a transaction).
-    pub db_page_count: u32,
-    /// Salt 1 from the journal file header (verified on read).
-    pub salt1: u32,
-    /// Salt 2 from the journal file header (verified on read).
-    pub salt2: u32,
-    /// Page size for this frame's data segment.
-    pub page_size: JournalPageSize,
-    // checksum at offset 20 — computed/verified on read/write; not stored here
-}
-
-impl JournalFrameHeader {
-    /// Compute the CRC32C checksum for a frame.
-    ///
-    /// Covers the first 20 bytes of the frame header (excluding the checksum
-    /// field itself) followed by the entire page data.
-    pub(crate) fn compute_checksum(header_prefix: &[u8; 20], page_data: &[u8]) -> u32 {
-        PageFrameRecord::compute_checksum(header_prefix, page_data)
-    }
-
-    /// Serialize the header and write it plus page data to `w`.
-    ///
-    /// Returns the byte offset **before** writing (i.e., where this frame
-    /// starts in the journal file), assuming `w` is positioned at the write cursor.
-    pub(crate) fn write<W: Write>(&self, w: &mut W, page_data: &[u8]) -> io::Result<()> {
-        PageFrameRecord {
-            page_number: self.page_number,
-            db_page_count: self.db_page_count,
-            salt1: self.salt1,
-            salt2: self.salt2,
-            page_size: self.page_size,
-        }
-        .write(w, page_data)
-    }
-
-    /// Read and validate a frame header from `r`.
-    ///
-    /// `expected_salt1` and `expected_salt2` are the salt values from the journal
-    /// file header.  Salt mismatch is treated as a checksum failure (stops
-    /// recovery at this frame).
-    ///
-    /// Returns `None` when a checksum failure is detected (indicating the end
-    /// of committed journal data).  Returns `Some(header)` on success.  On I/O
-    /// error, returns `Err`.
-    pub(crate) fn read<R: Read>(
-        r: &mut R,
-        expected_salt1: u32,
-        expected_salt2: u32,
-    ) -> Result<Option<Self>> {
-        let Some((record, _page_data)) = PageFrameRecord::read(r, expected_salt1, expected_salt2)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            page_number: record.page_number,
-            db_page_count: record.db_page_count,
-            salt1: record.salt1,
-            salt2: record.salt2,
-            page_size: record.page_size,
-        }))
-    }
-
-    /// Return the total byte size of this frame (header + page data).
-    pub(crate) fn total_size(&self) -> usize {
-        JOURNAL_FRAME_HEADER_SIZE + self.page_size.bytes()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Low-level journal I/O helpers
 // ---------------------------------------------------------------------------
 
@@ -1762,25 +1712,11 @@ impl ChainCommitFrame {
 }
 
 // ---------------------------------------------------------------------------
-// try_skip_chain_commit
+// ChainCommit cursor reader
 // ---------------------------------------------------------------------------
 
-/// Peek at the current position and skip over a `ChainCommitFrame` if one is
+/// Peek at the current position and read a `ChainCommitFrame` if one is
 /// present, returning the number of bytes consumed.
-///
-/// `JournalFrameHeader` and `ChainCommitFrame` cohabit the same append-only
-/// log. Every scanner that iterates frames linearly must call this helper
-/// before falling through to `JournalFrameHeader::read`; a `ChainCommit`
-/// frame interpreted as a legacy header errors out on the `page_size` field
-/// (invalid) and corrupts any `truncate_to` / recovery scan.
-///
-/// ## Disambiguation
-///
-/// A legacy frame with `page_number == 2` has an identical first 4 bytes
-/// (`[2, 0, 0, 0]`) to a `ChainCommit` header prefix. This helper performs
-/// the full `ChainCommitFrame::decode` CRC check to tell them apart. Matching
-/// CRCs for a 32+ byte header on random legacy data is astronomically
-/// unlikely (~1 in 2^32).
 ///
 /// ## Cursor semantics
 ///
@@ -1789,11 +1725,10 @@ impl ChainCommitFrame {
 ///   consumed, and `commit_ts` is the decoded commit timestamp (carried out
 ///   so recovery can fold it into `TimestampOracle::set_min`).
 ///   `start_offset` is the journal offset where the frame started.
-/// - On `Ok(None)`: the reader is restored to its original position. The
-///   caller proceeds to `JournalFrameHeader::read` as normal.
+/// - On `Ok(None)`: the reader is restored to its original position.
 /// - On `Err`: the reader position is undefined; the caller should treat
 ///   the scan as aborted.
-pub(crate) fn try_skip_chain_commit<R: Read + Seek>(
+pub(crate) fn read_chain_commit_at_cursor<R: Read + Seek>(
     r: &mut R,
     expected_salt1: u32,
     expected_salt2: u32,
@@ -1860,8 +1795,7 @@ pub(crate) fn try_skip_chain_commit<R: Read + Seek>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum LogicalScan {
-    /// Bytes are NOT a logical frame attempt — try the next helper or fall
-    /// through to legacy.
+    /// Bytes are NOT a logical frame attempt; try the next record kind.
     NotLogical,
     /// Structural signature matches but decode failed (CRC mismatch or
     /// truncated mid-body) — bytes look like a partially-written logical
@@ -1938,54 +1872,9 @@ pub(crate) fn try_skip_logical_txn_disposition<R: Read + Seek>(
         }
     }
 
-    // Logical decode rejected (truncated body or CRC mismatch). The
-    // structural signature aliases a legacy frame whose `page_number` LSB
-    // is `FRAME_KIND_LOGICAL_TXN` (=0x03), high bytes 0, salts at the
-    // expected offsets, and `db_page_count` ∈
-    // [`LOGICAL_TXN_MIN_FRAME_SIZE`, `LOGICAL_TXN_MAX_FRAME_SIZE`]. Probe
-    // the same offset as a legacy frame and verify its CRC; if it
-    // validates the bytes are unambiguously a real legacy frame and the
-    // helper must report `NotLogical` so the legacy parser handles them.
-    // CRC32C collision on a 4 KB / 32 KB buffer is ~2^-32, so this fallback
-    // is effectively unambiguous in practice.
-    r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
-    let mut legacy_hdr = [0u8; JOURNAL_FRAME_HEADER_SIZE];
-    let legacy_hdr_complete = match r.read_exact(&mut legacy_hdr) {
-        Ok(()) => true,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => false,
-        Err(e) => return Err(Error::Io(e)),
-    };
-    if legacy_hdr_complete {
-        let legacy_page_size_u32 =
-            u32::from_le_bytes(legacy_hdr[16..20].try_into().expect("4 bytes"));
-        let legacy_page_size = match legacy_page_size_u32 {
-            PAGE_SIZE_INTERNAL => Some(PAGE_SIZE_INTERNAL as usize),
-            PAGE_SIZE_LEAF => Some(PAGE_SIZE_LEAF as usize),
-            _ => None,
-        };
-        if let Some(page_bytes) = legacy_page_size {
-            let mut legacy_page_data = vec![0u8; page_bytes];
-            let legacy_data_complete = match r.read_exact(&mut legacy_page_data) {
-                Ok(()) => true,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => false,
-                Err(e) => return Err(Error::Io(e)),
-            };
-            if legacy_data_complete {
-                let legacy_stored_crc =
-                    u32::from_le_bytes(legacy_hdr[20..24].try_into().expect("4 bytes"));
-                let legacy_prefix: [u8; 20] = legacy_hdr[..20].try_into().expect("20 bytes");
-                let legacy_computed_crc =
-                    JournalFrameHeader::compute_checksum(&legacy_prefix, &legacy_page_data);
-                if legacy_stored_crc == legacy_computed_crc {
-                    r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
-                    return Ok(LogicalScan::NotLogical);
-                }
-            }
-        }
-    }
-
-    // Neither logical decode nor legacy CRC validated → genuine torn
-    // logical frame.
+    // The bytes carry the logical structural signature but did not decode.
+    // Unsupported old page-record bytes are not parsed as a compatibility
+    // format here; recovery treats this as a torn logical tail.
     r.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
     Ok(LogicalScan::Torn)
 }
@@ -1993,11 +1882,9 @@ pub(crate) fn try_skip_logical_txn_disposition<R: Read + Seek>(
 /// Peek at the current position and skip over a [`LogicalTxnFrame`] if one is
 /// present, returning the number of bytes consumed and the decoded frame.
 ///
-/// Mirrors [`try_skip_chain_commit`]: every linear journal scanner must call
-/// this helper before falling through to [`JournalFrameHeader::read`] so a
-/// logical-transaction frame is not misinterpreted as a legacy page-write
-/// frame (§6.1). Always uses [`DecodeCtx::Scanning`] — every §4.6
-/// disposition-table failure row rewinds the reader and returns `Ok(None)`.
+/// Probe the current cursor for a [`LogicalTxnFrame`]. Always uses
+/// [`DecodeCtx::Scanning`]: every §4.6 disposition-table failure row rewinds
+/// the reader and returns `Ok(None)`.
 ///
 /// # Arguments
 /// - `r`: reader positioned at the candidate frame start.
@@ -2009,9 +1896,7 @@ pub(crate) fn try_skip_logical_txn_disposition<R: Read + Seek>(
 /// - On `Ok(Some((n, frame)))`: the reader is positioned at `start + n`, `n`
 ///   is the number of bytes consumed by the logical frame, and `frame` is
 ///   the decoded value for downstream Pass 1 collection.
-/// - On `Ok(None)`: the reader is restored to its original position. The
-///   caller proceeds to the next skip helper or to
-///   [`JournalFrameHeader::read`] as normal.
+/// - On `Ok(None)`: the reader is restored to its original position.
 /// - On `Err`: the reader position is undefined; the caller should treat
 ///   the scan as aborted.
 #[allow(dead_code)]

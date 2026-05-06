@@ -16,12 +16,14 @@ use crate::query::planner::{
 };
 use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
+use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::IndexState;
 use crate::storage::history_store::HistoryStore;
 use crate::storage::reconcile::driver::{
     build_checkpoint_reconcile_plan, reconcile_tree_dirty_set, CheckpointReconcilePlan,
 };
 use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedEpoch, PublishedIndex};
+use crate::storage::structural_page_batch::StructuralPageBatch;
 
 use super::btree_ops::btree_collscan;
 use super::catalog_ops::rebuild_and_publish_locked;
@@ -396,16 +398,50 @@ fn checkpoint_after_reconcile_plan(
     ort: crate::mvcc::Ts,
     checkpoint_plan: CheckpointReconcilePlan,
 ) -> Result<()> {
-    let mut overlay = crate::storage::txn_page_store::TxnOverlay::new();
-    let (primary_catalog_dirty, mut materialized_trees, primary_requires_logical_tail) =
-        materialize_primary_deltas_for_checkpoint(&engine.shared, md, &mut overlay)?;
-    let (secondary_catalog_dirty, secondary_materialized_trees, secondary_requires_logical_tail) =
-        materialize_ready_secondary_deltas_for_checkpoint(&engine.shared, md, &mut overlay)?;
-    materialized_trees.extend(secondary_materialized_trees);
-    let published_catalog_dirty = primary_catalog_dirty || secondary_catalog_dirty;
-    let requires_logical_tail = primary_requires_logical_tail || secondary_requires_logical_tail;
+    let mut batch = StructuralPageBatch::new(&engine.shared.handle);
+    let materialize_result = (|| -> Result<_> {
+        let (primary_catalog_dirty, mut materialized_trees, primary_requires_logical_tail) =
+            materialize_primary_deltas_for_checkpoint(&engine.shared, md, &mut batch)?;
+        let (
+            secondary_catalog_dirty,
+            secondary_materialized_trees,
+            secondary_requires_logical_tail,
+        ) = materialize_ready_secondary_deltas_for_checkpoint(&engine.shared, md, &mut batch)?;
+        materialized_trees.extend(secondary_materialized_trees);
+        Ok((
+            primary_catalog_dirty || secondary_catalog_dirty,
+            materialized_trees,
+            primary_requires_logical_tail || secondary_requires_logical_tail,
+        ))
+    })();
+    let (published_catalog_dirty, materialized_trees, mut requires_logical_tail) =
+        match materialize_result {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = batch.abort(&engine.shared.handle);
+                return Err(err);
+            }
+        };
     let mut base_store = super::catalog_ops::new_store(&engine.shared);
-    overlay.commit(&mut base_store, &engine.shared.handle)?;
+    batch.commit(&mut base_store, &engine.shared.handle)?;
+    for tree in checkpoint_plan.trees() {
+        if !materialized_trees.contains(tree.ident()) {
+            continue;
+        }
+        for page_id in tree.mutation_ready_pages() {
+            engine
+                .shared
+                .handle
+                .pool()
+                .clear_chains_on_page(*page_id, PageSize::Large32k)?;
+        }
+        engine
+            .shared
+            .clear_dirty_pages(tree.ident(), tree.mutation_ready_pages());
+        if !tree.excluded_future_dirty_pages().is_empty() {
+            requires_logical_tail = true;
+        }
+    }
     if published_catalog_dirty {
         let mut dirty = PublishDirty::default();
         dirty.mark_published();
@@ -435,6 +471,9 @@ fn checkpoint_after_reconcile_plan(
     })?;
 
     for tree in checkpoint_plan.trees() {
+        if materialized_trees.contains(tree.ident()) {
+            continue;
+        }
         let stats = reconcile_tree_dirty_set(
             engine,
             md,
@@ -445,9 +484,11 @@ fn checkpoint_after_reconcile_plan(
             materialized_trees.contains(tree.ident()),
         )?;
         if stats.not_installable > 0 {
-            return Err(Error::Internal(
-                "checkpoint reconcile plan allowed a non-installable dirty leaf".into(),
-            ));
+            // The pre-mutation plan rejected hard blockers up front. A page
+            // that becomes non-installable here keeps the logical journal tail
+            // as the durable recovery source for this checkpoint round.
+            requires_logical_tail = true;
+            continue;
         }
         debug_assert!(
             !tree.excluded_future_dirty_pages().is_empty()
@@ -488,6 +529,11 @@ fn checkpoint_after_reconcile_plan(
             .page_lifetime_queue()
             .depth() as u64,
     );
+    if !requires_logical_tail {
+        engine.shared.handle.allocator().update_header(|header| {
+            header.last_checkpoint_ts = header.last_checkpoint_ts.max(checkpoint_ts);
+        })?;
+    }
     {
         let _journal = engine.lock_journal_mutex();
         engine.flush_under_journal_mutex()?;
@@ -497,7 +543,12 @@ fn checkpoint_after_reconcile_plan(
         }
     }
     let checkpointed_journal = engine.shared.handle.emergency_checkpoint()?;
-    if !checkpointed_journal {
+    let truncated_logical_tail = if checkpointed_journal {
+        false
+    } else {
+        engine.shared.handle.truncate_checkpointed_journal_tail()?
+    };
+    if !checkpointed_journal && !truncated_logical_tail {
         engine.shared.handle.advance_page_lifetime_checkpoint()?;
     }
     Ok(())

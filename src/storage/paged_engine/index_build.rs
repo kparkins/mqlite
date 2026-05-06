@@ -4,7 +4,7 @@
 //! - [`PagedEngine::create_index_reserve`] — allocate a root page, write an
 //!   `IndexEntry { state: Building }`, publish.
 //! - [`PagedEngine::create_index_build`] — populate the index from the data
-//!   tree under the namespace lane.
+//!   tree under the DDL admission/drain fence.
 //! - [`PagedEngine::create_index_commit`] — flip `state: Ready` under
 //!   `metadata.write()` and publish.
 //! - [`PagedEngine::create_index_cleanup`] — drop an orphan Building entry
@@ -17,10 +17,11 @@ use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
 use crate::storage::secondary_index::build_index_mvcc;
-use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
+use crate::storage::structural_page_batch::StructuralPageBatch;
 
 use super::catalog_ops::{
-    catalog_lock, new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,
+    catalog_lock, new_store, new_structural_store, rebuild_and_publish_locked,
+    sync_catalog_root_structural,
 };
 use super::doc_helpers::now_millis;
 use super::index_maint::{CreateIndexReservation, ReserveOutcome};
@@ -80,19 +81,7 @@ impl PagedEngine {
         let reserve_result = (|| -> Result<()> {
             let _journal = self.lock_journal_mutex();
             let mark = self.shared.handle.begin_txn()?;
-            let mut overlay = TxnOverlay::new();
-            let ready = self
-                .shared
-                .handle
-                .allocator()
-                .drain_deferred_free_reservations();
-            for page in ready {
-                overlay.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+            let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
             let body = (|| {
                 let mut cat = catalog_lock(&self.metadata_state);
@@ -102,8 +91,8 @@ impl PagedEngine {
                     let data_root =
                         cat.create_collection(ns, ns_id, bson::doc! {}, now_millis())?;
                     drop(cat);
-                    sync_catalog_root_overlay(&self.shared, &self.metadata_state, &mut overlay)?;
-                    let data_store = new_txn_store(&self.shared, &mut overlay);
+                    sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
+                    let data_store = new_structural_store(&self.shared, &mut batch);
                     BTree::create_at(data_store, data_root)?;
                     cat = catalog_lock(&self.metadata_state);
                     cat.get_collection(ns)?.ok_or_else(|| {
@@ -154,11 +143,11 @@ impl PagedEngine {
                     root_level: entry.root_level,
                 });
                 drop(cat);
-                sync_catalog_root_overlay(&self.shared, &self.metadata_state, &mut overlay)?;
+                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
 
                 // Initialize the freshly-allocated leaf page so the index
                 // tree is valid to open for writes during the build step.
-                let idx_store = new_txn_store(&self.shared, &mut overlay);
+                let idx_store = new_structural_store(&self.shared, &mut batch);
                 BTree::create_at(idx_store, idx_root)?;
                 Ok(())
             })();
@@ -166,32 +155,13 @@ impl PagedEngine {
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    overlay.commit(&mut base_store, &self.shared.handle)?;
+                    batch.commit(&mut base_store, &self.shared.handle)?;
                     self.flush_under_journal_mutex()?;
-                    let db_page_count = self
-                        .shared
-                        .handle
-                        .allocator()
-                        .with_header(|h| h.total_page_count)?;
-                    let header_data = {
-                        let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
-                        page.data().to_vec()
-                    };
-                    let emergency = self.shared.handle.commit_txn(
-                        0,
-                        PageSize::Small4k,
-                        &header_data,
-                        db_page_count,
-                    )?;
-                    if emergency {
-                        // Defer the legacy page-frame checkpoint until
-                        // checkpoint materialization has folded the logical
-                        // row tail.
-                    }
                     Ok(())
                 }
                 Err(e) => {
-                    let _ = self.rollback_overlay_and_wal(overlay, mark);
+                    let _ = batch.abort(&self.shared.handle);
+                    let _ = self.shared.handle.rollback_txn(mark);
                     Err(e)
                 }
             }
@@ -302,27 +272,15 @@ impl PagedEngine {
             }
         }
 
-        // Stage the build in an overlay first. Journal rollback marks are not
-        // captured during the body because no journal frames are appended here,
-        // and other namespace lanes may commit while this long build runs.
-        let mut overlay = TxnOverlay::new();
-        let ready_reservations = self
-            .shared
-            .handle
-            .allocator()
-            .drain_deferred_free_reservations();
-        for page in ready_reservations {
-            overlay.push_reservation(PageReservation {
-                page,
-                size: PageSize::Large32k,
-                origin: PageOrigin::DeferredFree,
-            });
-        }
+        // Stage the build in the structural batch. Journal rollback marks are
+        // not captured during the body because no journal frames are appended
+        // here, and other namespaces may commit while this long build runs.
+        let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
         let body: Result<()> = (|| {
             // The data tree is read-only during index build — we use a
-            // plain BufferPoolPageStore (no overlay) so the idx_store
-            // can hold the sole &mut TxnOverlay borrow simultaneously.
+            // plain BufferPoolPageStore (no structural batch) so the
+            // idx_store can hold the sole mutable batch borrow simultaneously.
             let data_store = new_store(&self.shared);
             let data_tree = BTree::open(
                 data_store,
@@ -335,7 +293,7 @@ impl PagedEngine {
             let original_root_page = idx_entry.root_page;
             let original_root_level = idx_entry.root_level;
             let (root_page, root_level, any_multikey) = {
-                let idx_store = new_txn_store(&self.shared, &mut overlay);
+                let idx_store = new_structural_store(&self.shared, &mut batch);
                 let mut idx_tree = if rebuild_derived_pages {
                     BTree::create(idx_store)?
                 } else {
@@ -351,7 +309,7 @@ impl PagedEngine {
                 (idx_tree.root_page, idx_tree.root_level, any_multikey)
             };
             if rebuild_derived_pages {
-                let old_store = new_txn_store(&self.shared, &mut overlay);
+                let old_store = new_structural_store(&self.shared, &mut batch);
                 BTree::open(old_store, original_root_page, original_root_level).free_all_pages()?;
             }
 
@@ -389,7 +347,7 @@ impl PagedEngine {
                     return Err(stale_target());
                 }
                 drop(cat);
-                sync_catalog_root_overlay(&self.shared, &self.metadata_state, &mut overlay)?;
+                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
             }
             Ok(())
         })();
@@ -402,37 +360,18 @@ impl PagedEngine {
                 // `journal_mutex` so all page-store flush paths share the
                 // same Phase 5 rollback/persist exclusion.
                 let mut base = new_store(&self.shared);
-                overlay.commit(&mut base, &self.shared.handle)?;
+                batch.commit(&mut base, &self.shared.handle)?;
                 {
                     let _journal = self.lock_journal_mutex();
                     self.flush_under_journal_mutex()?;
-                }
-                let db_page_count = self
-                    .shared
-                    .handle
-                    .allocator()
-                    .with_header(|h| h.total_page_count)?;
-                let header_data = {
-                    let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
-                    page.data().to_vec()
-                };
-                let emergency = self.shared.handle.commit_txn(
-                    0,
-                    PageSize::Small4k,
-                    &header_data,
-                    db_page_count,
-                )?;
-                if emergency {
-                    // Defer the legacy page-frame checkpoint until checkpoint
-                    // materialization has folded the logical row tail.
                 }
                 Ok(())
             }
             Err(e) => {
                 // The build body has not appended any journal frames yet. Do
-                // not truncate to `mark`: other namespace lanes may have
-                // committed since this build transaction began.
-                let _ = self.rollback_overlay_only(overlay);
+                // not truncate to `mark`: other namespaces may have committed
+                // since this build transaction began.
+                let _ = batch.abort(&self.shared.handle);
                 Err(e)
             }
         }
@@ -506,19 +445,7 @@ impl PagedEngine {
         let commit_result = (|| -> Result<()> {
             let _journal = self.lock_journal_mutex();
             let mark = self.shared.handle.begin_txn()?;
-            let mut overlay = TxnOverlay::new();
-            let ready = self
-                .shared
-                .handle
-                .allocator()
-                .drain_deferred_free_reservations();
-            for page in ready {
-                overlay.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+            let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
             let body = (|| -> Result<()> {
                 {
@@ -540,45 +467,21 @@ impl PagedEngine {
                         return Err(stale_target());
                     }
                 }
-                sync_catalog_root_overlay(&self.shared, &self.metadata_state, &mut overlay)?;
+                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
                 Ok(())
             })();
 
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    overlay.commit(&mut base_store, &self.shared.handle)?;
+                    batch.commit(&mut base_store, &self.shared.handle)?;
                     self.flush_under_journal_mutex()?;
-                    let db_page_count = self
-                        .shared
-                        .handle
-                        .allocator()
-                        .with_header(|h| h.total_page_count)?;
-                    let header_data = {
-                        let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
-                        page.data().to_vec()
-                    };
-                    let emergency = match self.shared.handle.commit_txn(
-                        0,
-                        PageSize::Small4k,
-                        &header_data,
-                        db_page_count,
-                    ) {
-                        Ok(emergency) => {
-                            durable = true;
-                            emergency
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    if emergency {
-                        // Defer the legacy page-frame checkpoint until
-                        // checkpoint materialization has folded the logical
-                        // row tail.
-                    }
+                    durable = true;
                     Ok(())
                 }
                 Err(e) => {
-                    let _ = self.rollback_overlay_and_wal(overlay, mark);
+                    let _ = batch.abort(&self.shared.handle);
+                    let _ = self.shared.handle.rollback_txn(mark);
                     Err(e)
                 }
             }
@@ -668,11 +571,11 @@ impl PagedEngine {
 
     pub(super) fn free_index_pages_exclusive(
         &self,
-        overlay: &mut TxnOverlay,
+        batch: &mut StructuralPageBatch,
         index: &IndexEntry,
     ) -> Result<()> {
         let mut tree = BTree::open(
-            new_txn_store(&self.shared, overlay),
+            new_structural_store(&self.shared, batch),
             index.root_page,
             index.root_level,
         );
@@ -687,7 +590,7 @@ impl PagedEngine {
                     .pin_for_write_sized(*page_id, *size)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut store = new_txn_store(&self.shared, overlay);
+        let mut store = new_structural_store(&self.shared, batch);
         for (page_id, size) in pages {
             match size {
                 PageSize::Small4k => store.free_internal(page_id)?,
@@ -790,22 +693,10 @@ impl PagedEngine {
         let cleanup_result = (|| -> Result<()> {
             let _journal = self.lock_journal_mutex();
             let mark = self.shared.handle.begin_txn()?;
-            let mut overlay = TxnOverlay::new();
-            let ready = self
-                .shared
-                .handle
-                .allocator()
-                .drain_deferred_free_reservations();
-            for page in ready {
-                overlay.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+            let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
             let body = (|| -> Result<()> {
-                self.free_index_pages_exclusive(&mut overlay, &target_index)?;
+                self.free_index_pages_exclusive(&mut batch, &target_index)?;
                 {
                     let mut cat = catalog_lock(&self.metadata_state);
                     let removed = cat.drop_index(ns, name)?;
@@ -813,7 +704,7 @@ impl PagedEngine {
                         return Ok(());
                     }
                 }
-                sync_catalog_root_overlay(&self.shared, &self.metadata_state, &mut overlay)?;
+                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
                 self.shared.clear_dirty_tree(&TreeIdent {
                     collection_id: target.ns_id,
                     kind: TreeKind::Secondary {
@@ -826,38 +717,14 @@ impl PagedEngine {
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    overlay.commit(&mut base_store, &self.shared.handle)?;
+                    batch.commit(&mut base_store, &self.shared.handle)?;
                     self.flush_under_journal_mutex()?;
-                    let db_page_count = self
-                        .shared
-                        .handle
-                        .allocator()
-                        .with_header(|h| h.total_page_count)?;
-                    let header_data = {
-                        let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
-                        page.data().to_vec()
-                    };
-                    let emergency = match self.shared.handle.commit_txn(
-                        0,
-                        PageSize::Small4k,
-                        &header_data,
-                        db_page_count,
-                    ) {
-                        Ok(emergency) => {
-                            durable = true;
-                            emergency
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    if emergency {
-                        // Defer the legacy page-frame checkpoint until
-                        // checkpoint materialization has folded the logical
-                        // row tail.
-                    }
+                    durable = true;
                     Ok(())
                 }
                 Err(e) => {
-                    let _ = self.rollback_overlay_and_wal(overlay, mark);
+                    let _ = batch.abort(&self.shared.handle);
+                    let _ = self.shared.handle.rollback_txn(mark);
                     Err(e)
                 }
             }

@@ -34,6 +34,7 @@ const UNRESOLVED_COMMIT_TS: Ts = Ts {
     physical_ms: 2_000,
     logical: 0,
 };
+const MIN_SYNTHETIC_COMMIT_TS_OFFSET_MS: u64 = 1;
 
 /// Build a fresh in-memory catalog with one collection (id=1) and one
 /// index (id=10) attached to that collection.
@@ -98,6 +99,19 @@ fn setup_checkpointed_collection(db_path: &Path) {
     client.close().expect("checkpoint setup catalog");
 }
 
+fn synthetic_uncheckpointed_ts(header: &crate::storage::header::FileHeader, requested: Ts) -> Ts {
+    if requested > header.last_checkpoint_ts {
+        return requested;
+    }
+    Ts {
+        physical_ms: header
+            .last_checkpoint_ts
+            .physical_ms
+            .saturating_add(requested.physical_ms.max(MIN_SYNTHETIC_COMMIT_TS_OFFSET_MS)),
+        logical: requested.logical,
+    }
+}
+
 fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
     use crate::journal::JournalManager;
     use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
@@ -118,6 +132,7 @@ fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
     let mut mgr = JournalManager::open_or_create(db_path, &header, &mut main_file)
         .expect("open journal manager");
     let (salt1, salt2) = mgr.salts();
+    let commit_ts = synthetic_uncheckpointed_ts(&header, commit_ts);
     let mut frame = frame_primary_insert(commit_ts, ns_id);
     frame.salt1 = salt1;
     frame.salt2 = salt2;

@@ -17,6 +17,7 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::{Catalog, CollectionEntry, IndexEntry};
 use crate::storage::handle::BufferPoolHandle;
+use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::root_snapshot::PublishedEpoch;
 
 use super::catalog_ops::catalog_lock;
@@ -161,9 +162,10 @@ fn replay_logical_op(
             key,
             id_bytes,
         } => {
-            if let Some((_coll, index)) = catalog.find_index_by_id(*index_id)? {
+            if let Some((coll, index)) = catalog.find_index_by_id(*index_id)? {
                 replay_secondary_op(
                     shared,
+                    coll.id,
                     &index,
                     DeltaReplay {
                         key,
@@ -176,9 +178,10 @@ fn replay_logical_op(
             }
         }
         LogicalOpKind::SecondaryDelete { index_id, key } => {
-            if let Some((_coll, index)) = catalog.find_index_by_id(*index_id)? {
+            if let Some((coll, index)) = catalog.find_index_by_id(*index_id)? {
                 replay_secondary_op(
                     shared,
+                    coll.id,
                     &index,
                     DeltaReplay {
                         key,
@@ -211,21 +214,44 @@ fn replay_primary_op(
     coll: &CollectionEntry,
     delta: DeltaReplay<'_>,
 ) -> Result<()> {
-    replay_chain_op(shared, coll.data_root_page, coll.data_root_level, delta)
+    replay_chain_op(
+        shared,
+        TreeIdent {
+            collection_id: coll.id,
+            kind: TreeKind::Primary,
+        },
+        coll.data_root_page,
+        coll.data_root_level,
+        DirtyReason::PrimaryWrite,
+        delta,
+    )
 }
 
 fn replay_secondary_op(
     shared: &SharedState,
+    collection_id: i64,
     index: &IndexEntry,
     delta: DeltaReplay<'_>,
 ) -> Result<()> {
-    replay_chain_op(shared, index.root_page, index.root_level, delta)
+    replay_chain_op(
+        shared,
+        TreeIdent {
+            collection_id,
+            kind: TreeKind::Secondary { index_id: index.id },
+        },
+        index.root_page,
+        index.root_level,
+        DirtyReason::SecondaryWrite,
+        delta,
+    )
 }
 
 fn replay_chain_op(
     shared: &SharedState,
+    ident: TreeIdent,
     root_page: u32,
     root_level: u8,
+    dirty_reason: DirtyReason,
     delta: DeltaReplay<'_>,
 ) -> Result<()> {
     let tree = BTree::open(
@@ -250,6 +276,7 @@ fn replay_chain_op(
                 .handle
                 .pool()
                 .put_chain(leaf_page, delta.key.to_vec(), chain_arc)?;
+            shared.mark_leaf_dirty(ident, leaf_page, dirty_reason);
             return Ok(());
         }
         if let Some(prev_head) = chain_mut.front_mut() {
@@ -268,6 +295,7 @@ fn replay_chain_op(
         .handle
         .pool()
         .put_chain(leaf_page, delta.key.to_vec(), chain_arc)?;
+    shared.mark_leaf_dirty(ident, leaf_page, dirty_reason);
     Ok(())
 }
 

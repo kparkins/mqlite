@@ -14,10 +14,9 @@
 //!
 //! Contract 3.2 predicate (see docs/STORAGE-CONTRACTS-FROZEN.md §3.2):
 //!
-//!   CRUD writers serialize through the namespace lane and then the global
-//!   journal envelope in that order; publication happens only after staged secondary
-//!   work, primary install, overlay commit, journal flush, ChainCommit, and
-//!   commit_txn complete.
+//!   CRUD writers enter the global journal envelope after staging secondary
+//!   work and primary install; publication happens only after journal flush,
+//!   ChainCommit, and commit finalization complete.
 //!
 //! # Approach
 //!
@@ -61,7 +60,7 @@ fn publication_follows_full_staged_envelope() {
     let col = db.collection::<Document>("env_col");
 
     let report = client
-        .__phase0_probe_insert(
+        .__crash_cut_probe_insert(
             "envdb.env_col",
             doc! { "_id": 1i32, "v": "staged" },
             Phase0ProbeCut::CompleteWithPrePublishProbe,

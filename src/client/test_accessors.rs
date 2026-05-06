@@ -312,6 +312,7 @@ impl Client {
 
     /// Test-only US-013 hook: pause `create_index_build` at scan entry.
     #[doc(hidden)]
+    #[must_use]
     pub fn __install_create_index_build_hook(
         &self,
         ns: &str,
@@ -325,6 +326,7 @@ impl Client {
     /// Test-only US-038 hook: pause `create_index_build`, then fail it after
     /// release so `create_index_cleanup` runs.
     #[doc(hidden)]
+    #[must_use]
     pub fn __install_create_index_build_failure_hook(
         &self,
         ns: &str,
@@ -411,17 +413,17 @@ impl Client {
         self.inner.engine.us017_group_commit_observations()
     }
 
-    /// Test-only US-008 hook: reset committed overlay leaf-byte accounting.
+    /// Test-only US-008 hook: reset committed structural leaf-byte accounting.
     #[doc(hidden)]
-    pub fn __us008_reset_overlay_observations(&self) {
-        self.inner.engine.us008_reset_overlay_observations();
+    pub fn __us008_reset_structural_page_observations(&self) {
+        self.inner.engine.us008_reset_structural_page_observations();
     }
 
-    /// Test-only US-008 hook: committed overlay leaf bytes since reset.
+    /// Test-only US-008 hook: committed structural leaf bytes since reset.
     #[doc(hidden)]
     #[must_use]
-    pub fn __us008_committed_overlay_leaf_bytes(&self) -> u64 {
-        self.inner.engine.us008_committed_overlay_leaf_bytes()
+    pub fn __us008_committed_structural_leaf_bytes(&self) -> u64 {
+        self.inner.engine.us008_committed_structural_leaf_bytes()
     }
 
     /// Test-only US-011 hook: install one pending unique email secondary entry.
@@ -482,7 +484,7 @@ impl Client {
     #[doc(hidden)]
     pub fn __us036_register_publish_slot(
         &self,
-    ) -> crate::error::Result<crate::storage::paged_engine::us036_test_probe::Us036PublishSlot>
+    ) -> crate::error::Result<crate::storage::paged_engine::engine_fatal_test_probe::Us036PublishSlot>
     {
         self.inner.engine.us036_test_register_publish_slot()
     }
@@ -496,8 +498,9 @@ impl Client {
         &self,
         ns_id: i64,
         timeout_ms: u64,
-    ) -> crate::error::Result<crate::storage::paged_engine::us036_test_probe::Us036WriterTicket>
-    {
+    ) -> crate::error::Result<
+        crate::storage::paged_engine::engine_fatal_test_probe::Us036WriterTicket,
+    > {
         self.inner.engine.us036_test_admit_writer(ns_id, timeout_ms)
     }
 

@@ -33,7 +33,7 @@ impl ClientInner {
         tracing::debug!(target: "mqlite", collection = name, doc_count = 1u64, "mqlite::insert");
 
         let bson_doc = bson::to_document(doc).map_err(Error::BsonSerialization)?;
-        // Per-namespace lanes inside the engine serialize same-ns writers.
+        // The storage engine owns write admission and publication ordering.
         let id = self.engine.insert(name, bson_doc)?;
         let oid = match id {
             Bson::ObjectId(o) => o,

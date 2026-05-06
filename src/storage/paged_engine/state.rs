@@ -371,6 +371,24 @@ impl SharedState {
         self.dirty_leaves.remove(ident);
     }
 
+    /// Remove dirty-leaf state for pages that a checkpoint successfully folded.
+    pub(crate) fn clear_dirty_pages(&self, ident: &TreeIdent, pages: &[u32]) {
+        if pages.is_empty() {
+            return;
+        }
+        let remove_tree = if let Some(mut dirty) = self.dirty_leaves.get_mut(ident) {
+            for page in pages {
+                dirty.remove(page);
+            }
+            dirty.is_empty()
+        } else {
+            false
+        };
+        if remove_tree {
+            self.dirty_leaves.remove(ident);
+        }
+    }
+
     /// Remove dirty-leaf state for every tree owned by a dropped collection.
     pub(crate) fn clear_dirty_collection(&self, collection_id: i64) {
         let idents: Vec<TreeIdent> = self
@@ -833,9 +851,9 @@ impl MetadataState {
 mod state_tests;
 
 #[cfg(test)]
-#[path = "state_us001_tests.rs"]
-mod state_us001_tests;
+#[path = "tests/dirty_leaf_state_tests.rs"]
+mod dirty_leaf_state_tests;
 
 #[cfg(test)]
-#[path = "state_us002_tests.rs"]
-mod state_us002_tests;
+#[path = "tests/dirty_leaf_marking_tests.rs"]
+mod dirty_leaf_marking_tests;

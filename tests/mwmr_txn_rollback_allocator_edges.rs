@@ -1,5 +1,5 @@
-//! MWMR edge-case tests: PR 6 (TxnPageStore page-byte overlay) and
-//! PR 7 (allocator reservations + header rollback).
+//! MWMR edge-case tests: PR 6 (page-byte rollback) and
+//! PR 7 (allocator/lifetime rollback + header rollback).
 //!
 //! These tests target corner cases that the existing acceptance gates in
 //! `mwmr_txn_isolation.rs` do not fully cover:
@@ -8,7 +8,7 @@
 //! - TC2:  Rollback of many small inserts (no leaked pages after 100 failures)
 //! - TC3:  Alloc-then-free in same logical txn (update_one round-trip)
 //! - TC4:  Overflow page allocation under churn (4 k payloads, delete+reinsert)
-//! - TC5:  Buffer pool invalidation on rollback (stale overlay bytes not cached)
+//! - TC5:  Buffer pool invalidation on rollback (stale staged bytes not cached)
 //! - TC6:  Cross-collection independence under txn isolation
 //! - TC7:  Concurrent readers during failing writes (no partial-row observation)
 //! - TC8:  Allocator drain safety (deferred-free reused after failing inserts)
@@ -344,13 +344,13 @@ fn tc4_overflow_page_alloc_under_churn() {
 // TC5: Buffer pool invalidation on rollback
 // ---------------------------------------------------------------------------
 //
-// If rollback (PR 6 overlay drop) fails to invalidate cached buffer-pool
+// If rollback fails to invalidate cached buffer-pool
 // frames, a subsequent read could return stale/corrupted data from the
-// rolled-back overlay. This test exercises that path:
+// rolled-back write. This test exercises that path:
 //   1. Insert {_id:1} — read it back to populate the buffer pool frame.
-//   2. Attempt 100 failing dup-_id inserts (each creates/drops an overlay).
+//   2. Attempt 100 failing dup-_id inserts.
 //   3. Insert {_id:2} — must succeed and be readable with correct data.
-//   4. Read {_id:1} — must still return original data, not overlay garbage.
+//   4. Read {_id:1} — must still return original data.
 
 #[test]
 fn tc5_buffer_pool_invalidation_on_rollback() {
@@ -372,8 +372,7 @@ fn tc5_buffer_pool_invalidation_on_rollback() {
         "TC5: initial read must return correct data"
     );
 
-    // 100 failing dup-_id inserts — each creates a TxnPageStore overlay
-    // and drops it on rollback.
+    // 100 failing dup-_id inserts.
     for i in 0..100u32 {
         let _ = col.insert_one(&doc! { "_id": 1, "overlay_junk": i });
     }
@@ -397,7 +396,7 @@ fn tc5_buffer_pool_invalidation_on_rollback() {
         "TC5: rolled-back field 'overlay_junk' must not appear in doc _id=2"
     );
 
-    // Read _id=1 again — must still see original data, not stale overlay.
+    // Read _id=1 again — must still see original data.
     let doc1_after = col
         .find_one(doc! { "_id": 1 })
         .expect("find_one _id=1 after")
@@ -588,7 +587,7 @@ fn tc7_concurrent_readers_during_failing_writes() {
             for row in &rows {
                 assert!(
                     row.get("partial").is_none(),
-                    "TC7: reader observed 'partial' field from a rolled-back write — overlay leaked"
+                    "TC7: reader observed 'partial' field from a rolled-back write"
                 );
             }
         }
@@ -624,7 +623,7 @@ fn tc7_concurrent_readers_during_failing_writes() {
 // 1. Seed 100 docs.
 // 2. Delete all 100 docs — creates deferred-free entries in the queue.
 // 3. Attempt 50 dup-_id failing inserts — each failing txn drains the
-//    deferred-free queue into its reservations, then returns them on rollback.
+//    deferred-free queue into its lifetime batch, then returns them on rollback.
 // 4. Insert 100 new docs — file size should not grow appreciably beyond the
 //    original seeded size (deferred-freed pages are reused, not leaked).
 

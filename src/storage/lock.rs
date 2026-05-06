@@ -366,16 +366,14 @@ impl FileLock for PosixFileLock {
 // Windows stub
 // ---------------------------------------------------------------------------
 
-/// Windows file lock stub.
+/// Windows file lock placeholder.
 ///
-/// Not yet implemented. The production implementation will use
-/// `LockFileEx()` / `UnlockFileEx()` for byte-range locking via the
-/// `windows-sys` crate. The stub ensures the project compiles on Windows;
-/// the `acquire_*` methods return `Error::WriterBusy` to prevent accidental
-/// use in production on Windows.
+/// The production implementation must use `LockFileEx()` / `UnlockFileEx()`
+/// for byte-range locking via the `windows-sys` crate. Until then, every
+/// operation returns an explicit error so Windows builds cannot silently run
+/// without lock-file I/O.
 #[cfg(windows)]
 pub(crate) struct WindowsFileLock {
-    // TODO: add HANDLE field and implement LockFileEx / UnlockFileEx.
     _marker: std::marker::PhantomData<()>,
 }
 
@@ -391,38 +389,33 @@ impl WindowsFileLock {
 #[cfg(windows)]
 impl FileLock for WindowsFileLock {
     fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<()> {
-        // TODO: implement using WriteFile at offset via OVERLAPPED.
         Err(Error::Internal(
             "WindowsFileLock::write_at: not yet implemented".into(),
         ))
     }
 
     fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
-        // TODO: implement using ReadFile at offset via OVERLAPPED.
         Err(Error::Internal(
             "WindowsFileLock::read_exact_at: not yet implemented".into(),
         ))
     }
 
     fn acquire_exclusive(&self, _timeout: Duration) -> Result<bool> {
-        // TODO: implement using LockFileEx() with LOCKFILE_EXCLUSIVE_LOCK.
-        // The OVERLAPPED structure's Offset/OffsetHigh fields map to the byte
-        // range within the file to lock.
         Err(Error::Internal(
-            "Windows file locking not yet implemented".into(),
+            "WindowsFileLock::acquire_exclusive: not yet implemented".into(),
         ))
     }
 
     fn acquire_shared(&self, _timeout: Duration) -> Result<bool> {
-        // TODO: implement using LockFileEx() without LOCKFILE_EXCLUSIVE_LOCK.
         Err(Error::Internal(
-            "Windows file locking not yet implemented".into(),
+            "WindowsFileLock::acquire_shared: not yet implemented".into(),
         ))
     }
 
     fn release(&self) -> Result<()> {
-        // TODO: implement using UnlockFileEx().
-        Ok(())
+        Err(Error::Internal(
+            "WindowsFileLock::release: not yet implemented".into(),
+        ))
     }
 }
 

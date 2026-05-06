@@ -49,10 +49,10 @@ mod chains;
 // despite being exercised by the buffer-pool unit tests.
 #[allow(dead_code)]
 mod page_latch;
-mod partition;
+pub mod page_latch_fairness_test_probe;
 #[cfg(any(test, feature = "test-hooks"))]
-pub mod us019_test_probe;
-pub mod us020_test_probe;
+pub mod page_latch_upgrade_test_probe;
+mod partition;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
@@ -275,7 +275,9 @@ impl Drop for LatchHoldRecorder<'_> {
         // Step 2 — record the latch-release event AFTER the unlock has
         // actually happened. In production the line is a no-op.
         #[cfg(test)]
-        us029_test_probe::record_drop_event(us029_test_probe::EVENT_LATCH_RELEASE);
+        latched_pinned_page_drop_test_probe::record_drop_event(
+            latched_pinned_page_drop_test_probe::EVENT_LATCH_RELEASE,
+        );
     }
 }
 
@@ -606,7 +608,9 @@ impl Drop for LatchedPinnedPage<'_> {
         // Pin-release event fires AFTER `unpin_internal` returns, so
         // the recorded order matches the actual side-effect order.
         #[cfg(test)]
-        us029_test_probe::record_drop_event(us029_test_probe::EVENT_PIN_RELEASE);
+        latched_pinned_page_drop_test_probe::record_drop_event(
+            latched_pinned_page_drop_test_probe::EVENT_PIN_RELEASE,
+        );
     }
 }
 
@@ -1475,22 +1479,28 @@ pub(crate) mod default_sizes {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "tests/delta_eviction_policy_tests.rs"]
+mod delta_eviction_policy_tests;
+#[cfg(test)]
+#[path = "tests/delta_occupancy_metrics_tests.rs"]
+mod delta_occupancy_metrics_tests;
+#[cfg(test)]
 mod delta_order_tests;
 #[cfg(test)]
-mod tests;
+#[path = "tests/dirty_frame_snapshot_tests.rs"]
+mod dirty_frame_snapshot_tests;
 #[cfg(test)]
-mod us005_tests;
+#[path = "tests/latched_dirty_frame_tests.rs"]
+mod latched_dirty_frame_tests;
 #[cfg(test)]
-mod us006_tests;
+mod latched_pinned_page_drop_test_probe;
+#[cfg(test)]
+#[path = "tests/latched_pinned_page_tests.rs"]
+mod latched_pinned_page_tests;
+#[cfg(test)]
+#[path = "tests/reconcile_delta_preservation_tests.rs"]
+mod reconcile_delta_preservation_tests;
 #[cfg(any(test, feature = "test-hooks"))]
-mod us009_test_probe;
+mod resident_chain_test_probe;
 #[cfg(test)]
-mod us013_tests;
-#[cfg(test)]
-mod us014_tests;
-#[cfg(test)]
-mod us015_tests;
-#[cfg(test)]
-mod us029_test_probe;
-#[cfg(test)]
-mod us029_tests;
+mod tests;

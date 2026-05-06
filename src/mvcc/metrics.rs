@@ -521,7 +521,7 @@ pub fn reset_published_snapshot_rebuilds() {
 // ---------------------------------------------------------------------------
 
 /// CRUD commits whose body did NOT persist updated tree-root metadata
-/// (no `sync_catalog_root_overlay` call during the txn).
+/// (no catalog-root header owner update during the txn).
 ///
 /// Observation only — write-side updates are lock-free atomics; snapshot/reset
 /// calls are test/admin surfaces and must not race with active writers.
@@ -547,7 +547,7 @@ pub fn reset_crud_commits_root_neutral() {
 // ---------------------------------------------------------------------------
 
 /// CRUD commits whose body DID persist updated tree-root metadata (the
-/// `sync_catalog_root_overlay` path fired at least once during the txn).
+/// catalog-root header owner path fired at least once during the txn).
 ///
 /// Observation only — write-side updates are lock-free atomics; snapshot/reset
 /// calls are test/admin surfaces and must not race with active writers.
@@ -572,10 +572,10 @@ pub fn reset_crud_commits_root_changing() {
 // P3a — lane_wait_ns_total  (counter, cumulative nanoseconds)
 // ---------------------------------------------------------------------------
 
-/// Cumulative nanoseconds CRUD writers spent waiting to acquire their
-/// per-namespace lane mutex. Timed with `Instant::now()` reads taken OUTSIDE
-/// the critical section; the write-side record call is a lock-free atomic
-/// add that does not extend the critical section.
+/// Cumulative nanoseconds CRUD writers spent waiting on write admission.
+/// Timed with `Instant::now()` reads taken OUTSIDE the critical section; the
+/// write-side record call is a lock-free atomic add that does not extend the
+/// critical section.
 ///
 /// Observation only — write-side updates are lock-free atomics; snapshot/reset
 /// calls are test/admin surfaces and must not race with active writers.
@@ -632,8 +632,8 @@ pub fn reset_journal_mutex_wait_ns() {
 // P4a — recovery_legacy_page_frames_total  (counter)
 // ---------------------------------------------------------------------------
 
-/// Total number of legacy page-replay frames processed by the recovery loop
-/// (`JournalFrameHeader` frames — non-commit and commit).
+/// Total number of retired page-replay records processed by older recovery
+/// loops.
 ///
 /// Observation only — write-side updates are lock-free atomics; snapshot/reset
 /// calls are test/admin surfaces and must not race with active writers.
@@ -773,7 +773,7 @@ pub fn reset_published_catalog_rebuild_count() {
 // ---------------------------------------------------------------------------
 
 /// Number of publishes whose txn had `catalog_header_dirty == true`
-/// (i.e. `sync_catalog_root_overlay` ran during the body). Ticks on
+/// (i.e. the catalog-root header owner ran during the body). Ticks on
 /// every root-moving CRUD and on every DDL; does NOT tick on
 /// root-neutral CRUD or on multikey-only flips where the on-disk
 /// header did not change.
@@ -802,7 +802,7 @@ pub fn reset_catalog_header_sync_count() {
 
 /// Number of publishes whose txn had BOTH flags clear — i.e.
 /// root-neutral CRUD commits that reuse the prior catalog Arc and
-/// skip `sync_catalog_root_overlay`.
+/// skip the catalog-root header owner.
 ///
 /// Observation only — no lock held while reading or writing.
 pub static ROOT_NEUTRAL_COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);

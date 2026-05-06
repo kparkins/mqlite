@@ -55,8 +55,9 @@ use crate::storage::page::{OVERFLOW_HEADER_SIZE, PAGE_SIZE_INTERNAL, PAGE_SIZE_L
 /// Immutable 32 KiB leaf page image returned by reader paths.
 ///
 /// Buffer-pool readers can hold the existing published `ArcSwap<Vec<u8>>`
-/// snapshot without cloning the page bytes. Writer-side overlays still return
-/// owned images so mutable paths never edit shared frame snapshots in place.
+/// snapshot without cloning the page bytes. Structural staged writes still
+/// return owned images so mutable paths never edit shared frame snapshots in
+/// place.
 #[derive(Clone)]
 pub(crate) enum LeafPageImage {
     Shared(Arc<Vec<u8>>),
@@ -138,11 +139,11 @@ pub(crate) struct BTreePathStep {
 
 mod chain;
 mod node;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod reader_crabbing_test_probe;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod reader_latch_scope_test_probe;
 pub(crate) mod reconcile;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod us016_test_probe;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod us025_test_probe;
 
 use chain::*;
 pub(crate) use node::CellValue;
@@ -497,12 +498,12 @@ impl BTreePageStore for MemPageStore {
 // Empty-page seed helpers
 // ---------------------------------------------------------------------------
 //
-// Used by `TxnPageStore::alloc_leaf` / `alloc_internal` to seed the
-// per-txn overlay with a valid empty-page image immediately after a
-// fresh page is returned from the base allocator. Without the seed, any
-// subsequent in-txn read of the page falls through the overlay to the
-// shared buffer-pool frame, which still holds zero bytes (or stale
-// bytes if the page was recycled from the free list). The decoder
+// Used by `StructuralBatchStore::alloc_leaf` / `alloc_internal` to seed staged
+// structural bytes with a valid empty-page image immediately after a fresh page
+// is returned from the base allocator. Without the seed, any subsequent
+// in-batch read of the page falls through to the shared buffer-pool frame,
+// which still holds zero bytes (or stale bytes if the page was recycled from
+// the free list). The decoder
 // rejects that as "unknown cell value type 0x00" or "expected leaf
 // page type 0x02, found 0x00".
 //
@@ -676,33 +677,33 @@ mod scan;
 mod tests;
 
 #[cfg(test)]
-#[path = "../btree_us004_tests.rs"]
-mod btree_us004_tests;
+#[path = "tests/history_probe_scan_tests.rs"]
+mod history_probe_scan_tests;
 
 #[cfg(test)]
-#[path = "../btree_us005_tests.rs"]
-mod btree_us005_tests;
+#[path = "tests/delta_point_lookup_tests.rs"]
+mod delta_point_lookup_tests;
 
 #[cfg(test)]
-#[path = "../btree_us006_tests.rs"]
-mod btree_us006_tests;
+#[path = "tests/merged_range_scan_tests.rs"]
+mod merged_range_scan_tests;
 
 #[cfg(test)]
-#[path = "../btree_phase4_us007_tests.rs"]
-mod btree_phase4_us007_tests;
+#[path = "tests/folded_leaf_encoding_tests.rs"]
+mod folded_leaf_encoding_tests;
 
 #[cfg(test)]
-#[path = "../btree_us012_tests.rs"]
-mod btree_us012_tests;
+#[path = "tests/history_fallthrough_tests.rs"]
+mod history_fallthrough_tests;
 
 #[cfg(test)]
-#[path = "../btree_us016_tests.rs"]
-mod btree_us016_tests;
+#[path = "tests/split_delta_routing_tests.rs"]
+mod split_delta_routing_tests;
 
 #[cfg(test)]
-#[path = "../btree_us017_tests.rs"]
-mod btree_us017_tests;
+#[path = "tests/split_atomicity_tests.rs"]
+mod split_atomicity_tests;
 
 #[cfg(test)]
-#[path = "../btree_us035_tests.rs"]
-mod btree_us035_tests;
+#[path = "tests/leaf_cell_decode_tests.rs"]
+mod leaf_cell_decode_tests;

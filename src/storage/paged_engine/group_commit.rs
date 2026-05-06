@@ -137,12 +137,12 @@ impl GroupCommitManager {
         F: FnMut() -> Result<()>,
     {
         #[cfg(any(test, feature = "test-hooks"))]
-        let leader_guard = super::us017_test_probe::leader_entered();
+        let leader_guard = super::group_commit_test_probe::leader_entered();
 
         let high_water = self.close_current_cohort_after_wait(cohort_id, max_wait)?;
 
         #[cfg(any(test, feature = "test-hooks"))]
-        let fsync_result = if super::us017_test_probe::take_fail_next_fsync() {
+        let fsync_result = if super::group_commit_test_probe::take_fail_next_fsync() {
             Err(Error::Internal(
                 "US-017 injected group-commit fsync failure".into(),
             ))
@@ -183,9 +183,9 @@ impl GroupCommitManager {
             #[cfg(any(test, feature = "test-hooks"))]
             {
                 let joined = state.open_cohort_joined;
-                if let Some(expected) = super::us017_test_probe::expected_cohort_size() {
+                if let Some(expected) = super::group_commit_test_probe::expected_cohort_size() {
                     if joined >= expected {
-                        super::us017_test_probe::clear_expected_cohort_size();
+                        super::group_commit_test_probe::clear_expected_cohort_size();
                         break;
                     }
                     if Instant::now() < test_deadline {
@@ -211,7 +211,7 @@ impl GroupCommitManager {
         drop(state);
 
         #[cfg(any(test, feature = "test-hooks"))]
-        super::us017_test_probe::pause_after_close_if_installed(cohort_id, high_water);
+        super::group_commit_test_probe::pause_after_close_if_installed(cohort_id, high_water);
 
         Ok(high_water)
     }
@@ -226,7 +226,7 @@ impl GroupCommitManager {
             state.wait_window_deadline = None;
         }
         #[cfg(any(test, feature = "test-hooks"))]
-        super::us017_test_probe::record_fsync_failure();
+        super::group_commit_test_probe::record_fsync_failure();
         let fatal = poison_after_durable_commit(shared, reason);
         self.leader_elected.store(false, Ordering::Release);
         self.fsync_completed.notify_all();

@@ -39,96 +39,119 @@ fn frame_header_size_constant() {
     assert_eq!(JOURNAL_HEADER_SIZE, 32);
 }
 
+fn write_test_page_frame_record(
+    page_number: u32,
+    db_page_count: u32,
+    salt1: u32,
+    salt2: u32,
+    page_size: JournalPageSize,
+    page_data: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_page_frame_record(
+        &mut buf,
+        page_number,
+        db_page_count,
+        salt1,
+        salt2,
+        page_size,
+        page_data,
+    )
+    .unwrap();
+    buf
+}
+
+fn corrupt_page_record_checksum(bytes: &mut [u8]) {
+    bytes[JOURNAL_FRAME_HEADER_SIZE - 4] ^= 0xFF;
+}
+
 #[test]
-fn frame_roundtrip_4k() {
-    let frame = JournalFrameHeader {
+fn checkpoint_batch_page_record_roundtrip_4k() {
+    let record = CheckpointBatchPageRecord {
         page_number: 42,
-        db_page_count: 100,
         salt1: 0xDEAD,
         salt2: 0xBEEF,
         page_size: JournalPageSize::Small4k,
     };
     let page_data = vec![0xABu8; PAGE_SIZE_INTERNAL as usize];
     let mut buf = Vec::new();
-    frame.write(&mut buf, &page_data).unwrap();
+    record.write(&mut buf, &page_data).unwrap();
     assert_eq!(
         buf.len(),
         JOURNAL_FRAME_HEADER_SIZE + PAGE_SIZE_INTERNAL as usize
     );
 
-    // Read back
     let mut cursor = std::io::Cursor::new(&buf);
-    let decoded = JournalFrameHeader::read(&mut cursor, 0xDEAD, 0xBEEF)
-        .unwrap()
-        .expect("should parse");
+    let (decoded, decoded_data) =
+        CheckpointBatchPageRecord::read_with_data(&mut cursor, 0xDEAD, 0xBEEF)
+            .unwrap()
+            .expect("checkpoint batch page must parse");
     assert_eq!(decoded.page_number, 42);
-    assert_eq!(decoded.db_page_count, 100);
     assert_eq!(decoded.page_size, JournalPageSize::Small4k);
+    assert_eq!(decoded_data, page_data);
 }
 
 #[test]
-fn frame_roundtrip_32k() {
-    let frame = JournalFrameHeader {
+fn checkpoint_batch_page_record_roundtrip_32k() {
+    let record = CheckpointBatchPageRecord {
         page_number: 7,
-        db_page_count: 0,
         salt1: 1,
         salt2: 2,
         page_size: JournalPageSize::Large32k,
     };
     let page_data = vec![0x5Au8; PAGE_SIZE_LEAF as usize];
     let mut buf = Vec::new();
-    frame.write(&mut buf, &page_data).unwrap();
+    record.write(&mut buf, &page_data).unwrap();
     assert_eq!(
         buf.len(),
         JOURNAL_FRAME_HEADER_SIZE + PAGE_SIZE_LEAF as usize
     );
 
     let mut cursor = std::io::Cursor::new(&buf);
-    let decoded = JournalFrameHeader::read(&mut cursor, 1, 2)
+    let (decoded, decoded_data) = CheckpointBatchPageRecord::read_with_data(&mut cursor, 1, 2)
         .unwrap()
-        .expect("should parse");
+        .expect("checkpoint batch page must parse");
     assert_eq!(decoded.page_number, 7);
-    assert_eq!(decoded.db_page_count, 0); // non-commit
+    assert_eq!(decoded.page_size, JournalPageSize::Large32k);
+    assert_eq!(decoded_data, page_data);
 }
 
 #[test]
-fn frame_bad_checksum_returns_none() {
-    let frame = JournalFrameHeader {
+fn checkpoint_batch_page_record_bad_checksum_returns_none() {
+    let record = CheckpointBatchPageRecord {
         page_number: 1,
-        db_page_count: 10,
         salt1: 1,
         salt2: 2,
         page_size: JournalPageSize::Small4k,
     };
     let page_data = vec![0u8; PAGE_SIZE_INTERNAL as usize];
     let mut buf = Vec::new();
-    frame.write(&mut buf, &page_data).unwrap();
-    // Corrupt a byte in the page data
+    record.write(&mut buf, &page_data).unwrap();
     let last = buf.len() - 1;
     buf[last] ^= 0xFF;
 
     let mut cursor = std::io::Cursor::new(&buf);
-    let result = JournalFrameHeader::read(&mut cursor, 1, 2).unwrap();
+    let result = CheckpointBatchPageRecord::read(&mut cursor, 1, 2).unwrap();
     assert!(result.is_none(), "bad checksum must return None");
+    assert_eq!(cursor.position(), 0, "reader must rewind on reject");
 }
 
 #[test]
-fn frame_salt_mismatch_returns_none() {
-    let frame = JournalFrameHeader {
+fn checkpoint_batch_page_record_salt_mismatch_returns_none() {
+    let record = CheckpointBatchPageRecord {
         page_number: 1,
-        db_page_count: 10,
         salt1: 1,
         salt2: 2,
         page_size: JournalPageSize::Small4k,
     };
     let page_data = vec![0u8; PAGE_SIZE_INTERNAL as usize];
     let mut buf = Vec::new();
-    frame.write(&mut buf, &page_data).unwrap();
+    record.write(&mut buf, &page_data).unwrap();
 
-    // Read with wrong salts
     let mut cursor = std::io::Cursor::new(&buf);
-    let result = JournalFrameHeader::read(&mut cursor, 99, 99).unwrap();
+    let result = CheckpointBatchPageRecord::read(&mut cursor, 99, 99).unwrap();
     assert!(result.is_none(), "salt mismatch must return None");
+    assert_eq!(cursor.position(), 0, "reader must rewind on reject");
 }
 
 #[test]
@@ -285,11 +308,11 @@ fn chain_commit_bogus_length_prefix_returns_none() {
 }
 
 // -----------------------------------------------------------------
-// try_skip_chain_commit
+// ChainCommit cursor reader
 // -----------------------------------------------------------------
 
 #[test]
-fn try_skip_chain_commit_advances_past_valid_frame() {
+fn chain_commit_cursor_reader_advances_past_valid_frame() {
     let frame = sample_chain_commit();
     let expected_ts = frame.commit_ts;
     let bytes = frame.encode().unwrap();
@@ -297,7 +320,7 @@ fn try_skip_chain_commit_advances_past_valid_frame() {
     prefixed.extend_from_slice(&bytes);
     let mut cursor = std::io::Cursor::new(prefixed);
     cursor.set_position(13);
-    let (n, ts, offset) = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2)
+    let (n, ts, offset) = read_chain_commit_at_cursor(&mut cursor, frame.salt1, frame.salt2)
         .unwrap()
         .expect("valid frame must be skipped");
     assert_eq!(n as usize, bytes.len());
@@ -307,25 +330,23 @@ fn try_skip_chain_commit_advances_past_valid_frame() {
 }
 
 #[test]
-fn try_skip_chain_commit_rewinds_on_legacy_frame() {
-    // A legacy JournalFrameHeader should NOT look like a ChainCommit —
-    // helper must restore position and return None.
-    let legacy = JournalFrameHeader {
-        page_number: 42,
-        db_page_count: 100,
-        salt1: 0xDEAD_BEEF,
-        salt2: 0xCAFE_BABE,
-        page_size: JournalPageSize::Small4k,
-    };
+fn chain_commit_cursor_reader_rewinds_on_page_record() {
+    // A checkpoint-shaped page record should not look like a ChainCommit.
     let page_data = vec![0u8; PAGE_SIZE_INTERNAL as usize];
-    let mut buf = Vec::new();
-    legacy.write(&mut buf, &page_data).unwrap();
+    let buf = write_test_page_frame_record(
+        42,
+        100,
+        0xDEAD_BEEF,
+        0xCAFE_BABE,
+        JournalPageSize::Small4k,
+        &page_data,
+    );
 
     let mut cursor = std::io::Cursor::new(buf);
-    let result = try_skip_chain_commit(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
+    let result = read_chain_commit_at_cursor(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
     assert!(
         result.is_none(),
-        "legacy page_number=42 frame must not look like ChainCommit"
+        "page_number=42 record must not look like ChainCommit"
     );
     assert_eq!(
         cursor.position(),
@@ -335,55 +356,54 @@ fn try_skip_chain_commit_rewinds_on_legacy_frame() {
 }
 
 #[test]
-fn try_skip_chain_commit_disambiguates_legacy_page_number_two() {
-    // Legacy frame with page_number=2: first 4 bytes are [2,0,0,0], the
-    // same as a ChainCommit header prefix. CRC check must reject.
-    let legacy = JournalFrameHeader {
-        page_number: 2,
-        db_page_count: 1,
-        salt1: 0xDEAD_BEEF,
-        salt2: 0xCAFE_BABE,
-        page_size: JournalPageSize::Small4k,
-    };
+fn chain_commit_cursor_reader_rewinds_on_page_number_two_record() {
+    // Page number 2 has the same first byte as the ChainCommit kind; the
+    // full ChainCommit decode must still reject it.
     let page_data = vec![0xAAu8; PAGE_SIZE_INTERNAL as usize];
-    let mut buf = Vec::new();
-    legacy.write(&mut buf, &page_data).unwrap();
+    let buf = write_test_page_frame_record(
+        2,
+        1,
+        0xDEAD_BEEF,
+        0xCAFE_BABE,
+        JournalPageSize::Small4k,
+        &page_data,
+    );
 
     let mut cursor = std::io::Cursor::new(buf);
-    let result = try_skip_chain_commit(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
+    let result = read_chain_commit_at_cursor(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();
     assert!(
         result.is_none(),
-        "page_number=2 legacy frame must be rejected via CRC disambiguation"
+        "page_number=2 record must be rejected by ChainCommit decode"
     );
     assert_eq!(cursor.position(), 0);
 }
 
 #[test]
-fn try_skip_chain_commit_rewinds_on_salt_mismatch() {
+fn chain_commit_cursor_reader_rewinds_on_salt_mismatch() {
     let frame = sample_chain_commit();
     let bytes = frame.encode().unwrap();
     let mut cursor = std::io::Cursor::new(bytes);
-    let result = try_skip_chain_commit(&mut cursor, 0, 0).unwrap();
+    let result = read_chain_commit_at_cursor(&mut cursor, 0, 0).unwrap();
     assert!(result.is_none(), "wrong salts must return None");
     assert_eq!(cursor.position(), 0, "cursor restored on salt mismatch");
 }
 
 #[test]
-fn try_skip_chain_commit_rewinds_on_truncated_buffer() {
+fn chain_commit_cursor_reader_rewinds_on_truncated_buffer() {
     let frame = sample_chain_commit();
     let bytes = frame.encode().unwrap();
     // Truncate inside the variable tail.
     let truncated = bytes[..bytes.len() - 10].to_vec();
     let mut cursor = std::io::Cursor::new(truncated);
-    let result = try_skip_chain_commit(&mut cursor, frame.salt1, frame.salt2).unwrap();
+    let result = read_chain_commit_at_cursor(&mut cursor, frame.salt1, frame.salt2).unwrap();
     assert!(result.is_none(), "truncated frame must return None");
     assert_eq!(cursor.position(), 0);
 }
 
 #[test]
-fn try_skip_chain_commit_handles_eof() {
+fn chain_commit_cursor_reader_handles_eof() {
     let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-    let result = try_skip_chain_commit(&mut cursor, 1, 2).unwrap();
+    let result = read_chain_commit_at_cursor(&mut cursor, 1, 2).unwrap();
     assert!(result.is_none(), "EOF returns None");
     assert_eq!(cursor.position(), 0);
 }
@@ -1497,24 +1517,23 @@ fn try_skip_logical_txn_advances_on_valid_frame() {
 
 #[test]
 fn try_skip_logical_txn_rewinds_on_bad_kind() {
-    // A legacy JournalFrameHeader must NOT look like a LogicalTxnFrame —
-    // the first-byte discriminant rejects and the helper restores position.
-    let legacy = JournalFrameHeader {
-        page_number: 42,
-        db_page_count: 100,
-        salt1: TEST_SALT1,
-        salt2: TEST_SALT2,
-        page_size: JournalPageSize::Small4k,
-    };
+    // A page record must not look like a LogicalTxnFrame. The first-byte
+    // discriminant rejects and the helper restores position.
     let page_data = vec![0u8; PAGE_SIZE_INTERNAL as usize];
-    let mut buf = Vec::new();
-    legacy.write(&mut buf, &page_data).unwrap();
+    let buf = write_test_page_frame_record(
+        42,
+        100,
+        TEST_SALT1,
+        TEST_SALT2,
+        JournalPageSize::Small4k,
+        &page_data,
+    );
 
     let mut cursor = std::io::Cursor::new(buf);
     let result = try_skip_logical_txn(&mut cursor, TEST_SALT1, TEST_SALT2).unwrap();
     assert!(
         result.is_none(),
-        "legacy frame must not look like LogicalTxnFrame"
+        "page record must not look like LogicalTxnFrame"
     );
     assert_eq!(
         cursor.position(),
@@ -1548,22 +1567,19 @@ fn try_skip_logical_txn_rewinds_on_salt_mismatch() {
 }
 
 #[test]
-fn try_skip_logical_txn_followed_by_try_skip_chain_commit_legacy() {
-    // Build a journal byte stream whose next frame is legacy — a
-    // `JournalFrameHeader` carrying a page of user data. Both
-    // try_skip_logical_txn and try_skip_chain_commit must rewind and return
-    // Ok(None) in sequence, leaving the cursor at its original position
-    // ready for the legacy reader path.
-    let legacy = JournalFrameHeader {
+fn logical_and_chain_readers_rewind_on_page_record() {
+    // Build a journal byte stream whose next record is checkpoint-shaped page
+    // data. Both readers must rewind and return Ok(None), leaving the cursor
+    // at its original position for a checkpoint-owned reader.
+    let record = CheckpointBatchPageRecord {
         page_number: 7,
-        db_page_count: 0,
         salt1: TEST_SALT1,
         salt2: TEST_SALT2,
         page_size: JournalPageSize::Small4k,
     };
     let page_data = vec![0x5Au8; PAGE_SIZE_INTERNAL as usize];
     let mut buf = Vec::new();
-    legacy.write(&mut buf, &page_data).unwrap();
+    record.write(&mut buf, &page_data).unwrap();
     let original_bytes = buf.clone();
 
     let mut cursor = std::io::Cursor::new(buf);
@@ -1572,27 +1588,222 @@ fn try_skip_logical_txn_followed_by_try_skip_chain_commit_legacy() {
     let logical = try_skip_logical_txn(&mut cursor, TEST_SALT1, TEST_SALT2).unwrap();
     assert!(
         logical.is_none(),
-        "legacy frame must not be consumed by try_skip_logical_txn"
+        "page record must not be consumed by try_skip_logical_txn"
     );
     assert_eq!(
         cursor.position(),
         start,
-        "cursor must be at start after logical helper rejects a legacy frame"
+        "cursor must be at start after logical helper rejects a page record"
     );
 
-    let chain = try_skip_chain_commit(&mut cursor, TEST_SALT1, TEST_SALT2).unwrap();
+    let chain = read_chain_commit_at_cursor(&mut cursor, TEST_SALT1, TEST_SALT2).unwrap();
     assert!(
         chain.is_none(),
-        "legacy frame must not be consumed by try_skip_chain_commit either"
+        "page record must not be consumed by ChainCommit reader either"
     );
     assert_eq!(
         cursor.position(),
         start,
-        "cursor must be at start after chain-commit helper rejects a legacy frame"
+        "cursor must be at start after chain-commit helper rejects a page record"
     );
 
     // Underlying bytes must be untouched.
     assert_eq!(cursor.get_ref(), &original_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 US-009: unsupported legacy-shaped byte negatives
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phase6_us009_old_page_frame_commit_aliases_logical_as_torn_tail() {
+    let page_data = vec![0xC3u8; PAGE_SIZE_INTERNAL as usize];
+    let bytes = write_test_page_frame_record(
+        u32::from(FRAME_KIND_LOGICAL_TXN),
+        (LOGICAL_TXN_MIN_FRAME_SIZE + 8) as u32,
+        TEST_SALT1,
+        TEST_SALT2,
+        JournalPageSize::Small4k,
+        &page_data,
+    );
+
+    let mut logical_cursor = std::io::Cursor::new(bytes.clone());
+    let scan =
+        try_skip_logical_txn_disposition(&mut logical_cursor, TEST_SALT1, TEST_SALT2).unwrap();
+    assert_eq!(
+        scan,
+        LogicalScan::Torn,
+        "unsupported page-frame commit bytes that alias logical framing must \
+         use the existing torn-tail path"
+    );
+    assert_eq!(logical_cursor.position(), 0);
+
+    let mut batch_cursor = std::io::Cursor::new(bytes.clone());
+    assert!(
+        CheckpointBatchPageRecord::read(&mut batch_cursor, TEST_SALT1, TEST_SALT2)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(batch_cursor.position(), 0);
+
+    let mut boundary_cursor = std::io::Cursor::new(bytes);
+    assert!(
+        Page0BoundaryRecord::read(&mut boundary_cursor, TEST_SALT1, TEST_SALT2)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(boundary_cursor.position(), 0);
+}
+
+#[test]
+fn phase6_us009_torn_page0_checkpoint_boundary_rewinds() {
+    let boundary = sample_page0_boundary(Ts {
+        physical_ms: 333,
+        logical: 1,
+    });
+    let mut bytes = Vec::new();
+    boundary.write(&mut bytes).unwrap();
+
+    for cut in [
+        JOURNAL_FRAME_HEADER_SIZE - 1,
+        JOURNAL_FRAME_HEADER_SIZE + 31,
+        bytes.len() - 1,
+    ] {
+        let mut cursor = std::io::Cursor::new(bytes[..cut].to_vec());
+        let decoded = Page0BoundaryRecord::read(&mut cursor, TEST_SALT1, TEST_SALT2).unwrap();
+        assert!(decoded.is_none(), "cut {cut} must be rejected");
+        assert_eq!(cursor.position(), 0, "cut {cut} must rewind");
+    }
+}
+
+#[test]
+fn phase6_us009_checkpoint_shaped_checksum_and_salt_mismatches_rewind() {
+    let batch = CheckpointBatchPageRecord {
+        page_number: 11,
+        salt1: TEST_SALT1,
+        salt2: TEST_SALT2,
+        page_size: JournalPageSize::Small4k,
+    };
+    let page_data = vec![0xA9u8; PAGE_SIZE_INTERNAL as usize];
+    let mut batch_bytes = Vec::new();
+    batch.write(&mut batch_bytes, &page_data).unwrap();
+    corrupt_page_record_checksum(&mut batch_bytes);
+
+    let mut batch_cursor = std::io::Cursor::new(batch_bytes);
+    assert!(
+        CheckpointBatchPageRecord::read(&mut batch_cursor, TEST_SALT1, TEST_SALT2)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(batch_cursor.position(), 0);
+
+    let boundary = sample_page0_boundary(Ts {
+        physical_ms: 444,
+        logical: 2,
+    });
+    let mut boundary_bytes = Vec::new();
+    boundary.write(&mut boundary_bytes).unwrap();
+    corrupt_page_record_checksum(&mut boundary_bytes);
+
+    let mut boundary_cursor = std::io::Cursor::new(boundary_bytes);
+    assert!(
+        Page0BoundaryRecord::read(&mut boundary_cursor, TEST_SALT1, TEST_SALT2)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(boundary_cursor.position(), 0);
+
+    let mut wrong_salt_cursor = std::io::Cursor::new({
+        let mut bytes = Vec::new();
+        boundary.write(&mut bytes).unwrap();
+        bytes
+    });
+    assert!(
+        Page0BoundaryRecord::read(&mut wrong_salt_cursor, 0, TEST_SALT2)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(wrong_salt_cursor.position(), 0);
+}
+
+#[test]
+fn phase6_us009_invalid_checkpoint_provenance_is_not_silently_accepted() {
+    let mut header = crate::storage::header::FileHeader::new_now();
+    header.total_page_count = 55;
+    header.last_checkpoint_ts = Ts::default();
+    let bytes = write_test_page_frame_record(
+        0,
+        header.total_page_count,
+        TEST_SALT1,
+        TEST_SALT2,
+        JournalPageSize::Small4k,
+        &header.to_bytes(),
+    );
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    assert!(
+        Page0BoundaryRecord::read(&mut cursor, TEST_SALT1, TEST_SALT2)
+            .unwrap()
+            .is_none(),
+        "page-0-shaped bytes without checkpoint provenance must not decode"
+    );
+    assert_eq!(cursor.position(), 0);
+
+    let mut mismatch_header = crate::storage::header::FileHeader::new_now();
+    mismatch_header.total_page_count = 55;
+    mismatch_header.last_checkpoint_ts = Ts {
+        physical_ms: 555,
+        logical: 0,
+    };
+    let corrupt_bytes = write_test_page_frame_record(
+        0,
+        mismatch_header.total_page_count + 1,
+        TEST_SALT1,
+        TEST_SALT2,
+        JournalPageSize::Small4k,
+        &mismatch_header.to_bytes(),
+    );
+    let mut corrupt_cursor = std::io::Cursor::new(corrupt_bytes);
+    let err = Page0BoundaryRecord::read(&mut corrupt_cursor, TEST_SALT1, TEST_SALT2)
+        .expect_err("boundary/header page-count mismatch must be corrupt");
+    assert!(matches!(err, Error::CorruptDatabase { .. }));
+}
+
+#[test]
+fn phase6_us009_arbitrary_legacy_shaped_bytes_do_not_consume_valid_logical_prefix() {
+    let valid_frame = sample_empty_logical_frame();
+    let valid_bytes = valid_frame.encode().unwrap();
+    let arbitrary_legacy = write_test_page_frame_record(
+        u32::from(FRAME_KIND_LOGICAL_TXN),
+        (LOGICAL_TXN_MAX_FRAME_SIZE as u32).wrapping_add(1),
+        TEST_SALT1,
+        TEST_SALT2,
+        JournalPageSize::Small4k,
+        &vec![0x7Fu8; PAGE_SIZE_INTERNAL as usize],
+    );
+
+    let mut bytes = valid_bytes.clone();
+    bytes.extend_from_slice(&arbitrary_legacy);
+    let mut cursor = std::io::Cursor::new(bytes);
+
+    let (consumed, decoded) = try_skip_logical_txn(&mut cursor, TEST_SALT1, TEST_SALT2)
+        .unwrap()
+        .expect("valid logical prefix must decode");
+    assert_eq!(consumed as usize, valid_bytes.len());
+    assert_eq!(decoded, valid_frame);
+    assert_eq!(cursor.position() as usize, valid_bytes.len());
+
+    let scan = try_skip_logical_txn_disposition(&mut cursor, TEST_SALT1, TEST_SALT2).unwrap();
+    assert_eq!(
+        scan,
+        LogicalScan::NotLogical,
+        "over-cap old-frame length must reject before variable allocation"
+    );
+    assert_eq!(
+        cursor.position() as usize,
+        valid_bytes.len(),
+        "unsupported trailing bytes must not consume or truncate the valid prefix"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,16 +1838,15 @@ fn page0_boundary_record_roundtrip() {
 
 #[test]
 fn page0_boundary_record_returns_none_for_non_boundary_page_frame() {
-    let frame = JournalFrameHeader {
-        page_number: 3,
-        db_page_count: 37,
-        salt1: 0xDEAD_BEEF,
-        salt2: 0xCAFE_BABE,
-        page_size: JournalPageSize::Small4k,
-    };
     let page_data = vec![0xA5; PAGE_SIZE_INTERNAL as usize];
-    let mut bytes = Vec::new();
-    frame.write(&mut bytes, &page_data).unwrap();
+    let bytes = write_test_page_frame_record(
+        3,
+        37,
+        0xDEAD_BEEF,
+        0xCAFE_BABE,
+        JournalPageSize::Small4k,
+        &page_data,
+    );
 
     let mut cursor = std::io::Cursor::new(bytes);
     let start = cursor.position();
@@ -1647,16 +1857,15 @@ fn page0_boundary_record_returns_none_for_non_boundary_page_frame() {
 
 #[test]
 fn checkpoint_batch_page_record_rejects_commit_frame() {
-    let frame = JournalFrameHeader {
-        page_number: 3,
-        db_page_count: 37,
-        salt1: 0xDEAD_BEEF,
-        salt2: 0xCAFE_BABE,
-        page_size: JournalPageSize::Small4k,
-    };
     let page_data = vec![0xA5; PAGE_SIZE_INTERNAL as usize];
-    let mut bytes = Vec::new();
-    frame.write(&mut bytes, &page_data).unwrap();
+    let bytes = write_test_page_frame_record(
+        3,
+        37,
+        0xDEAD_BEEF,
+        0xCAFE_BABE,
+        JournalPageSize::Small4k,
+        &page_data,
+    );
 
     let mut cursor = std::io::Cursor::new(bytes);
     let decoded = CheckpointBatchPageRecord::read(&mut cursor, 0xDEAD_BEEF, 0xCAFE_BABE).unwrap();

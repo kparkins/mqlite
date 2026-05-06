@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Verify file:line citations in phase docs and cck.md point to valid ranges
-containing the identifier named in the citing sentence.
+"""Verify that phase-doc file:line citations still point at live source ranges.
 
-Exit 0 normally (warnings only). Pass --strict to exit non-zero on any drift.
+The check is intentionally lightweight: it scans phase docs for `src/...` and
+`tests/...` citations, verifies that each target exists and that the cited line
+range is still in bounds, then optionally verifies a nearby backtick identifier.
+Pass `--strict` to fail on any drift.
 """
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -14,16 +15,6 @@ from typing import List, Optional, Tuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_GLOB = "docs/STORAGE-UPGRADE-PHASE-*.md"
 EXTRA_FILES = ["cck.md"]
-
-# Match backtick identifiers immediately before a file:line citation.
-# Capture group 1: identifier, group 2: file path, group 3: line spec.
-CITE_RE = re.compile(
-    r"`([A-Za-z_:][A-Za-z0-9_:<>()]*)`"   # backtick identifier
-    r"[^`]{0,120}?"                         # up to 120 chars gap (non-greedy)
-    r"`?(src/[^\s`:,\"')]+|tests/[^\s`:,\"')]+)"  # file path
-    r":(\d+(?:-\d+)?)`?",                   # :LINE or :LO-HI
-    re.DOTALL,
-)
 
 # Also match bare citations without a preceding identifier on the same pass,
 # so we can count all citations even when no identifier is nearby.
@@ -48,7 +39,6 @@ def lines_of(path: Path) -> Optional[List[str]]:
 
 
 def identifier_in_range(file_lines: List[str], lo: int, hi: int, ident: str) -> bool:
-    # Strip Rust path qualifier (Foo::bar -> bar, also try full form)
     bare = ident.split("::")[-1].rstrip("()")
     full = ident.rstrip("()")
     for line in file_lines[lo - 1 : hi]:
@@ -60,9 +50,9 @@ def identifier_in_range(file_lines: List[str], lo: int, hi: int, ident: str) -> 
 def collect_docs(repo: Path) -> List[Path]:
     paths = sorted(repo.glob(DOCS_GLOB))
     for name in EXTRA_FILES:
-        p = repo / name
-        if p.exists():
-            paths.append(p)
+        path = repo / name
+        if path.exists():
+            paths.append(path)
     return paths
 
 
@@ -71,10 +61,10 @@ def check_doc(doc_path: Path, repo: Path, strict: bool) -> Tuple[int, int]:
     total = 0
     drifts = 0
 
-    for m in BARE_CITE_RE.finditer(text):
+    for match in BARE_CITE_RE.finditer(text):
         total += 1
-        cite_file_str = m.group(1)
-        line_spec = m.group(2)
+        cite_file_str = match.group(1)
+        line_spec = match.group(2)
         cite_file = repo / cite_file_str
 
         if not cite_file.exists():
@@ -100,15 +90,13 @@ def check_doc(doc_path: Path, repo: Path, strict: bool) -> Tuple[int, int]:
             drifts += 1
             continue
 
-        # Clamp hi to file length for identifier search.
         hi = min(hi, total_lines)
 
         # Find the identifier that precedes this citation in the source text.
-        pos = m.start()
+        pos = match.start()
         preceding = text[max(0, pos - 200) : pos]
         id_match = re.search(r"`([A-Za-z_:][A-Za-z0-9_:<>()]*)`\s*$", preceding)
         if id_match is None:
-            # No identifier immediately before -- skip symbol check, count citation.
             continue
 
         ident = id_match.group(1)
@@ -136,9 +124,9 @@ def main() -> int:
     grand_drifts = 0
 
     for doc in docs:
-        t, d = check_doc(doc, repo, strict)
-        grand_total += t
-        grand_drifts += d
+        total, drifts = check_doc(doc, repo, strict)
+        grand_total += total
+        grand_drifts += drifts
 
     print(
         f"\nCitation check complete: "

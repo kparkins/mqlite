@@ -780,17 +780,17 @@ fn forget_history_record_overflow_ref(entry: VersionEntry) {
 mod tests;
 
 #[cfg(test)]
-#[path = "history_store_us009_tests.rs"]
-mod us009_tests;
+#[path = "tests/history_store_key_schema_tests.rs"]
+mod history_store_key_schema_tests;
 
 #[cfg(test)]
-#[path = "history_store_us011_tests.rs"]
-mod us011_tests;
+#[path = "tests/history_store_transaction_stage_tests.rs"]
+mod history_store_transaction_stage_tests;
 
 #[cfg(test)]
-#[path = "history_store_us012_tests.rs"]
-mod us012_tests;
+#[path = "tests/history_store_visibility_probe_tests.rs"]
+mod history_store_visibility_probe_tests;
 
 #[cfg(test)]
-#[path = "history_store_us013_tests.rs"]
-mod us013_tests;
+#[path = "tests/history_store_overflow_transfer_tests.rs"]
+mod history_store_overflow_transfer_tests;

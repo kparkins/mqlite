@@ -26,18 +26,18 @@
 use bson::{Bson, Document};
 
 #[cfg(any(test, feature = "test-hooks"))]
+use super::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
+#[cfg(any(test, feature = "test-hooks"))]
+use super::paged_engine::group_commit_test_probe::{
+    Us017GroupCommitObservations, Us017GroupCommitPauseGuard,
+};
+#[cfg(any(test, feature = "test-hooks"))]
 use super::paged_engine::test_accessors::{
     CreateIndexBuildHookGuard, Us007JournalBeginHookGuard, Us007JournalObservations,
     Us026CleanupObservations, Us026PostRegisterFailpoint, WriteBodyEntryHookGuard,
 };
 #[cfg(any(test, feature = "test-hooks"))]
-use super::paged_engine::us017_test_probe::{
-    Us017GroupCommitObservations, Us017GroupCommitPauseGuard,
-};
-#[cfg(any(test, feature = "test-hooks"))]
-use super::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::journal::us039_test_probe::Us039AppendSyncObservations;
+use crate::journal::append_sync_test_probe::Us039AppendSyncObservations;
 use crate::{
     error::Result,
     index::{IndexInfo, IndexModel},
@@ -513,14 +513,14 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     fn us039_reset_append_sync_observations(&self) {
-        crate::journal::us039_test_probe::reset();
+        crate::journal::append_sync_test_probe::reset();
     }
 
     /// Hidden US-039 test hook: snapshot append/sync ownership counters.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     fn us039_append_sync_observations(&self) -> Us039AppendSyncObservations {
-        crate::journal::us039_test_probe::snapshot()
+        crate::journal::append_sync_test_probe::snapshot()
     }
 
     /// Hidden US-017 test hook: reset group-commit probe state.
@@ -550,15 +550,15 @@ pub trait StorageEngine: Send + Sync {
         Us017GroupCommitObservations::default()
     }
 
-    /// Hidden US-008 test hook: reset committed overlay leaf-byte accounting.
+    /// Hidden US-008 test hook: reset committed structural leaf-byte accounting.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    fn us008_reset_overlay_observations(&self) {}
+    fn us008_reset_structural_page_observations(&self) {}
 
-    /// Hidden US-008 test hook: committed overlay leaf bytes since reset.
+    /// Hidden US-008 test hook: committed structural leaf bytes since reset.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    fn us008_committed_overlay_leaf_bytes(&self) -> u64 {
+    fn us008_committed_structural_leaf_bytes(&self) -> u64 {
         0
     }
 
@@ -591,7 +591,7 @@ pub trait StorageEngine: Send + Sync {
     /// write-envelope ordering without adding runtime hooks to normal CRUD.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    fn phase0_probe_insert(
+    fn crash_cut_probe_insert(
         &self,
         _ns: &str,
         _doc: Document,
@@ -634,7 +634,7 @@ pub trait StorageEngine: Send + Sync {
     #[doc(hidden)]
     fn us036_test_register_publish_slot(
         &self,
-    ) -> Result<crate::storage::paged_engine::us036_test_probe::Us036PublishSlot> {
+    ) -> Result<crate::storage::paged_engine::engine_fatal_test_probe::Us036PublishSlot> {
         Err(crate::error::Error::Internal(
             "us036 publish-slot probe is unsupported by this engine".into(),
         ))
@@ -647,7 +647,7 @@ pub trait StorageEngine: Send + Sync {
         &self,
         _ns_id: i64,
         _timeout_ms: u64,
-    ) -> Result<crate::storage::paged_engine::us036_test_probe::Us036WriterTicket> {
+    ) -> Result<crate::storage::paged_engine::engine_fatal_test_probe::Us036WriterTicket> {
         Err(crate::error::Error::Internal(
             "us036 writer-admit probe is unsupported by this engine".into(),
         ))

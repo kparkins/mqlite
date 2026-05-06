@@ -98,17 +98,17 @@ const REBASELINE_CUTS: [CrashCut; 8] = [
     },
     CrashCut {
         cut_id: "3",
-        source_range: "§10.16 S9→S10",
-        probe_cut: Phase0ProbeCut::AfterPrimaryInstallBeforeOverlayCommit,
-        chain_commit_expected: true,
+        source_range: "US-003 pre-durable Pending install",
+        probe_cut: Phase0ProbeCut::AfterPrimaryInstallBeforeStructuralBatchCommit,
+        chain_commit_expected: false,
         legacy_commit_expected: false,
-        cut_commit_visible_expected: true,
+        cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
         cut_id: "4",
         source_range: "§10.16 S10→S11",
-        probe_cut: Phase0ProbeCut::AfterOverlayCommitBeforeFlush,
+        probe_cut: Phase0ProbeCut::AfterStructuralBatchCommitBeforeFlush,
         chain_commit_expected: true,
         legacy_commit_expected: false,
         cut_commit_visible_expected: true,
@@ -147,7 +147,7 @@ const RETIRED_HEAD_ORDERING_CUTS: [CrashCut; 6] = [
     CrashCut {
         cut_id: "3",
         source_range: "pre-Phase-3 paged_engine.rs:463-464",
-        probe_cut: Phase0ProbeCut::AfterOverlayCommit,
+        probe_cut: Phase0ProbeCut::AfterStructuralBatchCommit,
         chain_commit_expected: false,
         legacy_commit_expected: false,
         cut_commit_visible_expected: false,
@@ -214,7 +214,7 @@ fn build_workload(cut: &CrashCut) -> (tempfile::TempDir, std::path::PathBuf, Pha
         let pre_probe_journal_len =
             fs::metadata(crash_harness::journal_path(&db_path)).map_or(32, |m| m.len());
         let report = client
-            .__phase0_probe_insert(
+            .__crash_cut_probe_insert(
                 NS_NAME,
                 doc! { "_id": CUT_COMMIT_ID, "kind": "cut" },
                 cut.probe_cut,
@@ -370,12 +370,12 @@ fn cut2b_invariant_durable_commit_replays_from_logical_frame() {
 }
 
 #[test]
-fn cut3_invariant_post_primary_install_replays_from_logical_frame() {
+fn cut3_invariant_post_primary_install_without_durable_frame_reopens_without_cut_write() {
     run_invariant(REBASELINE_CUTS[5]);
 }
 
 #[test]
-fn cut4_invariant_post_overlay_commit_replays_from_logical_frame() {
+fn cut4_invariant_post_structural_batch_commit_replays_from_logical_frame() {
     run_invariant(REBASELINE_CUTS[6]);
 }
 

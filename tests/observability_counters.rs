@@ -24,7 +24,7 @@
 
 use bson::{doc, Document};
 use mqlite::{Client, DurabilityMode, OpenOptions};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -178,34 +178,23 @@ fn lane_wait_ns_total_rises_with_same_namespace_writers() {
     // Pre-create the namespace so the writers do not race on bootstrap.
     let col = client.database("lwdb").collection::<Document>("sharedns");
     col.insert_one(&doc! { "_id": -1i32, "v": 0 }).unwrap();
+    let ns_id = client
+        .__us036_namespace_id("lwdb.sharedns")
+        .unwrap()
+        .expect("namespace id");
 
     reset_lane_wait_ns();
     reset_journal_mutex_wait_ns();
 
-    const N: i32 = 200;
-    let barrier = Arc::new(Barrier::new(2));
+    let first_ticket = client.__us036_admit_writer(ns_id, 1_000).unwrap();
     let c1 = client.clone();
-    let b1 = Arc::clone(&barrier);
-    let t1 = thread::spawn(move || {
-        let col = c1.database("lwdb").collection::<Document>("sharedns");
-        b1.wait();
-        for i in 0..N {
-            col.insert_one(&doc! { "_id": i, "payload": "x".repeat(256) })
-                .unwrap();
-        }
+    let waiting = thread::spawn(move || {
+        c1.__us036_admit_writer(ns_id, 1_000)
+            .expect("second writer admitted after first releases")
     });
-    let c2 = client.clone();
-    let b2 = Arc::clone(&barrier);
-    let t2 = thread::spawn(move || {
-        let col = c2.database("lwdb").collection::<Document>("sharedns");
-        b2.wait();
-        for i in N..(2 * N) {
-            col.insert_one(&doc! { "_id": i, "payload": "x".repeat(256) })
-                .unwrap();
-        }
-    });
-    t1.join().unwrap();
-    t2.join().unwrap();
+    thread::sleep(Duration::from_millis(20));
+    first_ticket.drop_ticket();
+    waiting.join().unwrap().drop_ticket();
 
     let lane_wait = lane_wait_ns_snapshot();
     assert!(
@@ -341,18 +330,13 @@ fn recovery_frame_counters_rise_on_reopen_after_workload() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn emergency_checkpoint_triggers_rise_on_journal_fill_stress() {
+fn emergency_checkpoint_triggers_stays_zero_for_phase6_logical_workload() {
     let _guard = COUNTER_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ec.mqlite");
 
-    // The emergency path fires when the journal index reaches
-    // JOURNAL_INDEX_HOT_THRESHOLD (= 3072) distinct page numbers. A single
-    // insert typically touches only 2-3 distinct pages (leaf + header +
-    // occasionally catalog), and the leaf is reused across inserts once
-    // the tree stabilises, so we need inserts that allocate fresh pages
-    // each time. Large payloads allocated into fresh leaves + high insert
-    // counts drive the index above 3072 live entries.
+    // Phase 6 ordinary CRUD writes logical journal records. The retired
+    // page-frame journal-fill trigger must stay inactive for this workload.
     let client = Client::open_with_options(
         &path,
         OpenOptions::new().durability(DurabilityMode::FullSync),
@@ -368,12 +352,7 @@ fn emergency_checkpoint_triggers_rise_on_journal_fill_stress() {
     reset_emergency_checkpoint_triggers();
     let before = emergency_checkpoint_triggers_snapshot();
 
-    // Each doc carries a ~32 KiB payload. Overflow-page chains plus the
-    // per-commit header and leaf-page mutations push the journal index
-    // past JOURNAL_INDEX_HOT_THRESHOLD (= 3072 distinct pages) before the
-    // loop finishes. 4000 inserts empirically crosses the threshold
-    // while keeping the test under ~20 s on a modern laptop.
-    const N: i32 = 4000;
+    const N: i32 = 200;
     for i in 0..N {
         col.insert_one(&doc! {
             "_id": i,
@@ -385,12 +364,11 @@ fn emergency_checkpoint_triggers_rise_on_journal_fill_stress() {
     thread::sleep(Duration::from_millis(10));
 
     let after = emergency_checkpoint_triggers_snapshot();
-    assert!(
-        after > before,
-        "emergency_checkpoint_triggers_total must rise during the \
-         journal-fill stress workload; saw before={}, after={}",
-        before,
-        after
+    assert_eq!(
+        after, before,
+        "emergency_checkpoint_triggers_total must stay unchanged for Phase 6 \
+         logical CRUD workload; saw before={}, after={}",
+        before, after
     );
     drop(client);
 }

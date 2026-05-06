@@ -275,7 +275,7 @@ fn ready_index_root_move_reuses_catalog_generation() {
     // false-positive the captured-identity gate even when no DDL ran.
     //
     // The "publishes a new catalog Arc" half of §10.8 #13 is owned by
-    // `tests/phase1_dirty_flags.rs` (rebuild counter); this test
+    // `tests/catalog_dirty_flags.rs` (rebuild counter); this test
     // pins the §10.17.1 generation-stability half.
     let (client, _d) = new_client("d13");
     let col = client.database("db").collection::<Document>("c");

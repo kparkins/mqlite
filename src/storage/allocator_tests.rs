@@ -775,7 +775,7 @@ fn test_overflow_deferred_free_drain_after_fence() {
 }
 
 #[test]
-fn drain_deferred_free_reservations_wait_for_checkpoint_fence() {
+fn drain_deferred_free_pages_wait_for_checkpoint_fence() {
     let mut hdr = fresh_header();
     hdr.total_page_count = 5;
     let handle = AllocatorHandle::new(hdr);
@@ -784,16 +784,16 @@ fn drain_deferred_free_reservations_wait_for_checkpoint_fence() {
     assert_eq!(handle.decref_overflow(4), 0);
     handle.enqueue_overflow_deferred_free(4);
 
-    let reserved_before_checkpoint = handle.drain_deferred_free_reservations();
+    let reserved_before_checkpoint = handle.drain_deferred_free_pages();
     assert!(
         reserved_before_checkpoint.is_empty(),
-        "txn reservation drain must also honor the checkpoint fence"
+        "lifetime drain must also honor the checkpoint fence"
     );
     assert_eq!(handle.page_lifetime_queue().depth(), 1);
 
     handle.advance_page_lifetime_checkpoint_fence();
 
-    let reserved_after_checkpoint = handle.drain_deferred_free_reservations();
+    let reserved_after_checkpoint = handle.drain_deferred_free_pages();
     assert_eq!(reserved_after_checkpoint, vec![4]);
     assert_eq!(handle.page_lifetime_queue().depth(), 0);
 }

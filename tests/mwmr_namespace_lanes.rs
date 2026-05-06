@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the in-process MWMR contract:
 //! - Writers on DIFFERENT namespaces overlap at deterministic body-entry hooks.
-//! - Writers on the SAME namespace serialize (don't corrupt each other).
+//! - Writers on the SAME namespace can overlap without corrupting each other.
 //! - drop_namespace waits for in-flight writers and recovers cleanly.
 
 #![allow(
@@ -81,7 +81,10 @@ fn different_namespace_writers_overlap() {
     assert_eq!(count_b, N as u64);
 }
 
-/// Same-namespace writers cannot both enter their write bodies at once.
+/// Same-namespace writers may enter their write bodies concurrently.
+///
+/// The legacy test name is retained because Phase 6 `US-001` uses it as the
+/// exact preflight selector while retiring the old namespace-lane assertion.
 #[cfg(feature = "test-hooks")]
 #[test]
 fn same_namespace_writers_serialize_with_barrier() {
@@ -121,17 +124,16 @@ fn same_namespace_writers_serialize_with_barrier() {
     });
 
     started_rx.recv().unwrap();
-    hook_b.assert_not_entered().unwrap();
+    let event_b = hook_b.wait_until_entered().unwrap();
+    assert_eq!(
+        event_b.observed_flag(),
+        Some(false),
+        "same-namespace writer should enter before the first writer is released",
+    );
     first_released.store(true, Ordering::Release);
     hook_a.release().unwrap();
     h_a.join().unwrap();
 
-    let event_b = hook_b.wait_until_entered().unwrap();
-    assert_eq!(
-        event_b.observed_flag(),
-        Some(true),
-        "same-namespace writer entered before the first writer was released",
-    );
     hook_b.release().unwrap();
     h_b.join().unwrap();
 
@@ -143,7 +145,7 @@ fn same_namespace_writers_serialize_with_barrier() {
     assert_eq!(count, 2);
 }
 
-/// Same-namespace writers must serialize (no torn writes, full count).
+/// Same-namespace writers must not produce torn writes.
 #[test]
 fn same_namespace_writers_serialize() {
     let dir = tempfile::tempdir().unwrap();

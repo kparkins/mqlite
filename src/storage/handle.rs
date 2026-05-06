@@ -186,8 +186,8 @@ impl BufferPoolHandle {
 
     /// Create a `BufferPoolHandle` with an attached [`JournalManager`].
     ///
-    /// All txn methods (`begin_txn`, `commit_txn`, `rollback_txn`,
-    /// `checkpoint_through_journal`) become active when a journal is present.
+    /// Journal rollback and checkpoint helpers become active when a journal is
+    /// present.
     pub(crate) fn with_journal(
         pool: Arc<BufferPool>,
         history_pool: Arc<BufferPool>,
@@ -332,7 +332,7 @@ impl BufferPoolHandle {
     /// 4. Flush the pool again to write the freshly dirtied header page.
     pub(crate) fn flush(&self) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
-        crate::journal::us039_test_probe::record_handle_flush();
+        crate::journal::append_sync_test_probe::record_handle_flush();
         // Pass 1 — flush dirty data pages.
         self.pool.flush()?;
         self.history_pool.flush()?;
@@ -361,43 +361,6 @@ impl BufferPoolHandle {
         Ok(Some(guard.write_cursor()))
     }
 
-    /// Write the commit frame to the journal.
-    ///
-    /// `page_number` / `page_size` / `page_data` identify the committing page
-    /// (typically the catalog root, which every write transaction touches).
-    /// `db_page_count` is the total database page count after this txn.
-    ///
-    /// Returns `true` if the journal index has reached its hot-threshold
-    /// (emergency checkpoint signal); `false` otherwise or when no journal
-    /// is attached.
-    pub(crate) fn commit_txn(
-        &self,
-        page_number: u32,
-        page_size: PageSize,
-        page_data: &[u8],
-        db_page_count: u32,
-    ) -> Result<bool> {
-        match &self.journal {
-            None => {
-                crate::mvcc::metrics::record_journal_commit();
-                Ok(false)
-            }
-            Some(journal) => {
-                let journal_page_size = match page_size {
-                    PageSize::Small4k => JournalPageSize::Small4k,
-                    PageSize::Large32k => JournalPageSize::Large32k,
-                };
-                let mut guard = journal
-                    .lock()
-                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                let result =
-                    guard.commit(page_number, journal_page_size, page_data, db_page_count)?;
-                crate::mvcc::metrics::record_journal_commit();
-                Ok(result)
-            }
-        }
-    }
-
     /// Roll back a transaction by truncating the journal and discarding dirty
     /// buffer pool frames.
     ///
@@ -414,12 +377,14 @@ impl BufferPoolHandle {
         self.pool.drop_all_dirty()
     }
 
-    /// Checkpoint using the `journal_main_file` handle stored on this handle.
+    /// Checkpoint legacy page-frame journal entries using the stored main file.
     ///
-    /// Returns `Ok(false)` when no journal is attached. Used by [`with_txn`] after
-    /// a commit frame signals the journal index has reached its hot-threshold,
-    /// and by [`with_txn`]'s callers that do not hold the main-file fd directly.
+    /// Returns `Ok(false)` when no journal is attached or the attached journal
+    /// has only logical/checkpoint-owned records that this path must preserve.
     pub(crate) fn emergency_checkpoint(&self) -> Result<bool> {
+        if !self.has_legacy_page_frames_to_checkpoint()? {
+            return Ok(false);
+        }
         let Some(file_mutex) = self.journal_main_file.as_ref() else {
             return Ok(false);
         };
@@ -428,6 +393,38 @@ impl BufferPoolHandle {
             .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
         self.checkpoint_through_journal(&mut guard)?;
         Ok(true)
+    }
+
+    /// Truncate a journal whose logical contents were fully materialized by
+    /// checkpoint.
+    ///
+    /// This path does not inspect or replay retired page-frame records. The
+    /// caller must have already flushed the materialized main file and proven no
+    /// logical tail is still required.
+    pub(crate) fn truncate_checkpointed_journal_tail(&self) -> Result<bool> {
+        if self.journal.is_none() {
+            return Ok(false);
+        }
+        let Some(file_mutex) = self.journal_main_file.as_ref() else {
+            return Ok(false);
+        };
+        let mut guard = file_mutex
+            .lock()
+            .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
+        self.checkpoint_through_journal(&mut guard)?;
+        Ok(true)
+    }
+
+    /// Return true when the attached journal can be drained by the legacy
+    /// page-frame checkpoint path.
+    pub(crate) fn has_legacy_page_frames_to_checkpoint(&self) -> Result<bool> {
+        let Some(journal) = &self.journal else {
+            return Ok(false);
+        };
+        let guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        Ok(guard.has_legacy_page_frames_to_checkpoint())
     }
 
     /// Copy the post-boundary checkpoint batch into the main file.
@@ -441,6 +438,10 @@ impl BufferPoolHandle {
     /// Returns [`Error::Internal`] if no journal/main-file pair is attached, no
     /// durable page-0 checkpoint boundary exists, or the boundary page count
     /// differs from `expected_total_page_count`.
+    #[allow(
+        dead_code,
+        reason = "Phase 7 checkpoint recovery primitive is retained for checkpoint-only callers"
+    )]
     pub(crate) fn emergency_checkpoint_after_boundary(
         &self,
         expected_total_page_count: u32,
@@ -538,6 +539,7 @@ impl BufferPoolHandle {
     /// Used by writer-path code that needs a `PageSource` for
     /// [`AllocatorHandle::drain_free_queue`] without re-constructing one.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn page_source(&self) -> &BufferPoolPageSource {
         &self.pool_io
     }
@@ -690,7 +692,7 @@ impl BufferPoolHandle {
             .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
         guard.sync_journal()?;
         #[cfg(any(test, feature = "test-hooks"))]
-        crate::journal::us039_test_probe::record_handle_journal_sync();
+        crate::journal::append_sync_test_probe::record_handle_journal_sync();
         Ok(())
     }
 

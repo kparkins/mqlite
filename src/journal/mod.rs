@@ -33,15 +33,15 @@
 // boundary so denylist-mode CI does not trip on the pre-existing pattern.
 #![allow(clippy::expect_used)]
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod append_sync_test_probe;
 #[allow(dead_code)]
 pub(crate) mod log_file;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod logical_replay_test_probe;
 mod recovery;
 #[allow(dead_code)]
 pub(crate) mod shm;
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) mod us018_test_probe;
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) mod us039_test_probe;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -60,9 +60,9 @@ use self::shm::JournalIndex;
 pub(crate) use self::recovery::ParsedLogicalFrames;
 
 use self::log_file::{
-    try_skip_chain_commit, try_skip_logical_txn, CheckpointBatchPageRecord, JournalFrameHeader,
-    JournalHeader, JournalOffset, JournalPageSize, LogicalTxnFrame, Page0BoundaryRecord, PageId,
-    JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
+    read_chain_commit_at_cursor, try_skip_logical_txn, write_page_frame_record,
+    CheckpointBatchPageRecord, JournalHeader, JournalOffset, JournalPageSize, LogicalTxnFrame,
+    Page0BoundaryRecord, PageId, JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -216,6 +216,21 @@ struct CheckpointFrameTag {
     page_id: PageId,
 }
 
+#[derive(Debug)]
+struct CheckpointRecoveryFrame {
+    next_cursor: u64,
+    kind: CheckpointRecoveryFrameKind,
+}
+
+#[derive(Debug)]
+enum CheckpointRecoveryFrameKind {
+    BatchPage,
+    Boundary {
+        checkpoint_ts: Ts,
+        db_page_count: u32,
+    },
+}
+
 /// Manages the journal and its in-memory page-offset index for one database.
 ///
 /// Created via [`JournalManager::open_or_create`].  On clean shutdown call
@@ -358,6 +373,35 @@ impl JournalManager {
     /// Return the batch id that the next checkpoint batch will receive.
     pub(crate) fn next_checkpoint_batch_id(&self) -> CheckpointBatchId {
         CheckpointBatchId(self.next_checkpoint_batch_id)
+    }
+
+    fn try_checkpoint_recovery_frame(
+        journal_file: &mut File,
+        salt1: u32,
+        salt2: u32,
+    ) -> Result<Option<CheckpointRecoveryFrame>> {
+        let frame_offset = journal_file.stream_position().map_err(Error::Io)?;
+        if CheckpointBatchPageRecord::read_with_data(journal_file, salt1, salt2)?.is_some() {
+            return Ok(Some(CheckpointRecoveryFrame {
+                next_cursor: journal_file.stream_position().map_err(Error::Io)?,
+                kind: CheckpointRecoveryFrameKind::BatchPage,
+            }));
+        }
+
+        if let Some(boundary) = Page0BoundaryRecord::read(journal_file, salt1, salt2)? {
+            return Ok(Some(CheckpointRecoveryFrame {
+                next_cursor: journal_file.stream_position().map_err(Error::Io)?,
+                kind: CheckpointRecoveryFrameKind::Boundary {
+                    checkpoint_ts: boundary.checkpoint_ts(),
+                    db_page_count: boundary.db_page_count(),
+                },
+            }));
+        }
+
+        journal_file
+            .seek(SeekFrom::Start(frame_offset))
+            .map_err(Error::Io)?;
+        Ok(None)
     }
 
     /// Open a checkpoint-owned pending range at the current clean cursor.
@@ -523,7 +567,9 @@ impl JournalManager {
         self.write_cursor += (JOURNAL_FRAME_HEADER_SIZE + JournalPageSize::Small4k.bytes()) as u64;
         self.last_committed_db_page_count = Some(staged_header.total_page_count);
         self.checkpoint_batch_active = None;
-        self.checkpoint_frame_tags.clear();
+        // Keep checkpoint frame provenance until the journal is truncated so
+        // same-process lookup/truncate paths can distinguish checkpoint-owned
+        // page records from unsupported ordinary page-frame bytes.
         Ok(BoundaryAppended {
             journal_offset: frame_offset,
             db_page_count: record.db_page_count(),
@@ -562,6 +608,14 @@ impl JournalManager {
         Ok(emergency)
     }
 
+    /// Return true when the journal still owns committed legacy page frames
+    /// that the old page-frame checkpoint path can safely drain.
+    pub(crate) fn has_legacy_page_frames_to_checkpoint(&self) -> bool {
+        self.last_committed_db_page_count.is_some()
+            && self.legacy_pending_start_offset.is_none()
+            && self.index.occupied_count() > 0
+    }
+
     /// Low-level frame append.  Returns the byte offset of the written frame.
     fn append_frame(
         &mut self,
@@ -594,17 +648,17 @@ impl JournalManager {
                 .map_err(Error::Io)?;
             record.total_size()
         } else {
-            let frame_hdr = JournalFrameHeader {
+            write_page_frame_record(
+                &mut self.journal_file,
                 page_number,
                 db_page_count,
-                salt1: self.salt1,
-                salt2: self.salt2,
+                self.salt1,
+                self.salt2,
                 page_size,
-            };
-            frame_hdr
-                .write(&mut self.journal_file, page_data)
-                .map_err(Error::Io)?;
-            frame_hdr.total_size()
+                page_data,
+            )
+            .map_err(Error::Io)?;
+            JOURNAL_FRAME_HEADER_SIZE + page_size.bytes()
         };
 
         self.write_cursor += frame_size as u64;
@@ -668,12 +722,11 @@ impl JournalManager {
     /// Fallback: linear journal scan to find `page_number`.
     ///
     /// O(journal frames) per lookup.  Acceptable with aggressive checkpointing.
-    pub(crate) fn read_page_linear(&mut self, page_number: u32) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn read_page_linear(&mut self, _page_number: u32) -> Result<Option<Vec<u8>>> {
         self.journal_file
             .seek(SeekFrom::Start(JOURNAL_HEADER_SIZE as u64))
             .map_err(Error::Io)?;
 
-        let mut latest: Option<Vec<u8>> = None;
         let mut cursor = JOURNAL_HEADER_SIZE as u64;
 
         loop {
@@ -681,18 +734,13 @@ impl JournalManager {
                 .seek(SeekFrom::Start(cursor))
                 .map_err(Error::Io)?;
 
-            // Skip ChainCommit frames — they carry no page_number and
-            // are invisible to the per-page linear scan.
+            // ChainCommit and logical frames carry no single page number.
             if let Some((n, _commit_ts, _offset)) =
-                try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
+                read_chain_commit_at_cursor(&mut self.journal_file, self.salt1, self.salt2)?
             {
                 cursor += n;
                 continue;
             }
-
-            // Phase 2 §6.5 / US-018: LogicalTxnFrame frames also carry
-            // no `page_number` for the per-page linear scan — skip past
-            // them so subsequent legacy page frames are still visited.
             if let Some((n, _frame)) =
                 try_skip_logical_txn(&mut self.journal_file, self.salt1, self.salt2)?
             {
@@ -700,32 +748,10 @@ impl JournalManager {
                 continue;
             }
 
-            let Some(frame_hdr) =
-                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?
-            else {
-                break;
-            };
-
-            let page_size_bytes = frame_hdr.page_size.bytes();
-            // Read the page data
-            let data_offset = cursor + JOURNAL_FRAME_HEADER_SIZE as u64;
-            self.journal_file
-                .seek(SeekFrom::Start(data_offset))
-                .map_err(Error::Io)?;
-            let mut page_data = vec![0u8; page_size_bytes];
-            self.journal_file
-                .read_exact(&mut page_data)
-                .map_err(Error::Io)?;
-
-            if frame_hdr.page_number == page_number {
-                // Found a frame for this page — keep it (later frames overwrite earlier)
-                latest = Some(page_data);
-            }
-
-            cursor = data_offset + page_size_bytes as u64;
+            break;
         }
 
-        Ok(latest)
+        Ok(None)
     }
 
     // -----------------------------------------------------------------------
@@ -867,7 +893,7 @@ impl JournalManager {
     pub(crate) fn sync_journal(&self) -> Result<()> {
         self.journal_file.sync_data().map_err(Error::Io)?;
         #[cfg(any(test, feature = "test-hooks"))]
-        self::us039_test_probe::record_journal_sync_os_boundary();
+        self::append_sync_test_probe::record_journal_sync_os_boundary();
         Ok(())
     }
 
@@ -954,29 +980,19 @@ impl JournalManager {
             .seek(SeekFrom::Start(JOURNAL_HEADER_SIZE as u64))
             .map_err(Error::Io)?;
         let mut scan = JOURNAL_HEADER_SIZE as u64;
-        let mut latest_commit_pages: Option<u32> = None;
         while scan < cursor {
             self.journal_file
                 .seek(SeekFrom::Start(scan))
                 .map_err(Error::Io)?;
 
-            // ChainCommit frames are part of the durable log but carry no
-            // `page_number` for the in-memory index. Skip past them so
-            // `JournalFrameHeader::read` below sees only legacy frames.
+            // ChainCommit and logical frames carry no single page number for
+            // the ordinary page index.
             if let Some((n, _commit_ts, _offset)) =
-                try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
+                read_chain_commit_at_cursor(&mut self.journal_file, self.salt1, self.salt2)?
             {
                 scan += n;
                 continue;
             }
-
-            // Phase 2 §6.5 / US-018: LogicalTxnFrame carries no page_number
-            // for the legacy per-page index, but truncate_to must skip past
-            // it so the scan continues into any following legacy page
-            // frames. Without this skip, a rollback (rollback_txn →
-            // truncate_to) after a successful CRUD commit would rebuild
-            // the index halted at the logical frame and lose every
-            // legacy page frame written after it.
             if let Some((n, _frame)) =
                 try_skip_logical_txn(&mut self.journal_file, self.salt1, self.salt2)?
             {
@@ -984,18 +1000,9 @@ impl JournalManager {
                 continue;
             }
 
-            let Some(frame_hdr) =
-                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?
-            else {
-                break;
-            };
-            self.index.insert(frame_hdr.page_number, scan);
-            if frame_hdr.db_page_count > 0 {
-                latest_commit_pages = Some(frame_hdr.db_page_count);
-            }
-            scan += (JOURNAL_FRAME_HEADER_SIZE + frame_hdr.page_size.bytes()) as u64;
+            break;
         }
-        self.last_committed_db_page_count = latest_commit_pages;
+        self.last_committed_db_page_count = None;
         self.legacy_pending_start_offset = None;
         self.last_legacy_commit_end_offset = self.write_cursor;
         self.checkpoint_batch_active = None;
@@ -1018,7 +1025,7 @@ impl JournalManager {
                 .seek(SeekFrom::Start(cursor))
                 .map_err(Error::Io)?;
             if let Some((n, _commit_ts, _offset)) =
-                try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
+                read_chain_commit_at_cursor(&mut self.journal_file, self.salt1, self.salt2)?
             {
                 cursor += n;
                 continue;
@@ -1030,33 +1037,22 @@ impl JournalManager {
                 continue;
             }
 
-            let Some(frame_hdr) =
-                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?
-            else {
-                return Ok(None);
-            };
-            let page_size_bytes = frame_hdr.page_size.bytes();
-            let data_offset = cursor + JOURNAL_FRAME_HEADER_SIZE as u64;
-            self.journal_file
-                .seek(SeekFrom::Start(data_offset))
-                .map_err(Error::Io)?;
-            let mut page_data = vec![0u8; page_size_bytes];
-            self.journal_file
-                .read_exact(&mut page_data)
-                .map_err(Error::Io)?;
-
-            if let Some(boundary) = Page0BoundaryRecord::from_page_frame_parts(
-                frame_hdr.page_number,
-                frame_hdr.db_page_count,
-                frame_hdr.salt1,
-                frame_hdr.salt2,
-                frame_hdr.page_size,
-                &page_data,
+            if let Some((_record, _page_data)) = CheckpointBatchPageRecord::read_with_data(
+                &mut self.journal_file,
+                self.salt1,
+                self.salt2,
             )? {
+                cursor = self.journal_file.stream_position().map_err(Error::Io)?;
+                continue;
+            }
+
+            if let Some(boundary) =
+                Page0BoundaryRecord::read(&mut self.journal_file, self.salt1, self.salt2)?
+            {
                 return Ok(Some(boundary.db_page_count()));
             }
 
-            cursor = data_offset + page_size_bytes as u64;
+            return Ok(None);
         }
     }
 
@@ -1075,7 +1071,7 @@ impl JournalManager {
                 .seek(SeekFrom::Start(cursor))
                 .map_err(Error::Io)?;
             if let Some((n, _commit_ts, _offset)) =
-                try_skip_chain_commit(&mut self.journal_file, self.salt1, self.salt2)?
+                read_chain_commit_at_cursor(&mut self.journal_file, self.salt1, self.salt2)?
             {
                 cursor += n;
                 continue;
@@ -1087,32 +1083,24 @@ impl JournalManager {
                 continue;
             }
 
-            let Some(frame_hdr) =
-                JournalFrameHeader::read(&mut self.journal_file, self.salt1, self.salt2)?
-            else {
-                return Err(Error::Internal(
-                    "checkpoint boundary not found before journal end".into(),
-                ));
-            };
-            let page_size_bytes = frame_hdr.page_size.bytes();
-            let data_offset = cursor + JOURNAL_FRAME_HEADER_SIZE as u64;
-            self.journal_file
-                .seek(SeekFrom::Start(data_offset))
-                .map_err(Error::Io)?;
-            let mut page_data = vec![0u8; page_size_bytes];
-            self.journal_file
-                .read_exact(&mut page_data)
-                .map_err(Error::Io)?;
+            if let Some((record, page_data)) = CheckpointBatchPageRecord::read_with_data(
+                &mut self.journal_file,
+                self.salt1,
+                self.salt2,
+            )? {
+                write_page_to_main(
+                    main_file,
+                    record.page_number,
+                    record.page_size.bytes(),
+                    &page_data,
+                )?;
+                cursor = self.journal_file.stream_position().map_err(Error::Io)?;
+                continue;
+            }
 
-            let boundary = Page0BoundaryRecord::from_page_frame_parts(
-                frame_hdr.page_number,
-                frame_hdr.db_page_count,
-                frame_hdr.salt1,
-                frame_hdr.salt2,
-                frame_hdr.page_size,
-                &page_data,
-            )?;
-            if let Some(boundary) = boundary.as_ref() {
+            if let Some(boundary) =
+                Page0BoundaryRecord::read(&mut self.journal_file, self.salt1, self.salt2)?
+            {
                 if boundary.db_page_count() != expected_total_page_count {
                     return Err(Error::Internal(format!(
                         "boundary page count {} does not match expected \
@@ -1120,20 +1108,15 @@ impl JournalManager {
                         boundary.db_page_count(),
                     )));
                 }
-            }
-
-            write_page_to_main(
-                main_file,
-                frame_hdr.page_number,
-                page_size_bytes,
-                &page_data,
-            )?;
-            if boundary.is_some() {
+                let page_data = boundary.header().to_bytes();
+                write_page_to_main(main_file, 0, page_data.len(), &page_data)?;
                 self.last_committed_db_page_count = Some(expected_total_page_count);
                 return Ok(());
             }
 
-            cursor = data_offset + page_size_bytes as u64;
+            return Err(Error::Internal(
+                "checkpoint boundary not found before journal end".into(),
+            ));
         }
     }
 
@@ -1231,23 +1214,15 @@ impl JournalManager {
 // JournalLayeredSource — PageSource that composes a file source with a journal
 // ---------------------------------------------------------------------------
 
-/// Maps the storage-layer [`PageSize`] to the journal's own page-size enum.
-fn page_size_to_journal(size: PageSize) -> JournalPageSize {
-    match size {
-        PageSize::Small4k => JournalPageSize::Small4k,
-        PageSize::Large32k => JournalPageSize::Large32k,
-    }
-}
-
 /// A [`PageSource`] that consults the journal before falling back to an
 /// underlying file source.
 ///
 /// * **Reads** — the journal is checked first via [`JournalManager::read_page`]; on
 ///   miss, the inner `PageSource` (typically [`crate::storage::file_io::FilePageSource`])
 ///   services the read.
-/// * **Writes** — each `write_page` appends a non-commit journal frame via
-///   [`JournalManager::append_non_commit`]; the main database file is not touched
-///   until checkpoint time.
+/// * **Writes** — active flushes pass through to the inner `PageSource`; logical
+///   journal frames and checkpoint-owned frames are appended by their explicit
+///   owners instead of this generic page source.
 ///
 /// The journal state is shared via `Arc<Mutex<JournalManager>>`; contention is
 /// managed at a higher level by the engine's `RwLock<BpBackend>`.
@@ -1282,12 +1257,7 @@ impl PageSource for JournalLayeredSource {
     }
 
     fn write_page(&self, page_number: u32, size: PageSize, buf: &[u8]) -> Result<()> {
-        let mut guard = self
-            .journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        guard.append_non_commit(page_number, page_size_to_journal(size), buf)?;
-        Ok(())
+        self.inner.write_page(page_number, size, buf)
     }
 }
 
@@ -1337,9 +1307,9 @@ pub(crate) fn write_page_to_main(
 mod tests_extracted;
 
 #[cfg(test)]
-#[path = "phase7_us006_tests.rs"]
-mod phase7_us006_tests;
+#[path = "tests/header_format_tests.rs"]
+mod header_format_tests;
 
 #[cfg(test)]
-#[path = "phase7_us011_tests.rs"]
-mod phase7_us011_tests;
+#[path = "tests/checkpoint_boundary_recovery_tests.rs"]
+mod checkpoint_boundary_recovery_tests;

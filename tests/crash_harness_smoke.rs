@@ -33,7 +33,7 @@ use mqlite::{Client, DurabilityMode, OpenOptions};
 ///
 /// 1. `truncate_journal_to_offset` at the current journal EOF is a no-op;
 ///    `reopen_inspect` still recovers all frames.
-/// 2. `reopen_inspect` returns `legacy_page_frame_count > 0` and
+/// 2. `reopen_inspect` returns `legacy_page_frame_count == 0` and
 ///    `chain_commit_frame_count == N` (one ChainCommit per committed insert).
 /// 3. `truncate_journal_before_frame_kind(ChainCommit)` removes the first
 ///    ChainCommit frame; after reopen `chain_commit_frame_count < N` and
@@ -46,8 +46,7 @@ use mqlite::{Client, DurabilityMode, OpenOptions};
 /// an `emergency_checkpoint` truncates it.  This test writes N inserts in a
 /// single open, uses `std::mem::forget` to skip the flush-on-drop, then
 /// reopens with `reopen_inspect`.  We assert on the exact ChainCommit count
-/// by counting how many frames the recovery loop sees, not by predicting how
-/// many legacy frames accumulate.
+/// by counting how many frames the recovery loop sees.
 #[test]
 fn smoke_harness_truncate_and_reopen() {
     const N: usize = 3;
@@ -97,10 +96,9 @@ fn smoke_harness_truncate_and_reopen() {
 
     let (_client1, report1) = crash_harness::reopen_inspect(&db_path).expect("reopen_inspect 1");
 
-    assert!(
-        report1.legacy_page_frame_count > 0,
-        "expected legacy_page_frame_count > 0, got {}",
-        report1.legacy_page_frame_count
+    assert_eq!(
+        report1.legacy_page_frame_count, 0,
+        "Phase 6 ordinary CRUD recovery must not process retired page frames"
     );
 
     // The recovery loop sees exactly as many ChainCommit frames as were

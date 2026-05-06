@@ -17,9 +17,9 @@ use crate::storage::btree::BTree;
 use crate::update::{apply_update, is_operator_update, upsert_base_from_filter};
 use crate::validation::validate_document;
 
-use super::btree_ops::btree_insert_doc;
-use super::catalog_ops::{catalog_lock, new_txn_store, sync_catalog_root_overlay};
-use super::doc_helpers::compare_docs;
+use super::btree_ops::stage_insert_doc;
+use super::catalog_ops::{catalog_lock, new_store};
+use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
     maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
 };
@@ -30,7 +30,6 @@ use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::root_snapshot::NamespaceSnapshot;
-use crate::storage::txn_page_store::TxnOverlay;
 
 fn expected_head_for_key(
     shared: &SharedState,
@@ -64,7 +63,6 @@ fn attach_expected_heads(
 pub(super) fn stage_insert_body(
     shared: &SharedState,
     md: &MetadataState,
-    overlay: &mut TxnOverlay,
     txn: &mut crate::mvcc::transaction::WriteTxn,
     vis: &WriteVisibility<'_>,
     ns: &str,
@@ -74,13 +72,13 @@ pub(super) fn stage_insert_body(
     let entry = catalog_lock(md)
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-write", ns)))?;
-    let mut tree = BTree::open(
-        new_txn_store(shared, overlay),
+    let tree = BTree::open(
+        new_store(shared),
         entry.data_root_page,
         entry.data_root_level,
     );
-    let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
-        &mut tree,
+    let (id, key, bson_bytes) = stage_insert_doc(
+        &tree,
         &mut doc,
         &[],
         vis,
@@ -88,29 +86,14 @@ pub(super) fn stage_insert_body(
         ns,
     )?;
     let entry_id = entry.id;
-    if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-        let mut updated = entry;
-        updated.data_root_page = tree.root_page;
-        updated.data_root_level = tree.root_level;
-        catalog_lock(md).update_collection(&updated)?;
-        sync_catalog_root_overlay(shared, md, overlay)?;
-        // Phase 1 §10.3 — primary data-tree root moved: reader-visible
-        // data_root_page changed AND the on-disk catalog header was
-        // synced, so both flags are set.
-        txn.mark_published();
-        txn.mark_header();
-    }
-    if structural_split {
-        txn.mark_structural_tree_change();
-    }
     txn.stage_primary_insert(entry_id, ns_arc, key, bson_bytes, None);
-    maintain_secondary_on_insert(shared, md, overlay, ns, &doc, &id, vis, txn)?;
+    maintain_secondary_on_insert(shared, md, ns, &doc, &id, vis, txn)?;
     Ok(id)
 }
 
 pub(super) fn insert(engine: &super::PagedEngine, ns: &str, doc: Document) -> Result<Bson> {
-    engine.run_write(ns, |shared, md, overlay, txn, vis| {
-        stage_insert_body(shared, md, overlay, txn, vis, ns, doc)
+    engine.run_write(ns, |shared, md, txn, vis| {
+        stage_insert_body(shared, md, txn, vis, ns, doc)
     })
 }
 
@@ -209,7 +192,7 @@ pub(super) fn update(
     };
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, overlay, txn, vis| {
+    engine.run_write_existing(ns, |shared, md, txn, vis| {
         let mut matched_count = 0u64;
         let mut modified_count = 0u64;
         for (key, mut doc, expected_head) in pairs_to_process {
@@ -222,7 +205,7 @@ pub(super) fn update(
                 let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
                 let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
                 maintain_secondary_on_update(
-                    shared, md, overlay, ns, &before, &doc, &before_id, &new_id, vis, txn,
+                    shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn,
                 )?;
                 let entry_opt = catalog_lock(md).get_collection(ns)?;
                 if let Some(entry) = entry_opt {
@@ -281,10 +264,10 @@ pub(super) fn delete(
     }
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, overlay, txn, _vis| {
+    engine.run_write_existing(ns, |shared, md, txn, _vis| {
         for (key, doc, expected_head) in &pairs_to_delete {
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-            maintain_secondary_on_delete(shared, md, overlay, ns, doc, &doc_id, txn)?;
+            maintain_secondary_on_delete(shared, md, ns, doc, &doc_id, txn)?;
             let entry_opt = catalog_lock(md).get_collection(ns)?;
             if let Some(entry) = entry_opt {
                 txn.stage_primary_delete(entry.id, ns_arc.clone(), key.clone(), *expected_head);
@@ -368,10 +351,8 @@ pub(super) fn find_one_and_update_doc(
     let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, overlay, txn, vis| {
-        maintain_secondary_on_update(
-            shared, md, overlay, ns, &before, &doc, &before_id, &new_id, vis, txn,
-        )?;
+    engine.run_write_existing(ns, |shared, md, txn, vis| {
+        maintain_secondary_on_update(shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn)?;
         let entry_opt = catalog_lock(md).get_collection(ns)?;
         if let Some(entry) = entry_opt {
             txn.stage_primary_update(entry.id, ns_arc.clone(), key, new_bytes, expected_head);
@@ -421,8 +402,8 @@ pub(super) fn find_one_and_delete_doc(
     let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, overlay, txn, _vis| {
-        maintain_secondary_on_delete(shared, md, overlay, ns, &doc, &doc_id, txn)?;
+    engine.run_write_existing(ns, |shared, md, txn, _vis| {
+        maintain_secondary_on_delete(shared, md, ns, &doc, &doc_id, txn)?;
         let entry_opt = catalog_lock(md).get_collection(ns)?;
         if let Some(entry) = entry_opt {
             txn.stage_primary_delete(entry.id, ns_arc.clone(), key, expected_head);
@@ -486,11 +467,10 @@ pub(super) fn find_one_and_replace_doc(
     let old_doc_clone = old_doc.clone();
     let new_doc_clone = new_doc.clone();
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, overlay, txn, vis| {
+    engine.run_write_existing(ns, |shared, md, txn, vis| {
         maintain_secondary_on_update(
             shared,
             md,
-            overlay,
             ns,
             &old_doc_clone,
             &new_doc_clone,
@@ -520,41 +500,8 @@ pub(super) fn do_upsert_update(
 ) -> Result<UpdateResult> {
     let mut new_doc = upsert_base_from_filter(filter);
     apply_update(&mut new_doc, update_doc, true)?;
-    let ns_arc = Ns::from(ns);
-    let id = engine.run_write(ns, |shared, md, overlay, txn, vis| {
-        let entry = catalog_lock(md)
-            .get_collection(ns)?
-            .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
-        let mut tree = BTree::open(
-            new_txn_store(shared, overlay),
-            entry.data_root_page,
-            entry.data_root_level,
-        );
-        let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
-            &mut tree,
-            &mut new_doc,
-            &[],
-            vis,
-            txn.pending_primary.as_slice(),
-            ns,
-        )?;
-        let entry_id = entry.id;
-        if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-            let mut updated = entry;
-            updated.data_root_page = tree.root_page;
-            updated.data_root_level = tree.root_level;
-            catalog_lock(md).update_collection(&updated)?;
-            sync_catalog_root_overlay(shared, md, overlay)?;
-            // Phase 1 §10.3 — data-tree root moved on upsert-style write.
-            txn.mark_published();
-            txn.mark_header();
-        }
-        if structural_split {
-            txn.mark_structural_tree_change();
-        }
-        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
-        maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
-        Ok(id)
+    let id = engine.run_write(ns, |shared, md, txn, vis| {
+        stage_insert_body(shared, md, txn, vis, ns, new_doc)
     })?;
     Ok(UpdateResult {
         matched_count: 0,
@@ -572,45 +519,14 @@ pub(super) fn fam_upsert_update(
 ) -> Result<Option<Document>> {
     let mut new_doc = upsert_base_from_filter(filter);
     apply_update(&mut new_doc, update_doc, true)?;
-    let ns_arc = Ns::from(ns);
-    engine.run_write(ns, |shared, md, overlay, txn, vis| {
-        let entry = catalog_lock(md)
-            .get_collection(ns)?
-            .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
-        let mut tree = BTree::open(
-            new_txn_store(shared, overlay),
-            entry.data_root_page,
-            entry.data_root_level,
-        );
-        let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
-            &mut tree,
-            &mut new_doc,
-            &[],
-            vis,
-            txn.pending_primary.as_slice(),
-            ns,
-        )?;
-        let entry_id = entry.id;
-        if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-            let mut updated = entry;
-            updated.data_root_page = tree.root_page;
-            updated.data_root_level = tree.root_level;
-            catalog_lock(md).update_collection(&updated)?;
-            sync_catalog_root_overlay(shared, md, overlay)?;
-            // Phase 1 §10.3 — data-tree root moved on upsert-style write.
-            txn.mark_published();
-            txn.mark_header();
-        }
-        if structural_split {
-            txn.mark_structural_tree_change();
-        }
-        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
-        maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
-        Ok(())
+    ensure_id(&mut new_doc);
+    let after_doc = new_doc.clone();
+    engine.run_write(ns, |shared, md, txn, vis| {
+        stage_insert_body(shared, md, txn, vis, ns, new_doc).map(|_| ())
     })?;
     Ok(match opts.return_document {
         ReturnDocument::Before => None,
-        ReturnDocument::After => Some(new_doc),
+        ReturnDocument::After => Some(after_doc),
     })
 }
 
@@ -621,44 +537,13 @@ pub(super) fn fam_upsert_replace(
     opts: &FindOneAndReplaceOptions,
 ) -> Result<Option<Document>> {
     let mut new_doc = replacement.clone();
-    let ns_arc = Ns::from(ns);
-    engine.run_write(ns, |shared, md, overlay, txn, vis| {
-        let entry = catalog_lock(md)
-            .get_collection(ns)?
-            .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-upsert", ns)))?;
-        let mut tree = BTree::open(
-            new_txn_store(shared, overlay),
-            entry.data_root_page,
-            entry.data_root_level,
-        );
-        let (id, key, bson_bytes, _tree_root, structural_split) = btree_insert_doc(
-            &mut tree,
-            &mut new_doc,
-            &[],
-            vis,
-            txn.pending_primary.as_slice(),
-            ns,
-        )?;
-        let entry_id = entry.id;
-        if tree.root_page != entry.data_root_page || tree.root_level != entry.data_root_level {
-            let mut updated = entry;
-            updated.data_root_page = tree.root_page;
-            updated.data_root_level = tree.root_level;
-            catalog_lock(md).update_collection(&updated)?;
-            sync_catalog_root_overlay(shared, md, overlay)?;
-            // Phase 1 §10.3 — data-tree root moved on upsert-style write.
-            txn.mark_published();
-            txn.mark_header();
-        }
-        if structural_split {
-            txn.mark_structural_tree_change();
-        }
-        txn.stage_primary_insert(entry_id, ns_arc.clone(), key, bson_bytes, None);
-        maintain_secondary_on_insert(shared, md, overlay, ns, &new_doc, &id, vis, txn)?;
-        Ok(())
+    ensure_id(&mut new_doc);
+    let after_doc = new_doc.clone();
+    engine.run_write(ns, |shared, md, txn, vis| {
+        stage_insert_body(shared, md, txn, vis, ns, new_doc).map(|_| ())
     })?;
     Ok(match opts.return_document {
         ReturnDocument::Before => None,
-        ReturnDocument::After => Some(new_doc),
+        ReturnDocument::After => Some(after_doc),
     })
 }

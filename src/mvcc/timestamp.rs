@@ -168,7 +168,7 @@ impl AtomicTs {
         // Bump version into the odd/"writer in progress" state.
         let prev = self.seq.fetch_add(1, Ordering::AcqRel);
         debug_assert!(
-            prev.is_multiple_of(2),
+            prev % 2 == 0,
             "AtomicTs::store called concurrently with another writer (seq must be even)"
         );
         self.physical_ms.store(ts.physical_ms, Ordering::Release);

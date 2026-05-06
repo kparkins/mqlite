@@ -133,12 +133,13 @@ impl BTreePageStore for BufferPoolPageStore {
         if !self.is_history {
             let latched = self.handle.pool().pin_for_read(page)?;
             #[cfg(any(test, feature = "test-hooks"))]
-            let hold_start = crate::storage::btree::us016_test_probe::begin_leaf_hold(page, 0);
+            let hold_start =
+                crate::storage::btree::reader_latch_scope_test_probe::begin_leaf_hold(page, 0);
             let page_data = latched.data_snapshot();
             let snap = Some(latched.snapshot_chains(None)?);
             drop(latched);
             #[cfg(any(test, feature = "test-hooks"))]
-            crate::storage::btree::us016_test_probe::finish_leaf_hold(hold_start);
+            crate::storage::btree::reader_latch_scope_test_probe::finish_leaf_hold(hold_start);
             return Ok((LeafPageImage::shared(page_data)?, snap));
         }
 
@@ -188,11 +189,14 @@ impl BTreePageStore for BufferPoolPageStore {
             SharedReaderPage::Latched(page) => {
                 #[cfg(any(test, feature = "test-hooks"))]
                 let hold_start =
-                    crate::storage::btree::us016_test_probe::begin_leaf_hold(page.page_id(), 0);
+                    crate::storage::btree::reader_latch_scope_test_probe::begin_leaf_hold(
+                        page.page_id(),
+                        0,
+                    );
                 let page_data = page.data_snapshot();
                 let snap = Some(page.snapshot_chains(None)?);
                 #[cfg(any(test, feature = "test-hooks"))]
-                crate::storage::btree::us016_test_probe::finish_leaf_hold(hold_start);
+                crate::storage::btree::reader_latch_scope_test_probe::finish_leaf_hold(hold_start);
                 Ok((LeafPageImage::shared(page_data)?, snap))
             }
             SharedReaderPage::Pinned(page) => {
@@ -213,11 +217,14 @@ impl BTreePageStore for BufferPoolPageStore {
             SharedReaderPage::Latched(page) => {
                 #[cfg(any(test, feature = "test-hooks"))]
                 let hold_start =
-                    crate::storage::btree::us016_test_probe::begin_leaf_hold(page.page_id(), 0);
+                    crate::storage::btree::reader_latch_scope_test_probe::begin_leaf_hold(
+                        page.page_id(),
+                        0,
+                    );
                 let page_data = page.data_snapshot();
                 let snap = Some(page.snapshot_chain_for_key(key, None)?);
                 #[cfg(any(test, feature = "test-hooks"))]
-                crate::storage::btree::us016_test_probe::finish_leaf_hold(hold_start);
+                crate::storage::btree::reader_latch_scope_test_probe::finish_leaf_hold(hold_start);
                 Ok((LeafPageImage::shared(page_data)?, snap))
             }
             SharedReaderPage::Pinned(_) => self.read_leaf(page),
@@ -477,5 +484,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "btree_store_us035_tests.rs"]
-mod us035_tests;
+#[path = "tests/buffer_pool_page_store_leaf_snapshot_tests.rs"]
+mod buffer_pool_page_store_leaf_snapshot_tests;

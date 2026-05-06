@@ -219,7 +219,7 @@ fn crash_between_chain_commit_and_publish_loses_publish_only() {
     // Drive a probe insert stopped AFTER commit_txn but BEFORE
     // publish. The ChainCommit frame exists, the header was updated.
     let _ = client
-        .__phase0_probe_insert(
+        .__crash_cut_probe_insert(
             "db.c",
             doc! { "_id": 99i32, "kind": "probe" },
             Phase0ProbeCut::AfterCommitTxnBeforePublish,

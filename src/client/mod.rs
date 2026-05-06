@@ -32,13 +32,13 @@ pub mod collection;
 /// Lightweight database-namespace handle (returned by `Client::database`).
 pub mod database;
 
+#[cfg(any(test, feature = "test-hooks"))]
+mod crash_cut_test_probe;
 mod crud;
 mod handle;
 mod inner;
 mod open;
 mod path;
-#[cfg(any(test, feature = "test-hooks"))]
-mod phase0_probe;
 /// Test-only `impl Client` accessors — `__`-prefixed, `#[doc(hidden)]`,
 /// and strictly NOT part of the public API. Isolated here so the
 /// boundary between production code and test scaffolding is obvious.

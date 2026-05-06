@@ -10,9 +10,8 @@ use crate::storage::btree::{
     OVERFLOW_THRESHOLD,
 };
 use crate::storage::buffer_pool::LatchedPinnedPage;
-use crate::storage::txn_page_store::TxnOverlay;
 
-use super::catalog_ops::new_txn_store;
+use super::catalog_ops::new_store;
 use super::state::SharedState;
 
 /// Shape of a staged write for Phase 5 SMO gating (§10.24).
@@ -141,9 +140,9 @@ pub(crate) fn classify_write(
     };
     let shape = classify_leaf_bytes(data.as_slice(), false, &[], &target)?;
     #[cfg(any(test, feature = "test-hooks"))]
-    super::us010_test_probe::record_classification("shared", &shape);
+    super::smo_classification_test_probe::record_classification("shared", &shape);
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(shape) = super::us010_test_probe::override_classification("shared") {
+    if let Some(shape) = super::smo_classification_test_probe::override_classification("shared") {
         return Ok(shape);
     }
     Ok(shape)
@@ -153,7 +152,6 @@ pub(crate) fn classify_write(
 /// reclassification when shared-latch classification is stale.
 pub(crate) fn acquire_smo_latches<'pool>(
     shared: &'pool SharedState,
-    overlay: &mut TxnOverlay,
     targets: &[SmoWriteTarget],
 ) -> Result<SmoLatchSet<'pool>> {
     if targets.is_empty() {
@@ -162,19 +160,19 @@ pub(crate) fn acquire_smo_latches<'pool>(
 
     let mut reclassifications = 0u32;
     loop {
-        let planned = plan_targets(shared, overlay, targets)?;
+        let planned = plan_targets(shared, targets)?;
         let required_pages = required_pages(&planned);
         let pages = acquire_pages(shared, &required_pages)?;
 
-        if !paths_still_valid(shared, overlay, &planned)? {
+        if !paths_still_valid(shared, &planned)? {
             return structural_contention();
         }
         #[cfg(any(test, feature = "test-hooks"))]
-        if super::us010_test_probe::force_revalidation_failure_once() {
+        if super::smo_classification_test_probe::force_revalidation_failure_once() {
             return structural_contention();
         }
 
-        let exclusive_shapes = reclassify_exclusive(overlay, &pages, &planned)?;
+        let exclusive_shapes = reclassify_exclusive(&pages, &planned)?;
         let exclusive_pages = required_pages_for_shapes(&planned, &exclusive_shapes);
         if exclusive_pages == required_pages {
             return Ok(SmoLatchSet {
@@ -189,34 +187,25 @@ pub(crate) fn acquire_smo_latches<'pool>(
         drop(pages);
         reclassifications = reclassifications.saturating_add(1);
         #[cfg(any(test, feature = "test-hooks"))]
-        super::us010_test_probe::record_reclassification(reclassifications);
+        super::smo_classification_test_probe::record_reclassification(reclassifications);
         if reclassifications >= shared.smo_classification_retry_cap {
             return structural_contention();
         }
     }
 }
 
-fn plan_targets(
-    shared: &SharedState,
-    overlay: &mut TxnOverlay,
-    targets: &[SmoWriteTarget],
-) -> Result<Vec<PlannedWrite>> {
+fn plan_targets(shared: &SharedState, targets: &[SmoWriteTarget]) -> Result<Vec<PlannedWrite>> {
     let mut planned = Vec::with_capacity(targets.len());
     for target in targets {
         let path = {
-            let tree = BTree::open(
-                new_txn_store(shared, overlay),
-                target.root_page,
-                target.root_level,
-            );
+            let tree = BTree::open(new_store(shared), target.root_page, target.root_level);
             tree.path_to_leaf(&target.key)?
         };
         let leaf = path
             .last()
             .ok_or_else(|| Error::Internal("empty B-tree path".into()))?;
-        let shape = classify_write_with_overlay(
+        let shape = classify_write_from_leaf(
             shared,
-            overlay,
             leaf.page_id,
             target.root_level == 0,
             &path,
@@ -232,9 +221,8 @@ fn plan_targets(
     Ok(planned)
 }
 
-fn classify_write_with_overlay(
+fn classify_write_from_leaf(
     shared: &SharedState,
-    overlay: &mut TxnOverlay,
     leaf: u32,
     is_root_leaf: bool,
     path: &[BTreePathStep],
@@ -246,22 +234,18 @@ fn classify_write_with_overlay(
     } else {
         None
     };
-    let snapshot;
-    let data = match overlay.overlay_leaf_bytes(leaf) {
-        Some(bytes) => bytes.as_slice(),
-        None => {
-            snapshot = _page
-                .as_ref()
-                .map(LatchedPinnedPage::data_snapshot)
-                .unwrap_or_else(|| Arc::new(Vec::new()));
-            snapshot.as_slice()
-        }
-    };
+    let snapshot = _page
+        .as_ref()
+        .map(LatchedPinnedPage::data_snapshot)
+        .unwrap_or_else(|| Arc::new(Vec::new()));
+    let data = snapshot.as_slice();
     let shape = classify_leaf_bytes(data, is_root_leaf, path, target)?;
     #[cfg(any(test, feature = "test-hooks"))]
     {
-        super::us010_test_probe::record_classification(phase, &shape);
-        if let Some(override_shape) = super::us010_test_probe::override_classification(phase) {
+        super::smo_classification_test_probe::record_classification(phase, &shape);
+        if let Some(override_shape) =
+            super::smo_classification_test_probe::override_classification(phase)
+        {
             return Ok(override_shape);
         }
     }
@@ -344,20 +328,16 @@ fn acquire_pages<'pool>(
     let mut pages = Vec::with_capacity(required_pages.len());
     for page_id in required_pages {
         #[cfg(any(test, feature = "test-hooks"))]
-        super::us010_test_probe::record_exclusive_acquire(*page_id);
+        super::smo_classification_test_probe::record_exclusive_acquire(*page_id);
         pages.push(shared.handle.pool().pin_for_write(*page_id)?);
     }
     Ok(pages)
 }
 
-fn paths_still_valid(
-    shared: &SharedState,
-    overlay: &mut TxnOverlay,
-    planned: &[PlannedWrite],
-) -> Result<bool> {
+fn paths_still_valid(shared: &SharedState, planned: &[PlannedWrite]) -> Result<bool> {
     for plan in planned {
         let tree = BTree::open(
-            new_txn_store(shared, overlay),
+            new_store(shared),
             plan.target.root_page,
             plan.target.root_level,
         );
@@ -369,7 +349,6 @@ fn paths_still_valid(
 }
 
 fn reclassify_exclusive(
-    overlay: &mut TxnOverlay,
     pages: &[LatchedPinnedPage<'_>],
     planned: &[PlannedWrite],
 ) -> Result<Vec<WriteShape>> {
@@ -390,21 +369,15 @@ fn reclassify_exclusive(
             .iter()
             .find(|page| page.page_id() == leaf)
             .ok_or_else(|| Error::Internal(format!("missing exclusive page {leaf}")))?;
-        let snapshot;
-        let data = match overlay.overlay_leaf_bytes(leaf) {
-            Some(bytes) => bytes.as_slice(),
-            None => {
-                snapshot = page.data_snapshot();
-                snapshot.as_slice()
-            }
-        };
+        let snapshot = page.data_snapshot();
+        let data = snapshot.as_slice();
         let shape =
             classify_leaf_bytes(data, plan.target.root_level == 0, &plan.path, &plan.target)?;
         #[cfg(any(test, feature = "test-hooks"))]
         {
-            super::us010_test_probe::record_classification("exclusive", &shape);
+            super::smo_classification_test_probe::record_classification("exclusive", &shape);
             if let Some(override_shape) =
-                super::us010_test_probe::override_classification("exclusive")
+                super::smo_classification_test_probe::override_classification("exclusive")
             {
                 shapes.push(override_shape);
                 continue;

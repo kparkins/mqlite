@@ -30,16 +30,16 @@ use super::state::SharedState;
 ///
 /// Root-neutral CRUD leaves both flags clear; DDL and root-moving CRUD
 /// set at least one. `published_catalog_dirty` forces a fresh
-/// `Arc<PublishedCatalog>` to be built; `catalog_header_dirty` triggers
-/// `sync_catalog_root_overlay` independently of the publish step (§4.4).
+/// `Arc<PublishedCatalog>` to be built; `catalog_header_dirty` tracks a
+/// catalog-root header owner update independently of the publish step (§4.4).
 #[derive(Default, Copy, Clone, Debug)]
 pub(crate) struct PublishDirty {
     /// Reader-visible published metadata changed. Forces a new
     /// `Arc<PublishedCatalog>` at publish time.
     pub published_catalog_dirty: bool,
     /// The on-disk catalog tree or file header changed, but the
-    /// reader-visible contract did not. Triggers
-    /// `sync_catalog_root_overlay` without rebuilding `PublishedCatalog`.
+    /// reader-visible contract did not. Tracks a catalog-root header owner
+    /// update without rebuilding `PublishedCatalog`.
     pub catalog_header_dirty: bool,
 }
 
@@ -50,7 +50,7 @@ impl PublishDirty {
         self.published_catalog_dirty = true;
     }
 
-    /// Mark the on-disk catalog header dirty (`sync_catalog_root_overlay`
+    /// Mark the on-disk catalog header dirty (the catalog-root header owner
     /// must run, but the published catalog Arc may be reused).
     pub(crate) fn mark_header(&mut self) {
         self.catalog_header_dirty = true;

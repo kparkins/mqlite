@@ -45,8 +45,6 @@ use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::secondary_index::build_index_keys;
 #[cfg(any(test, feature = "test-hooks"))]
-use crate::storage::txn_page_store::TxnOverlay;
-
 #[cfg(any(test, feature = "test-hooks"))]
 static PHASE3_COMMIT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -61,7 +59,7 @@ static US007_UNGUARDED_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(test, feature = "test-hooks"))]
 std::thread_local! {
-    static US007_JOURNAL_MUTEX_DEPTH: Cell<u32> = Cell::new(0);
+    static US007_JOURNAL_MUTEX_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// US-026 post-register cleanup failpoints.
@@ -81,7 +79,7 @@ pub enum Us026PostRegisterFailpoint {
     LegacyCommitTxn,
     /// Fail the final pre-durable flush.
     Flush,
-    /// Fail after structural overlay commit and force rollback to report
+    /// Fail after structural batch commit and force rollback to report
     /// an error after performing the rollback work.
     RollbackTxnAfterStructuralCommit,
 }
@@ -1215,9 +1213,9 @@ impl PagedEngine {
         left: bson::Document,
         right: bson::Document,
     ) -> Result<()> {
-        self.run_write(ns, |shared, md, overlay, txn, vis| {
-            super::doc_ops::stage_insert_body(shared, md, overlay, txn, vis, ns, left)?;
-            super::doc_ops::stage_insert_body(shared, md, overlay, txn, vis, ns, right)?;
+        self.run_write(ns, |shared, md, txn, vis| {
+            super::doc_ops::stage_insert_body(shared, md, txn, vis, ns, left)?;
+            super::doc_ops::stage_insert_body(shared, md, txn, vis, ns, right)?;
             Ok(())
         })
     }
@@ -1375,13 +1373,13 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us008_reset_overlay_observations(&self) {
-        crate::storage::txn_page_store_us008_probe::reset_committed_overlay_leaf_bytes();
+    pub(super) fn test_us008_reset_structural_page_observations(&self) {
+        crate::storage::structural_page_batch_test_probe::reset_committed_structural_leaf_bytes();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us008_committed_overlay_leaf_bytes(&self) -> u64 {
-        crate::storage::txn_page_store_us008_probe::committed_overlay_leaf_bytes()
+    pub(super) fn test_us008_committed_structural_leaf_bytes(&self) -> u64 {
+        crate::storage::structural_page_batch_test_probe::committed_structural_leaf_bytes()
     }
 
     /// Test-only US-011 probe: install one pending unique email index entry
@@ -1422,13 +1420,11 @@ impl PagedEngine {
             expected_head: None,
             op: SecIndexOp::Insert { id_bytes },
         };
-        let mut overlay = TxnOverlay::new();
         let vis = WriteVisibility::new(&self.shared, ns)?;
         let commit_ts = self.shared.oracle.commit()?;
         install_pending_sec_index(
             &self.shared,
             &self.metadata_state,
-            &mut overlay,
             vec![write],
             &vis,
             commit_ts,

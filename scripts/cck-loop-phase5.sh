@@ -51,7 +51,7 @@ PHASE5_FATAL_STALE_PATTERN+='|briefly re-acquired .*metadata\(read\)'
 PHASE5_REVIEW_SCAN_PATTERN='VersionState.*zero hits'
 PHASE5_REVIEW_SCAN_PATTERN+='|register publish_seq \(under journal_mutex'
 PHASE5_REVIEW_SCAN_PATTERN+='|briefly re-acquired .*metadata\(read\)'
-PHASE5_REVIEW_SCAN_PATTERN+='|cargo test tests/mwmr_p5_errors.rs'
+PHASE5_REVIEW_SCAN_PATTERN+='|cargo test tests/mwmr_failure_edges.rs'
 PHASE5_REVIEW_SCAN_PATTERN+='|cargo test --release --tests -- mwmr_p5'
 PHASE5_REVIEW_SCAN_PATTERN+='|commit_seq: Mutex<()> must be deleted'
 

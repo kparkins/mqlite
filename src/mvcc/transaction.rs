@@ -296,7 +296,7 @@ impl WriteTxn {
     }
 
     /// Mark the on-disk catalog header dirty (§10.2 Q-M1 accessor).
-    /// Triggers `sync_catalog_root_overlay` independently of publish.
+    /// Triggers the catalog-root header owner independently of publish.
     pub(crate) fn mark_header(&mut self) {
         self.publish_dirty.mark_header();
     }
@@ -727,7 +727,7 @@ mod tests {
     use super::*;
     use crate::mvcc::version::OverflowRef;
     use crate::storage::allocator::AllocatorHandle;
-    use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize};
+    use crate::storage::buffer_pool::{default_sizes, BufferPool};
     use crate::storage::handle::BufferPoolHandle;
     use crate::storage::header::FileHeader;
     use crate::storage::test_support::{ArcIo, MockIo};
@@ -1049,11 +1049,6 @@ mod tests {
         }
         assert!(matches!(t.pending_primary[2].op, PrimaryOp::Delete));
     }
-
-    // Silence the unused-import warning when PageSize isn't actually used
-    // in the test module — kept as a future anchor for phase 6 tests.
-    #[allow(dead_code)]
-    fn _marker(_: PageSize) {}
 
     // -----------------------------------------------------------------------
     // Phase 2 §3.1a — stage-time ns_id / index_id capture (US-009)

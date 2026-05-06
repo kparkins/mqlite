@@ -58,6 +58,36 @@ mod tests {
             .unwrap()
     }
 
+    fn append_test_checkpoint_batch(
+        mgr: &mut JournalManager,
+        base_header: &FileHeader,
+        pages: impl IntoIterator<Item = u32>,
+        fill: u8,
+        checkpoint_ts: crate::mvcc::timestamp::Ts,
+    ) -> BoundaryAppended {
+        let pages: Vec<u32> = pages.into_iter().collect();
+        let cursor = mgr.begin_checkpoint_batch().unwrap();
+        let batch_id = cursor.batch_id();
+        let page_data = make_page_4k(fill);
+        for page_number in &pages {
+            mgr.append_checkpoint_frame(
+                batch_id,
+                CheckpointPoolKind::Main,
+                *page_number,
+                JournalPageSize::Small4k,
+                &page_data,
+            )
+            .unwrap();
+        }
+        let mut staged_header = base_header.clone();
+        if let Some(max_page) = pages.iter().copied().max() {
+            staged_header.total_page_count = staged_header.total_page_count.max(max_page + 1);
+        }
+        staged_header.last_checkpoint_ts = checkpoint_ts;
+        mgr.append_checkpoint_commit_boundary(&staged_header, cursor)
+            .unwrap()
+    }
+
     // -----------------------------------------------------------------------
     // Path helpers
     // -----------------------------------------------------------------------
@@ -191,16 +221,12 @@ mod tests {
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let header = make_header();
 
-        let page_data = make_page_4k(0x7E);
         let cursor_before_logical;
         let logical_frame_offset;
         let encoded_logical;
         {
             let mut mgr =
                 JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-            mgr.commit(7, JournalPageSize::Small4k, &page_data, 8)
-                .unwrap();
 
             cursor_before_logical = mgr.write_cursor();
             let index_occupied_before = mgr.index().occupied_count();
@@ -268,13 +294,6 @@ mod tests {
             .open(&db_path)
             .unwrap();
         let mut mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
-
-        let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
-        main_file2
-            .seek(SeekFrom::Start(7 * PAGE_SIZE_LEAF as u64))
-            .unwrap();
-        main_file2.read_exact(&mut buf).unwrap();
-        assert_eq!(buf[0], 0x7E, "committed legacy page must be durable");
 
         assert!(
             mgr2.read_page_linear(99).unwrap().is_none(),
@@ -506,21 +525,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn recovery_replays_committed_frames() {
+    fn recovery_copies_checkpoint_batch_after_boundary() {
+        use crate::mvcc::timestamp::Ts;
+
         let (_dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let header = make_header();
 
-        // Write two frames and commit.
+        // Write checkpoint-owned pages and commit them with a page-0 boundary.
         {
             let mut mgr =
                 JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
-            let page_a = make_page_4k(0xAA);
-            let page_b = make_page_4k(0xBB);
-            mgr.append_non_commit(1, JournalPageSize::Small4k, &page_a)
-                .unwrap();
-            mgr.commit(2, JournalPageSize::Small4k, &page_b, 5).unwrap();
+            let _ = append_test_checkpoint_batch(
+                &mut mgr,
+                &header,
+                [1, 2],
+                0xAA,
+                Ts {
+                    physical_ms: 100,
+                    logical: 0,
+                },
+            );
             // Simulate crash: don't call close_and_cleanup.
             // Journal file left on disk.
         }
@@ -533,40 +559,42 @@ mod tests {
             .unwrap();
         let _mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
 
-        // Both pages should have been replayed into main file at 32 KB slots.
+        // Both checkpoint pages should have been copied into main file.
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
         main_file2
             .seek(SeekFrom::Start(PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
-        assert_eq!(buf[0], 0xAA, "page 1 should be replayed");
+        assert_eq!(buf[0], 0xAA, "page 1 should be copied");
 
         main_file2
             .seek(SeekFrom::Start(2 * PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
-        assert_eq!(buf[0], 0xBB, "page 2 should be replayed");
+        assert_eq!(buf[0], 0xAA, "page 2 should be copied");
     }
 
     #[test]
-    fn recovery_discards_uncommitted_frames() {
+    fn recovery_discards_checkpoint_batch_without_boundary() {
         let (_dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
         let header = make_header();
 
-        // Write one committed frame, then one uncommitted (simulated crash mid-tx).
+        // Write a checkpoint-owned page without its page-0 boundary.
         {
             let mut mgr =
                 JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
 
-            let page_committed = make_page_4k(0xCC);
-            let page_uncommitted = make_page_4k(0xDD);
-            mgr.commit(1, JournalPageSize::Small4k, &page_committed, 3)
-                .unwrap();
-            // Append non-commit frame — transaction never completed.
-            mgr.append_non_commit(2, JournalPageSize::Small4k, &page_uncommitted)
-                .unwrap();
-            // Crash: no commit for page 2.
+            let cursor = mgr.begin_checkpoint_batch().unwrap();
+            mgr.append_checkpoint_frame(
+                cursor.batch_id(),
+                CheckpointPoolKind::Main,
+                2,
+                JournalPageSize::Small4k,
+                &make_page_4k(0xDD),
+            )
+            .unwrap();
+            // Crash: no boundary for page 2.
         }
 
         let mut main_file2 = OpenOptions::new()
@@ -574,20 +602,19 @@ mod tests {
             .write(true)
             .open(&db_path)
             .unwrap();
-        let mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
+        let mut mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
 
-        // Page 1 (committed) should be in main file at the 32 KB slot offset.
+        // Page 2 should not be copied into the main file.
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
         main_file2
-            .seek(SeekFrom::Start(PAGE_SIZE_LEAF as u64))
+            .seek(SeekFrom::Start(2 * PAGE_SIZE_LEAF as u64))
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
-        assert_eq!(buf[0], 0xCC, "committed page must be present");
+        assert_eq!(buf[0], 0x00, "incomplete checkpoint page is discarded");
 
-        // Page 2 (uncommitted) — index should NOT have it after recovery.
         assert!(
-            mgr2.index().lookup(2).is_none(),
-            "uncommitted page must not be in journal index after recovery"
+            mgr2.read_page_linear(2).unwrap().is_none(),
+            "incomplete checkpoint page must not remain readable from journal"
         );
     }
 
@@ -639,7 +666,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn linear_scan_finds_committed_pages() {
+    fn linear_scan_ignores_untagged_page_frames() {
         let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
@@ -650,7 +677,7 @@ mod tests {
             .unwrap();
 
         let result = mgr.read_page_linear(7).unwrap();
-        assert_eq!(result, Some(page_data));
+        assert_eq!(result, None);
         assert!(mgr.read_page_linear(999).unwrap().is_none());
     }
 
@@ -659,7 +686,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn truncate_to_drops_frames_written_after_mark() {
+    fn truncate_to_does_not_rebuild_untagged_page_frames() {
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
@@ -675,11 +702,7 @@ mod tests {
         mgr.truncate_to(mark).unwrap();
 
         assert_eq!(mgr.write_cursor(), mark);
-        assert_eq!(
-            mgr.read_page(1).unwrap(),
-            Some(make_page_4k(0x11)),
-            "frame before mark must survive"
-        );
+        assert!(mgr.read_page(1).unwrap().is_none());
         assert!(
             mgr.read_page(2).unwrap().is_none(),
             "frame after mark must be dropped"
@@ -691,25 +714,37 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_preserves_prior_commit_state() {
+    fn truncate_to_does_not_rebuild_checkpoint_boundary_state() {
+        use crate::mvcc::timestamp::Ts;
+
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
 
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        mgr.append_non_commit(1, JournalPageSize::Small4k, &make_page_4k(0x11))
-            .unwrap();
-        mgr.commit(2, JournalPageSize::Small4k, &make_page_4k(0x22), 50)
-            .unwrap();
+        let _ = append_test_page0_boundary(
+            &mut mgr,
+            &header,
+            Ts {
+                physical_ms: 100,
+                logical: 0,
+            },
+        );
         let mark = mgr.write_cursor();
-        mgr.append_non_commit(3, JournalPageSize::Small4k, &make_page_4k(0x33))
-            .unwrap();
+        let cursor = mgr.begin_checkpoint_batch().unwrap();
+        mgr.append_checkpoint_frame(
+            cursor.batch_id(),
+            CheckpointPoolKind::Main,
+            55,
+            JournalPageSize::Small4k,
+            &make_page_4k(0x55),
+        )
+        .unwrap();
 
         mgr.truncate_to(mark).unwrap();
 
-        assert_eq!(mgr.last_committed_db_page_count, Some(50));
-        assert_eq!(mgr.read_page(1).unwrap(), Some(make_page_4k(0x11)));
-        assert_eq!(mgr.read_page(2).unwrap(), Some(make_page_4k(0x22)));
-        assert!(mgr.read_page(3).unwrap().is_none());
+        assert!(mgr.last_committed_db_page_count.is_none());
+        assert!(mgr.read_page(0).unwrap().is_none());
+        assert!(mgr.read_page(55).unwrap().is_none());
         drop(mgr);
         drop(main_file);
         drop(dir);
@@ -825,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn layered_source_write_appends_to_journal_not_file() {
+    fn layered_source_write_passes_through_to_file_not_journal() {
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
@@ -841,13 +876,10 @@ mod tests {
         layered.write_page(13, PageSize::Small4k, &payload).unwrap();
 
         let journal_bytes = journal.lock().unwrap().read_page(13).unwrap();
-        assert_eq!(journal_bytes, Some(payload));
+        assert_eq!(journal_bytes, None);
 
         let pages = file_src.pages.lock().unwrap();
-        assert!(
-            !pages.contains_key(&13),
-            "write_page must not touch the backing file source"
-        );
+        assert_eq!(pages.get(&13), Some(&payload));
         drop(pages);
         drop(journal);
         drop(main_file);
@@ -1521,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn read_page_linear_reads_page0_checkpoint_boundary() {
+    fn read_page_linear_ignores_page0_checkpoint_boundary() {
         use crate::mvcc::timestamp::Ts;
 
         let (dir, db_path, mut main_file) = make_db_file();
@@ -1538,16 +1570,17 @@ mod tests {
         );
 
         mgr.index.clear_index();
-        let page0 = mgr.read_page_linear(0).unwrap().expect("page-0 boundary");
-        let decoded = FileHeader::from_bytes(page0.as_slice().try_into().unwrap()).unwrap();
-        assert_eq!(decoded.last_checkpoint_ts.physical_ms, 100);
+        assert!(
+            mgr.read_page_linear(0).unwrap().is_none(),
+            "generic linear lookup must not expose checkpoint page-0 boundaries"
+        );
         drop(mgr);
         drop(main_file);
         drop(dir);
     }
 
     #[test]
-    fn truncate_to_indexes_page0_checkpoint_boundary() {
+    fn truncate_to_does_not_index_page0_checkpoint_boundary() {
         use crate::mvcc::timestamp::Ts;
 
         let (dir, db_path, mut main_file) = make_db_file();
@@ -1569,8 +1602,8 @@ mod tests {
             .unwrap();
 
         mgr.truncate_to(mark).unwrap();
-        assert!(mgr.read_page(0).unwrap().is_some());
-        assert_eq!(mgr.read_page(44).unwrap().unwrap()[0], 0x44);
+        assert!(mgr.read_page(0).unwrap().is_none());
+        assert!(mgr.read_page(44).unwrap().is_none());
         assert!(mgr.read_page(55).unwrap().is_none());
         drop(mgr);
         drop(main_file);
@@ -1836,6 +1869,20 @@ mod tests {
         physical_ms: 2_000,
         logical: 0,
     };
+    const MIN_SYNTHETIC_COMMIT_TS_OFFSET_MS: u64 = 1;
+
+    fn synthetic_uncheckpointed_ts(header: &FileHeader, requested: Ts) -> Ts {
+        if requested > header.last_checkpoint_ts {
+            return requested;
+        }
+        Ts {
+            physical_ms: header
+                .last_checkpoint_ts
+                .physical_ms
+                .saturating_add(requested.physical_ms.max(MIN_SYNTHETIC_COMMIT_TS_OFFSET_MS)),
+            logical: requested.logical,
+        }
+    }
 
     fn setup_pass2_live_catalog(db_path: &Path) {
         use crate::{Client, OpenOptions as DbOpts};
@@ -1868,6 +1915,7 @@ mod tests {
         let mut mgr = JournalManager::open_or_create(db_path, &header, &mut main_file)
             .expect("open journal manager");
         let (salt1, salt2) = mgr.salts();
+        let commit_ts = synthetic_uncheckpointed_ts(&header, commit_ts);
         let frame = LogicalTxnFrame {
             salt1,
             salt2,
@@ -2022,7 +2070,7 @@ mod crash_recovery_tests {
 
     use crate::error::{Error, Result};
     use crate::journal::log_file::JournalPageSize;
-    use crate::journal::{write_page_to_main, JournalManager};
+    use crate::journal::{write_page_to_main, CheckpointPoolKind, JournalManager};
     use crate::storage::header::FileHeader;
     use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
@@ -2090,19 +2138,81 @@ mod crash_recovery_tests {
         main_file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
         main_file.write_all(&header.to_bytes()).map_err(Error::Io)?;
         main_file.flush().map_err(Error::Io)?;
-        let mut journal = JournalManager::open_or_create(db_path, &header, &mut main_file)?;
         let page_data = vec![epoch1_fill(seed); PAGE_SIZE_INTERNAL as usize];
-        for page_no in EPOCH1_START..(EPOCH1_END - 1) {
-            journal.append_non_commit(page_no, JournalPageSize::Small4k, &page_data)?;
+        for page_no in EPOCH1_START..EPOCH1_END {
+            write_page_to_main(
+                &mut main_file,
+                page_no,
+                PAGE_SIZE_INTERNAL as usize,
+                &page_data,
+            )?;
         }
-        journal.commit(
-            EPOCH1_END - 1,
-            JournalPageSize::Small4k,
-            &page_data,
-            EPOCH1_END - 1,
-        )?;
-        drop(journal);
+        main_file.flush().map_err(Error::Io)?;
         drop(main_file);
+        Ok(())
+    }
+
+    fn append_crash_checkpoint_batch(
+        journal: &mut JournalManager,
+        header: &FileHeader,
+        pages: impl IntoIterator<Item = u32>,
+        fill: u8,
+        checkpoint_ts: crate::mvcc::timestamp::Ts,
+    ) -> Result<()> {
+        let pages: Vec<u32> = pages.into_iter().collect();
+        let cursor = journal.begin_checkpoint_batch()?;
+        let batch_id = cursor.batch_id();
+        let page_data = vec![fill; PAGE_SIZE_INTERNAL as usize];
+        for page_no in &pages {
+            journal.append_checkpoint_frame(
+                batch_id,
+                CheckpointPoolKind::Main,
+                *page_no,
+                JournalPageSize::Small4k,
+                &page_data,
+            )?;
+        }
+        let mut staged_header = header.clone();
+        if let Some(max_page) = pages.iter().copied().max() {
+            staged_header.total_page_count = staged_header.total_page_count.max(max_page + 1);
+        }
+        staged_header.last_checkpoint_ts = checkpoint_ts;
+        let _ = journal.append_checkpoint_commit_boundary(&staged_header, cursor)?;
+        Ok(())
+    }
+
+    fn append_crash_checkpoint_image(
+        journal: &mut JournalManager,
+        header: &FileHeader,
+        seed: u32,
+        checkpoint_ts: crate::mvcc::timestamp::Ts,
+    ) -> Result<()> {
+        let cursor = journal.begin_checkpoint_batch()?;
+        let batch_id = cursor.batch_id();
+        let epoch1 = vec![epoch1_fill(seed); PAGE_SIZE_INTERNAL as usize];
+        let epoch2 = vec![epoch2_fill(seed); PAGE_SIZE_INTERNAL as usize];
+        for page_no in EPOCH1_START..EPOCH1_END {
+            journal.append_checkpoint_frame(
+                batch_id,
+                CheckpointPoolKind::Main,
+                page_no,
+                JournalPageSize::Small4k,
+                &epoch1,
+            )?;
+        }
+        for page_no in EPOCH2_START..EPOCH2_END {
+            journal.append_checkpoint_frame(
+                batch_id,
+                CheckpointPoolKind::Main,
+                page_no,
+                JournalPageSize::Small4k,
+                &epoch2,
+            )?;
+        }
+        let mut staged_header = header.clone();
+        staged_header.total_page_count = staged_header.total_page_count.max(CHECKPOINT_PAGES + 1);
+        staged_header.last_checkpoint_ts = checkpoint_ts;
+        let _ = journal.append_checkpoint_commit_boundary(&staged_header, cursor)?;
         Ok(())
     }
 
@@ -2136,8 +2246,15 @@ mod crash_recovery_tests {
             }
             Scenario::InsertAtFrame10 => {
                 let page_data = vec![uc_fill; PAGE_SIZE_INTERNAL as usize];
+                let cursor = match journal.begin_checkpoint_batch() {
+                    Ok(cursor) => cursor,
+                    Err(_) => libc::_exit(4),
+                };
+                let batch_id = cursor.batch_id();
                 for i in 0u32..10 {
-                    let _ = journal.append_non_commit(
+                    let _ = journal.append_checkpoint_frame(
+                        batch_id,
+                        CheckpointPoolKind::Main,
                         EPOCH2_START + i,
                         JournalPageSize::Small4k,
                         &page_data,
@@ -2149,28 +2266,34 @@ mod crash_recovery_tests {
             Scenario::InsertAtFrame100 => {
                 let page_data = vec![uc_fill; PAGE_SIZE_INTERNAL as usize];
                 let span = EPOCH2_END - EPOCH2_START;
+                let cursor = match journal.begin_checkpoint_batch() {
+                    Ok(cursor) => cursor,
+                    Err(_) => libc::_exit(4),
+                };
+                let batch_id = cursor.batch_id();
                 for i in 0u32..100 {
                     let page_no = EPOCH2_START + (i % span);
-                    let _ =
-                        journal.append_non_commit(page_no, JournalPageSize::Small4k, &page_data);
+                    let _ = journal.append_checkpoint_frame(
+                        batch_id,
+                        CheckpointPoolKind::Main,
+                        page_no,
+                        JournalPageSize::Small4k,
+                        &page_data,
+                    );
                     step!();
                 }
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
             Scenario::InsertAtFinalFrame => {
-                let page_data = vec![e2_fill; PAGE_SIZE_INTERNAL as usize];
-                for i in 0u32..5 {
-                    let _ = journal.append_non_commit(
-                        EPOCH2_START + i,
-                        JournalPageSize::Small4k,
-                        &page_data,
-                    );
-                }
-                let _ = journal.commit(
-                    EPOCH2_START + 5,
-                    JournalPageSize::Small4k,
-                    &page_data,
-                    EPOCH2_START + 5,
+                let _ = append_crash_checkpoint_batch(
+                    &mut journal,
+                    &header,
+                    EPOCH2_START..(EPOCH2_START + 6),
+                    e2_fill,
+                    crate::mvcc::timestamp::Ts {
+                        physical_ms: 1_700_000_000_001 + seed as u64,
+                        logical: 0,
+                    },
                 );
                 step!();
                 std::thread::sleep(std::time::Duration::from_secs(60));
@@ -2178,20 +2301,14 @@ mod crash_recovery_tests {
             Scenario::CheckpointAt25Pct
             | Scenario::CheckpointAt50Pct
             | Scenario::CheckpointAt75Pct => {
-                let epoch2_data = vec![e2_fill; PAGE_SIZE_INTERNAL as usize];
-                let e2_span = EPOCH2_END - EPOCH2_START;
-                for i in 0..(e2_span - 1) {
-                    let _ = journal.append_non_commit(
-                        EPOCH2_START + i,
-                        JournalPageSize::Small4k,
-                        &epoch2_data,
-                    );
-                }
-                let _ = journal.commit(
-                    EPOCH2_START + e2_span - 1,
-                    JournalPageSize::Small4k,
-                    &epoch2_data,
-                    EPOCH2_START + e2_span - 1,
+                let _ = append_crash_checkpoint_image(
+                    &mut journal,
+                    &header,
+                    seed,
+                    crate::mvcc::timestamp::Ts {
+                        physical_ms: 1_700_000_000_001 + seed as u64,
+                        logical: 0,
+                    },
                 );
                 let garbage = vec![CHECKPOINT_GARBAGE_FILL; PAGE_SIZE_INTERNAL as usize];
                 for page_no in 1..=CHECKPOINT_PAGES {
@@ -2211,8 +2328,15 @@ mod crash_recovery_tests {
             }
             Scenario::IndexBuildMidway => {
                 let page_data = vec![uc_fill; PAGE_SIZE_INTERNAL as usize];
+                let cursor = match journal.begin_checkpoint_batch() {
+                    Ok(cursor) => cursor,
+                    Err(_) => libc::_exit(4),
+                };
+                let batch_id = cursor.batch_id();
                 for i in 0u32..5 {
-                    let _ = journal.append_non_commit(
+                    let _ = journal.append_checkpoint_frame(
+                        batch_id,
+                        CheckpointPoolKind::Main,
                         INDEX_START + i,
                         JournalPageSize::Small4k,
                         &page_data,
@@ -2223,8 +2347,15 @@ mod crash_recovery_tests {
             }
             Scenario::IndexBuildAtEnd => {
                 let page_data = vec![uc_fill; PAGE_SIZE_INTERNAL as usize];
+                let cursor = match journal.begin_checkpoint_batch() {
+                    Ok(cursor) => cursor,
+                    Err(_) => libc::_exit(4),
+                };
+                let batch_id = cursor.batch_id();
                 for i in 0u32..(INDEX_END - INDEX_START) {
-                    let _ = journal.append_non_commit(
+                    let _ = journal.append_checkpoint_frame(
+                        batch_id,
+                        CheckpointPoolKind::Main,
                         INDEX_START + i,
                         JournalPageSize::Small4k,
                         &page_data,

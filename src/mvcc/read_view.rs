@@ -347,7 +347,7 @@ impl ReadView {
 /// is opened against the same sequencer (US-037 acceptance test).
 ///
 /// Always compiled — the canonical `cargo test --release --test
-/// mwmr_p5_frontier read_view_uses_live_publish_sequencer_frontier`
+/// mwmr_timestamp_frontier read_view_uses_live_publish_sequencer_frontier`
 /// gate runs without enabling the `test-hooks` feature, so this thin
 /// wrapper must be visible at the public API boundary.
 pub struct TestFrontierHandle {
@@ -1189,10 +1189,10 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(not(loom))]
-#[path = "read_view_us001_tests.rs"]
-mod read_view_us001_tests;
+#[path = "tests/read_view_pending_visibility_tests.rs"]
+mod read_view_pending_visibility_tests;
 
 #[cfg(test)]
 #[cfg(not(loom))]
-#[path = "read_view_us004_tests.rs"]
-mod read_view_us004_tests;
+#[path = "tests/chain_snapshot_range_tests.rs"]
+mod chain_snapshot_range_tests;

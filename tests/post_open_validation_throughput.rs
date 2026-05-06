@@ -31,6 +31,13 @@ use mqlite::{Client, DurabilityMode, OpenOptions};
 const NUM_COLLECTIONS: usize = 100;
 const LOGICAL_FRAMES: usize = 10_000;
 const BUDGET_MS: u64 = 500;
+const JOURNAL_HEADER_BYTES: u64 = 32;
+
+fn journal_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push("-journal");
+    std::path::PathBuf::from(path)
+}
 
 fn budget() -> Duration {
     let mult: u64 = env::var("CARGO_VALIDATION_BUDGET_MULT")
@@ -105,4 +112,45 @@ fn test_post_open_validation_throughput_at_10k_logical_frames() {
          collections={} frames={}",
         elapsed, budget, NUM_COLLECTIONS, LOGICAL_FRAMES
     );
+}
+
+#[test]
+fn checkpoint_compacts_fully_materialized_logical_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint_tail.mqlite");
+    let journal = journal_path(&path);
+
+    {
+        let client = Client::open_with_options(
+            &path,
+            OpenOptions::new().durability(DurabilityMode::FullSync),
+        )
+        .unwrap();
+        let col = client.database("pov").collection::<Document>("tail");
+        for id in 0..8 {
+            col.insert_one(&doc! { "_id": id, "v": id })
+                .expect("insert");
+        }
+
+        let pre_checkpoint_len = std::fs::metadata(&journal).unwrap().len();
+        assert!(
+            pre_checkpoint_len > JOURNAL_HEADER_BYTES,
+            "logical writes should leave journal frames before checkpoint"
+        );
+
+        client.checkpoint().expect("checkpoint");
+        assert_eq!(
+            std::fs::metadata(&journal).unwrap().len(),
+            JOURNAL_HEADER_BYTES,
+            "checkpoint should truncate a fully materialized logical tail"
+        );
+    }
+
+    let reopened = Client::open_with_options(
+        &path,
+        OpenOptions::new().durability(DurabilityMode::FullSync),
+    )
+    .unwrap();
+    let col = reopened.database("pov").collection::<Document>("tail");
+    assert_eq!(col.count_documents(doc! {}).unwrap(), 8);
 }

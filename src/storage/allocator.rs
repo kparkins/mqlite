@@ -659,19 +659,18 @@ impl AllocatorHandle {
     /// Drain the deferred-free queue but hand the 0-refcount pages to the
     /// caller as a plain `Vec<u32>` rather than freeing them to the allocator.
     ///
-    /// Writer-txn `begin` uses this so the drained pages become
-    /// `PageOrigin::DeferredFree` reservations on the txn's overlay.
-    /// On commit the overlay translates each reservation into a proper
-    /// `free_*` call; on rollback the reservation pushes the page back
-    /// onto the queue, preserving the "concurrent readers must observe
-    /// refcount before free" invariant.
+    /// Structural batches use this so drained pages become lifetime-owned
+    /// pending frees. Commit translates each drained page into a proper
+    /// `free_*` call; rollback pushes the page back onto the queue,
+    /// preserving the "concurrent readers must observe refcount before free"
+    /// invariant.
     ///
     /// Refcount recheck uses Acquire ordering (matches `drain_free_queue`).
     /// Entries whose refcount is still non-zero are re-enqueued.
     ///
     /// Precondition: caller holds writer serialization (same as
     /// `drain_free_queue`).
-    pub(crate) fn drain_deferred_free_reservations(&self) -> Vec<u32> {
+    pub(crate) fn drain_deferred_free_pages(&self) -> Vec<u32> {
         let entries = self
             .inner
             .page_lifetime_queue

@@ -349,5 +349,5 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(not(loom))]
-#[path = "version_us013_tests.rs"]
-mod us013_tests;
+#[path = "tests/overflow_ref_clone_tests.rs"]
+mod overflow_ref_clone_tests;

@@ -13,12 +13,12 @@ use crate::mvcc::timestamp::Ts;
 use crate::storage::header::FileHeader;
 
 use super::log_file::{
-    try_skip_chain_commit, JournalFrameHeader, JournalHeader, JournalPageSize, LogicalTxnFrame,
-    Page0BoundaryRecord, JOURNAL_FORMAT_VERSION, JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
-    JOURNAL_MAGIC, RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
+    read_chain_commit_at_cursor, JournalHeader, LogicalTxnFrame, JOURNAL_FORMAT_VERSION,
+    JOURNAL_HEADER_SIZE, JOURNAL_MAGIC, RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
 };
 use super::shm::JournalIndex;
-use super::{write_page_to_main, JournalManager};
+use super::CheckpointRecoveryFrameKind;
+use super::JournalManager;
 
 // ---------------------------------------------------------------------------
 // ParsedLogicalFrames (Phase 2 §5.3) — Pass 1 → Pass 2 hand-off
@@ -132,12 +132,10 @@ impl JournalManager {
         #[cfg(feature = "tracing")]
         let mut _frames_replayed: u64 = 0;
 
-        // Scan frames: collect committed batches.
-        // A "batch" is a sequence of non-commit frames followed by one commit frame.
-        // On recovery we apply each committed batch to the main file.
-        let mut index = JournalIndex::new();
-        let mut pending: Vec<(u32, JournalPageSize, Vec<u8>, u64)> = Vec::new(); // (page_num, size, data, offset)
-        let mut pending_start_offset: Option<u64> = None;
+        // Scan the active logical/checkpoint journal. Phase 6 does not parse
+        // retired generic page-frame batches during recovery.
+        let index = JournalIndex::new();
+        let mut pending_checkpoint_start_offset: Option<u64> = None;
         let mut write_cursor = JOURNAL_HEADER_SIZE as u64;
         let mut last_committed_db_page_count: Option<u32> = None;
         // Fold every ChainCommit frame's `commit_ts` into a running max.
@@ -168,19 +166,14 @@ impl JournalManager {
         loop {
             let frame_offset = write_cursor;
 
-            // Peek for a `ChainCommit` frame first. These carry no legacy
-            // `JournalFrameHeader` and would crash the scan if parsed as one.
-            // `try_skip_chain_commit` advances the reader past a valid
-            // ChainCommit and returns its length; otherwise it restores
-            // position and returns None for legacy fall-through.
             journal_file
                 .seek(SeekFrom::Start(frame_offset))
                 .map_err(Error::Io)?;
             if let Some((n, commit_ts, chain_commit_offset)) =
-                try_skip_chain_commit(&mut journal_file, salt1, salt2)?
+                read_chain_commit_at_cursor(&mut journal_file, salt1, salt2)?
             {
-                // ChainCommit frame replay is a no-op for the page-replay
-                // loop (it carries no single page_number). Version-chain
+                // ChainCommit frame replay is a no-op for the page-copy loop
+                // because it carries no single page number. Version-chain
                 // state is rebuilt on demand; the only recovery-critical
                 // datum is `commit_ts`, which folds into `max_commit_ts`
                 // so the HLC oracle lifts above every durable commit.
@@ -243,109 +236,50 @@ impl JournalManager {
                 crate::journal::log_file::LogicalScan::NotLogical => {}
             }
 
-            // Bad checksum or EOF — stop here
-            let Some(frame_hdr) = JournalFrameHeader::read(&mut journal_file, salt1, salt2)? else {
-                break;
-            };
-            crate::mvcc::metrics::record_recovery_legacy_page_frame();
-
-            // NOTE: JournalFrameHeader::read above already consumed the page data bytes
-            // from the reader (to validate checksum), but didn't return them.
-            // We need to re-read from the known offset.
-            let page_size_bytes = frame_hdr.page_size.bytes();
-            let data_offset = frame_offset + JOURNAL_FRAME_HEADER_SIZE as u64;
-
-            journal_file
-                .seek(SeekFrom::Start(data_offset))
-                .map_err(Error::Io)?;
-            let mut page_data = vec![0u8; page_size_bytes];
-            journal_file.read_exact(&mut page_data).map_err(Error::Io)?;
-
-            let next_frame_offset = data_offset + page_size_bytes as u64;
-            write_cursor = next_frame_offset;
-
-            let page0_boundary = Page0BoundaryRecord::from_page_frame_parts(
-                frame_hdr.page_number,
-                frame_hdr.db_page_count,
-                frame_hdr.salt1,
-                frame_hdr.salt2,
-                frame_hdr.page_size,
-                &page_data,
-            )?;
-            if let Some(boundary) = page0_boundary.as_ref() {
-                let checkpoint_ts = boundary.checkpoint_ts();
-                if let Some(prev) = highest_checkpoint_ts {
-                    if checkpoint_ts < prev {
-                        return Err(Error::CorruptDatabase {
-                            path: journal_path.to_path_buf(),
-                            detail: format!(
-                                "page-0 checkpoint boundary last_checkpoint_ts regressed: \
-                                 prev={prev:?}, new={checkpoint_ts:?}"
-                            ),
-                            recoverable: false,
-                        });
+            if let Some(frame) =
+                JournalManager::try_checkpoint_recovery_frame(&mut journal_file, salt1, salt2)?
+            {
+                match frame.kind {
+                    CheckpointRecoveryFrameKind::BatchPage => {
+                        pending_checkpoint_start_offset.get_or_insert(frame_offset);
+                    }
+                    CheckpointRecoveryFrameKind::Boundary {
+                        checkpoint_ts,
+                        db_page_count,
+                    } => {
+                        if let Some(prev) = highest_checkpoint_ts {
+                            if checkpoint_ts < prev {
+                                return Err(Error::CorruptDatabase {
+                                    path: journal_path.to_path_buf(),
+                                    detail: format!(
+                                        "page-0 checkpoint boundary last_checkpoint_ts regressed: \
+                                         prev={prev:?}, new={checkpoint_ts:?}"
+                                    ),
+                                    recoverable: false,
+                                });
+                            }
+                        }
+                        highest_checkpoint_ts = Some(
+                            highest_checkpoint_ts
+                                .map_or(checkpoint_ts, |prev| prev.max(checkpoint_ts)),
+                        );
+                        durable_checkpoint_page_count = Some(db_page_count);
+                        last_committed_db_page_count = Some(db_page_count);
+                        pending_checkpoint_start_offset = None;
+                        crate::mvcc::metrics::record_recovery_page0_boundary_frame();
                     }
                 }
-                highest_checkpoint_ts = Some(
-                    highest_checkpoint_ts.map_or(checkpoint_ts, |prev| prev.max(checkpoint_ts)),
-                );
-                durable_checkpoint_page_count = Some(boundary.db_page_count());
-                crate::mvcc::metrics::record_recovery_page0_boundary_frame();
+                write_cursor = frame.next_cursor;
+                continue;
             }
 
-            if frame_hdr.db_page_count == 0 {
-                // Non-commit frame — add to pending.
-                pending_start_offset.get_or_insert(frame_offset);
-                pending.push((
-                    frame_hdr.page_number,
-                    frame_hdr.page_size,
-                    page_data,
-                    frame_offset,
-                ));
-            } else {
-                // Commit frame — apply all pending + this frame.
-                pending.push((
-                    frame_hdr.page_number,
-                    frame_hdr.page_size,
-                    page_data,
-                    frame_offset,
-                ));
-
-                let db_page_count = frame_hdr.db_page_count;
-                if page0_boundary.is_some() {
-                    last_committed_db_page_count = Some(db_page_count);
-                    pending.clear();
-                    pending_start_offset = None;
-                    continue;
-                }
-                for (pn, ps, data, off) in &pending {
-                    // Write page to main file.
-                    write_page_to_main(main_file, *pn, ps.bytes(), data)?;
-                    // Update in-memory index.
-                    index.insert(*pn, *off);
-                }
-                last_committed_db_page_count = Some(db_page_count);
-                #[cfg(feature = "tracing")]
-                {
-                    _frames_replayed += pending.len() as u64;
-                }
-                pending.clear();
-                pending_start_offset = None;
-
-                // Seek back to after this commit frame for next iteration.
-                journal_file
-                    .seek(SeekFrom::Start(write_cursor))
-                    .map_err(Error::Io)?;
-            }
+            break;
         }
 
-        // Discard pending non-committed page frames. They are not durable
-        // authority without a following commit frame / page-0 boundary.
-        if !pending.is_empty() {
-            if let Some(start) = pending_start_offset {
-                write_cursor = start;
-            }
-            pending.clear();
+        // Discard an incomplete checkpoint batch. Its page records are not
+        // durable authority without a following page-0 boundary.
+        if let Some(start) = pending_checkpoint_start_offset {
+            write_cursor = start;
         }
 
         // §3.8(b) — orphan-logical sweep: any logical frame whose commit_ts

@@ -1,11 +1,12 @@
 //! Plan §M4a/§M4b acceptance gate: a writer that returns `Err` mid-body
 //! does not leak its dirty state — page bytes (M4a, PR 6), allocator
-//! reservations / buffer-pool frames / file-header mutations (M4b, PR 7) —
+//! allocator lifetime state / buffer-pool frames / file-header mutations
+//! (M4b, PR 7) —
 //! into the shared engine.
 //!
-//! Under PR 6 the failing write is staged into a `TxnPageStore`
-//! overlay that is dropped on rollback, so shared buffer-pool frames
-//! are never mutated by a failing writer. PR 7 extends this to cover
+//! The failing write is rolled back before its staged state can become
+//! visible, so shared buffer-pool frames are never exposed to a failing writer.
+//! PR 7 extends this to cover
 //! allocator-state mutations and header mutations: pages allocated by
 //! a rolled-back txn return to the free list, the buffer-pool frames
 //! they pinned are invalidated, and the pre-txn header snapshot is
@@ -13,8 +14,8 @@
 //!
 //! Tests:
 //!
-//! - `rollback_leaves_no_dirty_frames` (PR 6): page-byte overlay.
-//! - `rollback_returns_allocated_pages` (PR 7): allocator reservations.
+//! - `rollback_leaves_no_dirty_frames` (PR 6): page-byte rollback.
+//! - `rollback_returns_allocated_pages` (PR 7): allocator lifetime rollback.
 //! - `rollback_reverts_header` (PR 7): header snapshot restore.
 //! - `reader_survives_concurrent_free_list_churn` (PR 7, Gap 4): the
 //!   deferred-free queue round-trip preserves reader-visible invariants
@@ -48,14 +49,14 @@ fn rollback_leaves_no_dirty_frames() {
     // Provoke a failing write. A duplicate `_id` fails the primary
     // `BTree::insert` unique-constraint pre-check, which returns Err
     // inside the `with_txn` body — the outer `with_txn` then hits the
-    // abort path, drops the overlay, and rolls back the WAL mark.
+    // abort path, discards staged write state, and rolls back the WAL mark.
     let err = col.insert_one(&doc! { "_id": 1, "clash": true });
     assert!(err.is_err(), "duplicate _id must fail");
 
     // After the failed insert, the committing writer's state must be
     // unchanged — the only visible document is the original one.
-    // Under PR 6 this is guaranteed by the overlay: the failed
-    // writer's staged bytes never touched shared frames.
+    // The failed writer's staged bytes never become visible through shared
+    // frames.
     let post: Vec<_> = col
         .find(doc! {})
         .run()
@@ -83,7 +84,7 @@ fn rollback_leaves_no_dirty_frames() {
 }
 
 // ---------------------------------------------------------------------------
-// PR 7 — allocator reservations
+// PR 7 — allocator lifetime rollback
 // ---------------------------------------------------------------------------
 
 /// Plan §M4b acceptance gate: a rolled-back txn returns every page it

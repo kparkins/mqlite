@@ -64,8 +64,8 @@
 //! | [`Error`] | ✅ | ✅ | — |
 //!
 //! `Client`, `Database`, and `Collection<T>` can be cloned and sent to other threads without
-//! any additional synchronization. mqlite serializes concurrent writes internally
-//! through per-namespace lane mutexes in the engine.
+//! any additional synchronization. The storage engine coordinates concurrent
+//! writes through MVCC publication, page latches, and DDL admission fences.
 //!
 //! `Cursor<T>` is `Send` but not `Sync` — matching the MongoDB Rust driver contract.
 //! Use `Mutex<Cursor<T>>` if you need to drive a cursor from multiple threads simultaneously.
@@ -167,7 +167,7 @@ pub use error::{Error, Result};
 pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
+pub use storage::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
@@ -184,27 +184,27 @@ pub use storage::paged_engine::test_accessors::{
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::buffer_pool::us019_test_probe::page_latch_upgrade_race_counts as __us019_page_latch_upgrade_race_counts;
+pub use storage::buffer_pool::page_latch_upgrade_test_probe::page_latch_upgrade_race_counts as __us019_page_latch_upgrade_race_counts;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use journal::us018_test_probe::{
+pub use journal::logical_replay_test_probe::{
     append_logical_replay_frames as __us018_append_logical_replay_frames, Us018LogicalReplayFrame,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use journal::us039_test_probe::Us039AppendSyncObservations;
+pub use journal::append_sync_test_probe::Us039AppendSyncObservations;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::paged_engine::us017_test_probe::{
+pub use storage::paged_engine::group_commit_test_probe::{
     Us017GroupCommitObservations, Us017GroupCommitPauseGuard,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::paged_engine::us010_test_probe::{
+pub use storage::paged_engine::smo_classification_test_probe::{
     drain_events as __us010_drain_events,
     force_revalidation_failures as __us010_force_revalidation_failures,
     push_classification_override_names as __us010_push_classification_override_names,
@@ -213,26 +213,26 @@ pub use storage::paged_engine::us010_test_probe::{
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::btree::us025_test_probe::{
+pub use storage::btree::reader_crabbing_test_probe::{
     drain_events as __us025_drain_events, reset as __us025_reset_probe, Us025CrabbingEvent,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::btree::us016_test_probe::{
+pub use storage::btree::reader_latch_scope_test_probe::{
     drain_latch_samples as __us016_drain_latch_samples,
     install_range_scan_iteration_pause as __us016_install_range_scan_iteration_pause,
     reset as __us016_reset_probe, Us016RangeScanPauseGuard, Us016ReadLatchSample,
 };
 
 #[doc(hidden)]
-pub use storage::buffer_pool::us020_test_probe::{
+pub use storage::buffer_pool::page_latch_fairness_test_probe::{
     us020_upgrade_loser_backoff_progress, us020_writer_preference_bounds_reader_starvation,
     Us020UpgradeRaceProgress,
 };
 
 #[doc(hidden)]
-pub use storage::paged_engine::us020_test_probe::{
+pub use storage::paged_engine::publish_registry_test_probe::{
     Us020PublishSequencer, Us020PublishSlot, Us020WriterRegistry, Us020WriterTicket,
 };
 

@@ -8,4 +8,5 @@ pub(crate) mod plan;
 pub(crate) mod synth;
 
 #[cfg(test)]
-mod synth_us008_tests;
+#[path = "tests/synthesize_page_visibility_tests.rs"]
+mod synthesize_page_visibility_tests;

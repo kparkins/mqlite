@@ -29,16 +29,27 @@
 
 mod btree_ops;
 mod catalog_ops;
+#[cfg(any(test, feature = "test-hooks"))]
+mod crash_cut_test_probe;
 mod doc_helpers;
 mod doc_ops;
+/// Test-only engine-fatal probe — engine-fatal poison + sequencer + writer
+/// ticket handles. Isolated per the Phase 5 PRD guardrail "Intrusive
+/// test code must live in a separate file from the production code
+/// it exercises".
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod engine_fatal_test_probe;
 mod group_commit;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod group_commit_test_probe;
 mod index_build;
 mod index_maint;
-#[cfg(any(test, feature = "test-hooks"))]
-mod phase0_probe;
 pub(crate) mod publish;
+pub mod publish_registry_test_probe;
 pub(crate) mod publish_sequencer;
 mod recovery_apply;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod smo_classification_test_probe;
 mod smo_latch;
 mod snapshot_ops;
 mod state;
@@ -47,60 +58,68 @@ mod state;
 /// visible at a glance.
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod test_accessors;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod us010_test_probe;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod us017_test_probe;
-pub mod us020_test_probe;
-/// Test-only US-036 probe — engine-fatal poison + sequencer + writer
-/// ticket handles. Isolated per the Phase 5 PRD guardrail "Intrusive
-/// test code must live in a separate file from the production code
-/// it exercises".
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod us036_test_probe;
 mod visibility;
 pub(crate) mod writer_registry;
 
 #[cfg(test)]
-mod phase7_us002_tests;
+#[path = "paged_engine/tests/allocator_freeze_boundary_tests.rs"]
+mod allocator_freeze_boundary_tests;
 #[cfg(test)]
-mod phase7_us003_tests;
+#[path = "paged_engine/tests/checkpoint_boundary_replay_tests.rs"]
+mod checkpoint_boundary_replay_tests;
 #[cfg(test)]
-mod phase7_us004_tests;
+#[path = "paged_engine/tests/checkpoint_dirty_leaf_reconcile_tests.rs"]
+mod checkpoint_dirty_leaf_reconcile_tests;
 #[cfg(test)]
-mod phase7_us005_tests;
+#[path = "paged_engine/tests/checkpoint_flush_set_tests.rs"]
+mod checkpoint_flush_set_tests;
 #[cfg(test)]
-mod phase7_us007_tests;
+#[path = "paged_engine/tests/checkpoint_gate_tests.rs"]
+mod checkpoint_gate_tests;
 #[cfg(test)]
-mod phase7_us008_tests;
+#[path = "paged_engine/tests/checkpoint_incomplete_metrics_tests.rs"]
+mod checkpoint_incomplete_metrics_tests;
 #[cfg(test)]
-mod phase7_us009_tests;
+#[path = "paged_engine/tests/checkpoint_reconcile_plan_tests.rs"]
+mod checkpoint_reconcile_plan_tests;
 #[cfg(test)]
-mod phase7_us010_tests;
+#[path = "paged_engine/tests/dirty_leaf_integration_tests.rs"]
+mod dirty_leaf_integration_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/index_build_recovery_tests.rs"]
+mod index_build_recovery_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/logical_replay_frontier_tests.rs"]
+mod logical_replay_frontier_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/orphan_chain_commit_recovery_tests.rs"]
+mod orphan_chain_commit_recovery_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/pending_write_visibility_tests.rs"]
+mod pending_write_visibility_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/published_epoch_coherence_tests.rs"]
+mod published_epoch_coherence_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/retired_sequence_source_audit_tests.rs"]
+mod retired_sequence_source_audit_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/secondary_index_delta_scan_tests.rs"]
+mod secondary_index_delta_scan_tests;
+#[cfg(test)]
+#[path = "paged_engine/tests/secondary_index_pending_write_tests.rs"]
+mod secondary_index_pending_write_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod us002_tests;
+#[path = "paged_engine/tests/unique_constraint_delta_tests.rs"]
+mod unique_constraint_delta_tests;
 #[cfg(test)]
-mod us007_tests;
+#[path = "paged_engine/tests/write_commit_sequence_tests.rs"]
+mod write_commit_sequence_tests;
 #[cfg(test)]
-mod us008_tests;
-#[cfg(test)]
-mod us009_tests;
-#[cfg(test)]
-mod us011_tests;
-#[cfg(test)]
-mod us012_tests;
-#[cfg(test)]
-mod us015_tests;
-#[cfg(test)]
-mod us018c_tests;
-#[cfg(test)]
-mod us020_tests;
-#[cfg(test)]
-mod us027_tests;
-#[cfg(test)]
-mod us037_tests;
+#[path = "paged_engine/tests/write_visibility_epoch_tests.rs"]
+mod write_visibility_epoch_tests;
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -114,9 +133,9 @@ use crate::options::BusyHandler;
 
 use bson::{Bson, Document};
 
-use super::engine::StorageEngine;
 #[cfg(any(test, feature = "test-hooks"))]
-use super::phase0_probe::{Phase0ProbeCut, Phase0ProbeReport};
+use super::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
+use super::engine::StorageEngine;
 use crate::error::{Error, Result, WriteConflictReason};
 use crate::index::{IndexInfo, IndexModel};
 use crate::mvcc::transaction::WriteTxn;
@@ -128,10 +147,11 @@ use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
-use crate::storage::txn_page_store::{PageOrigin, PageReservation, TxnOverlay};
+use crate::storage::structural_page_batch::StructuralPageBatch;
 
 use self::catalog_ops::{
-    catalog_lock, new_store, new_txn_store, rebuild_and_publish_locked, sync_catalog_root_overlay,
+    catalog_lock, new_store, new_structural_store, rebuild_and_publish_locked,
+    sync_catalog_root_structural,
 };
 use self::doc_helpers::now_millis;
 use self::index_maint::{
@@ -387,7 +407,7 @@ impl PagedEngine {
         // retired. Durable monotonic ids (Phase 1 §10.7) are the resurrection
         // barrier; a freshly-bootstrapped collection of a previously-dropped
         // name receives a fresh `CollectionEntry.id`.
-        self.run_namespace_create_ddl(|shared, md, overlay| {
+        self.run_namespace_create_ddl(|shared, md, batch| {
             let data_root = {
                 let mut cat = catalog_lock(md);
                 if let Some(entry) = cat.get_collection(ns)? {
@@ -399,29 +419,23 @@ impl PagedEngine {
                 let data_root = cat.create_collection(ns, id, bson::doc! {}, now_millis())?;
                 (id, data_root)
             };
-            sync_catalog_root_overlay(shared, md, overlay)?;
-            let _ = BTree::create_at(new_txn_store(shared, overlay), data_root.1)?;
+            sync_catalog_root_structural(shared, md, batch)?;
+            let _ = BTree::create_at(new_structural_store(shared, batch), data_root.1)?;
             Ok(data_root.0)
         })
     }
 
     /// CRUD write lifecycle.
     ///
-    /// Drives: metadata.read() → bootstrap-if-missing → lane → overlay +
+    /// Drives: metadata.read() → bootstrap-if-missing → private logical
     /// WriteTxn setup → body → install Pending deltas → journal_mutex {
-    /// overlay commit + logical/chain/legacy journal appends + non-FullSync
-    /// final flush } → flip Pending to Committed → publish → release lane.
+    /// logical/chain journal appends + non-FullSync final flush } → flip
+    /// Pending to Committed → publish.
     /// FullSync flush/sync ownership is the explicit sync boundary after the
     /// API write batch.
     fn run_write<F, R>(&self, ns: &str, f: F) -> Result<R>
     where
-        F: FnOnce(
-            &SharedState,
-            &MetadataState,
-            &mut TxnOverlay,
-            &mut WriteTxn,
-            &WriteVisibility<'_>,
-        ) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
     {
         self.shared.check_engine_not_poisoned()?;
         // Take read guard; if namespace absent, bootstrap then retry.
@@ -443,26 +457,14 @@ impl PagedEngine {
 
     fn run_write_existing<F, R>(&self, ns: &str, f: F) -> Result<R>
     where
-        F: FnOnce(
-            &SharedState,
-            &MetadataState,
-            &mut TxnOverlay,
-            &mut WriteTxn,
-            &WriteVisibility<'_>,
-        ) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
     {
         self.run_write_inner(ns, None, f)
     }
 
     fn run_write_bootstrapped<F, R>(&self, ns: &str, ns_id: i64, f: F) -> Result<R>
     where
-        F: FnOnce(
-            &SharedState,
-            &MetadataState,
-            &mut TxnOverlay,
-            &mut WriteTxn,
-            &WriteVisibility<'_>,
-        ) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
     {
         self.run_write_inner(ns, Some(ns_id), f)
     }
@@ -470,14 +472,13 @@ impl PagedEngine {
     /// Internal form of `run_write` that assumes the namespace already exists
     /// (or the write path tolerates its absence — `update`/`delete` do).
     ///
-    /// Phase 5 §10.17 metadata-guard protocol (US-006): there is exactly
-    /// one `metadata.read()` acquisition in this function. It is held
-    /// only across the short id-capture + `NsWriterRegistry::admit`
-    /// scope at S1, then dropped before the body runs. The body, install
-    /// (S8/S9), `journal_mutex` envelope (S10/S11), and publish (S12) run
-    /// WITHOUT `metadata.read()`; serialization against DDL is provided
-    /// by the writer ticket admitted into the registry (DDL drains the
-    /// lane via `close_and_drain` before mutating the catalog).
+    /// US-003 metadata-guard protocol: there is exactly one
+    /// `metadata.read()` acquisition in this function. It is held across
+    /// ordinary CRUD's full private-logical lifecycle so DDL cannot mutate
+    /// the catalog identity while the writer installs resident Pending deltas,
+    /// appends logical durability records, and publishes through the
+    /// sequencer. `NsWriterRegistry` is no longer ordinary CRUD's
+    /// same-namespace serialization authority.
     ///
     /// AC #4 captured-identity gate (§10.17.1): immediately before the
     /// durable journal envelope this function compares the
@@ -489,46 +490,20 @@ impl PagedEngine {
     /// namespaces does not invalidate the writer's captured identity.
     fn run_write_inner<F, R>(&self, ns: &str, bootstrapped_ns_id: Option<i64>, f: F) -> Result<R>
     where
-        F: FnOnce(
-            &SharedState,
-            &MetadataState,
-            &mut TxnOverlay,
-            &mut WriteTxn,
-            &WriteVisibility<'_>,
-        ) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
     {
         self.shared.check_engine_not_poisoned()?;
         let _checkpoint_writer_admission = self.shared.checkpoint_admission.admit_writer()?;
-        let (captured_ns_id, captured_catalog_gen, captured_catalog_identity, mut writer_ticket) =
+        let _crud_read = self
+            .metadata
+            .read()
+            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        let (captured_ns_id, captured_catalog_gen, captured_catalog_identity) =
             if let Some(ns_id) = bootstrapped_ns_id {
-                // US-030: the bootstrap path admits the allocated durable id
-                // directly after the namespace-create publish. It does not
-                // re-enter the name-keyed lane path or resolve the id back
-                // from the namespace name before obtaining the writer ticket.
                 let captured_identity = Self::namespace_catalog_identity(&self.metadata_state, ns)?;
                 let captured_gen = self.shared.published.load_full().catalog_generation;
-                let ticket = Some(self.shared.ns_writers.admit(ns_id, self.busy_timeout)?);
-                (Some(ns_id), captured_gen, captured_identity, ticket)
+                (Some(ns_id), captured_gen, captured_identity)
             } else {
-                // S1: id-capture scope (§10.17 step 3, US-006 AC #2).
-                //
-                // The single `self.metadata.read()` call in this function is
-                // here. Inside this scope we (a) resolve the durable `ns_id`
-                // against the live catalog, (b) snapshot the current published
-                // `catalog_generation`, and (c) admit a writer ticket on the
-                // collection's lane. The guard is dropped before the body call
-                // — admission BEFORE this scope or AFTER it is forbidden,
-                // because either ordering recreates the DDL/CRUD deadlock
-                // rejected by CCK (§10.17 step 3).
-                //
-                // The structural source-gate test
-                // `tests/mwmr_p5_ddl_barriers.rs::test_run_write_existing_holds_exactly_one_metadata_read`
-                // verifies that no other `metadata.read()` acquisition appears
-                // in this function from here through publish.
-                let _md_read = self
-                    .metadata
-                    .read()
-                    .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
                 let captured_identity = Self::namespace_catalog_identity(&self.metadata_state, ns)?;
                 let captured_ns_id_opt = captured_identity.as_ref().map(|identity| identity.ns_id);
                 // §10.17.1 — published `catalog_generation` is the cheap
@@ -536,77 +511,28 @@ impl PagedEngine {
                 // DDL does through the `next_catalog_gen` reservation. If it
                 // changes before the AC #4 gate, we revalidate the captured
                 // target namespace/index identity before deciding whether
-                // this writer is stale.
-                // Use `published.load_full()` directly (not `load_published`)
-                // because the §10.5 single-load gate is scoped to the read
-                // path; this is a write-path identity capture and must not
-                // increment the test-only read-load counter (§10.5 / US-008).
+                // this writer is stale. Use `published.load_full()` directly
+                // because the §10.5 single-load gate is scoped to reads.
                 let captured_gen = self.shared.published.load_full().catalog_generation;
-                // §10.1 / §10.27 — the writer ticket is the post-§10.17
-                // anti-deadlock fence between this CRUD body and a later
-                // DDL `close_and_drain`. The ticket is held across body,
-                // install, `journal_mutex` envelope, and publish; its
-                // body-entry mutex is released after the closure returns.
-                // DDL drains the lane after taking `metadata.write()` so
-                // existing CRUD bodies finish without re-acquiring the
-                // metadata read guard.
-                let ticket = match captured_ns_id_opt {
-                    Some(ns_id) => Some(self.shared.ns_writers.admit(ns_id, self.busy_timeout)?),
-                    // The namespace may still be absent — `update` /
-                    // `delete` tolerate it (the body returns 0 affected),
-                    // and `bootstrap_namespace` retries via `run_write`.
-                    // No ticket is admitted in that case.
-                    None => None,
-                };
-                (captured_ns_id_opt, captured_gen, captured_identity, ticket)
-                // _md_read is dropped HERE, before the body runs.
+                (captured_ns_id_opt, captured_gen, captured_identity)
             };
         // S2: create the writer visibility context held through S12.
         // COMMIT-ENVELOPE-RESIDUE: A (visibility setup fails before journal append).
         let vis = self.write_visibility_after_capture(ns, captured_ns_id)?;
 
-        // Setup overlay + WriteTxn. Journal rollback marks are captured later,
-        // inside `journal_mutex`, immediately before this transaction can append
-        // journal frames. Capturing a mark here is unsafe with independent
-        // namespace lanes: another writer may commit after the mark and before
-        // this body fails, and truncating to the old mark would erase that
-        // committed writer's frames.
-        let mut overlay = TxnOverlay::new();
-        let ready = self
-            .shared
-            .handle
-            .allocator()
-            .drain_deferred_free_reservations();
-        for page in ready {
-            overlay.push_reservation(PageReservation {
-                page,
-                size: PageSize::Large32k,
-                origin: PageOrigin::DeferredFree,
-            });
-        }
+        // Setup private logical write state. Journal rollback marks are
+        // captured later, inside `journal_mutex`, immediately before this
+        // transaction can append journal frames.
         let txn_id = vis.read_view.txn_id;
         let mut txn = WriteTxn::new(txn_id);
 
-        // S3: execute the write body without `metadata.read()`. The
-        // catalog itself is behind `Mutex<Catalog>`, so mutations
-        // happen inside the closure under the catalog mutex; the
-        // §10.17 fence against DDL is provided by the writer ticket admitted
-        // in S1. The same-namespace body-entry mutex is released immediately
-        // after this closure returns; the DDL drain ticket remains held across
-        // install, durability, and publish. `journal_mutex` serializes only
-        // the durability envelope.
+        // S3: execute the write body under the CRUD metadata read guard. The
+        // catalog itself is behind `Mutex<Catalog>`, while page latches and
+        // expected-head checks serialize resident chain mutation.
+        // `journal_mutex` serializes only the durability envelope.
         #[cfg(any(test, feature = "test-hooks"))]
         self::test_accessors::write_body_entry_if_installed(&self.shared, ns);
-        let body_result = f(
-            &self.shared,
-            &self.metadata_state,
-            &mut overlay,
-            &mut txn,
-            &vis,
-        );
-        if let Some(ticket) = writer_ticket.as_mut() {
-            ticket.finish_body();
-        }
+        let body_result = f(&self.shared, &self.metadata_state, &mut txn, &vis);
 
         match body_result {
             Ok(value) => {
@@ -614,7 +540,7 @@ impl PagedEngine {
                 // still captures catalog-root movement; Phase 7 logical-chain
                 // installs can also make primary B-tree structural progress
                 // without forcing a fresh catalog header.
-                let mut root_changing = overlay.has_header_update() || txn.structural_tree_change();
+                let mut root_changing = txn.structural_tree_change();
 
                 // §7 / US-024 AC#3 — refresh the logical-txn append-duration
                 // percentiles after the journal envelope releases.
@@ -649,7 +575,6 @@ impl PagedEngine {
                             != captured_catalog_identity
                     {
                         drop(txn);
-                        let _ = self.rollback_overlay_only(overlay);
                         return Err(Error::WriteConflict {
                             reason: WriteConflictReason::CatalogGenerationChanged,
                         });
@@ -662,8 +587,6 @@ impl PagedEngine {
                     Ok(slot) => slot,
                     Err(e) => {
                         drop(txn);
-                        let _ = self.rollback_overlay_only(overlay);
-                        drop(writer_ticket);
                         return Err(e);
                     }
                 };
@@ -683,7 +606,6 @@ impl PagedEngine {
 
                 let sec_pages = match self.install_pending_sec_index_with_retry(
                     &self.metadata_state,
-                    &mut overlay,
                     &sec_writes,
                     &vis,
                     commit_ts,
@@ -692,20 +614,14 @@ impl PagedEngine {
                     Ok(pages) => pages,
                     Err(e) => {
                         drop(txn);
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            writer_ticket,
-                            Some(overlay),
-                            None,
-                            e,
-                        ));
+                        return Err(
+                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
+                        );
                     }
                 };
 
                 let primary_install = self.install_pending_primary_with_retry(
                     &self.metadata_state,
-                    &mut overlay,
                     &primary_writes,
                     &vis,
                     commit_ts,
@@ -715,14 +631,9 @@ impl PagedEngine {
                     Ok(result) => result,
                     Err(e) => {
                         drop(txn);
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            writer_ticket,
-                            Some(overlay),
-                            None,
-                            e,
-                        ));
+                        return Err(
+                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
+                        );
                     }
                 };
                 root_changing |= primary_structural_tree_change;
@@ -736,26 +647,16 @@ impl PagedEngine {
                         &self.shared,
                         Us026PostRegisterFailpoint::BeginTxnAfterRegister,
                     ) {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            writer_ticket,
-                            Some(overlay),
-                            None,
-                            e,
-                        ));
+                        return Err(
+                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
+                        );
                     }
                     let commit_mark = match self.shared.handle.begin_txn() {
                         Ok(mark) => mark,
                         Err(e) => {
-                            return Err(self.cleanup_registered_pre_durable_failure(
-                                txn_id,
-                                slot,
-                                writer_ticket,
-                                Some(overlay),
-                                None,
-                                e,
-                            ));
+                            return Err(
+                                self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
+                            );
                         }
                     };
                     #[cfg(any(test, feature = "test-hooks"))]
@@ -765,36 +666,6 @@ impl PagedEngine {
                         return Err(self.cleanup_registered_pre_durable_failure(
                             txn_id,
                             slot,
-                            writer_ticket,
-                            Some(overlay),
-                            commit_mark,
-                            e,
-                        ));
-                    }
-
-                    let mut base_store = new_store(&self.shared);
-                    if let Err(e) =
-                        overlay.commit_structural_only(&mut base_store, &self.shared.handle)
-                    {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            writer_ticket,
-                            None,
-                            commit_mark,
-                            e,
-                        ));
-                    }
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    if let Err(e) = self::test_accessors::us026_fail_if_armed(
-                        &self.shared,
-                        Us026PostRegisterFailpoint::RollbackTxnAfterStructuralCommit,
-                    ) {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            writer_ticket,
-                            None,
                             commit_mark,
                             e,
                         ));
@@ -813,8 +684,6 @@ impl PagedEngine {
                         return Err(self.cleanup_registered_pre_durable_failure(
                             txn_id,
                             slot,
-                            writer_ticket,
-                            None,
                             commit_mark,
                             e,
                         ));
@@ -823,8 +692,6 @@ impl PagedEngine {
                         return Err(self.cleanup_registered_pre_durable_failure(
                             txn_id,
                             slot,
-                            writer_ticket,
-                            None,
                             commit_mark,
                             e,
                         ));
@@ -846,8 +713,6 @@ impl PagedEngine {
                         return Err(self.cleanup_registered_pre_durable_failure(
                             txn_id,
                             slot,
-                            writer_ticket,
-                            None,
                             commit_mark,
                             e,
                         ));
@@ -856,8 +721,6 @@ impl PagedEngine {
                         return Err(self.cleanup_registered_pre_durable_failure(
                             txn_id,
                             slot,
-                            writer_ticket,
-                            None,
                             commit_mark,
                             e,
                         ));
@@ -867,16 +730,6 @@ impl PagedEngine {
                         Phase3CommitFailpoint::AfterChainCommitBeforeLegacyCommit,
                     );
 
-                    if let Err(e) = self.commit_legacy_header_frame() {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            writer_ticket,
-                            None,
-                            commit_mark,
-                            e,
-                        ));
-                    }
                     // US-039: FullSync owns the final data flush at the
                     // explicit sync boundary; non-FullSync preserves the
                     // existing per-writer flush-before-publish behavior.
@@ -885,8 +738,6 @@ impl PagedEngine {
                             return Err(self.cleanup_registered_pre_durable_failure(
                                 txn_id,
                                 slot,
-                                writer_ticket,
-                                None,
                                 commit_mark,
                                 e,
                             ));
@@ -896,7 +747,6 @@ impl PagedEngine {
 
                 if matches!(self.durability_mode, DurabilityMode::FullSync) {
                     if let Err(e) = self.fullsync_group_commit() {
-                        drop(writer_ticket);
                         return Err(e);
                     }
                 }
@@ -919,7 +769,6 @@ impl PagedEngine {
                     if self::test_accessors::us009_fail_after_committed_flip_if_armed(&self.shared)
                         .is_err()
                     {
-                        drop(writer_ticket);
                         return Err(self.engine_fatal(
                             crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
                         ));
@@ -950,18 +799,14 @@ impl PagedEngine {
                 match publish_result {
                     Ok(()) => {}
                     Err(Error::EngineFatal { reason }) => {
-                        drop(writer_ticket);
                         return Err(Error::EngineFatal { reason });
                     }
                     Err(_) => {
-                        drop(writer_ticket);
                         return Err(self.engine_fatal(
                             crate::error::EngineFatalReason::PostDurablePublishFailure,
                         ));
                     }
                 }
-
-                drop(writer_ticket);
 
                 if root_changing {
                     crate::mvcc::metrics::record_crud_commit_root_changing();
@@ -973,48 +818,9 @@ impl PagedEngine {
             Err(e) => {
                 // COMMIT-ENVELOPE-RESIDUE: A (S3 body failure before journal append).
                 drop(txn);
-                let _ = self.rollback_overlay_only(overlay);
-                drop(writer_ticket);
                 Err(e)
             }
         }
-    }
-
-    fn commit_legacy_header_frame(&self) -> Result<()> {
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::test_accessors::us026_fail_if_armed(
-            &self.shared,
-            Us026PostRegisterFailpoint::CommitHeaderRead,
-        )?;
-        let db_page_count = self
-            .shared
-            .handle
-            .allocator()
-            .with_header(|h| h.total_page_count)?;
-        // Build the commit-frame page-0 bytes from the allocator's
-        // authoritative header rather than the buffer pool. The overlay
-        // commit may have written stale header bytes if concurrent catalog
-        // work advanced the allocator header before this writer sequenced.
-        let header_data = self
-            .shared
-            .handle
-            .allocator()
-            .with_header(|h| h.to_bytes())?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::test_accessors::us026_fail_if_armed(
-            &self.shared,
-            Us026PostRegisterFailpoint::LegacyCommitTxn,
-        )?;
-        let emergency =
-            self.shared
-                .handle
-                .commit_txn(0, PageSize::Small4k, &header_data, db_page_count)?;
-        if emergency {
-            crate::mvcc::metrics::record_emergency_checkpoint_trigger();
-            // Defer the legacy page-frame checkpoint until checkpoint
-            // materialization has folded the logical row tail.
-        }
-        Ok(())
     }
 
     fn register_ordinary_crud_slot(&self) -> Result<self::publish_sequencer::PublishSlotGuard> {
@@ -1026,8 +832,6 @@ impl PagedEngine {
         &self,
         txn_id: u64,
         slot: self::publish_sequencer::PublishSlotGuard,
-        writer_ticket: Option<self::writer_registry::NsWriteTicket>,
-        overlay: Option<TxnOverlay>,
         mark: Option<u64>,
         error: Error,
     ) -> Error {
@@ -1035,18 +839,13 @@ impl PagedEngine {
         self.shared.publish_sequencer.mark_aborted(slot);
         #[cfg(any(test, feature = "test-hooks"))]
         self::test_accessors::us026_note_cleanup_rollback_attempt(&self.shared);
-        let rollback_result = if let Some(overlay) = overlay {
-            self.rollback_overlay_and_wal(overlay, mark)
-        } else {
-            self.shared.handle.rollback_txn(mark)
-        };
+        let rollback_result = self.shared.handle.rollback_txn(mark);
         #[cfg(any(test, feature = "test-hooks"))]
         let rollback_result = self::test_accessors::us026_maybe_force_cleanup_rollback_failure(
             &self.shared,
             rollback_result,
         );
         let _ = rollback_result;
-        drop(writer_ticket);
         error
     }
 
@@ -1072,7 +871,6 @@ impl PagedEngine {
     fn install_pending_sec_index_with_retry(
         &self,
         md: &MetadataState,
-        overlay: &mut TxnOverlay,
         writes: &[crate::mvcc::SecIndexWrite],
         vis: &WriteVisibility<'_>,
         commit_ts: crate::mvcc::Ts,
@@ -1081,28 +879,12 @@ impl PagedEngine {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
-        match install_pending_sec_index(
-            &self.shared,
-            md,
-            overlay,
-            writes.to_vec(),
-            vis,
-            commit_ts,
-            txn_id,
-        ) {
+        match install_pending_sec_index(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id) {
             Ok(pages) => return Ok(pages),
             Err(e @ Error::WriteConflict { .. }) => return Err(e),
             Err(_) => {}
         }
-        match install_pending_sec_index(
-            &self.shared,
-            md,
-            overlay,
-            writes.to_vec(),
-            vis,
-            commit_ts,
-            txn_id,
-        ) {
+        match install_pending_sec_index(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id) {
             Ok(pages) => Ok(pages),
             Err(e @ Error::WriteConflict { .. }) => Err(e),
             Err(e) => Err(e),
@@ -1112,7 +894,6 @@ impl PagedEngine {
     fn install_pending_primary_with_retry(
         &self,
         md: &MetadataState,
-        overlay: &mut TxnOverlay,
         writes: &[crate::mvcc::PrimaryWrite],
         vis: &WriteVisibility<'_>,
         commit_ts: crate::mvcc::Ts,
@@ -1124,26 +905,11 @@ impl PagedEngine {
         #[cfg(any(test, feature = "test-hooks"))]
         let first_attempt = self::test_accessors::us019_maybe_fail_primary_install(&self.shared)
             .and_then(|()| {
-                install_pending_primary(
-                    &self.shared,
-                    md,
-                    overlay,
-                    writes.to_vec(),
-                    vis,
-                    commit_ts,
-                    txn_id,
-                )
+                install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id)
             });
         #[cfg(not(any(test, feature = "test-hooks")))]
-        let first_attempt = install_pending_primary(
-            &self.shared,
-            md,
-            overlay,
-            writes.to_vec(),
-            vis,
-            commit_ts,
-            txn_id,
-        );
+        let first_attempt =
+            install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id);
         match first_attempt {
             Ok(pages) => return Ok(pages),
             Err(e @ Error::WriteConflict { .. }) => return Err(e),
@@ -1152,41 +918,16 @@ impl PagedEngine {
         #[cfg(any(test, feature = "test-hooks"))]
         let second_attempt = self::test_accessors::us019_maybe_fail_primary_install(&self.shared)
             .and_then(|()| {
-                install_pending_primary(
-                    &self.shared,
-                    md,
-                    overlay,
-                    writes.to_vec(),
-                    vis,
-                    commit_ts,
-                    txn_id,
-                )
+                install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id)
             });
         #[cfg(not(any(test, feature = "test-hooks")))]
-        let second_attempt = install_pending_primary(
-            &self.shared,
-            md,
-            overlay,
-            writes.to_vec(),
-            vis,
-            commit_ts,
-            txn_id,
-        );
+        let second_attempt =
+            install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id);
         match second_attempt {
             Ok(pages) => Ok(pages),
             Err(e @ Error::WriteConflict { .. }) => Err(e),
             Err(e) => Err(e),
         }
-    }
-
-    fn rollback_overlay_only(&self, overlay: TxnOverlay) -> Result<()> {
-        overlay.rollback(&self.shared.handle)
-    }
-
-    fn rollback_overlay_and_wal(&self, overlay: TxnOverlay, mark: Option<u64>) -> Result<()> {
-        overlay.rollback(&self.shared.handle)?;
-        let _ = self.shared.handle.rollback_txn(mark);
-        Ok(())
     }
 }
 
@@ -1290,7 +1031,7 @@ impl StorageEngine for PagedEngine {
 
     fn create_namespace(&self, ns: &str) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
-        let result = self.run_namespace_create_ddl(|shared, md, overlay| {
+        let result = self.run_namespace_create_ddl(|shared, md, batch| {
             let data_root = {
                 let mut cat = catalog_lock(md);
                 if cat.get_collection(ns)?.is_some() {
@@ -1303,8 +1044,8 @@ impl StorageEngine for PagedEngine {
                 let id = cat.allocate_namespace_id();
                 cat.create_collection(ns, id, bson::doc! {}, now_millis())?
             };
-            sync_catalog_root_overlay(shared, md, overlay)?;
-            let store = new_txn_store(shared, overlay);
+            sync_catalog_root_structural(shared, md, batch)?;
+            let store = new_structural_store(shared, batch);
             BTree::create_at(store, data_root)?;
             Ok(())
         });
@@ -1364,19 +1105,7 @@ impl StorageEngine for PagedEngine {
         let drop_result = (|| -> Result<()> {
             let _journal = self.lock_journal_mutex();
             let mark = self.shared.handle.begin_txn()?;
-            let mut overlay = TxnOverlay::new();
-            let ready = self
-                .shared
-                .handle
-                .allocator()
-                .drain_deferred_free_reservations();
-            for page in ready {
-                overlay.push_reservation(PageReservation {
-                    page,
-                    size: PageSize::Large32k,
-                    origin: PageOrigin::DeferredFree,
-                });
-            }
+            let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
             let body = (|| -> Result<()> {
                 {
@@ -1391,9 +1120,9 @@ impl StorageEngine for PagedEngine {
                     }
                 }
 
-                self.free_tree_pages_exclusive(&mut overlay, data_root, data_level)?;
+                self.free_tree_pages_exclusive(&mut batch, data_root, data_level)?;
                 for (root_page, root_level) in &index_roots {
-                    self.free_tree_pages_exclusive(&mut overlay, *root_page, *root_level)?;
+                    self.free_tree_pages_exclusive(&mut batch, *root_page, *root_level)?;
                 }
 
                 {
@@ -1413,7 +1142,7 @@ impl StorageEngine for PagedEngine {
                         });
                     }
                 }
-                sync_catalog_root_overlay(&self.shared, &self.metadata_state, &mut overlay)?;
+                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
                 self.shared.clear_dirty_collection(ns_id);
                 Ok(())
             })();
@@ -1421,38 +1150,14 @@ impl StorageEngine for PagedEngine {
             match body {
                 Ok(()) => {
                     let mut base_store = new_store(&self.shared);
-                    overlay.commit(&mut base_store, &self.shared.handle)?;
+                    batch.commit(&mut base_store, &self.shared.handle)?;
                     self.flush_under_journal_mutex()?;
-                    let db_page_count = self
-                        .shared
-                        .handle
-                        .allocator()
-                        .with_header(|h| h.total_page_count)?;
-                    let header_data = {
-                        let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
-                        page.data().to_vec()
-                    };
-                    let emergency = match self.shared.handle.commit_txn(
-                        0,
-                        PageSize::Small4k,
-                        &header_data,
-                        db_page_count,
-                    ) {
-                        Ok(emergency) => {
-                            durable = true;
-                            emergency
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    if emergency {
-                        // Defer the legacy page-frame checkpoint until
-                        // checkpoint materialization has folded the logical
-                        // row tail.
-                    }
+                    durable = true;
                     Ok(())
                 }
                 Err(e) => {
-                    let _ = self.rollback_overlay_and_wal(overlay, mark);
+                    let _ = batch.abort(&self.shared.handle);
+                    let _ = self.shared.handle.rollback_txn(mark);
                     Err(e)
                 }
             }
@@ -1718,41 +1423,41 @@ impl StorageEngine for PagedEngine {
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_reset_group_commit_probe(&self) {
-        self::us017_test_probe::reset();
+        self::group_commit_test_probe::reset();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_expect_group_commit_cohort_size(&self, expected: u64) {
-        self::us017_test_probe::set_expected_cohort_size(expected);
+        self::group_commit_test_probe::set_expected_cohort_size(expected);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_fail_next_group_commit_fsync(&self) {
-        self::us017_test_probe::fail_next_fsync();
+        self::group_commit_test_probe::fail_next_fsync();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_pause_next_group_commit_after_close(
         &self,
-    ) -> self::us017_test_probe::Us017GroupCommitPauseGuard {
-        self::us017_test_probe::install_pause_after_close()
+    ) -> self::group_commit_test_probe::Us017GroupCommitPauseGuard {
+        self::group_commit_test_probe::install_pause_after_close()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_group_commit_observations(
         &self,
-    ) -> self::us017_test_probe::Us017GroupCommitObservations {
-        self::us017_test_probe::observations(&self.shared.group_commit)
+    ) -> self::group_commit_test_probe::Us017GroupCommitObservations {
+        self::group_commit_test_probe::observations(&self.shared.group_commit)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us008_reset_overlay_observations(&self) {
-        self.test_us008_reset_overlay_observations();
+    fn us008_reset_structural_page_observations(&self) {
+        self.test_us008_reset_structural_page_observations();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us008_committed_overlay_leaf_bytes(&self) -> u64 {
-        self.test_us008_committed_overlay_leaf_bytes()
+    fn us008_committed_structural_leaf_bytes(&self) -> u64 {
+        self.test_us008_committed_structural_leaf_bytes()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1773,13 +1478,13 @@ impl StorageEngine for PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn phase0_probe_insert(
+    fn crash_cut_probe_insert(
         &self,
         ns: &str,
         doc: Document,
         cut: Phase0ProbeCut,
     ) -> Result<Phase0ProbeReport> {
-        self.phase0_probe_insert_impl(ns, doc, cut)
+        self.crash_cut_probe_insert_impl(ns, doc, cut)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1793,7 +1498,9 @@ impl StorageEngine for PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us036_test_register_publish_slot(&self) -> Result<self::us036_test_probe::Us036PublishSlot> {
+    fn us036_test_register_publish_slot(
+        &self,
+    ) -> Result<self::engine_fatal_test_probe::Us036PublishSlot> {
         self.us036_test_register_publish_slot()
     }
 
@@ -1802,7 +1509,7 @@ impl StorageEngine for PagedEngine {
         &self,
         ns_id: i64,
         timeout_ms: u64,
-    ) -> Result<self::us036_test_probe::Us036WriterTicket> {
+    ) -> Result<self::engine_fatal_test_probe::Us036WriterTicket> {
         self.us036_test_admit_writer(ns_id, timeout_ms)
     }
 
@@ -1846,7 +1553,7 @@ impl PagedEngine {
     /// drains remain owned by their later Phase 5 stories.
     fn run_namespace_create_ddl<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(&SharedState, &MetadataState, &mut TxnOverlay) -> Result<R>,
+        F: FnOnce(&SharedState, &MetadataState, &mut StructuralPageBatch) -> Result<R>,
     {
         self.shared.check_engine_not_poisoned()?;
         let _md_w = self
@@ -1867,66 +1574,25 @@ impl PagedEngine {
             catalog_header_dirty: true,
         };
 
-        let mut overlay = TxnOverlay::new();
-        let ready = self
-            .shared
-            .handle
-            .allocator()
-            .drain_deferred_free_reservations();
-        for page in ready {
-            overlay.push_reservation(PageReservation {
-                page,
-                size: PageSize::Large32k,
-                origin: PageOrigin::DeferredFree,
-            });
-        }
+        let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
         let mut durable = false;
         let journal_result = {
             let _journal = self.lock_journal_mutex();
             let mark = self.shared.handle.begin_txn()?;
-            match f(&self.shared, &self.metadata_state, &mut overlay) {
+            match f(&self.shared, &self.metadata_state, &mut batch) {
                 Ok(value) => {
                     let mut base_store = new_store(&self.shared);
-                    if let Err(e) = overlay.commit(&mut base_store, &self.shared.handle) {
+                    if let Err(e) = batch.commit(&mut base_store, &self.shared.handle) {
                         let _ = self.shared.handle.rollback_txn(mark);
                         return Err(e);
                     }
-                    let db_page_count = self
-                        .shared
-                        .handle
-                        .allocator()
-                        .with_header(|h| h.total_page_count)?;
-                    let header_data = {
-                        let page = self.shared.handle.fetch_page(0, PageSize::Small4k)?;
-                        page.data().to_vec()
-                    };
-                    let emergency = match self.shared.handle.commit_txn(
-                        0,
-                        PageSize::Small4k,
-                        &header_data,
-                        db_page_count,
-                    ) {
-                        Ok(emergency) => {
-                            durable = true;
-                            emergency
-                        }
-                        Err(e) => {
-                            let _ = self.shared.handle.rollback_txn(mark);
-                            return Err(e);
-                        }
-                    };
                     self.flush_under_journal_mutex()?;
-                    if emergency {
-                        crate::mvcc::metrics::record_emergency_checkpoint_trigger();
-                        // Defer the legacy page-frame checkpoint until
-                        // checkpoint materialization has folded the logical
-                        // row tail.
-                    }
+                    durable = true;
                     Ok(value)
                 }
                 Err(e) => {
-                    overlay.rollback(&self.shared.handle)?;
+                    batch.abort(&self.shared.handle)?;
                     let _ = self.shared.handle.rollback_txn(mark);
                     Err(e)
                 }
@@ -1968,11 +1634,15 @@ impl PagedEngine {
 
     fn free_tree_pages_exclusive(
         &self,
-        overlay: &mut TxnOverlay,
+        batch: &mut StructuralPageBatch,
         root_page: u32,
         root_level: u8,
     ) -> Result<()> {
-        let mut tree = BTree::open(new_txn_store(&self.shared, overlay), root_page, root_level);
+        let mut tree = BTree::open(
+            new_structural_store(&self.shared, batch),
+            root_page,
+            root_level,
+        );
         let mut pages = tree.collect_pages_by_size()?;
         pages.sort_by_key(|(page_id, _)| *page_id);
         let latches = pages
@@ -1984,7 +1654,7 @@ impl PagedEngine {
                     .pin_for_write_sized(*page_id, *size)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut store = new_txn_store(&self.shared, overlay);
+        let mut store = new_structural_store(&self.shared, batch);
         for (page_id, size) in pages {
             match size {
                 PageSize::Small4k => store.free_internal(page_id)?,
