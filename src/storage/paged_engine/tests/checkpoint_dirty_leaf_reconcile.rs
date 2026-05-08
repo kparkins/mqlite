@@ -15,7 +15,7 @@ use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::reconcile::driver::reconcile_tree_dirty_set;
-use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::test_support::{ArcIo, MockIo};
 
 const NS: &str = "test.us015";

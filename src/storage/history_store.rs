@@ -67,7 +67,7 @@ use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState}
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 
 // ---------------------------------------------------------------------------
 // Thread-local non-recursion sentinel

@@ -20,7 +20,7 @@ use crate::storage::header::FileHeader;
 use crate::storage::reconcile::driver::{
     checkpoint_incomplete_error, checkpoint_reason_for_plan_blocker, CheckpointPlanBlocker,
 };
-use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::test_support::{ArcIo, MockIo};
 
 const NS: &str = "phase7.us010";

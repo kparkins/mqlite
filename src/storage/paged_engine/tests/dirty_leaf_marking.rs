@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
-use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::test_support::{ArcIo, MockIo};
 
 use super::MetadataState;

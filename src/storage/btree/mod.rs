@@ -147,7 +147,7 @@ pub mod range_scan_latch_scope;
 pub mod reader_crabbing_observations;
 pub(crate) mod reconcile;
 
-use chain::*;
+use chain::{collect_subtree_pages, free_subtree};
 pub(crate) use node::CellValue;
 use node::{InternalNode, LeafNode};
 

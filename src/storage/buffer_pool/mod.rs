@@ -72,7 +72,7 @@ use crate::storage::allocator::AllocatorHandle;
 use crate::storage::btree::reconcile::{predict_encoded_leaf_size, FoldedLeafCell, RetainedChains};
 use crate::storage::btree::OVERFLOW_THRESHOLD;
 use crate::storage::page::{PAGE_SIZE_LEAF, PAGE_TYPE_LEAF};
-use crate::storage::reconcile::plan::TreeIdent;
+use crate::storage::reconcile::driver::TreeIdent;
 
 use page_latch::{LatchMode, PageLatch, PageLatchExclusive, PageLatchShared};
 use partition::{Frame, Partition};

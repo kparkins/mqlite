@@ -16,7 +16,7 @@ use crate::storage::btree::reconcile::{
 use crate::storage::btree::OVERFLOW_THRESHOLD;
 use crate::storage::page::PAGE_SIZE_LEAF;
 
-use super::plan::TreeIdent;
+use super::driver::TreeIdent;
 
 const LEAF_PAGE_BUDGET: usize = PAGE_SIZE_LEAF as usize;
 

@@ -24,7 +24,7 @@ use crate::mvcc::timestamp::Ts;
 #[cfg(test)]
 use crate::storage::allocator::AllocatorHandle;
 #[cfg(test)]
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 
 use super::{BufferPool, PageSize};
 #[cfg(test)]

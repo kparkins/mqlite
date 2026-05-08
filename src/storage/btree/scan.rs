@@ -5,14 +5,42 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::ops::Bound;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mvcc::read_view::{ChainSnapshot, ReadView};
 use crate::mvcc::version::{VersionData, VersionEntry};
 use crate::storage::buffer_pool::PageSize;
+use crate::storage::page::{OverflowPageHeader, OVERFLOW_HEADER_SIZE, PAGE_SIZE_LEAF};
 
-use super::chain::read_overflow_chain;
 use super::node::{InternalNode, LeafNode};
 use super::{BTree, BTreePageStore, CellValue, HistoryProbe, LeafPageImage};
+
+// ---------------------------------------------------------------------------
+// Overflow read helper
+// ---------------------------------------------------------------------------
+
+pub(super) fn read_overflow_chain<S: BTreePageStore>(
+    store: &S,
+    first_page: u32,
+    total_length: u32,
+) -> Result<Vec<u8>> {
+    let mut result = Vec::with_capacity(total_length as usize);
+    let mut cur = first_page;
+    while cur != 0 {
+        let (buf, _) = store.read_leaf(cur)?;
+        let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
+        hdr.validate_type()?;
+        let data_len = hdr.data_length as usize;
+        if OVERFLOW_HEADER_SIZE + data_len > PAGE_SIZE_LEAF as usize {
+            return Err(Error::Internal(format!(
+                "overflow page {cur}: data_length {data_len} exceeds page size"
+            )));
+        }
+        result.extend_from_slice(&buf[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + data_len]);
+        cur = hdr.next_overflow_page;
+    }
+    result.truncate(total_length as usize);
+    Ok(result)
+}
 
 /// A visible delta key paired with `Some(value)` for live versions or `None`
 /// for tombstones.

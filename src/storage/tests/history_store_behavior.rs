@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::storage::btree::MemPageStore;
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 
 const EXPECTED_GC_PASS_TICK: u64 = 1;
 const SECONDARY_INDEX_ID: i64 = 1;

@@ -20,7 +20,7 @@ use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
 use crate::storage::history_store::{HistorySpillTxn, HistoryStore};
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 use crate::storage::test_support::{ArcIo, MockIo};
 
 const READY_NS: &str = "test.us011.ready";

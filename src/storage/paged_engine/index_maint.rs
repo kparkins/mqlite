@@ -14,7 +14,7 @@ use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::handle::BufferPoolHandle;
-use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::secondary_index::{
     update_index_on_delete, update_index_on_insert, update_index_on_update,
 };

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::reconcile::{encode_folded_leaf, FoldedLeafCell, FoldedLeafLinks};
 use crate::storage::page::PAGE_SIZE_LEAF;
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 use crate::storage::reconcile::synth::{synthesize_page, NotInstallable};
 
 const COLLECTION_ID: i64 = 42;

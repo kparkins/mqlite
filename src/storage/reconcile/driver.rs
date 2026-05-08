@@ -10,10 +10,46 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::ReplaceLeafError;
 use crate::storage::history_store::{HistorySpillTxn, HistoryStore};
 use crate::storage::paged_engine::PagedEngine;
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
 use crate::storage::reconcile::synth::{
     synthesize_page, visible_winners_fit_individual_leaf_pages, NotInstallable, PageSynthesisResult,
 };
+
+/// Stable identity for a tree whose leaves may need reconciliation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct TreeIdent {
+    /// Durable collection identifier that owns the tree.
+    pub(crate) collection_id: i64,
+    /// Primary or secondary tree discriminator.
+    pub(crate) kind: TreeKind,
+}
+
+/// Kind of tree represented by a [`TreeIdent`].
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum TreeKind {
+    /// Primary collection data tree.
+    Primary,
+    /// Secondary index tree.
+    Secondary {
+        /// Durable index identifier for the secondary tree.
+        index_id: i64,
+    },
+}
+
+/// Dirty-leaf metadata retained until a checkpoint reconcile pass consumes it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LeafState {
+    /// Reason the leaf was marked dirty.
+    pub(crate) dirty_reason: DirtyReason,
+}
+
+/// Source operation that made a leaf eligible for reconcile planning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirtyReason {
+    /// Primary data tree write.
+    PrimaryWrite,
+    /// Secondary index tree write.
+    SecondaryWrite,
+}
 
 /// Per-tree checkpoint reconcile statistics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -256,11 +292,24 @@ fn plan_leaf(
         // to reconcile; the durable page image has already left the pool.
         return Ok(LeafPlanOutcome::ExcludedFutureDirty);
     };
-    if !has_checkpoint_visible_committed_delta(&snapshot.chains, checkpoint_ts) {
+    if !snapshot.chains.values().any(|chain| {
+        chain.iter().any(|entry| {
+            matches!(entry.state, crate::mvcc::VersionState::Committed)
+                && entry.start_ts <= checkpoint_ts
+        })
+    }) {
         return Ok(LeafPlanOutcome::ExcludedFutureDirty);
     }
     let blocker_err =
         |blocker| checkpoint_incomplete_error(page_id, checkpoint_reason_for_plan_blocker(blocker));
+    let synth_to_blocker = |reason: NotInstallable| match reason {
+        NotInstallable::VisibleWinnerExceedsPageBudget => {
+            CheckpointPlanBlocker::VisibleWinnerExceedsPageBudget
+        }
+        NotInstallable::FoldedLeafExceedsPageByteBudget => {
+            CheckpointPlanBlocker::TombstonePredecessorPressure
+        }
+    };
     match synthesize_page(
         &snapshot.base_image,
         &snapshot.chains,
@@ -275,34 +324,11 @@ fn plan_leaf(
                 Ok(false) => Err(blocker_err(
                     CheckpointPlanBlocker::VisibleWinnerExceedsPageBudget,
                 )),
-                Err(reason) => Err(blocker_err(checkpoint_blocker_for_synth(reason))),
+                Err(reason) => Err(blocker_err(synth_to_blocker(reason))),
             }
         }
-        Err(reason) => Err(blocker_err(checkpoint_blocker_for_synth(reason))),
+        Err(reason) => Err(blocker_err(synth_to_blocker(reason))),
     }
-}
-
-fn checkpoint_blocker_for_synth(reason: NotInstallable) -> CheckpointPlanBlocker {
-    match reason {
-        NotInstallable::VisibleWinnerExceedsPageBudget => {
-            CheckpointPlanBlocker::VisibleWinnerExceedsPageBudget
-        }
-        NotInstallable::FoldedLeafExceedsPageByteBudget => {
-            CheckpointPlanBlocker::TombstonePredecessorPressure
-        }
-    }
-}
-
-fn has_checkpoint_visible_committed_delta(
-    chains: &crate::storage::buffer_pool::RetainedLeafChains,
-    checkpoint_ts: crate::mvcc::Ts,
-) -> bool {
-    chains.values().any(|chain| {
-        chain.iter().any(|entry| {
-            matches!(entry.state, crate::mvcc::VersionState::Committed)
-                && entry.start_ts <= checkpoint_ts
-        })
-    })
 }
 
 /// Reconcile every dirty leaf currently recorded for one tree identity.
@@ -347,7 +373,18 @@ pub(crate) fn reconcile_tree_dirty_set<M>(
         }
     }
 
-    clear_installed_dirty_pages(engine, &ident, &installed_pages);
+    if !installed_pages.is_empty() {
+        let mut remove_tree = false;
+        if let Some(mut dirty) = engine.shared.dirty_leaves.get_mut(&ident) {
+            for page in &installed_pages {
+                dirty.remove(page);
+            }
+            remove_tree = dirty.is_empty();
+        }
+        if remove_tree {
+            engine.shared.dirty_leaves.remove(&ident);
+        }
+    }
     Ok(stats)
 }
 
@@ -389,6 +426,12 @@ fn reconcile_leaf(
         }
         Err(_) => return Ok(LeafReconcileOutcome::NotInstallable),
     };
+    let replace_err = |err: ReplaceLeafError| match err {
+        ReplaceLeafError::NotResident => Ok(LeafReconcileOutcome::NotInstallable),
+        ReplaceLeafError::NotLeaf => Err(Error::Internal(
+            "dirty-leaf reconcile target is not a leaf page".into(),
+        )),
+    };
     let mut latched_pages = match engine
         .shared
         .handle
@@ -396,7 +439,7 @@ fn reconcile_leaf(
         .pin_leaf_set_for_reconcile(ident, &[page_id])
     {
         Ok(pages) => pages,
-        Err(err) => return map_replace_error(err),
+        Err(err) => return replace_err(err),
     };
     let Some(page) = latched_pages.first_mut() else {
         return Ok(LeafReconcileOutcome::NotInstallable);
@@ -410,7 +453,7 @@ fn reconcile_leaf(
         synthesized.retained_chains,
     ) {
         Ok(()) => Ok(LeafReconcileOutcome::Installed { history_spills }),
-        Err(err) => map_replace_error(err),
+        Err(err) => replace_err(err),
     }
 }
 
@@ -449,28 +492,3 @@ fn commit_history_spills(engine: &PagedEngine, synthesized: &PageSynthesisResult
     history.commit_spill_txn_durable(spill_txn)
 }
 
-fn clear_installed_dirty_pages(engine: &PagedEngine, ident: &TreeIdent, pages: &[u32]) {
-    if pages.is_empty() {
-        return;
-    }
-
-    let mut remove_tree = false;
-    if let Some(mut dirty) = engine.shared.dirty_leaves.get_mut(ident) {
-        for page in pages {
-            dirty.remove(page);
-        }
-        remove_tree = dirty.is_empty();
-    }
-    if remove_tree {
-        engine.shared.dirty_leaves.remove(ident);
-    }
-}
-
-fn map_replace_error(err: ReplaceLeafError) -> Result<LeafReconcileOutcome> {
-    match err {
-        ReplaceLeafError::NotResident => Ok(LeafReconcileOutcome::NotInstallable),
-        ReplaceLeafError::NotLeaf => Err(Error::Internal(
-            "dirty-leaf reconcile target is not a leaf page".into(),
-        )),
-    }
-}

@@ -38,9 +38,46 @@ use crate::storage::buffer_pool::{LatchedPinnedPage, PageSize, PinnedPage};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
-// Local usize aliases for array dimensions.
-const INTERNAL_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
-const LEAF_SIZE: usize = PAGE_SIZE_LEAF as usize;
+pub(crate) const INTERNAL_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
+pub(crate) const LEAF_SIZE: usize = PAGE_SIZE_LEAF as usize;
+
+// ---------------------------------------------------------------------------
+// LeafHoldScope — RAII wrapper for test-hook latch-hold instrumentation.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-hooks"))]
+struct LeafHoldScope {
+    start: Option<crate::storage::btree::range_scan_latch_scope::Us016LeafHoldStart>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl LeafHoldScope {
+    fn new(page: u32) -> Self {
+        let start =
+            crate::storage::btree::range_scan_latch_scope::begin_leaf_hold(page, 0);
+        Self { start: Some(start) }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for LeafHoldScope {
+    fn drop(&mut self) {
+        if let Some(start) = self.start.take() {
+            crate::storage::btree::range_scan_latch_scope::finish_leaf_hold(start);
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+struct LeafHoldScope;
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+impl LeafHoldScope {
+    #[inline(always)]
+    fn new(_page: u32) -> Self {
+        Self
+    }
+}
 
 // ---------------------------------------------------------------------------
 // BufferPoolPageStore
@@ -108,6 +145,33 @@ impl BufferPoolPageStore {
             self.handle.alloc_page(size)
         }
     }
+
+    /// Copy page bytes and snapshot chains from a shared reader guard.
+    ///
+    /// `snap_chains` is called only for the `Latched` arm, where MVCC chains
+    /// are present. The `Pinned` arm (history pages) always returns `None`.
+    fn snapshot_leaf<F>(
+        &self,
+        guard: &SharedReaderPage<'_>,
+        snap_chains: F,
+    ) -> Result<(LeafPageImage, Option<ChainSnapshot>)>
+    where
+        F: FnOnce(&LatchedPinnedPage<'_>) -> Result<ChainSnapshot>,
+    {
+        match guard {
+            SharedReaderPage::Latched(p) => {
+                let _hold = LeafHoldScope::new(p.page_id());
+                let data = p.data_snapshot();
+                let snap = snap_chains(p)?;
+                Ok((LeafPageImage::shared(data)?, Some(snap)))
+            }
+            SharedReaderPage::Pinned(p) => {
+                let mut buf = Box::new([0u8; LEAF_SIZE]);
+                buf.copy_from_slice(p.data());
+                Ok((LeafPageImage::owned(buf), None))
+            }
+        }
+    }
 }
 
 impl BTreePageStore for BufferPoolPageStore {
@@ -129,24 +193,8 @@ impl BTreePageStore for BufferPoolPageStore {
     }
 
     fn read_leaf(&self, page: u32) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
-        if !self.is_history {
-            let latched = self.handle.pool().pin_for_read(page)?;
-            #[cfg(any(test, feature = "test-hooks"))]
-            let hold_start =
-                crate::storage::btree::range_scan_latch_scope::begin_leaf_hold(page, 0);
-            let page_data = latched.data_snapshot();
-            let snap = Some(latched.snapshot_chains(None)?);
-            drop(latched);
-            #[cfg(any(test, feature = "test-hooks"))]
-            crate::storage::btree::range_scan_latch_scope::finish_leaf_hold(hold_start);
-            return Ok((LeafPageImage::shared(page_data)?, snap));
-        }
-
-        let pinned = self.fetch(page, PageSize::Large32k)?;
-        let mut buf = Box::new([0u8; LEAF_SIZE]);
-        buf.copy_from_slice(pinned.data());
-        Ok((LeafPageImage::owned(buf), None))
-        // pinned auto-unpins here
+        let guard = self.pin_shared_for_read(page, PageSize::Large32k)?;
+        self.snapshot_leaf(&guard, |p| p.snapshot_chains(None))
     }
 
     fn pin_shared_for_read<'a>(
@@ -169,13 +217,14 @@ impl BTreePageStore for BufferPoolPageStore {
         guard: &Self::SharedReadGuard<'_>,
     ) -> Result<Box<[u8; INTERNAL_SIZE]>> {
         let mut buf = Box::new([0u8; INTERNAL_SIZE]);
-        match guard {
-            SharedReaderPage::Latched(page) => {
-                let page_data = page.data_snapshot();
-                buf.copy_from_slice(&page_data[..INTERNAL_SIZE]);
+        let src = match guard {
+            SharedReaderPage::Latched(p) => p.data_snapshot(),
+            SharedReaderPage::Pinned(p) => {
+                buf.copy_from_slice(p.data());
+                return Ok(buf);
             }
-            SharedReaderPage::Pinned(page) => buf.copy_from_slice(page.data()),
-        }
+        };
+        buf.copy_from_slice(&src[..INTERNAL_SIZE]);
         Ok(buf)
     }
 
@@ -184,48 +233,16 @@ impl BTreePageStore for BufferPoolPageStore {
         _page: u32,
         guard: &Self::SharedReadGuard<'_>,
     ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
-        match guard {
-            SharedReaderPage::Latched(page) => {
-                #[cfg(any(test, feature = "test-hooks"))]
-                let hold_start = crate::storage::btree::range_scan_latch_scope::begin_leaf_hold(
-                    page.page_id(),
-                    0,
-                );
-                let page_data = page.data_snapshot();
-                let snap = Some(page.snapshot_chains(None)?);
-                #[cfg(any(test, feature = "test-hooks"))]
-                crate::storage::btree::range_scan_latch_scope::finish_leaf_hold(hold_start);
-                Ok((LeafPageImage::shared(page_data)?, snap))
-            }
-            SharedReaderPage::Pinned(page) => {
-                let mut buf = Box::new([0u8; LEAF_SIZE]);
-                buf.copy_from_slice(page.data());
-                Ok((LeafPageImage::owned(buf), None))
-            }
-        }
+        self.snapshot_leaf(guard, |p| p.snapshot_chains(None))
     }
 
     fn read_leaf_for_key_guarded(
         &self,
-        page: u32,
+        _page: u32,
         guard: &Self::SharedReadGuard<'_>,
         key: &[u8],
     ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
-        match guard {
-            SharedReaderPage::Latched(page) => {
-                #[cfg(any(test, feature = "test-hooks"))]
-                let hold_start = crate::storage::btree::range_scan_latch_scope::begin_leaf_hold(
-                    page.page_id(),
-                    0,
-                );
-                let page_data = page.data_snapshot();
-                let snap = Some(page.snapshot_chain_for_key(key, None)?);
-                #[cfg(any(test, feature = "test-hooks"))]
-                crate::storage::btree::range_scan_latch_scope::finish_leaf_hold(hold_start);
-                Ok((LeafPageImage::shared(page_data)?, snap))
-            }
-            SharedReaderPage::Pinned(_) => self.read_leaf(page),
-        }
+        self.snapshot_leaf(guard, |p| p.snapshot_chain_for_key(key, None))
     }
 
     // -----------------------------------------------------------------------
@@ -329,156 +346,8 @@ impl BTreePageStore for BufferPoolPageStore {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::btree::{BTree, BTreePageStore};
-    use crate::storage::buffer_pool::default_sizes;
-    use crate::storage::buffer_pool::BufferPool;
-    use crate::storage::header::FileHeader;
-    use crate::storage::test_support::{ArcIo, MockIo};
-
-    fn make_store() -> BufferPoolPageStore {
-        let io = MockIo::new();
-        let pool = Arc::new(BufferPool::new(
-            default_sizes::DESKTOP,
-            Box::new(ArcIo(Arc::clone(&io))),
-        ));
-        let history_pool = Arc::new(BufferPool::new(
-            default_sizes::IOT,
-            Box::new(ArcIo(Arc::clone(&io))),
-        ));
-        let header = FileHeader::new_now();
-        let handle = Arc::new(BufferPoolHandle::new(pool, history_pool, header));
-        BufferPoolPageStore::new(handle)
-    }
-
-    // -----------------------------------------------------------------------
-    // alloc_internal / alloc_leaf
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn alloc_internal_returns_first_free_page() {
-        let mut store = make_store();
-        let pn = store.alloc_internal().unwrap();
-        assert_eq!(pn, 1, "first internal page must be 1");
-    }
-
-    #[test]
-    fn alloc_leaf_returns_first_free_page() {
-        let mut store = make_store();
-        let pn = store.alloc_leaf().unwrap();
-        assert_eq!(pn, 1, "first leaf page must be 1");
-    }
-
-    #[test]
-    fn sequential_allocs_return_consecutive_pages() {
-        let mut store = make_store();
-        let a = store.alloc_internal().unwrap();
-        let b = store.alloc_leaf().unwrap();
-        let c = store.alloc_internal().unwrap();
-
-        assert_eq!(a, 1);
-        assert_eq!(b, 2);
-        assert_eq!(c, 3);
-    }
-
-    // -----------------------------------------------------------------------
-    // write / read roundtrip
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn write_and_read_internal_roundtrip() {
-        let mut store = make_store();
-        let pn = store.alloc_internal().unwrap();
-
-        let mut data = [0u8; INTERNAL_SIZE];
-        data[0] = 0xAA;
-        data[4090] = 0xBB;
-        store.write_internal(pn, &data).unwrap();
-
-        let read_back = store.read_internal(pn).unwrap();
-        assert_eq!(read_back[0], 0xAA);
-        assert_eq!(read_back[4090], 0xBB);
-    }
-
-    #[test]
-    fn write_and_read_leaf_roundtrip() {
-        let mut store = make_store();
-        let pn = store.alloc_leaf().unwrap();
-
-        let mut data = [0u8; LEAF_SIZE];
-        data[0] = 0xCC;
-        data[32760] = 0xDD;
-        store.write_leaf_structural(pn, &data).unwrap();
-
-        let (read_back, _) = store.read_leaf(pn).unwrap();
-        assert_eq!(read_back[0], 0xCC);
-        assert_eq!(read_back[32760], 0xDD);
-    }
-
-    // -----------------------------------------------------------------------
-    // free / realloc
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn free_internal_recycles_on_next_alloc() {
-        let mut store = make_store();
-        let pn = store.alloc_internal().unwrap();
-        store.free_internal(pn).unwrap();
-        let recycled = store.alloc_internal().unwrap();
-        assert_eq!(recycled, pn, "freed internal page must be recycled");
-    }
-
-    #[test]
-    fn free_leaf_recycles_on_next_alloc() {
-        let mut store = make_store();
-        let pn = store.alloc_leaf().unwrap();
-        store.free_leaf(pn).unwrap();
-        let recycled = store.alloc_leaf().unwrap();
-        assert_eq!(recycled, pn, "freed leaf page must be recycled");
-    }
-
-    // -----------------------------------------------------------------------
-    // B+ tree smoke test through BufferPoolPageStore
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn btree_insert_and_get_via_pool_store() {
-        let store = make_store();
-        let mut tree = BTree::create(store).unwrap();
-
-        let key = b"hello";
-        let val = b"world!";
-
-        tree.insert(key, val).unwrap();
-
-        let result = tree.get(key).unwrap();
-        assert_eq!(result.as_deref(), Some(val.as_ref()));
-    }
-
-    #[test]
-    fn btree_insert_multiple_keys_and_get_all() {
-        let store = make_store();
-        let mut tree = BTree::create(store).unwrap();
-
-        for i in 0u8..50 {
-            let key = [i];
-            let val = [i, i + 1];
-            tree.insert(&key, &val).unwrap();
-        }
-
-        for i in 0u8..50 {
-            let key = [i];
-            let expected = [i, i + 1];
-            let result = tree.get(&key).unwrap();
-            assert_eq!(
-                result.as_deref(),
-                Some(expected.as_ref()),
-                "key {i} not found"
-            );
-        }
-    }
-}
+#[path = "tests/btree_store_basic.rs"]
+mod btree_store_basic;
 
 #[cfg(test)]
 #[path = "tests/buffer_pool_page_store_leaf_snapshot.rs"]

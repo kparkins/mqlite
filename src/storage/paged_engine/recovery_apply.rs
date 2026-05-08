@@ -17,7 +17,7 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::{Catalog, CollectionEntry, IndexEntry};
 use crate::storage::handle::BufferPoolHandle;
-use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::root_snapshot::PublishedEpoch;
 
 use super::catalog_ops::catalog_lock;

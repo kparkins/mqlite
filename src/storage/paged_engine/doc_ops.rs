@@ -23,9 +23,7 @@ use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
     maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
 };
-use super::snapshot_ops::{
-    apply_find_opts, execute_snapshot_pairs_from_snap, execute_snapshot_pairs_only,
-};
+use super::snapshot_ops::{apply_find_opts, execute_snapshot_pairs_from_snap};
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -154,14 +152,15 @@ pub(super) fn update_documents(
         Some(ns_snap) => attach_expected_heads(
             &engine.shared,
             ns_snap,
-            execute_snapshot_pairs_only(
+            execute_snapshot_pairs_from_snap(
                 &engine.shared,
                 ns,
                 ns_snap,
                 filter,
                 Arc::clone(&snap),
                 false,
-            )?,
+            )
+            .map(|(_, p)| p)?,
         )?,
     };
 
@@ -224,14 +223,15 @@ pub(super) fn delete_documents(
                 let pairs = attach_expected_heads(
                     &engine.shared,
                     ns_snap,
-                    execute_snapshot_pairs_only(
+                    execute_snapshot_pairs_from_snap(
                         &engine.shared,
                         ns,
                         ns_snap,
                         filter,
                         Arc::clone(&snap),
                         false,
-                    )?,
+                    )
+                    .map(|(_, p)| p)?,
                 )?;
                 if many {
                     pairs
@@ -271,14 +271,15 @@ pub(super) fn count_documents(
         None => return Ok(0),
         Some(n) => n,
     };
-    Ok(execute_snapshot_pairs_only(
+    Ok(execute_snapshot_pairs_from_snap(
         &engine.shared,
         ns,
         ns_snap,
         filter,
         Arc::clone(&snap),
         false,
-    )?
+    )
+    .map(|(_, p)| p)?
     .len() as u64)
 }
 
@@ -307,14 +308,15 @@ pub(super) fn find_one_and_update(
             Some(ns_snap) => attach_expected_heads(
                 &engine.shared,
                 ns_snap,
-                execute_snapshot_pairs_only(
+                execute_snapshot_pairs_from_snap(
                     &engine.shared,
                     ns,
                     ns_snap,
                     filter,
                     Arc::clone(&snap),
                     false,
-                )?,
+                )
+                .map(|(_, p)| p)?,
             )?,
         };
 
@@ -364,14 +366,17 @@ pub(super) fn find_one_and_delete(
             Some(ns_snap) => attach_expected_heads(
                 &engine.shared,
                 ns_snap,
-                execute_snapshot_pairs_only(
-                    &engine.shared,
-                    ns,
-                    ns_snap,
-                    filter,
-                    Arc::clone(&snap),
-                    false,
-                )?,
+                {
+                    let (_, pairs) = execute_snapshot_pairs_from_snap(
+                        &engine.shared,
+                        ns,
+                        ns_snap,
+                        filter,
+                        Arc::clone(&snap),
+                        false,
+                    )?;
+                    pairs
+                },
             )?,
         };
 
@@ -417,14 +422,17 @@ pub(super) fn find_one_and_replace(
             Some(ns_snap) => attach_expected_heads(
                 &engine.shared,
                 ns_snap,
-                execute_snapshot_pairs_only(
-                    &engine.shared,
-                    ns,
-                    ns_snap,
-                    filter,
-                    Arc::clone(&snap),
-                    false,
-                )?,
+                {
+                    let (_, pairs) = execute_snapshot_pairs_from_snap(
+                        &engine.shared,
+                        ns,
+                        ns_snap,
+                        filter,
+                        Arc::clone(&snap),
+                        false,
+                    )?;
+                    pairs
+                },
             )?,
         };
 

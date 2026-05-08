@@ -22,7 +22,7 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::history_store::HistoryStore;
-use crate::storage::reconcile::plan::{DirtyReason, LeafState, TreeIdent};
+use crate::storage::reconcile::driver::{DirtyReason, LeafState, TreeIdent};
 use crate::storage::root_snapshot::PublishedEpoch;
 
 use super::catalog_ops::catalog_lock;

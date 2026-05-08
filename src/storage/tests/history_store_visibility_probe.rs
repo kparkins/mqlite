@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::storage::btree::MemPageStore;
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 
 const COLLECTION_ID: i64 = 12;
 

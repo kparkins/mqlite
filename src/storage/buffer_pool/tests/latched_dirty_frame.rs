@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::page::PAGE_TYPE_LEAF;
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 
 const COLLECTION_ID: i64 = 42;
 const PAGE_ID: u32 = 65;

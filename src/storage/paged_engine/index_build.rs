@@ -16,7 +16,7 @@ use crate::journal::log_file::CatalogCommitKind;
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::{IndexEntry, IndexState};
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 use crate::storage::secondary_index::build_index_mvcc;
 use crate::storage::structural_page_batch::StructuralPageBatch;
 

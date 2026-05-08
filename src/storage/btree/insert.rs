@@ -2,10 +2,60 @@
 //! node split with key promotion to the parent.
 
 use crate::error::{Error, Result};
+use crate::storage::page::{
+    overflow_page_checksum, OverflowPageHeader, OVERFLOW_HEADER_SIZE, PAGE_SIZE_LEAF,
+    PAGE_TYPE_OVERFLOW,
+};
 
-use super::chain::write_overflow_chain;
 use super::node::{InternalNode, LeafCell, LeafNode, SplitResult};
-use super::{BTree, BTreePageStore, CellValue, OVERFLOW_THRESHOLD};
+use super::{BTree, BTreePageStore, CellValue, OVERFLOW_PAGE_DATA, OVERFLOW_THRESHOLD};
+
+// ---------------------------------------------------------------------------
+// Overflow write helper
+// ---------------------------------------------------------------------------
+
+pub(super) fn write_overflow_chain<S: BTreePageStore>(store: &mut S, data: &[u8]) -> Result<u32> {
+    let chunks: Vec<&[u8]> = data.chunks(OVERFLOW_PAGE_DATA).collect();
+    let n = chunks.len();
+    if n == 0 {
+        return Err(Error::Internal("write_overflow_chain: empty data".into()));
+    }
+
+    // Allocate all pages first.
+    let mut pages = Vec::with_capacity(n);
+    for _ in 0..n {
+        pages.push(store.alloc_leaf()?);
+    }
+
+    // Write each page from last to first so we have next pointers.
+    for i in (0..n).rev() {
+        let chunk = chunks[i];
+        let next = if i + 1 < n { pages[i + 1] } else { 0 };
+
+        let mut buf = [0u8; PAGE_SIZE_LEAF as usize];
+        let hdr = OverflowPageHeader {
+            page_type: PAGE_TYPE_OVERFLOW,
+            // Legacy non-MVCC writer: refcount semantics land in T5'/T6.
+            // Starting at 0 preserves previous behaviour — no pins are
+            // claimed here — and tracks the "unmanaged" state until the
+            // MVCC writer path wraps these pages in OverflowRefs.
+            refcount: 0,
+            checksum: 0,
+            next_overflow_page: next,
+            data_length: chunk.len() as u32,
+        };
+        hdr.write_to(&mut buf);
+        buf[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
+
+        let cs = overflow_page_checksum(&buf);
+        // Post-T3 checksum field is at bytes 8..12 (Format Lock §A.1).
+        buf[8..12].copy_from_slice(&cs.to_le_bytes());
+
+        store.write_leaf_structural(pages[i], &buf)?;
+    }
+
+    Ok(pages[0])
+}
 
 impl<S: BTreePageStore> BTree<S> {
     /// Insert `key` → `value` into the tree.

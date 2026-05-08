@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::storage::btree::MemPageStore;
 use crate::storage::header::FileHeader;
-use crate::storage::reconcile::plan::{TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 
 const COLLECTION_ID: i64 = 13;
 const FIRST_PAGE: u32 = 1300;

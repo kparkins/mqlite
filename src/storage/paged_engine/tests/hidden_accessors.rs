@@ -39,7 +39,7 @@ use crate::storage::btree::reconcile::{encode_folded_leaf, FoldedLeafCell, Folde
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::btree::BTree;
 #[cfg(any(test, feature = "test-hooks"))]
-use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
+use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::secondary_index::build_index_keys;
 #[cfg(any(test, feature = "test-hooks"))]
