@@ -7,6 +7,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{EngineFatalReason, Error, Result};
+use crate::journal::log_file::{CheckpointBoundaryPayload, LogRecordDraft};
 use crate::keys::{encode_compound_key, encode_key, COMPOUND_SEP};
 use crate::mvcc::read_view::ReadView;
 use crate::options::FindOptions;
@@ -399,6 +400,20 @@ fn checkpoint_after_reconcile_plan(
     checkpoint_plan: CheckpointReconcilePlan,
 ) -> Result<()> {
     let mut batch = StructuralPageBatch::new(&engine.shared.handle);
+    engine
+        .shared
+        .handle
+        .sync_journal_ready_prefix()
+        .map_err(|error| engine.poison_after_log_manager_failure(error))?;
+    let initial_checkpoint_applied_lsn = engine.shared.handle.current_journal_durable_lsn()?;
+    engine
+        .shared
+        .handle
+        .set_main_file_flush_lsn(initial_checkpoint_applied_lsn);
+    engine
+        .shared
+        .handle
+        .stamp_unflushable_dirty_pages_lsn(initial_checkpoint_applied_lsn)?;
     let materialize_result = (|| -> Result<_> {
         let (primary_catalog_dirty, mut materialized_trees, primary_requires_logical_tail) =
             materialize_primary_deltas_for_checkpoint(&engine.shared, md, &mut batch)?;
@@ -423,7 +438,11 @@ fn checkpoint_after_reconcile_plan(
             }
         };
     let mut base_store = super::catalog_ops::new_store(&engine.shared);
-    batch.commit(&mut base_store, &engine.shared.handle)?;
+    batch.commit_lsn_fenced(
+        &mut base_store,
+        &engine.shared.handle,
+        initial_checkpoint_applied_lsn,
+    )?;
     for tree in checkpoint_plan.trees() {
         if !materialized_trees.contains(tree.ident()) {
             continue;
@@ -529,28 +548,70 @@ fn checkpoint_after_reconcile_plan(
             .page_lifetime_queue()
             .depth() as u64,
     );
+    let mut checkpoint_applied_lsn = None;
     if !requires_logical_tail {
-        engine.shared.handle.allocator().update_header(|header| {
-            header.last_checkpoint_ts = header.last_checkpoint_ts.max(checkpoint_ts);
-        })?;
+        engine
+            .shared
+            .handle
+            .sync_journal_ready_prefix()
+            .map_err(|error| engine.poison_after_log_manager_failure(error))?;
+        let candidate_lsn = engine.shared.handle.current_journal_durable_lsn()?;
+        engine.shared.handle.set_main_file_flush_lsn(candidate_lsn);
+        engine
+            .shared
+            .handle
+            .stamp_unflushable_dirty_pages_lsn(candidate_lsn)?;
+        checkpoint_applied_lsn = Some(candidate_lsn);
     }
-    {
-        let _journal = engine.lock_journal_mutex();
-        engine.flush_under_journal_mutex()?;
-        if requires_logical_tail {
-            engine.sync_journal_under_journal_mutex()?;
-            return Ok(());
-        }
+    #[cfg(any(test, feature = "test-hooks"))]
+    super::test_accessors::us026_fail_if_armed(
+        &engine.shared,
+        super::test_accessors::Us026PostRegisterFailpoint::Flush,
+    )?;
+    engine.shared.handle.flush()?;
+    if engine.shared.handle.has_dirty_pages()? {
+        requires_logical_tail = true;
     }
-    let checkpointed_journal = engine.shared.handle.emergency_checkpoint()?;
-    let truncated_logical_tail = if checkpointed_journal {
-        false
-    } else {
-        engine.shared.handle.truncate_checkpointed_journal_tail()?
-    };
-    if !checkpointed_journal && !truncated_logical_tail {
-        engine.shared.handle.advance_page_lifetime_checkpoint()?;
+    if requires_logical_tail {
+        engine
+            .shared
+            .handle
+            .sync_journal_ready_prefix()
+            .map_err(|error| engine.poison_after_log_manager_failure(error))?;
+        return Ok(());
     }
+    #[cfg(any(test, feature = "test-hooks"))]
+    super::test_accessors::phase8_checkpoint_abort_if_armed(
+        super::test_accessors::Phase8CheckpointFailpoint::AfterMaterializationFlushBeforeBoundary,
+    );
+    let checkpoint_applied_lsn = checkpoint_applied_lsn.ok_or_else(|| {
+        Error::Internal("checkpoint boundary requested without an applied LSN".into())
+    })?;
+    engine.shared.handle.allocator().update_header(|header| {
+        header.last_checkpoint_ts = header.last_checkpoint_ts.max(checkpoint_ts);
+        header.checkpoint_applied_lsn = checkpoint_applied_lsn;
+    })?;
+    engine.shared.handle.flush()?;
+    engine.shared.handle.sync_main_file()?;
+    let header = engine.shared.handle.allocator().with_header(Clone::clone)?;
+    let payload = CheckpointBoundaryPayload {
+        checkpoint_applied_lsn: header.checkpoint_applied_lsn,
+        header,
+    }
+    .encode()?;
+    let draft = LogRecordDraft::checkpoint_boundary(0, checkpoint_ts, payload);
+    let reserved = engine.shared.handle.reserve_log_record(draft)?;
+    let boundary_end_lsn = reserved.end_lsn();
+    let written_end_lsn = reserved
+        .write_and_mark()
+        .map_err(|error| engine.poison_after_log_manager_failure(error))?;
+    debug_assert_eq!(written_end_lsn, boundary_end_lsn);
+    engine
+        .shared
+        .handle
+        .wait_journal_durable(boundary_end_lsn)
+        .map_err(|error| engine.poison_after_log_manager_failure(error))?;
+    engine.shared.handle.advance_page_lifetime_checkpoint()?;
     Ok(())
 }
 
@@ -573,9 +634,17 @@ pub(super) fn close(engine: &super::PagedEngine) -> crate::error::Result<()> {
               this helper backs the explicit StorageEngine journal_sync surface"
 )]
 pub(super) fn journal_sync(engine: &super::PagedEngine) -> crate::error::Result<()> {
-    let _journal = engine.lock_journal_mutex();
-    engine.flush_under_journal_mutex()?;
-    engine.sync_journal_under_journal_mutex()
+    engine
+        .shared
+        .handle
+        .sync_journal_ready_prefix()
+        .map_err(|error| engine.poison_after_log_manager_failure(error))?;
+    let durable_lsn = engine.shared.handle.current_journal_durable_lsn()?;
+    engine.shared.handle.set_main_file_flush_lsn(durable_lsn);
+    engine
+        .shared
+        .handle
+        .stamp_unflushable_dirty_pages_lsn(durable_lsn)
 }
 
 pub(super) fn snapshot_bytes(

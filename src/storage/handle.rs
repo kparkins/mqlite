@@ -37,10 +37,10 @@ use std::fs::File;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::journal::log_file::{JournalPageSize, PageId};
+use crate::journal::log_file::{JournalPageSize, LogRecordDraft, PageId};
 use crate::journal::{
     CheckpointBatchCursor, CheckpointBatchId, CheckpointFlushSet, CheckpointPoolKind,
-    JournalManager,
+    JournalManager, LogManager, ReservedLogRecord,
 };
 use crate::mvcc::read_view::ReadViewRegistry;
 use crate::storage::allocator::AllocatorHandle;
@@ -236,6 +236,7 @@ impl BufferPoolHandle {
             "BufferPoolHandle::fetch_page entered from within HistoryStore body \
              — non-recursion invariant violated"
         );
+        self.refresh_main_file_flush_lsn()?;
         self.pool
             .pin_with_reconcile(page_number, size, &self.read_view_registry, &self.allocator)
     }
@@ -255,6 +256,7 @@ impl BufferPoolHandle {
     /// Callers should immediately pin the returned page via `fetch_page` to
     /// write their content before the next eviction sweep.
     pub(crate) fn alloc_page(&self, size: PageSize) -> Result<u32> {
+        self.refresh_main_file_flush_lsn()?;
         let page_no = match size {
             PageSize::Small4k => self.allocator.alloc_4k(&self.pool_io)?,
             PageSize::Large32k => self.allocator.alloc_32k(&self.pool_io)?,
@@ -312,6 +314,7 @@ impl BufferPoolHandle {
     /// free-list head (via the buffer pool) and the frame is marked dirty so
     /// the free-list link is persisted on the next flush.
     pub(crate) fn free_page(&self, page_number: u32, size: PageSize) -> Result<()> {
+        self.refresh_main_file_flush_lsn()?;
         match size {
             PageSize::Small4k => self.allocator.free_4k(page_number, &self.pool_io),
             PageSize::Large32k => self.allocator.free_32k(page_number, &self.pool_io),
@@ -333,98 +336,60 @@ impl BufferPoolHandle {
     pub(crate) fn flush(&self) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
         crate::journal::append_sync_test_probe::record_handle_flush();
+        let durable_lsn = self.journal_durable_lsn()?;
+        let Some(durable_lsn) = durable_lsn else {
+            return self.flush_journal_less_test_handle();
+        };
+        self.pool.set_main_file_flush_lsn(durable_lsn);
+        self.history_pool.set_main_file_flush_lsn(durable_lsn);
         // Pass 1 — flush dirty data pages.
-        self.pool.flush()?;
-        self.history_pool.flush()?;
+        self.pool.flush_lsn_fenced(durable_lsn)?;
+        self.history_pool.flush_lsn_fenced(durable_lsn)?;
         // Persist the updated header (page 0) if any allocs / frees changed it.
         self.allocator.flush_header(&self.pool_io)?;
+        self.stamp_unflushable_dirty_pages_lsn(durable_lsn)?;
         // Pass 2 — flush the header page that flush_header may have dirtied.
+        self.pool.flush_lsn_fenced(durable_lsn)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn flush_journal_less_test_handle(&self) -> Result<()> {
+        debug_assert!(
+            self.journal_main_file.is_none(),
+            "journal-less test handles must not carry production main-file checkpoint I/O"
+        );
+        self.pool.flush()?;
+        self.history_pool.flush()?;
+        self.allocator.flush_header(&self.pool_io)?;
         self.pool.flush()
     }
 
-    // -----------------------------------------------------------------------
-    // Journal transaction primitives
-    // -----------------------------------------------------------------------
-
-    /// Snapshot the journal write cursor as the begin-of-transaction mark.
-    ///
-    /// Returns `Some(cursor)` when a journal is attached, `None` for journal-less
-    /// handles (in-memory / test).  The returned value must be passed to
-    /// [`rollback_txn`](Self::rollback_txn) on failure.
-    pub(crate) fn begin_txn(&self) -> Result<Option<u64>> {
-        let Some(journal) = &self.journal else {
-            return Ok(None);
-        };
-        let guard = journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        Ok(Some(guard.write_cursor()))
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn flush_journal_less_test_handle(&self) -> Result<()> {
+        Err(Error::Internal(
+            "journal-less main-file flush is not a production durability boundary".into(),
+        ))
     }
 
-    /// Roll back a transaction by truncating the journal and discarding dirty
-    /// buffer pool frames.
-    ///
-    /// `mark` is the cursor value returned by the paired [`begin_txn`](Self::begin_txn)
-    /// call.  When `mark` is `None` (no journal attached), only dirty frames are
-    /// dropped from the pool.
-    pub(crate) fn rollback_txn(&self, mark: Option<u64>) -> Result<()> {
-        if let (Some(mark), Some(journal)) = (mark, &self.journal) {
-            let mut guard = journal
-                .lock()
-                .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-            guard.truncate_to(mark)?;
-        }
-        self.pool.drop_all_dirty()
+    /// Return whether any resident frame still has unflushed dirty bytes.
+    pub(crate) fn has_dirty_pages(&self) -> Result<bool> {
+        Ok(!self.pool.dirty_page_ids()?.is_empty()
+            || !self.history_pool.dirty_page_ids()?.is_empty())
     }
 
-    /// Checkpoint legacy page-frame journal entries using the stored main file.
-    ///
-    /// Returns `Ok(false)` when no journal is attached or the attached journal
-    /// has only logical/checkpoint-owned records that this path must preserve.
-    pub(crate) fn emergency_checkpoint(&self) -> Result<bool> {
-        if !self.has_legacy_page_frames_to_checkpoint()? {
-            return Ok(false);
-        }
+    /// Fsync the main database file after checkpoint has written a stable
+    /// materialized frontier.
+    pub(crate) fn sync_main_file(&self) -> Result<()> {
         let Some(file_mutex) = self.journal_main_file.as_ref() else {
-            return Ok(false);
+            return Ok(());
         };
-        let mut guard = file_mutex
+        let file_guard = file_mutex
             .lock()
             .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
-        self.checkpoint_through_journal(&mut guard)?;
-        Ok(true)
-    }
-
-    /// Truncate a journal whose logical contents were fully materialized by
-    /// checkpoint.
-    ///
-    /// This path does not inspect or replay retired page-frame records. The
-    /// caller must have already flushed the materialized main file and proven no
-    /// logical tail is still required.
-    pub(crate) fn truncate_checkpointed_journal_tail(&self) -> Result<bool> {
-        if self.journal.is_none() {
-            return Ok(false);
-        }
-        let Some(file_mutex) = self.journal_main_file.as_ref() else {
-            return Ok(false);
-        };
-        let mut guard = file_mutex
-            .lock()
-            .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
-        self.checkpoint_through_journal(&mut guard)?;
-        Ok(true)
-    }
-
-    /// Return true when the attached journal can be drained by the legacy
-    /// page-frame checkpoint path.
-    pub(crate) fn has_legacy_page_frames_to_checkpoint(&self) -> Result<bool> {
-        let Some(journal) = &self.journal else {
-            return Ok(false);
-        };
-        let guard = journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        Ok(guard.has_legacy_page_frames_to_checkpoint())
+        file_guard.sync_data().map_err(Error::Io)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::journal::append_sync_test_probe::record_main_file_sync();
+        Ok(())
     }
 
     /// Copy the post-boundary checkpoint batch into the main file.
@@ -464,34 +429,6 @@ impl BufferPoolHandle {
             .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
         journal_guard
             .emergency_checkpoint_after_boundary(&mut file_guard, expected_total_page_count)
-    }
-
-    /// Checkpoint all journal frames into `main_file` and reset the journal.
-    ///
-    /// Reads the current [`FileHeader`] from the allocator, passes it to
-    /// [`JournalManager::checkpoint`] (which may update `total_page_count`), then
-    /// writes the updated count back into the allocator header.
-    ///
-    /// No-op when no journal is attached.
-    pub(crate) fn checkpoint_through_journal(&self, main_file: &mut File) -> Result<()> {
-        match &self.journal {
-            None => Ok(()),
-            Some(journal) => {
-                let mut header = self.allocator.with_header(|h| h.clone())?;
-                let mut guard = journal
-                    .lock()
-                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                guard.checkpoint(main_file, &mut header)?;
-                drop(guard);
-                // Propagate total_page_count update back into the allocator.
-                let new_count = header.total_page_count;
-                self.allocator.update_header(|h| {
-                    h.total_page_count = new_count;
-                })?;
-                self.advance_page_lifetime_checkpoint()?;
-                Ok(())
-            }
-        }
     }
 
     /// Advance the page-lifetime checkpoint fence and drain newly eligible pages.
@@ -559,6 +496,17 @@ impl BufferPoolHandle {
         Ok(guard.recovered_max_commit_ts())
     }
 
+    /// Highest non-control Phase 8 `publish_seq` accepted during recovery.
+    pub(crate) fn recovered_max_publish_seq(&self) -> Result<Option<u64>> {
+        let Some(journal) = &self.journal else {
+            return Ok(None);
+        };
+        let guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        Ok(guard.recovered_max_publish_seq())
+    }
+
     /// Return the batch id that the next checkpoint flush should carry.
     #[allow(
         dead_code,
@@ -598,14 +546,17 @@ impl BufferPoolHandle {
                 "checkpoint flush requires an attached journal".into(),
             ));
         };
+        let checkpoint_applied_lsn = self.journal_durable_lsn()?.unwrap_or(u64::MAX);
         self.validate_checkpoint_flush_set(&checkpoint_flush_set)?;
         let main_frames = self.pool.checkpoint_dirty_frame_snapshots(
             checkpoint_flush_set.main_pages(),
             checkpoint_flush_set.excluded_future_dirty_pages(),
+            checkpoint_applied_lsn,
         )?;
         let history_frames = self.history_pool.checkpoint_dirty_frame_snapshots(
             checkpoint_flush_set.history_pages(),
             &BTreeSet::new(),
+            checkpoint_applied_lsn,
         )?;
 
         let mut guard = journal
@@ -690,10 +641,136 @@ impl BufferPoolHandle {
         let guard = journal
             .lock()
             .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        guard.sync_journal()?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::journal::append_sync_test_probe::record_handle_journal_sync();
+        guard.sync_journal()
+    }
+
+    fn journal_log_manager(&self) -> Result<Option<Arc<LogManager>>> {
+        let Some(journal) = &self.journal else {
+            return Ok(None);
+        };
+        let guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        Ok(Some(guard.log_manager()))
+    }
+
+    /// Reserve and finalize a Phase 8 log record for later positioned write.
+    pub(crate) fn reserve_log_record(&self, draft: LogRecordDraft) -> Result<ReservedLogRecord> {
+        let Some(journal) = &self.journal else {
+            return Ok(ReservedLogRecord::journalless(draft.finalize(0)?));
+        };
+        let mut guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        guard.reserve_log_record(draft)
+    }
+
+    fn journal_durable_lsn(&self) -> Result<Option<u64>> {
+        let Some(log_manager) = self.journal_log_manager()? else {
+            return Ok(None);
+        };
+        Ok(Some(log_manager.durable_lsn()))
+    }
+
+    /// Return the current durable LSN, or `u64::MAX` for journal-less handles.
+    pub(crate) fn current_journal_durable_lsn(&self) -> Result<u64> {
+        Ok(self.journal_durable_lsn()?.unwrap_or(u64::MAX))
+    }
+
+    fn refresh_main_file_flush_lsn(&self) -> Result<()> {
+        let durable_lsn = self.journal_durable_lsn()?.unwrap_or(u64::MAX);
+        self.set_main_file_flush_lsn(durable_lsn);
         Ok(())
+    }
+
+    /// Update the durable LSN fence used by buffer-pool eviction and flush.
+    pub(crate) fn set_main_file_flush_lsn(&self, durable_lsn: u64) {
+        self.pool.set_main_file_flush_lsn(durable_lsn);
+        self.history_pool.set_main_file_flush_lsn(durable_lsn);
+    }
+
+    /// Return the current contiguous ready journal frontier.
+    #[allow(dead_code)]
+    pub(crate) fn journal_ready_lsn(&self) -> Result<u64> {
+        let Some(log_manager) = self.journal_log_manager()? else {
+            return Ok(0);
+        };
+        Ok(log_manager.ready_lsn())
+    }
+
+    /// Return `(next_lsn, ready_lsn, durable_lsn)` for Phase 8 tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
+        let Some(log_manager) = self.journal_log_manager()? else {
+            return Ok((0, 0, 0));
+        };
+        Ok((
+            log_manager.next_lsn(),
+            log_manager.ready_lsn(),
+            log_manager.durable_lsn(),
+        ))
+    }
+
+    /// Wait until the journal write prefix covers `end_lsn`.
+    pub(crate) fn wait_journal_ready(&self, end_lsn: u64) -> Result<()> {
+        let Some(log_manager) = self.journal_log_manager()? else {
+            return Ok(());
+        };
+        log_manager.wait_ready(end_lsn)
+    }
+
+    /// Wait until the journal durable frontier covers `end_lsn`.
+    pub(crate) fn wait_journal_durable(&self, end_lsn: u64) -> Result<()> {
+        let Some(log_manager) = self.journal_log_manager()? else {
+            return Ok(());
+        };
+        log_manager.wait_durable(end_lsn)
+    }
+
+    /// Sync the currently ready journal prefix.
+    pub(crate) fn sync_journal_ready_prefix(&self) -> Result<()> {
+        let Some(log_manager) = self.journal_log_manager()? else {
+            return Ok(());
+        };
+        log_manager.ensure_sync(log_manager.ready_lsn())
+    }
+
+    /// Stamp resident dirty pages with the commit record end LSN.
+    pub(crate) fn stamp_dirty_pages_lsn(&self, pages: &[u32], last_lsn: u64) -> Result<()> {
+        self.pool.stamp_dirty_pages_lsn(pages, last_lsn)
+    }
+
+    /// Stamp resident dirty pages in both main and history pools.
+    pub(crate) fn stamp_dirty_pages_lsn_all_pools(
+        &self,
+        pages: &[u32],
+        last_lsn: u64,
+    ) -> Result<()> {
+        self.pool.stamp_dirty_pages_lsn(pages, last_lsn)?;
+        self.history_pool.stamp_dirty_pages_lsn(pages, last_lsn)
+    }
+
+    /// Snapshot dirty resident frames in both main and history pools.
+    pub(crate) fn dirty_frame_snapshots_for_pages(
+        &self,
+        pages: &BTreeSet<PageId>,
+    ) -> Result<Vec<(u32, PageSize, Vec<u8>)>> {
+        let mut frames = self.pool.dirty_frame_snapshots_for_pages(pages)?;
+        frames.extend(self.history_pool.dirty_frame_snapshots_for_pages(pages)?);
+        frames.sort_by_key(|(page, size, _data)| {
+            let size_order = match size {
+                PageSize::Small4k => 0u8,
+                PageSize::Large32k => 1u8,
+            };
+            (*page, size_order)
+        });
+        Ok(frames)
+    }
+
+    /// Stamp unflushable resident dirty bytes after an explicit log sync.
+    pub(crate) fn stamp_unflushable_dirty_pages_lsn(&self, last_lsn: u64) -> Result<()> {
+        self.pool.stamp_unflushable_dirty_lsn(last_lsn)?;
+        self.history_pool.stamp_unflushable_dirty_lsn(last_lsn)
     }
 
     /// Fsync the logical-transaction journal tail after appending a
@@ -707,16 +784,10 @@ impl BufferPoolHandle {
         self.journal_sync()
     }
 
-    /// Append an MVCC `ChainCommit` frame (Format Lock §A.2).
-    ///
-    /// `commit_ts` is the transaction's commit timestamp from the
-    /// [`TimestampOracle`](crate::mvcc::timestamp::TimestampOracle).
-    /// `refcount_deltas` carries overflow-chain refcount adjustments;
-    /// `page_writes` carries any durable page-writes this commit installs.
-    ///
-    /// Returns the byte offset at which the frame was written. No-op
-    /// (returns `Ok(0)`) on journal-less handles.
-    pub(crate) fn append_chain_commit(
+    /// Append an MVCC `ChainCommit` frame and return its exclusive end LSN.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn append_chain_commit_end_lsn(
+        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
         &self,
         commit_ts: crate::mvcc::timestamp::Ts,
         refcount_deltas: Vec<(u32, i32)>,
@@ -728,9 +799,10 @@ impl BufferPoolHandle {
                 let mut guard = journal
                     .lock()
                     .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                let offset = guard.append_chain_commit(commit_ts, refcount_deltas, page_writes)?;
+                let end_lsn =
+                    guard.append_chain_commit_end_lsn(commit_ts, refcount_deltas, page_writes)?;
                 crate::mvcc::metrics::record_journal_chain_commit_frame();
-                Ok(offset)
+                Ok(end_lsn)
             }
         }
     }
@@ -742,7 +814,9 @@ impl BufferPoolHandle {
     ///
     /// Returns the byte offset at which the frame was written. No-op
     /// (returns `Ok(0)`) on journal-less handles.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn append_logical_txn(
+        // allow-phase8-legacy-audit: test-only retired logical append probe
         &self,
         frame: crate::journal::log_file::LogicalTxnFrame,
     ) -> Result<u64> {

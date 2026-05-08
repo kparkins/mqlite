@@ -353,16 +353,16 @@ fn bootstrap_race_new_namespace() {
 }
 
 // ---------------------------------------------------------------------------
-// TC6: journal_mutex serialization under churn
+// TC6: durable write serialization under churn
 // ---------------------------------------------------------------------------
 
 /// 8 threads each insert 50 docs into DIFFERENT namespaces concurrently.
-/// After join: every namespace has exactly 50 docs — a broken journal_mutex envelope
+/// After join: every namespace has exactly 50 docs — a broken durable-write envelope
 /// would manifest as lost writes or corrupt scan state.
 #[test]
-fn journal_mutex_serialization_under_churn() {
+fn durable_write_serialization_under_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("journal_mutex.mqlite");
+    let path = dir.path().join("durable_write_serialization.mqlite");
     let client = Client::open(&path).unwrap();
 
     const THREADS: usize = 8;
@@ -411,7 +411,7 @@ fn journal_mutex_serialization_under_churn() {
                 .unwrap();
             assert!(
                 doc.is_some(),
-                "ns{t}: _id={id} missing after concurrent inserts (journal_mutex corruption?)"
+                "ns{t}: _id={id} missing after concurrent inserts"
             );
         }
     }

@@ -113,6 +113,7 @@ fn synthetic_uncheckpointed_ts(header: &crate::storage::header::FileHeader, requ
 }
 
 fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
+    use crate::journal::log_file::{ChainCommitFrame, LogRecordDraft};
     use crate::journal::JournalManager;
     use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
     use std::fs::OpenOptions;
@@ -133,13 +134,30 @@ fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
         .expect("open journal manager");
     let (salt1, salt2) = mgr.salts();
     let commit_ts = synthetic_uncheckpointed_ts(&header, commit_ts);
+    let publish_seq = mgr.recovered_max_publish_seq().unwrap_or(0) + 1;
     let mut frame = frame_primary_insert(commit_ts, ns_id);
     frame.salt1 = salt1;
     frame.salt2 = salt2;
-
-    mgr.append_logical_txn(frame).expect("append logical");
-    mgr.append_chain_commit(commit_ts, vec![], vec![])
-        .expect("append chain commit");
+    let logical = frame.encode().expect("encode logical");
+    let chain = ChainCommitFrame {
+        salt1,
+        salt2,
+        commit_ts,
+        refcount_deltas: vec![],
+        page_writes: vec![],
+    }
+    .encode()
+    .expect("encode chain");
+    let record = mgr
+        .reserve_log_record(LogRecordDraft::crud(
+            ns_id as u64,
+            publish_seq,
+            commit_ts,
+            logical,
+            chain,
+        ))
+        .expect("reserve phase8 crud");
+    record.write_and_mark().expect("write phase8 crud");
     mgr.sync_journal().expect("sync journal");
 }
 

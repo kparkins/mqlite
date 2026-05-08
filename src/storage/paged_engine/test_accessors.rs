@@ -13,13 +13,11 @@
 //! visible at a glance. Matches the Phase 0 convention of keeping
 //! test helpers out of the primary code path.
 
-#[cfg(any(test, feature = "test-hooks"))]
-use std::cell::Cell;
 #[cfg(test)]
 use std::sync::Barrier;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc,
 };
@@ -45,167 +43,35 @@ use crate::storage::reconcile::plan::{DirtyReason, TreeIdent, TreeKind};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::secondary_index::build_index_keys;
 #[cfg(any(test, feature = "test-hooks"))]
+static PHASE3_COMMIT_FAILPOINT: AtomicU8 = AtomicU8::new(0);
 #[cfg(any(test, feature = "test-hooks"))]
-static PHASE3_COMMIT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[cfg(any(test, feature = "test-hooks"))]
-static US007_GUARDED_FLUSHES: AtomicU64 = AtomicU64::new(0);
-#[cfg(any(test, feature = "test-hooks"))]
-static US007_UNGUARDED_FLUSHES: AtomicU64 = AtomicU64::new(0);
-#[cfg(any(test, feature = "test-hooks"))]
-static US007_GUARDED_SYNCS: AtomicU64 = AtomicU64::new(0);
-#[cfg(any(test, feature = "test-hooks"))]
-static US007_UNGUARDED_SYNCS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(any(test, feature = "test-hooks"))]
-std::thread_local! {
-    static US007_JOURNAL_MUTEX_DEPTH: Cell<u32> = const { Cell::new(0) };
-}
+static PHASE8_CHECKPOINT_FAILPOINT: AtomicU8 = AtomicU8::new(0);
 
 /// US-026 post-register cleanup failpoints.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[doc(hidden)]
 pub enum Us026PostRegisterFailpoint {
-    /// Fail before `begin_txn` creates a rollback mark.
-    BeginTxnAfterRegister,
-    /// Fail the logical transaction frame append.
-    EmitLogicalTxnFrame,
-    /// Fail the ChainCommit append.
-    ChainCommitAppend,
-    /// Fail while reading the commit header before legacy `commit_txn`.
-    CommitHeaderRead,
-    /// Fail the legacy `commit_txn` call.
-    LegacyCommitTxn,
+    /// Fail after Pending install and before log reservation.
+    BeforeLogReservation,
     /// Fail the final pre-durable flush.
     Flush,
-    /// Fail after structural batch commit and force rollback to report
-    /// an error after performing the rollback work.
-    RollbackTxnAfterStructuralCommit,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Us026PostRegisterFailpoint {
     fn slot(self) -> u8 {
         match self {
-            Self::BeginTxnAfterRegister => 1,
-            Self::EmitLogicalTxnFrame => 2,
-            Self::ChainCommitAppend => 3,
-            Self::CommitHeaderRead => 4,
-            Self::LegacyCommitTxn => 5,
-            Self::Flush => 6,
-            Self::RollbackTxnAfterStructuralCommit => 7,
+            Self::BeforeLogReservation => 1,
+            Self::Flush => 2,
         }
     }
 
     fn message(self) -> &'static str {
         match self {
-            Self::BeginTxnAfterRegister => "US-026 injected begin_txn failure",
-            Self::EmitLogicalTxnFrame => "US-026 injected logical frame append failure",
-            Self::ChainCommitAppend => "US-026 injected ChainCommit append failure",
-            Self::CommitHeaderRead => "US-026 injected commit header read failure",
-            Self::LegacyCommitTxn => "US-026 injected legacy commit_txn failure",
+            Self::BeforeLogReservation => "US-026 injected pre-reservation failure",
             Self::Flush => "US-026 injected flush failure",
-            Self::RollbackTxnAfterStructuralCommit => {
-                "US-026 injected failure after structural commit"
-            }
         }
-    }
-
-    fn forces_rollback_failure(self) -> bool {
-        matches!(self, Self::RollbackTxnAfterStructuralCommit)
-    }
-}
-
-/// US-026 cleanup observations.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[doc(hidden)]
-pub struct Us026CleanupObservations {
-    /// Number of cleanup helper rollback attempts.
-    pub rollback_attempts: u64,
-    /// Number of test-forced rollback failure returns.
-    pub forced_rollback_failures: u64,
-}
-
-/// Snapshot of US-007 journal-envelope observations.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[doc(hidden)]
-pub struct Us007JournalObservations {
-    /// Number of data flushes observed while this thread held `journal_mutex`.
-    pub guarded_flushes: u64,
-    /// Number of data flushes observed without the current thread holding
-    /// `journal_mutex`.
-    pub unguarded_flushes: u64,
-    /// Number of explicit journal syncs observed while this thread held
-    /// `journal_mutex`.
-    pub guarded_syncs: u64,
-    /// Number of explicit journal syncs observed without the current thread
-    /// holding `journal_mutex`.
-    pub unguarded_syncs: u64,
-}
-
-/// Test-only scope guard paired with the production `journal_mutex` guard.
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-pub(crate) struct Us007JournalMutexScopeGuard;
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl Drop for Us007JournalMutexScopeGuard {
-    fn drop(&mut self) {
-        US007_JOURNAL_MUTEX_DEPTH.with(|depth| {
-            let current = depth.get();
-            debug_assert!(current > 0, "US-007 journal depth underflow");
-            depth.set(current.saturating_sub(1));
-        });
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn us007_enter_journal_mutex_scope() -> Us007JournalMutexScopeGuard {
-    US007_JOURNAL_MUTEX_DEPTH.with(|depth| depth.set(depth.get() + 1));
-    Us007JournalMutexScopeGuard
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn us007_current_thread_holds_journal_mutex() -> bool {
-    US007_JOURNAL_MUTEX_DEPTH.with(|depth| depth.get() > 0)
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn us007_record_flush() {
-    if us007_current_thread_holds_journal_mutex() {
-        US007_GUARDED_FLUSHES.fetch_add(1, Ordering::AcqRel);
-    } else {
-        US007_UNGUARDED_FLUSHES.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn us007_record_sync() {
-    if us007_current_thread_holds_journal_mutex() {
-        US007_GUARDED_SYNCS.fetch_add(1, Ordering::AcqRel);
-    } else {
-        US007_UNGUARDED_SYNCS.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn us007_reset_journal_observations() {
-    US007_GUARDED_FLUSHES.store(0, Ordering::Release);
-    US007_UNGUARDED_FLUSHES.store(0, Ordering::Release);
-    US007_GUARDED_SYNCS.store(0, Ordering::Release);
-    US007_UNGUARDED_SYNCS.store(0, Ordering::Release);
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn us007_journal_observations() -> Us007JournalObservations {
-    Us007JournalObservations {
-        guarded_flushes: US007_GUARDED_FLUSHES.load(Ordering::Acquire),
-        unguarded_flushes: US007_UNGUARDED_FLUSHES.load(Ordering::Acquire),
-        guarded_syncs: US007_GUARDED_SYNCS.load(Ordering::Acquire),
-        unguarded_syncs: US007_UNGUARDED_SYNCS.load(Ordering::Acquire),
     }
 }
 
@@ -217,16 +83,6 @@ pub(crate) fn us026_arm_post_register_failpoint(
     shared
         .us026_post_register_failpoint
         .store(failpoint.slot(), Ordering::Release);
-    shared.us026_force_cleanup_rollback_failure.store(
-        u8::from(failpoint.forces_rollback_failure()),
-        Ordering::Release,
-    );
-    shared
-        .us026_cleanup_rollback_attempts
-        .store(0, Ordering::Release);
-    shared
-        .us026_forced_rollback_failures
-        .store(0, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -245,90 +101,179 @@ pub(crate) fn us026_fail_if_armed(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn us026_note_cleanup_rollback_attempt(shared: &SharedState) {
+pub(crate) fn phase8_arm_dirty_lsn_stamp_failure(shared: &SharedState) {
     shared
-        .us026_cleanup_rollback_attempts
-        .fetch_add(1, Ordering::AcqRel);
+        .phase8_fail_next_dirty_lsn_stamp
+        .store(1, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn us026_maybe_force_cleanup_rollback_failure(
-    shared: &SharedState,
-    result: Result<()>,
-) -> Result<()> {
+pub(crate) fn phase8_fail_dirty_lsn_stamp_if_armed(shared: &SharedState) -> Result<()> {
     if shared
-        .us026_force_cleanup_rollback_failure
+        .phase8_fail_next_dirty_lsn_stamp
         .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        shared
-            .us026_forced_rollback_failures
-            .fetch_add(1, Ordering::AcqRel);
         return Err(Error::Internal(
-            "US-026 injected rollback_txn failure".into(),
+            "Phase 8 injected stamp_dirty_pages_lsn failure".into(),
         ));
     }
-    result
+    Ok(())
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn us026_cleanup_observations(shared: &SharedState) -> Us026CleanupObservations {
-    Us026CleanupObservations {
-        rollback_attempts: shared
-            .us026_cleanup_rollback_attempts
-            .load(Ordering::Acquire),
-        forced_rollback_failures: shared
-            .us026_forced_rollback_failures
-            .load(Ordering::Acquire),
+pub(crate) fn phase8_arm_after_dirty_lsn_stamp_failure(shared: &SharedState) {
+    shared
+        .phase8_fail_next_after_dirty_lsn_stamp
+        .store(1, Ordering::Release);
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn phase8_fail_after_dirty_lsn_stamp_if_armed(shared: &SharedState) -> Result<()> {
+    if shared
+        .phase8_fail_next_after_dirty_lsn_stamp
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return Err(Error::Internal(
+            "Phase 8 injected after dirty LSN stamp before write failure".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn phase8_arm_after_durable_before_flip_failure(shared: &SharedState) {
+    shared
+        .phase8_fail_next_after_durable_before_flip
+        .store(1, Ordering::Release);
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn phase8_fail_after_durable_before_flip_if_armed(shared: &SharedState) -> Result<()> {
+    if shared
+        .phase8_fail_next_after_durable_before_flip
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return Err(Error::Internal(
+            "Phase 8 injected after durable sync before Pending flip failure".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Pending test-only hook consumed after Pending install and before
+/// reservation.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) struct Phase8BeforeReservationHook {
+    entered_tx: Sender<()>,
+    release_rx: Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Phase8BeforeReservationHook {
+    fn fire(self) {
+        if self.entered_tx.send(()).is_ok() {
+            let _ = self.release_rx.recv();
+        }
     }
 }
 
-/// Phase 3 US-021b failpoints at the live commit-envelope boundaries.
+/// RAII guard for the Phase 8 before-reservation pause hook.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub struct Phase8BeforeReservationHookGuard {
+    shared: Arc<SharedState>,
+    entered_rx: Receiver<()>,
+    release_tx: Option<Sender<()>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Phase8BeforeReservationHookGuard {
+    /// Wait until the hooked writer reaches the before-reservation point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::RecvError`] if the writer exits before reaching the hook.
+    pub fn wait_until_entered(&self) -> std::result::Result<(), mpsc::RecvError> {
+        self.entered_rx.recv()
+    }
+
+    /// Release the hooked writer if it is blocked before reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::SendError`] if the writer is no longer waiting.
+    pub fn release(&mut self) -> std::result::Result<(), mpsc::SendError<()>> {
+        if let Some(tx) = self.release_tx.take() {
+            tx.send(())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for Phase8BeforeReservationHookGuard {
+    fn drop(&mut self) {
+        let _ = self.release();
+        if let Ok(mut hook) = self.shared.phase8_before_reservation_hook.lock() {
+            *hook = None;
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn install_phase8_before_reservation_hook(
+    shared: &Arc<SharedState>,
+) -> Phase8BeforeReservationHookGuard {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let hook = Phase8BeforeReservationHook {
+        entered_tx,
+        release_rx,
+    };
+    let mut slot = shared
+        .phase8_before_reservation_hook
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(hook);
+    Phase8BeforeReservationHookGuard {
+        shared: Arc::clone(shared),
+        entered_rx,
+        release_tx: Some(release_tx),
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn phase8_before_reservation_if_installed(shared: &SharedState) {
+    let hook = {
+        let Ok(mut slot) = shared.phase8_before_reservation_hook.lock() else {
+            return;
+        };
+        slot.take()
+    };
+    if let Some(hook) = hook {
+        hook.fire();
+    }
+}
+
+/// Test-hook failpoints around the remaining publish-boundary crash cuts.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase3CommitFailpoint {
-    /// Before appending the `LogicalTxnFrame` at S5/S6.
-    BeforeLogicalTxnAppend,
-    /// After logical append returns and before the explicit S6 fsync.
-    AfterLogicalTxnAppendBeforeFsync,
-    /// After S6 fsync and before the S7 `ChainCommit`.
-    AfterLogicalTxnFsyncBeforeChainCommit,
-    /// After S7 `ChainCommit` and before S8/S9/S11 legacy effects.
-    AfterChainCommitBeforeLegacyCommit,
-    /// After S11 legacy effects and before S12 publish.
+    /// After pending heads flip committed and before publish.
     AfterLegacyCommitBeforePublish,
-    /// During S12 publish, immediately before the `PublishedEpoch` store.
+    /// During publish, immediately before the `PublishedEpoch` store.
     DuringPublishBeforeStore,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Phase3CommitFailpoint {
-    /// Parse the stable environment name used by the self-reexec harness.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "before_logical_txn_append" => Some(Self::BeforeLogicalTxnAppend),
-            "after_logical_txn_append_before_fsync" => Some(Self::AfterLogicalTxnAppendBeforeFsync),
-            "after_logical_txn_fsync_before_chain_commit" => {
-                Some(Self::AfterLogicalTxnFsyncBeforeChainCommit)
-            }
-            "after_chain_commit_before_legacy_commit" => {
-                Some(Self::AfterChainCommitBeforeLegacyCommit)
-            }
-            "after_legacy_commit_before_publish" => Some(Self::AfterLegacyCommitBeforePublish),
-            "during_publish_before_store" => Some(Self::DuringPublishBeforeStore),
-            _ => None,
-        }
-    }
-
     fn slot(self) -> u8 {
         match self {
-            Self::BeforeLogicalTxnAppend => 1,
-            Self::AfterLogicalTxnAppendBeforeFsync => 2,
-            Self::AfterLogicalTxnFsyncBeforeChainCommit => 3,
-            Self::AfterChainCommitBeforeLegacyCommit => 4,
-            Self::AfterLegacyCommitBeforePublish => 5,
-            Self::DuringPublishBeforeStore => 6,
+            Self::AfterLegacyCommitBeforePublish => 1,
+            Self::DuringPublishBeforeStore => 2,
         }
     }
 }
@@ -373,6 +318,68 @@ pub fn arm_phase3_commit_failpoint(
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn phase3_abort_if_armed(failpoint: Phase3CommitFailpoint) {
     if PHASE3_COMMIT_FAILPOINT.load(Ordering::Acquire) == failpoint.slot() {
+        std::process::abort();
+    }
+}
+
+/// Phase 8 checkpoint crash-cut failpoints at durable-boundary edges.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Phase8CheckpointFailpoint {
+    /// After the checkpoint materialization flush and before any
+    /// `checkpoint_applied_lsn` header advance or CheckpointBoundary record.
+    AfterMaterializationFlushBeforeBoundary,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Phase8CheckpointFailpoint {
+    fn slot(self) -> u8 {
+        match self {
+            Self::AfterMaterializationFlushBeforeBoundary => 1,
+        }
+    }
+}
+
+/// RAII guard that clears the armed Phase 8 checkpoint failpoint on drop.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub struct Phase8CheckpointFailpointGuard {
+    slot: u8,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for Phase8CheckpointFailpointGuard {
+    fn drop(&mut self) {
+        let _ = PHASE8_CHECKPOINT_FAILPOINT.compare_exchange(
+            self.slot,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// Arm one exclusive Phase 8 checkpoint failpoint for the current process.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] if another checkpoint failpoint is already armed.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn arm_phase8_checkpoint_failpoint(
+    failpoint: Phase8CheckpointFailpoint,
+) -> Result<Phase8CheckpointFailpointGuard> {
+    let slot = failpoint.slot();
+    PHASE8_CHECKPOINT_FAILPOINT
+        .compare_exchange(0, slot, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| Error::Internal("Phase 8 checkpoint failpoint already armed".into()))?;
+    Ok(Phase8CheckpointFailpointGuard { slot })
+}
+
+/// Abort the process if the requested Phase 8 checkpoint failpoint is armed.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn phase8_checkpoint_abort_if_armed(failpoint: Phase8CheckpointFailpoint) {
+    if PHASE8_CHECKPOINT_FAILPOINT.load(Ordering::Acquire) == failpoint.slot() {
         std::process::abort();
     }
 }
@@ -730,154 +737,6 @@ pub(crate) fn create_index_build_if_installed(
             hooks.remove(&key);
         }
         hook
-    };
-    if let Some(hook) = hook {
-        hook.fire()?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// US-007 journal-begin rendezvous hook.
-// ---------------------------------------------------------------------------
-
-/// Pending test-only hook consumed immediately after `begin_txn` while
-/// `journal_mutex` is still held.
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) struct Us007JournalBeginHook {
-    id: u64,
-    entered_tx: Sender<()>,
-    release_rx: Receiver<()>,
-    fail_after_release: bool,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl Us007JournalBeginHook {
-    fn fire(self) -> Result<()> {
-        if self.entered_tx.send(()).is_ok() {
-            let _ = self.release_rx.recv();
-        }
-        if self.fail_after_release {
-            return Err(Error::Internal(
-                "US-007 injected rollback after begin_txn".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// RAII guard for a US-007 journal-begin rendezvous hook.
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-pub struct Us007JournalBeginHookGuard {
-    shared: Arc<SharedState>,
-    id: u64,
-    entered_rx: Receiver<()>,
-    release_tx: Option<Sender<()>>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl Us007JournalBeginHookGuard {
-    /// Wait until the hooked writer reaches `begin_txn` under `journal_mutex`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`mpsc::RecvError`] if the writer exits before reaching the hook.
-    pub fn wait_until_entered(&self) -> std::result::Result<(), mpsc::RecvError> {
-        self.entered_rx.recv()
-    }
-
-    /// Wait with a timeout until the hooked writer reaches `begin_txn`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`mpsc::RecvTimeoutError`] on timeout or disconnect.
-    pub fn wait_until_entered_timeout(
-        &self,
-        timeout: std::time::Duration,
-    ) -> std::result::Result<(), mpsc::RecvTimeoutError> {
-        self.entered_rx.recv_timeout(timeout)
-    }
-
-    /// Return `Ok(())` when this hook has not been reached yet.
-    ///
-    /// # Errors
-    ///
-    /// Returns a static error string if the hook fired or disconnected.
-    pub fn assert_not_entered(&self) -> std::result::Result<(), &'static str> {
-        match self.entered_rx.try_recv() {
-            Ok(()) => Err("US-007 journal-begin hook fired before expected"),
-            Err(TryRecvError::Empty) => Ok(()),
-            Err(TryRecvError::Disconnected) => {
-                Err("US-007 journal-begin hook disconnected before entry")
-            }
-        }
-    }
-
-    /// Release the hooked writer if it is blocked after `begin_txn`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`mpsc::SendError`] if the writer is no longer waiting.
-    pub fn release(&mut self) -> std::result::Result<(), mpsc::SendError<()>> {
-        if let Some(tx) = self.release_tx.take() {
-            tx.send(())?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl Drop for Us007JournalBeginHookGuard {
-    fn drop(&mut self) {
-        let _ = self.release();
-        clear_us007_journal_begin_hook(&self.shared, self.id);
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn clear_us007_journal_begin_hook(shared: &SharedState, id: u64) {
-    let Ok(mut hooks) = shared.us007_journal_begin_hooks.lock() else {
-        return;
-    };
-    hooks.retain(|hook| hook.id != id);
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn install_us007_journal_begin_hook(
-    shared: &Arc<SharedState>,
-    fail_after_release: bool,
-) -> Us007JournalBeginHookGuard {
-    let id = shared
-        .write_body_entry_hook_next_id
-        .fetch_add(1, Ordering::AcqRel);
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    shared
-        .us007_journal_begin_hooks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push_back(Us007JournalBeginHook {
-            id,
-            entered_tx,
-            release_rx,
-            fail_after_release,
-        });
-    Us007JournalBeginHookGuard {
-        shared: Arc::clone(shared),
-        id,
-        entered_rx,
-        release_tx: Some(release_tx),
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn us007_after_begin_if_installed(shared: &SharedState) -> Result<()> {
-    let hook = {
-        let Ok(mut hooks) = shared.us007_journal_begin_hooks.lock() else {
-            return Ok(());
-        };
-        hooks.pop_front()
     };
     if let Some(hook) = hook {
         hook.fire()?;
@@ -1323,8 +1182,30 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us026_cleanup_observations(&self) -> Us026CleanupObservations {
-        us026_cleanup_observations(&self.shared)
+    pub(super) fn test_phase8_journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
+        self.shared.handle.journal_lsn_snapshot()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn test_phase8_fail_next_dirty_lsn_stamp(&self) {
+        phase8_arm_dirty_lsn_stamp_failure(&self.shared);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn test_phase8_fail_next_after_dirty_lsn_stamp(&self) {
+        phase8_arm_after_dirty_lsn_stamp_failure(&self.shared);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn test_phase8_fail_next_after_durable_before_flip(&self) {
+        phase8_arm_after_durable_before_flip_failure(&self.shared);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn test_install_phase8_before_reservation_hook(
+        &self,
+    ) -> Phase8BeforeReservationHookGuard {
+        install_phase8_before_reservation_hook(&self.shared)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1352,24 +1233,6 @@ impl PagedEngine {
         index_name: &str,
     ) -> CreateIndexBuildHookGuard {
         install_create_index_build_hook_with_failure(&self.shared, ns, index_name, true)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us007_install_journal_begin_hook(
-        &self,
-        fail_after_release: bool,
-    ) -> Us007JournalBeginHookGuard {
-        install_us007_journal_begin_hook(&self.shared, fail_after_release)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us007_reset_journal_observations(&self) {
-        us007_reset_journal_observations();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us007_journal_observations(&self) -> Us007JournalObservations {
-        us007_journal_observations()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

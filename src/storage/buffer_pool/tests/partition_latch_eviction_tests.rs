@@ -41,13 +41,13 @@ fn resident_partition() -> Partition {
     let mut partition = Partition::new(TEST_CAPACITY, LARGE_PAGE_BYTES);
 
     partition
-        .pin_page(PAGE_A, &io, PageSize::Large32k)
+        .pin_page(PAGE_A, &io, PageSize::Large32k, u64::MAX)
         .expect("PAGE_A must load into partition");
     partition
         .unpin_page(PAGE_A, false, None)
         .expect("PAGE_A must unpin");
     partition
-        .pin_page(PAGE_B, &io, PageSize::Large32k)
+        .pin_page(PAGE_B, &io, PageSize::Large32k, u64::MAX)
         .expect("PAGE_B must load into partition");
     partition
         .unpin_page(PAGE_B, false, None)
@@ -76,7 +76,7 @@ fn eviction_skips_exclusively_latched_frame() {
     let held = unsafe { &*latch }.lock_exclusive();
 
     let victim = partition
-        .find_victim()
+        .find_victim(u64::MAX)
         .expect("fallback frame must remain evictable");
 
     assert_eq!(
@@ -130,7 +130,7 @@ fn eviction_exclusive_latch_probe_is_guardless_source_audit() {
         panic!("cannot read {}: {e}", partition_path.display());
     });
     let victim_start = partition_body
-        .find("fn find_victim(&mut self)")
+        .find("fn find_victim(&mut self, durable_lsn: u64)")
         .expect("Partition::find_victim must exist");
     let victim_slice = &partition_body[victim_start..victim_start.saturating_add(2048)];
 

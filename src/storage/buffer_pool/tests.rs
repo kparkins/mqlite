@@ -1,8 +1,9 @@
 use super::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::error::PoolExhaustedReason;
+use crate::journal::log_file::PageId;
 
 // -----------------------------------------------------------------------
 // Mock I/O backend
@@ -289,6 +290,7 @@ fn flush_writes_both_partitions() {
 
 #[test]
 fn eviction_writes_dirty_victim_before_loading_new_page() {
+    const FLUSHABLE_LSN: u64 = 9;
     // Create a pool with only 1 frame in the 32 KB partition
     let io = MockIo::new();
     let mut seed = vec![0u8; PageSize::Large32k.bytes()];
@@ -305,6 +307,7 @@ fn eviction_writes_dirty_victim_before_loading_new_page() {
         page.data_mut()[0] = 0xBB; // dirty
     }
     // pin_count back to 0; dirty=true
+    pool.stamp_dirty_pages_lsn(&[1], FLUSHABLE_LSN).unwrap();
 
     // Pin page 2 — triggers eviction of page 1 (dirty → written to disk)
     let _page2 = pool.pin(2, PageSize::Large32k).unwrap();
@@ -315,6 +318,114 @@ fn eviction_writes_dirty_victim_before_loading_new_page() {
     );
     let written = io.read_back(1).unwrap();
     assert_eq!(written[0], 0xBB);
+}
+
+#[test]
+fn eviction_skips_unflushable_dirty_victim_without_writing() {
+    let io = MockIo::new();
+    let pool = make_pool_with(PageSize::Large32k.bytes(), Arc::clone(&io));
+
+    {
+        let mut page = pool.pin(1, PageSize::Large32k).unwrap();
+        page.data_mut()[0] = 0xCC;
+    }
+
+    match pool.pin(2, PageSize::Large32k) {
+        Ok(_) => panic!("unflushable dirty page must not be evicted"),
+        Err(Error::PoolExhausted {
+            reason: PoolExhaustedReason::AllFramesPinned,
+        }) => {}
+        Err(err) => panic!("expected pool exhaustion from unflushable victim, got {err:?}"),
+    }
+    assert_eq!(io.write_count(), 0);
+    assert!(
+        io.read_back(1).is_none(),
+        "unflushable page bytes must not reach the backing I/O"
+    );
+}
+
+#[test]
+fn flush_lsn_fenced_skips_dirty_page_above_durable_lsn() {
+    const PAGE_LAST_LSN: u64 = 30;
+    const BELOW_PAGE_LSN: u64 = PAGE_LAST_LSN - 1;
+
+    let io = MockIo::new();
+    let pool = make_pool_with(PageSize::Large32k.bytes(), Arc::clone(&io));
+
+    {
+        let mut page = pool.pin(1, PageSize::Large32k).unwrap();
+        page.data_mut()[0] = 0xDD;
+    }
+    pool.stamp_dirty_pages_lsn(&[1], PAGE_LAST_LSN).unwrap();
+
+    pool.flush_lsn_fenced(BELOW_PAGE_LSN).unwrap();
+    assert_eq!(
+        io.write_count(),
+        0,
+        "page above the durable frontier must be skipped"
+    );
+
+    pool.flush_lsn_fenced(PAGE_LAST_LSN).unwrap();
+    assert_eq!(io.write_count(), 1);
+    assert_eq!(io.read_back(1).unwrap()[0], 0xDD);
+}
+
+#[test]
+fn checkpoint_snapshots_skip_pages_above_checkpoint_applied_lsn() {
+    const PAGE_LAST_LSN: u64 = 40;
+    const CHECKPOINT_APPLIED_LSN: u64 = PAGE_LAST_LSN - 1;
+
+    let io = MockIo::new();
+    let pool = make_pool_with(PageSize::Large32k.bytes(), Arc::clone(&io));
+
+    {
+        let mut page = pool.pin(1, PageSize::Large32k).unwrap();
+        page.data_mut()[0] = 0xEE;
+    }
+    pool.stamp_dirty_pages_lsn(&[1], PAGE_LAST_LSN).unwrap();
+
+    let owned_pages = BTreeSet::from([PageId(1)]);
+    let skipped = pool
+        .checkpoint_dirty_frame_snapshots(&owned_pages, &BTreeSet::new(), CHECKPOINT_APPLIED_LSN)
+        .unwrap();
+    assert!(
+        skipped.is_empty(),
+        "checkpoint must skip dirty pages above checkpoint_applied_lsn"
+    );
+
+    let included = pool
+        .checkpoint_dirty_frame_snapshots(&owned_pages, &BTreeSet::new(), PAGE_LAST_LSN)
+        .unwrap();
+    assert_eq!(included.len(), 1);
+    assert_eq!(included[0].0, 1);
+    assert_eq!(included[0].2[0], 0xEE);
+}
+
+#[test]
+fn multi_writer_page_lsn_preserves_newer_commit_when_lower_stamp_arrives_last() {
+    const OLDER_COMMIT_LSN: u64 = 50;
+    const NEWER_COMMIT_LSN: u64 = 60;
+
+    let io = MockIo::new();
+    let pool = make_pool_with(PageSize::Large32k.bytes(), Arc::clone(&io));
+
+    {
+        let mut page = pool.pin(1, PageSize::Large32k).unwrap();
+        page.data_mut()[0] = 0xF0;
+    }
+    pool.stamp_dirty_pages_lsn(&[1], NEWER_COMMIT_LSN).unwrap();
+    pool.stamp_dirty_pages_lsn(&[1], OLDER_COMMIT_LSN).unwrap();
+
+    pool.flush_lsn_fenced(OLDER_COMMIT_LSN).unwrap();
+    assert_eq!(
+        io.write_count(),
+        0,
+        "a lower late stamp must not make newer page bytes flushable"
+    );
+
+    pool.flush_lsn_fenced(NEWER_COMMIT_LSN).unwrap();
+    assert_eq!(io.write_count(), 1);
+    assert_eq!(io.read_back(1).unwrap()[0], 0xF0);
 }
 
 #[test]

@@ -7,12 +7,10 @@
 //!    drops are returned to the free list before the new commit allocates.
 //! 2. Accumulates pending overflow-chain pins in `self.pending` (RAII
 //!    decref on abort — pages enqueue for deferred-free on Drop).
-//! 3. On `commit`: requests a `commit_ts` from the oracle, emits exactly
-//!    one `ChainCommit` journal frame carrying the commit timestamp and any
-//!    refcount deltas / page writes, and transfers ownership of the pending
-//!    `OverflowRef`s into the installed version chains (refcounts remain
-//!    bumped post-commit because the chain now holds the pin). Durability sync
-//!    is owned by the caller's journal envelope.
+//! 3. On the Phase 8 commit path: the caller drains the staged chain payload
+//!    into one self-contained log record and transfers ownership of the
+//!    pending `OverflowRef`s into installed version chains. Durability sync is
+//!    owned by the caller's LSN group-commit boundary.
 //! 4. On `rollback` / `Drop`: pending `OverflowRef`s decref via RAII.
 //!
 //! ## Lock ownership
@@ -36,6 +34,16 @@ use crate::storage::allocator::AllocatorHandle;
 use crate::storage::buffer_pool::PageSource;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::paged_engine::publish::PublishDirty;
+
+/// Encoded ChainCommit payload and ownership drained from a write txn.
+pub(crate) struct PreparedChainCommit {
+    /// Overflow refs drained from the transaction.
+    pub(crate) pending: Vec<OverflowRef>,
+    /// Secondary-index writes drained from the transaction.
+    pub(crate) pending_sec_index: Vec<SecIndexWrite>,
+    /// Encoded ChainCommit frame bytes for the Phase 8 CRUD log record.
+    pub(crate) payload: Vec<u8>,
+}
 
 /// Stage-time identity of the live version head a writer observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,12 +507,13 @@ impl WriteTxn {
     ///   same transaction panics on re-entry.
     ///
     /// Error behavior: propagates [`Error::JournalFrameTooLarge`] from
-    /// [`LogicalTxnFrame::encode`] via
-    /// [`JournalManager::append_logical_txn`] unchanged, matching §3.5.
+    /// [`LogicalTxnFrame::encode`] unchanged, matching §3.5.
     ///
     /// No new `Mutex` / `Arc` — the Cell provides single-threaded interior
     /// mutability scoped to this transaction.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn emit_logical_txn_frame(
+        // allow-phase8-legacy-audit: test-only retired logical append probe
         &self,
         journal: &BufferPoolHandle,
         primary_writes: &[PrimaryWrite],
@@ -564,7 +573,9 @@ impl WriteTxn {
     /// Returns `(commit_ts, pending, pending_sec_index)`. Callers that
     /// stage no overflow data may drop the returned vecs, which runs
     /// `OverflowRef::Drop` on every entry — correct for no-op commits.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn commit(
+        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
         self,
         oracle: &TimestampOracle,
         journal: &BufferPoolHandle,
@@ -594,34 +605,69 @@ impl WriteTxn {
     /// BEFORE journaling so a journal failure leaves the caller with
     /// `pending` refcount ownership. Returns `(pending, pending_sec_index)`
     /// on success; flips `finalized` so `Drop` skips the refcount decref.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn commit_with_ts(
+        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
         self,
         commit_ts: Ts,
         journal: &BufferPoolHandle,
     ) -> Result<(Vec<OverflowRef>, Vec<SecIndexWrite>)> {
-        self.commit_chain_commit(journal, commit_ts)
+        let (pending, pending_sec_index, _end_lsn) =
+            self.commit_chain_commit(journal, commit_ts)?;
+        Ok((pending, pending_sec_index))
     }
 
     /// Append the S7 `ChainCommit` frame for this transaction.
     ///
-    /// Returns the drained overflow refs and secondary-index write list after
-    /// the chain commit has been appended. This consumes `self`; on any append
-    /// failure, `Drop` still owns the drained vectors and aborts their refcounts
-    /// normally.
+    /// Returns the drained overflow refs, secondary-index write list, and
+    /// chain-commit end LSN after the frame has been appended. This consumes
+    /// `self`; on any append failure, `Drop` still owns the drained vectors
+    /// and aborts their refcounts normally.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn commit_chain_commit(
+        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
         mut self,
         journal: &BufferPoolHandle,
         commit_ts: Ts,
-    ) -> Result<(Vec<OverflowRef>, Vec<SecIndexWrite>)> {
+    ) -> Result<(Vec<OverflowRef>, Vec<SecIndexWrite>, u64)> {
         let pending = std::mem::take(&mut self.pending).into_vec();
         let page_writes = std::mem::take(&mut self.page_writes).into_vec();
         let refcount_deltas = std::mem::take(&mut self.refcount_deltas).into_vec();
         let pending_sec_index = std::mem::take(&mut self.pending_sec_index).into_vec();
 
-        journal.append_chain_commit(commit_ts, refcount_deltas, page_writes)?;
+        let end_lsn =
+            journal.append_chain_commit_end_lsn(commit_ts, refcount_deltas, page_writes)?;
 
         self.finalized = true;
-        Ok((pending, pending_sec_index))
+        Ok((pending, pending_sec_index, end_lsn))
+    }
+
+    /// Build and drain the ChainCommit payload without appending it.
+    pub(crate) fn prepare_chain_commit_payload(
+        mut self,
+        journal: &BufferPoolHandle,
+        commit_ts: Ts,
+    ) -> Result<PreparedChainCommit> {
+        let pending = std::mem::take(&mut self.pending).into_vec();
+        let page_writes = std::mem::take(&mut self.page_writes).into_vec();
+        let refcount_deltas = std::mem::take(&mut self.refcount_deltas).into_vec();
+        let pending_sec_index = std::mem::take(&mut self.pending_sec_index).into_vec();
+        let (salt1, salt2) = journal.journal_salts().unwrap_or((0, 0));
+        let payload = crate::journal::log_file::ChainCommitFrame {
+            salt1,
+            salt2,
+            commit_ts,
+            refcount_deltas,
+            page_writes,
+        }
+        .encode()?;
+
+        self.finalized = true;
+        Ok(PreparedChainCommit {
+            pending,
+            pending_sec_index,
+            payload,
+        })
     }
 
     /// Explicit abort — equivalent to dropping the transaction.

@@ -325,24 +325,14 @@ fn assert_successor_insert_completes(client: &Client) {
 }
 
 #[cfg(feature = "test-hooks")]
-fn assert_post_register_cleanup(
-    failpoint: Us026PostRegisterFailpoint,
-    file_name: &str,
-    expect_forced_rollback_failure: bool,
-) {
-    assert_post_register_cleanup_with_options(
-        failpoint,
-        file_name,
-        expect_forced_rollback_failure,
-        fullsync_options(),
-    );
+fn assert_post_register_cleanup(failpoint: Us026PostRegisterFailpoint, file_name: &str) {
+    assert_post_register_cleanup_with_options(failpoint, file_name, fullsync_options());
 }
 
 #[cfg(feature = "test-hooks")]
 fn assert_post_register_cleanup_with_options(
     failpoint: Us026PostRegisterFailpoint,
     file_name: &str,
-    expect_forced_rollback_failure: bool,
     opts: OpenOptions,
 ) {
     let (_dir, client) = open_client_with_options(file_name, opts);
@@ -387,61 +377,6 @@ fn assert_post_register_cleanup_with_options(
     assert!(
         !states.iter().any(|state| state == "Pending"),
         "cleanup must leave no Pending entries for readers/reconcile: {states:?}"
-    );
-
-    let observations = client.__us026_cleanup_observations();
-    assert_eq!(
-        observations.rollback_attempts, 1,
-        "cleanup must attempt rollback exactly once"
-    );
-    assert_eq!(
-        observations.forced_rollback_failures,
-        if expect_forced_rollback_failure { 1 } else { 0 },
-        "forced rollback failure observation mismatch"
-    );
-
-    assert_successor_insert_completes(&client);
-    client
-        .__us036_close_and_drain(ns_id, 1_000)
-        .expect("writer ticket must be released");
-}
-
-#[cfg(feature = "test-hooks")]
-fn assert_retired_post_register_failpoint_is_not_reached(
-    failpoint: Us026PostRegisterFailpoint,
-    file_name: &str,
-) {
-    let (_dir, client) = open_client_with_options(file_name, fullsync_options());
-    client
-        .database("db")
-        .create_collection("c")
-        .expect("create collection");
-    let coll = client.database("db").collection::<Document>("c");
-    let ns_id = client
-        .__us036_namespace_id(POST_REGISTER_NS)
-        .expect("namespace id lookup")
-        .expect("namespace id exists");
-
-    client.__us026_arm_post_register_failpoint(failpoint);
-    coll.insert_one(&test_doc(1, "retired@example.com"))
-        .expect("retired failpoint must not be reachable by ordinary CRUD");
-
-    let found = coll
-        .find_one(doc! { "_id": 1 })
-        .expect("reader after retired failpoint");
-    assert!(
-        found.is_some(),
-        "ordinary CRUD write must commit when retired failpoint is armed"
-    );
-
-    let observations = client.__us026_cleanup_observations();
-    assert_eq!(
-        observations.rollback_attempts, 0,
-        "retired failpoint must not trigger pre-durable cleanup"
-    );
-    assert_eq!(
-        observations.forced_rollback_failures, 0,
-        "retired failpoint must not force rollback failure"
     );
 
     assert_successor_insert_completes(&client);
@@ -560,64 +495,6 @@ fn test_expected_head_mismatch_yields_stale_snapshot() {
 
 #[cfg(feature = "test-hooks")]
 #[test]
-fn test_pending_delta_rolled_back_on_journal_failure() {
-    let (_dir, client) = open_client("us009-journal-rollback.mqlite");
-    let coll = client.database("db").collection::<Document>("c");
-
-    let mut hook = client.__us007_install_journal_begin_hook(true);
-    let writer_client = client.clone();
-    let writer = thread::spawn(move || {
-        writer_client
-            .database("db")
-            .collection::<Document>("c")
-            .insert_one(&test_doc(1, "rollback@example.com"))
-    });
-    hook.wait_until_entered()
-        .expect("writer reached journal hook");
-    hook.release().expect("release journal hook");
-    let result = writer.join().expect("writer thread");
-    assert!(matches!(result, Err(Error::Internal(_))));
-
-    let found = coll
-        .find_one(doc! { "_id": 1 })
-        .expect("reader after rollback");
-    assert!(found.is_none(), "rolled-back Pending delta must not read");
-    let states = client
-        .__us009_primary_chain_states("db.c", &Bson::Int32(1))
-        .expect("primary chain states");
-    assert_eq!(states.first().map(String::as_str), Some("Aborted"));
-}
-
-#[cfg(feature = "test-hooks")]
-#[test]
-fn test_pending_delta_not_folded_by_reconcile() {
-    let (_dir, client) = open_client("us009-pending-resident.mqlite");
-
-    let mut hook = client.__us007_install_journal_begin_hook(false);
-    let writer_client = client.clone();
-    let writer = thread::spawn(move || {
-        writer_client
-            .database("db")
-            .collection::<Document>("c")
-            .insert_one(&test_doc(1, "pending@example.com"))
-    });
-    hook.wait_until_entered()
-        .expect("writer reached journal hook");
-
-    let states = client
-        .__us009_primary_chain_states("db.c", &Bson::Int32(1))
-        .expect("primary chain states");
-    assert_eq!(states.first().map(String::as_str), Some("Pending"));
-
-    hook.release().expect("release journal hook");
-    writer
-        .join()
-        .expect("writer thread")
-        .expect("writer commit");
-}
-
-#[cfg(feature = "test-hooks")]
-#[test]
 fn test_primary_install_failure_flips_secondary_pending_to_aborted() {
     let (_dir, client) = open_client("us009-secondary-abort.mqlite");
     let coll = client.database("db").collection::<Document>("c");
@@ -721,66 +598,10 @@ mod post_register {
     use super::*;
 
     #[test]
-    fn test_begin_txn_failure_after_register_cleans_up() {
+    fn test_before_log_reservation_failure_after_register_cleans_up() {
         assert_post_register_cleanup(
-            Us026PostRegisterFailpoint::BeginTxnAfterRegister,
-            "us026-begin-txn.mqlite",
-            false,
-        );
-    }
-
-    #[test]
-    fn test_flush_failure_after_register_cleans_up() {
-        // Non-FullSync keeps the flush inside the pre-publish cleanup path.
-        // FullSync leader flush failures are the group-commit engine-fatal
-        // contract covered by `tests/mwmr_crash_recovery.rs`.
-        assert_post_register_cleanup_with_options(
-            Us026PostRegisterFailpoint::Flush,
-            "us026-flush.mqlite",
-            false,
-            OpenOptions::new(),
-        );
-    }
-
-    #[test]
-    fn test_emit_logical_txn_frame_failure_after_register_cleans_up() {
-        assert_post_register_cleanup(
-            Us026PostRegisterFailpoint::EmitLogicalTxnFrame,
-            "us026-logical-frame.mqlite",
-            false,
-        );
-    }
-
-    #[test]
-    fn test_chain_commit_append_failure_after_register_cleans_up() {
-        assert_post_register_cleanup(
-            Us026PostRegisterFailpoint::ChainCommitAppend,
-            "us026-chain-commit.mqlite",
-            false,
-        );
-    }
-
-    #[test]
-    fn test_retired_commit_header_read_failpoint_is_not_reached() {
-        assert_retired_post_register_failpoint_is_not_reached(
-            Us026PostRegisterFailpoint::CommitHeaderRead,
-            "us026-header-read.mqlite",
-        );
-    }
-
-    #[test]
-    fn test_retired_legacy_commit_txn_failpoint_is_not_reached() {
-        assert_retired_post_register_failpoint_is_not_reached(
-            Us026PostRegisterFailpoint::LegacyCommitTxn,
-            "us026-legacy-commit.mqlite",
-        );
-    }
-
-    #[test]
-    fn test_retired_structural_commit_rollback_failpoint_is_not_reached() {
-        assert_retired_post_register_failpoint_is_not_reached(
-            Us026PostRegisterFailpoint::RollbackTxnAfterStructuralCommit,
-            "us026-rollback-failure.mqlite",
+            Us026PostRegisterFailpoint::BeforeLogReservation,
+            "us026-before-log-reservation.mqlite",
         );
     }
 }

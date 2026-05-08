@@ -157,6 +157,9 @@ pub mod wire;
 
 // Core entry points
 pub use client::{Client, Collection, Database};
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use client::{Phase8CatalogCommitKind, Phase8LogRecordKind, Phase8LogRecordSummary};
 pub use cursor::Cursor;
 pub use query::explain::ExplainResult;
 
@@ -176,10 +179,10 @@ pub use storage::header::{read_durable_header_counters, DurableHeaderCounters};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use storage::paged_engine::test_accessors::{
-    arm_phase3_commit_failpoint, CreateIndexBuildHookGuard, Phase3CommitFailpoint,
-    Phase3CommitFailpointGuard, Us007JournalBeginHookGuard, Us007JournalObservations,
-    Us026CleanupObservations, Us026PostRegisterFailpoint, WriteBodyEntryEvent,
-    WriteBodyEntryHookGuard,
+    arm_phase3_commit_failpoint, arm_phase8_checkpoint_failpoint, CreateIndexBuildHookGuard,
+    Phase3CommitFailpoint, Phase3CommitFailpointGuard, Phase8BeforeReservationHookGuard,
+    Phase8CheckpointFailpoint, Phase8CheckpointFailpointGuard, Us026PostRegisterFailpoint,
+    WriteBodyEntryEvent, WriteBodyEntryHookGuard,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]

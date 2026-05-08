@@ -14,7 +14,7 @@
 //! ```text
 //! Offset  Size  Field
 //!   0      4    Magic: "MQJL" (0x4D514A4C)
-//!   4      4    Format version: u32 LE (2)
+//!   4      4    Format version: u32 LE (3)
 //!   8      4    Page size internal: u32 LE (4096)
 //!  12      4    Page size leaf: u32 LE (32768)
 //!  16      4    Salt 1: u32 LE (must match main file header)
@@ -46,11 +46,122 @@
 
 #![allow(clippy::expect_used)]
 
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
+use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
+
+// ---------------------------------------------------------------------------
+// Positioned log I/O
+// ---------------------------------------------------------------------------
+
+/// Positioned write and sync operations used by the Phase 8 log manager.
+pub(crate) trait PositionedLogIo: Send + Sync {
+    /// Write some bytes from `data` at absolute byte offset `offset`.
+    ///
+    /// Returning a short byte count is allowed; callers are responsible for
+    /// retrying until the full buffer is written or an error is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns any OS or test-injected write error.
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<usize>;
+
+    /// Sync log file data to stable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns any OS or test-injected sync error.
+    fn sync_data(&self) -> io::Result<()>;
+}
+
+impl PositionedLogIo for File {
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            FileExt::write_at(self, data, offset)
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            self.seek_write(data, offset)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (offset, data);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "positioned log writes are unsupported on this platform",
+            ))
+        }
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        File::sync_data(self)
+    }
+}
+
+/// File wrapper that writes log bytes at explicit offsets.
+pub(crate) struct PositionedLogFile {
+    io: Box<dyn PositionedLogIo>,
+}
+
+impl PositionedLogFile {
+    /// Create a positioned log writer from a file handle.
+    pub(crate) fn new(file: File) -> Self {
+        Self { io: Box::new(file) }
+    }
+
+    /// Create a positioned log writer from a test or adapter implementation.
+    pub(crate) fn from_io(io: Box<dyn PositionedLogIo>) -> Self {
+        Self { io }
+    }
+
+    /// Write all bytes from `data` at absolute byte offset `offset`.
+    ///
+    /// Short positioned writes are retried. A zero-length progress report is
+    /// converted to [`io::ErrorKind::WriteZero`] so callers never mark a
+    /// partially written slot complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns any write error from the underlying positioned writer or
+    /// [`io::ErrorKind::WriteZero`] if the writer made no progress.
+    pub(crate) fn write_all_at(&self, mut offset: u64, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let written = self.io.write_at(offset, data)?;
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "positioned log write made no progress",
+                ));
+            }
+            offset = offset.checked_add(written as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "positioned log offset overflow",
+                )
+            })?;
+            data = &data[written..];
+        }
+        Ok(())
+    }
+
+    /// Sync log file data to stable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns any sync error from the underlying writer.
+    pub(crate) fn sync_data(&self) -> io::Result<()> {
+        self.io.sync_data()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -60,10 +171,10 @@ use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 pub(crate) const JOURNAL_MAGIC: [u8; 4] = *b"MQJL";
 
 /// Journal format version (increment on backward-incompatible changes).
-pub(crate) const JOURNAL_FORMAT_VERSION: u32 = 2;
+pub(crate) const JOURNAL_FORMAT_VERSION: u32 = 3;
 
 /// Pre-release journal format versions this build may safely discard.
-pub(crate) const RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS: &[u32] = &[1];
+pub(crate) const RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS: &[u32] = &[1, 2];
 
 /// Total size of the journal file header in bytes.
 pub(crate) const JOURNAL_HEADER_SIZE: usize = 32;
@@ -74,6 +185,970 @@ pub(crate) const JOURNAL_FRAME_HEADER_SIZE: usize = 24;
 /// Total size of a page-0 checkpoint boundary record.
 pub(crate) const PAGE0_BOUNDARY_RECORD_WIRE_SIZE: usize =
     JOURNAL_FRAME_HEADER_SIZE + PAGE_SIZE_INTERNAL as usize;
+
+// ---------------------------------------------------------------------------
+// Phase 8 LogRecord codec
+// ---------------------------------------------------------------------------
+
+/// Magic value for a Phase 8 redo-log record.
+///
+/// The little-endian byte sequence is `MQL8`.
+pub(crate) const LOG_RECORD_MAGIC: u32 = 0x384C_514D;
+
+/// Phase 8 outer-record format version.
+pub(crate) const LOG_RECORD_FORMAT_VERSION: u16 = 1;
+
+/// Fixed byte size of a Phase 8 `LogRecord` header.
+pub(crate) const LOG_RECORD_HEADER_LEN: usize = 72;
+
+/// Hard cap on one encoded Phase 8 log record.
+pub(crate) const MAX_LOG_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Offset of the `magic` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_MAGIC_OFFSET: usize = 0;
+/// Offset of the `format_version` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_FORMAT_VERSION_OFFSET: usize = 4;
+/// Offset of the `header_len` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_HEADER_LEN_OFFSET: usize = 6;
+/// Offset of the `record_kind` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_KIND_OFFSET: usize = 8;
+/// Offset of the `flags` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_FLAGS_OFFSET: usize = 10;
+/// Offset of the `total_len` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_TOTAL_LEN_OFFSET: usize = 12;
+/// Offset of the `start_lsn` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_START_LSN_OFFSET: usize = 16;
+/// Offset of the `end_lsn` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_END_LSN_OFFSET: usize = 24;
+/// Offset of the `txn_id` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_TXN_ID_OFFSET: usize = 32;
+/// Offset of the `publish_seq` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_PUBLISH_SEQ_OFFSET: usize = 40;
+/// Offset of the `commit_ts.physical_ms` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_COMMIT_TS_PHYSICAL_OFFSET: usize = 48;
+/// Offset of the `commit_ts.logical` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET: usize = 56;
+/// Offset of the `payload_len` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_PAYLOAD_LEN_OFFSET: usize = 60;
+/// Offset of the `header_crc32c` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_HEADER_CRC32C_OFFSET: usize = 64;
+/// Offset of the `payload_crc32c` field in the fixed log-record header.
+pub(crate) const LOG_RECORD_PAYLOAD_CRC32C_OFFSET: usize = 68;
+
+const LOG_RECORD_KIND_CRUD_COMMIT: u16 = 1;
+const LOG_RECORD_KIND_CATALOG_COMMIT: u16 = 2;
+const LOG_RECORD_KIND_CHECKPOINT_BOUNDARY: u16 = 3;
+
+const LOG_RECORD_FLAG_HAS_LOGICAL_PAYLOAD: u16 = 0x0001;
+const LOG_RECORD_FLAG_HAS_CHAIN_PAYLOAD: u16 = 0x0002;
+const LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD: u16 = 0x0004;
+const LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY: u16 = 0x0008;
+const LOG_RECORD_KNOWN_FLAGS: u16 = LOG_RECORD_FLAG_HAS_LOGICAL_PAYLOAD
+    | LOG_RECORD_FLAG_HAS_CHAIN_PAYLOAD
+    | LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD
+    | LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY;
+
+/// Legal Phase 8 outer-record kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogRecordKind {
+    /// CRUD commit record.
+    CrudCommit,
+    /// Catalog or DDL commit record.
+    CatalogCommit,
+    /// Checkpoint control record.
+    CheckpointBoundary,
+}
+
+impl LogRecordKind {
+    fn from_wire(value: u16) -> Result<Self> {
+        match value {
+            LOG_RECORD_KIND_CRUD_COMMIT => Ok(Self::CrudCommit),
+            LOG_RECORD_KIND_CATALOG_COMMIT => Ok(Self::CatalogCommit),
+            LOG_RECORD_KIND_CHECKPOINT_BOUNDARY => Ok(Self::CheckpointBoundary),
+            _ => Err(invalid_log_record(format!(
+                "Phase 8 LogRecord unknown record_kind {value}"
+            ))),
+        }
+    }
+
+    fn wire_value(self) -> u16 {
+        match self {
+            Self::CrudCommit => LOG_RECORD_KIND_CRUD_COMMIT,
+            Self::CatalogCommit => LOG_RECORD_KIND_CATALOG_COMMIT,
+            Self::CheckpointBoundary => LOG_RECORD_KIND_CHECKPOINT_BOUNDARY,
+        }
+    }
+
+    fn required_flags(self) -> LogRecordFlags {
+        match self {
+            Self::CrudCommit => LogRecordFlags(
+                LOG_RECORD_FLAG_HAS_LOGICAL_PAYLOAD | LOG_RECORD_FLAG_HAS_CHAIN_PAYLOAD,
+            ),
+            Self::CatalogCommit => LogRecordFlags(LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD),
+            Self::CheckpointBoundary => LogRecordFlags(LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY),
+        }
+    }
+}
+
+/// Phase 8 log-record flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogRecordFlags(u16);
+
+impl LogRecordFlags {
+    /// `CrudCommit` carries the logical transaction payload bytes.
+    pub(crate) const HAS_LOGICAL_PAYLOAD: Self = Self(LOG_RECORD_FLAG_HAS_LOGICAL_PAYLOAD);
+    /// `CrudCommit` carries chain/refcount/page-write payload bytes.
+    pub(crate) const HAS_CHAIN_PAYLOAD: Self = Self(LOG_RECORD_FLAG_HAS_CHAIN_PAYLOAD);
+    /// `CatalogCommit` carries catalog payload bytes.
+    pub(crate) const HAS_CATALOG_PAYLOAD: Self = Self(LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD);
+    /// `CheckpointBoundary` carries checkpoint-frontier payload bytes.
+    pub(crate) const CHECKPOINT_BOUNDARY: Self = Self(LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY);
+
+    fn from_bits(bits: u16) -> Result<Self> {
+        let flags = Self(bits);
+        flags.reject_unknown_bits()?;
+        Ok(flags)
+    }
+
+    /// Return the raw wire bits.
+    pub(crate) fn bits(self) -> u16 {
+        self.0
+    }
+
+    fn reject_unknown_bits(self) -> Result<()> {
+        let unknown = self.0 & !LOG_RECORD_KNOWN_FLAGS;
+        if unknown != 0 {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord unknown flag bits {unknown:#06x}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_for_kind(self, kind: LogRecordKind) -> Result<()> {
+        self.reject_unknown_bits()?;
+        let required = kind.required_flags();
+        if self != required {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord invalid flags {:#06x} for {:?}",
+                self.0, kind
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Typed Phase 8 log-record payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LogRecordPayload {
+    /// CRUD commit payload: existing logical bytes plus chain/refcount/page-write bytes.
+    CrudCommit {
+        /// Encoded logical transaction bytes.
+        logical_payload: Vec<u8>,
+        /// Encoded chain/refcount/page-write bytes.
+        chain_payload: Vec<u8>,
+    },
+    /// Catalog commit payload bytes.
+    CatalogCommit(Vec<u8>),
+    /// Checkpoint boundary control payload bytes.
+    CheckpointBoundary(Vec<u8>),
+}
+
+impl LogRecordPayload {
+    fn kind(&self) -> LogRecordKind {
+        match self {
+            Self::CrudCommit { .. } => LogRecordKind::CrudCommit,
+            Self::CatalogCommit(_) => LogRecordKind::CatalogCommit,
+            Self::CheckpointBoundary(_) => LogRecordKind::CheckpointBoundary,
+        }
+    }
+
+    fn flags(&self) -> LogRecordFlags {
+        self.kind().required_flags()
+    }
+
+    fn encoded_len(&self) -> Result<usize> {
+        match self {
+            Self::CrudCommit {
+                logical_payload,
+                chain_payload,
+            } => 8usize
+                .checked_add(logical_payload.len())
+                .and_then(|n| n.checked_add(chain_payload.len()))
+                .ok_or_else(|| log_record_too_large(usize::MAX)),
+            Self::CatalogCommit(payload) | Self::CheckpointBoundary(payload) => Ok(payload.len()),
+        }
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Self::CrudCommit {
+                logical_payload,
+                chain_payload,
+            } => {
+                out.extend_from_slice(&len_to_u32(logical_payload.len())?.to_le_bytes());
+                out.extend_from_slice(&len_to_u32(chain_payload.len())?.to_le_bytes());
+                out.extend_from_slice(logical_payload);
+                out.extend_from_slice(chain_payload);
+            }
+            Self::CatalogCommit(payload) | Self::CheckpointBoundary(payload) => {
+                out.extend_from_slice(payload);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(kind: LogRecordKind, payload: &[u8]) -> Result<Self> {
+        match kind {
+            LogRecordKind::CrudCommit => {
+                if payload.len() < 8 {
+                    return Err(invalid_log_record(
+                        "Phase 8 CrudCommit payload is shorter than split header",
+                    ));
+                }
+                let logical_len =
+                    u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+                let chain_len =
+                    u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes")) as usize;
+                let logical_end = 8usize.checked_add(logical_len).ok_or_else(|| {
+                    invalid_log_record("Phase 8 CrudCommit logical length overflow")
+                })?;
+                let chain_end = logical_end.checked_add(chain_len).ok_or_else(|| {
+                    invalid_log_record("Phase 8 CrudCommit chain length overflow")
+                })?;
+                if chain_end != payload.len() {
+                    return Err(invalid_log_record(
+                        "Phase 8 CrudCommit payload split does not match payload_len",
+                    ));
+                }
+                Ok(Self::CrudCommit {
+                    logical_payload: payload[8..logical_end].to_vec(),
+                    chain_payload: payload[logical_end..chain_end].to_vec(),
+                })
+            }
+            LogRecordKind::CatalogCommit => Ok(Self::CatalogCommit(payload.to_vec())),
+            LogRecordKind::CheckpointBoundary => Ok(Self::CheckpointBoundary(payload.to_vec())),
+        }
+    }
+}
+
+/// Phase 8 log-record draft whose length is known before LSN reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogRecordDraft {
+    kind: LogRecordKind,
+    flags: LogRecordFlags,
+    txn_id: u64,
+    publish_seq: u64,
+    commit_ts: Ts,
+    payload: LogRecordPayload,
+}
+
+impl LogRecordDraft {
+    /// Build a CRUD commit draft from existing logical and chain payload bytes.
+    pub(crate) fn crud(
+        txn_id: u64,
+        publish_seq: u64,
+        commit_ts: Ts,
+        logical_payload: Vec<u8>,
+        chain_payload: Vec<u8>,
+    ) -> Self {
+        Self::from_payload(
+            txn_id,
+            publish_seq,
+            commit_ts,
+            LogRecordPayload::CrudCommit {
+                logical_payload,
+                chain_payload,
+            },
+        )
+    }
+
+    /// Build a catalog commit draft.
+    pub(crate) fn catalog(txn_id: u64, publish_seq: u64, commit_ts: Ts, payload: Vec<u8>) -> Self {
+        Self::from_payload(
+            txn_id,
+            publish_seq,
+            commit_ts,
+            LogRecordPayload::CatalogCommit(payload),
+        )
+    }
+
+    /// Build a checkpoint-boundary control draft.
+    pub(crate) fn checkpoint_boundary(txn_id: u64, commit_ts: Ts, payload: Vec<u8>) -> Self {
+        Self::from_payload(
+            txn_id,
+            0,
+            commit_ts,
+            LogRecordPayload::CheckpointBoundary(payload),
+        )
+    }
+
+    fn from_payload(
+        txn_id: u64,
+        publish_seq: u64,
+        commit_ts: Ts,
+        payload: LogRecordPayload,
+    ) -> Self {
+        Self {
+            kind: payload.kind(),
+            flags: payload.flags(),
+            txn_id,
+            publish_seq,
+            commit_ts,
+            payload,
+        }
+    }
+
+    /// Compute the final encoded length before LSN reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::JournalFrameTooLarge`] if the draft exceeds
+    /// [`MAX_LOG_RECORD_BYTES`], or [`Error::CorruptDatabase`] if the draft
+    /// violates Phase 8 kind/flag/publish-sequence rules.
+    pub(crate) fn encoded_len(&self) -> Result<usize> {
+        self.validate_semantics()?;
+        let payload_len = self.payload.encoded_len()?;
+        let total_len = LOG_RECORD_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or_else(|| log_record_too_large(usize::MAX))?;
+        if total_len > MAX_LOG_RECORD_BYTES {
+            return Err(log_record_too_large(total_len));
+        }
+        Ok(total_len)
+    }
+
+    /// Finalize the draft for a reserved LSN range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::JournalFrameTooLarge`] if the draft exceeds
+    /// [`MAX_LOG_RECORD_BYTES`], or [`Error::CorruptDatabase`] if the LSN range
+    /// overflows or the draft violates Phase 8 semantics.
+    pub(crate) fn finalize(self, start_lsn: u64) -> Result<FinalizedLogRecord> {
+        let total_len = self.encoded_len()?;
+        let end_lsn = start_lsn
+            .checked_add(total_len as u64)
+            .ok_or_else(|| invalid_log_record("Phase 8 LogRecord end_lsn overflow"))?;
+
+        let payload_len = total_len - LOG_RECORD_HEADER_LEN;
+        let mut payload = Vec::with_capacity(payload_len);
+        self.payload.encode_into(&mut payload)?;
+        debug_assert_eq!(payload.len(), payload_len);
+
+        let payload_crc32c = crc32c::crc32c(&payload);
+        let header = LogRecordHeader {
+            kind: self.kind,
+            flags: self.flags,
+            total_len,
+            start_lsn,
+            end_lsn,
+            txn_id: self.txn_id,
+            publish_seq: self.publish_seq,
+            commit_ts: self.commit_ts,
+            payload_len,
+            payload_crc32c,
+        };
+
+        let mut bytes = vec![0u8; total_len];
+        header.write_with_header_crc(0, &mut bytes[..LOG_RECORD_HEADER_LEN])?;
+        let header_crc32c = crc32c::crc32c(&bytes[..LOG_RECORD_HEADER_LEN]);
+        bytes[LOG_RECORD_HEADER_CRC32C_OFFSET..LOG_RECORD_HEADER_CRC32C_OFFSET + 4]
+            .copy_from_slice(&header_crc32c.to_le_bytes());
+        bytes[LOG_RECORD_HEADER_LEN..].copy_from_slice(&payload);
+
+        Ok(FinalizedLogRecord {
+            start_lsn,
+            end_lsn,
+            bytes,
+        })
+    }
+
+    fn validate_semantics(&self) -> Result<()> {
+        self.flags.validate_for_kind(self.kind)?;
+        if self.payload.kind() != self.kind {
+            return Err(invalid_log_record(
+                "Phase 8 LogRecord payload kind does not match record_kind",
+            ));
+        }
+        match self.kind {
+            LogRecordKind::CrudCommit | LogRecordKind::CatalogCommit if self.publish_seq == 0 => {
+                Err(invalid_log_record(
+                    "Phase 8 LogRecord publish_seq 0 is reserved for CheckpointBoundary",
+                ))
+            }
+            LogRecordKind::CheckpointBoundary if self.publish_seq != 0 => Err(invalid_log_record(
+                "Phase 8 CheckpointBoundary publish_seq must be 0",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Finalized Phase 8 log record bytes ready for `write_reserved`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalizedLogRecord {
+    start_lsn: u64,
+    end_lsn: u64,
+    bytes: Vec<u8>,
+}
+
+impl FinalizedLogRecord {
+    /// Return the reserved start LSN.
+    pub(crate) fn start_lsn(&self) -> u64 {
+        self.start_lsn
+    }
+
+    /// Return the exclusive end LSN.
+    pub(crate) fn end_lsn(&self) -> u64 {
+        self.end_lsn
+    }
+
+    /// Return the exact finalized bytes to write at `start_lsn`.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Decoded Phase 8 outer log record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogRecord {
+    /// Inclusive byte-offset LSN where the record starts.
+    pub(crate) start_lsn: u64,
+    /// Exclusive byte-offset LSN where the record ends.
+    pub(crate) end_lsn: u64,
+    /// Diagnostic transaction id carried by the writer.
+    pub(crate) txn_id: u64,
+    /// Durable publish sequence for replay ordering.
+    pub(crate) publish_seq: u64,
+    /// Commit timestamp carried by the writer.
+    pub(crate) commit_ts: Ts,
+    /// Legal record kind.
+    pub(crate) kind: LogRecordKind,
+    /// Legal flags for `kind`.
+    pub(crate) flags: LogRecordFlags,
+    /// Encoded payload byte length.
+    pub(crate) payload_len: usize,
+    /// Encoded total record byte length.
+    pub(crate) total_len: usize,
+    /// Stored header CRC32C.
+    pub(crate) header_crc32c: u32,
+    /// Stored payload CRC32C.
+    pub(crate) payload_crc32c: u32,
+    /// Decoded typed payload.
+    pub(crate) payload: LogRecordPayload,
+}
+
+impl LogRecord {
+    /// Decode and validate the leading Phase 8 log record in `buf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptDatabase`] for malformed, truncated, corrupt,
+    /// unsupported, or semantically invalid record bytes.
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < LOG_RECORD_HEADER_LEN {
+            return Err(invalid_log_record(
+                "Phase 8 LogRecord truncated fixed header",
+            ));
+        }
+
+        let magic = read_u32(buf, LOG_RECORD_MAGIC_OFFSET);
+        if magic != LOG_RECORD_MAGIC {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord bad magic {magic:#010x}"
+            )));
+        }
+
+        let format_version = read_u16(buf, LOG_RECORD_FORMAT_VERSION_OFFSET);
+        if format_version != LOG_RECORD_FORMAT_VERSION {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord bad format_version {format_version}"
+            )));
+        }
+
+        let header_len = read_u16(buf, LOG_RECORD_HEADER_LEN_OFFSET) as usize;
+        if header_len != LOG_RECORD_HEADER_LEN {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord header_len {header_len} does not match {LOG_RECORD_HEADER_LEN}"
+            )));
+        }
+
+        let kind = LogRecordKind::from_wire(read_u16(buf, LOG_RECORD_KIND_OFFSET))?;
+        let flags = LogRecordFlags::from_bits(read_u16(buf, LOG_RECORD_FLAGS_OFFSET))?;
+        flags.validate_for_kind(kind)?;
+
+        let total_len = read_u32(buf, LOG_RECORD_TOTAL_LEN_OFFSET) as usize;
+        if total_len > MAX_LOG_RECORD_BYTES {
+            return Err(log_record_too_large(total_len));
+        }
+        let start_lsn = read_u64(buf, LOG_RECORD_START_LSN_OFFSET);
+        let end_lsn = read_u64(buf, LOG_RECORD_END_LSN_OFFSET);
+        let txn_id = read_u64(buf, LOG_RECORD_TXN_ID_OFFSET);
+        let publish_seq = read_u64(buf, LOG_RECORD_PUBLISH_SEQ_OFFSET);
+        let commit_ts = Ts {
+            physical_ms: read_u64(buf, LOG_RECORD_COMMIT_TS_PHYSICAL_OFFSET),
+            logical: read_u32(buf, LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET),
+        };
+        let payload_len = read_u32(buf, LOG_RECORD_PAYLOAD_LEN_OFFSET) as usize;
+        let header_crc32c = read_u32(buf, LOG_RECORD_HEADER_CRC32C_OFFSET);
+        let payload_crc32c = read_u32(buf, LOG_RECORD_PAYLOAD_CRC32C_OFFSET);
+
+        let expected_total_len = header_len
+            .checked_add(payload_len)
+            .ok_or_else(|| invalid_log_record("Phase 8 LogRecord total_len overflow"))?;
+        if total_len != expected_total_len {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord total_len {total_len} does not equal header_len + payload_len {expected_total_len}"
+            )));
+        }
+        if buf.len() < total_len {
+            return Err(invalid_log_record("Phase 8 LogRecord truncated payload"));
+        }
+        let expected_end_lsn = start_lsn
+            .checked_add(total_len as u64)
+            .ok_or_else(|| invalid_log_record("Phase 8 LogRecord end_lsn overflow"))?;
+        if end_lsn != expected_end_lsn {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord end_lsn {end_lsn} does not equal start_lsn + total_len {expected_end_lsn}"
+            )));
+        }
+
+        let mut header_for_crc = [0u8; LOG_RECORD_HEADER_LEN];
+        header_for_crc.copy_from_slice(&buf[..LOG_RECORD_HEADER_LEN]);
+        header_for_crc[LOG_RECORD_HEADER_CRC32C_OFFSET..LOG_RECORD_HEADER_CRC32C_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        let computed_header_crc32c = crc32c::crc32c(&header_for_crc);
+        if header_crc32c != computed_header_crc32c {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord header_crc32c mismatch: stored 0x{header_crc32c:08X}, computed 0x{computed_header_crc32c:08X}"
+            )));
+        }
+
+        let payload_bytes = &buf[LOG_RECORD_HEADER_LEN..total_len];
+        let computed_payload_crc32c = crc32c::crc32c(payload_bytes);
+        if payload_crc32c != computed_payload_crc32c {
+            return Err(invalid_log_record(format!(
+                "Phase 8 LogRecord payload_crc32c mismatch: stored 0x{payload_crc32c:08X}, computed 0x{computed_payload_crc32c:08X}"
+            )));
+        }
+
+        match kind {
+            LogRecordKind::CrudCommit | LogRecordKind::CatalogCommit if publish_seq == 0 => {
+                return Err(invalid_log_record(
+                    "Phase 8 LogRecord publish_seq 0 is reserved for CheckpointBoundary",
+                ));
+            }
+            LogRecordKind::CheckpointBoundary if publish_seq != 0 => {
+                return Err(invalid_log_record(
+                    "Phase 8 CheckpointBoundary publish_seq must be 0",
+                ));
+            }
+            _ => {}
+        }
+
+        let payload = LogRecordPayload::decode(kind, payload_bytes)?;
+        Ok(Self {
+            start_lsn,
+            end_lsn,
+            txn_id,
+            publish_seq,
+            commit_ts,
+            kind,
+            flags,
+            payload_len,
+            total_len,
+            header_crc32c,
+            payload_crc32c,
+            payload,
+        })
+    }
+}
+
+const CATALOG_COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"MQCC";
+const CATALOG_COMMIT_PAYLOAD_VERSION: u16 = 1;
+const CHECKPOINT_BOUNDARY_PAYLOAD_MAGIC: [u8; 4] = *b"MQCB";
+const CHECKPOINT_BOUNDARY_PAYLOAD_VERSION: u16 = 1;
+
+/// Typed catalog/DDL operation carried by a Phase 8 `CatalogCommit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogCommitKind {
+    /// Namespace create or implicit collection bootstrap.
+    NamespaceCreate,
+    /// Namespace drop.
+    NamespaceDrop,
+    /// Reserve a Building index entry.
+    IndexReserve,
+    /// Persist index build page/catalog changes before Ready publish.
+    IndexBuild,
+    /// Promote a Building index to Ready.
+    IndexBuildCommit,
+    /// Remove a failed Building index.
+    IndexCleanup,
+    /// Drop a Ready index.
+    IndexDrop,
+}
+
+impl CatalogCommitKind {
+    fn wire_value(self) -> u8 {
+        match self {
+            Self::NamespaceCreate => 1,
+            Self::NamespaceDrop => 2,
+            Self::IndexReserve => 3,
+            Self::IndexBuild => 4,
+            Self::IndexBuildCommit => 5,
+            Self::IndexCleanup => 6,
+            Self::IndexDrop => 7,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::NamespaceCreate),
+            2 => Ok(Self::NamespaceDrop),
+            3 => Ok(Self::IndexReserve),
+            4 => Ok(Self::IndexBuild),
+            5 => Ok(Self::IndexBuildCommit),
+            6 => Ok(Self::IndexCleanup),
+            7 => Ok(Self::IndexDrop),
+            _ => Err(invalid_log_record(format!(
+                "Phase 8 CatalogCommit unknown variant {value}"
+            ))),
+        }
+    }
+}
+
+/// One page image included in a typed catalog commit payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogCommitPage {
+    /// Page number in the main database file.
+    pub(crate) page_number: u32,
+    /// Physical page size of `data`.
+    pub(crate) page_size: JournalPageSize,
+    /// Full page bytes to write during recovery replay.
+    pub(crate) data: Vec<u8>,
+}
+
+/// Typed payload carried by `LogRecordKind::CatalogCommit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogCommitPayload {
+    /// Catalog lifecycle operation represented by this record.
+    pub(crate) kind: CatalogCommitKind,
+    /// Published catalog generation before the operation.
+    pub(crate) catalog_generation_before: u64,
+    /// Published catalog generation after the operation.
+    pub(crate) catalog_generation_after: u64,
+    /// Header image that must be durable with the structural pages.
+    pub(crate) header: FileHeader,
+    /// Structural catalog/data/index page images staged by the DDL batch.
+    pub(crate) pages: Vec<CatalogCommitPage>,
+}
+
+impl CatalogCommitPayload {
+    /// Encode this catalog commit payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the page count or any page image is invalid for the
+    /// Phase 8 wire format.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&CATALOG_COMMIT_PAYLOAD_MAGIC);
+        out.extend_from_slice(&CATALOG_COMMIT_PAYLOAD_VERSION.to_le_bytes());
+        out.push(self.kind.wire_value());
+        out.push(0);
+        out.extend_from_slice(&self.catalog_generation_before.to_le_bytes());
+        out.extend_from_slice(&self.catalog_generation_after.to_le_bytes());
+        out.extend_from_slice(&len_to_u32(HEADER_PAGE_SIZE)?.to_le_bytes());
+        out.extend_from_slice(&self.header.to_bytes());
+        out.extend_from_slice(&len_to_u32(self.pages.len())?.to_le_bytes());
+        for page in &self.pages {
+            if page.data.len() != page.page_size.bytes() {
+                return Err(invalid_log_record(format!(
+                    "Phase 8 CatalogCommit page {} has {} bytes for {:?}",
+                    page.page_number,
+                    page.data.len(),
+                    page.page_size
+                )));
+            }
+            out.extend_from_slice(&page.page_number.to_le_bytes());
+            out.extend_from_slice(&page.page_size.as_u32().to_le_bytes());
+            out.extend_from_slice(&len_to_u32(page.data.len())?.to_le_bytes());
+            out.extend_from_slice(&page.data);
+        }
+        Ok(out)
+    }
+
+    /// Decode and validate a catalog commit payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptDatabase`] if the payload is malformed or uses
+    /// an unsupported catalog variant.
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
+        const PREFIX_LEN: usize = 28;
+        if buf.len() < PREFIX_LEN {
+            return Err(invalid_log_record(
+                "Phase 8 CatalogCommit payload truncated fixed header",
+            ));
+        }
+        if buf[0..4] != CATALOG_COMMIT_PAYLOAD_MAGIC {
+            return Err(invalid_log_record("Phase 8 CatalogCommit bad magic"));
+        }
+        let version = read_u16(buf, 4);
+        if version != CATALOG_COMMIT_PAYLOAD_VERSION {
+            return Err(invalid_log_record(format!(
+                "Phase 8 CatalogCommit bad version {version}"
+            )));
+        }
+        let kind = CatalogCommitKind::from_wire(buf[6])?;
+        if buf[7] != 0 {
+            return Err(invalid_log_record(
+                "Phase 8 CatalogCommit reserved byte must be zero",
+            ));
+        }
+        let catalog_generation_before = read_u64(buf, 8);
+        let catalog_generation_after = read_u64(buf, 16);
+        let header_len = read_u32(buf, 24) as usize;
+        if header_len != HEADER_PAGE_SIZE {
+            return Err(invalid_log_record(format!(
+                "Phase 8 CatalogCommit header length {header_len} is invalid"
+            )));
+        }
+        let header_start = PREFIX_LEN;
+        let header_end = header_start
+            .checked_add(header_len)
+            .ok_or_else(|| invalid_log_record("Phase 8 CatalogCommit header length overflow"))?;
+        if buf.len() < header_end + 4 {
+            return Err(invalid_log_record(
+                "Phase 8 CatalogCommit payload truncated header image",
+            ));
+        }
+        let header_bytes: &[u8; HEADER_PAGE_SIZE] = buf[header_start..header_end]
+            .try_into()
+            .expect("validated header len");
+        let header = FileHeader::from_bytes(header_bytes)?;
+        let mut cursor = header_end;
+        let page_count = read_u32(buf, cursor) as usize;
+        cursor += 4;
+        let mut pages = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            if buf.len().saturating_sub(cursor) < 12 {
+                return Err(invalid_log_record(
+                    "Phase 8 CatalogCommit payload truncated page header",
+                ));
+            }
+            let page_number = read_u32(buf, cursor);
+            cursor += 4;
+            let page_size = JournalPageSize::from_u32(read_u32(buf, cursor))?;
+            cursor += 4;
+            let data_len = read_u32(buf, cursor) as usize;
+            cursor += 4;
+            if data_len != page_size.bytes() {
+                return Err(invalid_log_record(format!(
+                    "Phase 8 CatalogCommit page {page_number} data length {data_len} \
+                     does not match {:?}",
+                    page_size
+                )));
+            }
+            let data_end = cursor.checked_add(data_len).ok_or_else(|| {
+                invalid_log_record("Phase 8 CatalogCommit page data length overflow")
+            })?;
+            if data_end > buf.len() {
+                return Err(invalid_log_record(
+                    "Phase 8 CatalogCommit payload truncated page data",
+                ));
+            }
+            pages.push(CatalogCommitPage {
+                page_number,
+                page_size,
+                data: buf[cursor..data_end].to_vec(),
+            });
+            cursor = data_end;
+        }
+        if cursor != buf.len() {
+            return Err(invalid_log_record(
+                "Phase 8 CatalogCommit payload has trailing bytes",
+            ));
+        }
+        Ok(Self {
+            kind,
+            catalog_generation_before,
+            catalog_generation_after,
+            header,
+            pages,
+        })
+    }
+}
+
+/// Typed payload carried by `LogRecordKind::CheckpointBoundary`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckpointBoundaryPayload {
+    /// Highest byte-LSN durably materialized into the main file.
+    pub(crate) checkpoint_applied_lsn: u64,
+    /// Header image written and fsynced before the boundary record.
+    pub(crate) header: FileHeader,
+}
+
+impl CheckpointBoundaryPayload {
+    /// Encode this checkpoint boundary payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header length cannot be encoded.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        if self.header.checkpoint_applied_lsn != self.checkpoint_applied_lsn {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointBoundary header checkpoint_applied_lsn mismatch",
+            ));
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&CHECKPOINT_BOUNDARY_PAYLOAD_MAGIC);
+        out.extend_from_slice(&CHECKPOINT_BOUNDARY_PAYLOAD_VERSION.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&self.checkpoint_applied_lsn.to_le_bytes());
+        out.extend_from_slice(&len_to_u32(HEADER_PAGE_SIZE)?.to_le_bytes());
+        out.extend_from_slice(&self.header.to_bytes());
+        Ok(out)
+    }
+
+    /// Decode and validate a checkpoint boundary payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptDatabase`] if the payload is malformed.
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
+        const PREFIX_LEN: usize = 20;
+        if buf.len() < PREFIX_LEN {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointBoundary payload truncated fixed header",
+            ));
+        }
+        if buf[0..4] != CHECKPOINT_BOUNDARY_PAYLOAD_MAGIC {
+            return Err(invalid_log_record("Phase 8 CheckpointBoundary bad magic"));
+        }
+        let version = read_u16(buf, 4);
+        if version != CHECKPOINT_BOUNDARY_PAYLOAD_VERSION {
+            return Err(invalid_log_record(format!(
+                "Phase 8 CheckpointBoundary bad version {version}"
+            )));
+        }
+        if read_u16(buf, 6) != 0 {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointBoundary reserved field must be zero",
+            ));
+        }
+        let checkpoint_applied_lsn = read_u64(buf, 8);
+        let header_len = read_u32(buf, 16) as usize;
+        if header_len != HEADER_PAGE_SIZE {
+            return Err(invalid_log_record(format!(
+                "Phase 8 CheckpointBoundary header length {header_len} is invalid"
+            )));
+        }
+        if buf.len() != PREFIX_LEN + HEADER_PAGE_SIZE {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointBoundary payload length mismatch",
+            ));
+        }
+        let header_bytes: &[u8; HEADER_PAGE_SIZE] =
+            buf[PREFIX_LEN..].try_into().expect("validated header len");
+        let header = FileHeader::from_bytes(header_bytes)?;
+        if header.checkpoint_applied_lsn != checkpoint_applied_lsn {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointBoundary header checkpoint_applied_lsn mismatch",
+            ));
+        }
+        Ok(Self {
+            checkpoint_applied_lsn,
+            header,
+        })
+    }
+}
+
+struct LogRecordHeader {
+    kind: LogRecordKind,
+    flags: LogRecordFlags,
+    total_len: usize,
+    start_lsn: u64,
+    end_lsn: u64,
+    txn_id: u64,
+    publish_seq: u64,
+    commit_ts: Ts,
+    payload_len: usize,
+    payload_crc32c: u32,
+}
+
+impl LogRecordHeader {
+    fn write_with_header_crc(&self, header_crc32c: u32, out: &mut [u8]) -> Result<()> {
+        debug_assert_eq!(out.len(), LOG_RECORD_HEADER_LEN);
+        out[LOG_RECORD_MAGIC_OFFSET..LOG_RECORD_MAGIC_OFFSET + 4]
+            .copy_from_slice(&LOG_RECORD_MAGIC.to_le_bytes());
+        out[LOG_RECORD_FORMAT_VERSION_OFFSET..LOG_RECORD_FORMAT_VERSION_OFFSET + 2]
+            .copy_from_slice(&LOG_RECORD_FORMAT_VERSION.to_le_bytes());
+        out[LOG_RECORD_HEADER_LEN_OFFSET..LOG_RECORD_HEADER_LEN_OFFSET + 2]
+            .copy_from_slice(&len_to_u16(LOG_RECORD_HEADER_LEN)?.to_le_bytes());
+        out[LOG_RECORD_KIND_OFFSET..LOG_RECORD_KIND_OFFSET + 2]
+            .copy_from_slice(&self.kind.wire_value().to_le_bytes());
+        out[LOG_RECORD_FLAGS_OFFSET..LOG_RECORD_FLAGS_OFFSET + 2]
+            .copy_from_slice(&self.flags.bits().to_le_bytes());
+        out[LOG_RECORD_TOTAL_LEN_OFFSET..LOG_RECORD_TOTAL_LEN_OFFSET + 4]
+            .copy_from_slice(&len_to_u32(self.total_len)?.to_le_bytes());
+        out[LOG_RECORD_START_LSN_OFFSET..LOG_RECORD_START_LSN_OFFSET + 8]
+            .copy_from_slice(&self.start_lsn.to_le_bytes());
+        out[LOG_RECORD_END_LSN_OFFSET..LOG_RECORD_END_LSN_OFFSET + 8]
+            .copy_from_slice(&self.end_lsn.to_le_bytes());
+        out[LOG_RECORD_TXN_ID_OFFSET..LOG_RECORD_TXN_ID_OFFSET + 8]
+            .copy_from_slice(&self.txn_id.to_le_bytes());
+        out[LOG_RECORD_PUBLISH_SEQ_OFFSET..LOG_RECORD_PUBLISH_SEQ_OFFSET + 8]
+            .copy_from_slice(&self.publish_seq.to_le_bytes());
+        out[LOG_RECORD_COMMIT_TS_PHYSICAL_OFFSET..LOG_RECORD_COMMIT_TS_PHYSICAL_OFFSET + 8]
+            .copy_from_slice(&self.commit_ts.physical_ms.to_le_bytes());
+        out[LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET..LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET + 4]
+            .copy_from_slice(&self.commit_ts.logical.to_le_bytes());
+        out[LOG_RECORD_PAYLOAD_LEN_OFFSET..LOG_RECORD_PAYLOAD_LEN_OFFSET + 4]
+            .copy_from_slice(&len_to_u32(self.payload_len)?.to_le_bytes());
+        out[LOG_RECORD_HEADER_CRC32C_OFFSET..LOG_RECORD_HEADER_CRC32C_OFFSET + 4]
+            .copy_from_slice(&header_crc32c.to_le_bytes());
+        out[LOG_RECORD_PAYLOAD_CRC32C_OFFSET..LOG_RECORD_PAYLOAD_CRC32C_OFFSET + 4]
+            .copy_from_slice(&self.payload_crc32c.to_le_bytes());
+        Ok(())
+    }
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(buf[offset..offset + 2].try_into().expect("2 bytes"))
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("4 bytes"))
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(buf[offset..offset + 8].try_into().expect("8 bytes"))
+}
+
+fn len_to_u16(len: usize) -> Result<u16> {
+    u16::try_from(len).map_err(|_| invalid_log_record("Phase 8 LogRecord length exceeds u16"))
+}
+
+fn len_to_u32(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| invalid_log_record("Phase 8 LogRecord length exceeds u32"))
+}
+
+fn log_record_too_large(total_len: usize) -> Error {
+    Error::JournalFrameTooLarge {
+        logical_frame_bytes: total_len,
+        max_bytes: MAX_LOG_RECORD_BYTES,
+    }
+}
+
+fn invalid_log_record(detail: impl Into<String>) -> Error {
+    Error::CorruptDatabase {
+        path: std::path::PathBuf::new(),
+        detail: detail.into(),
+        recoverable: true,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FrameKind

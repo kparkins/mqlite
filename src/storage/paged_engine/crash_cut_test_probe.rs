@@ -7,6 +7,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{EngineFatalReason, Error, Result};
+use crate::journal::log_file::LogRecordDraft;
 use crate::mvcc::transaction::WriteTxn;
 use crate::storage::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
 
@@ -86,20 +87,24 @@ impl PagedEngine {
         let commit_ts = slot.commit_ts();
         txn.commit_ts.set(Some(commit_ts));
         report.commit_ts = Some((commit_ts.physical_ms, commit_ts.logical));
-        if matches!(
-            cut,
-            Phase0ProbeCut::AfterCommitTsBeforeLogicalFrame | Phase0ProbeCut::AfterAllocateCommitTs
-        ) {
+        if matches!(cut, Phase0ProbeCut::AfterCommitTsBeforeLogicalFrame) {
             return Self::phase0_stop_before_recovery(report, txn);
         }
 
         let frame = txn.build_logical_txn_frame(&self.shared.handle, &primary_writes, &sec_writes);
-        if cut == Phase0ProbeCut::AfterLogicalFrameBeforeAppend {
+        if cut == Phase0ProbeCut::AfterLogicalFrameBeforeReservation {
             return Self::phase0_stop_before_recovery(report, txn);
         }
 
         let dirty = txn.publish_dirty();
         let root_changing = txn.structural_tree_change();
+        let logical_payload = match frame.encode() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                drop(txn);
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+            }
+        };
         let sec_pages = match install_pending_sec_index(
             &self.shared,
             &self.metadata_state,
@@ -129,71 +134,50 @@ impl PagedEngine {
         let root_changing = root_changing | primary_structural_tree_change;
         let mut pending_pages = sec_pages;
         pending_pages.extend(primary_pages);
-        if matches!(
-            cut,
-            Phase0ProbeCut::AfterPrimaryInstallBeforeStructuralBatchCommit
-                | Phase0ProbeCut::AfterInstallPendingPrimary
-        ) {
+        if matches!(cut, Phase0ProbeCut::AfterPendingInstallBeforeReservation) {
             return Self::phase0_stop_before_recovery(report, txn);
         }
+        let prepared = match txn.prepare_chain_commit_payload(&self.shared.handle, commit_ts) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+            }
+        };
+        let _pending = prepared.pending;
+        let _pending_sec_index = prepared.pending_sec_index;
 
+        let draft = LogRecordDraft::crud(
+            txn_id,
+            slot.publish_seq(),
+            commit_ts,
+            logical_payload,
+            prepared.payload,
+        );
+        let reserved = match self.shared.handle.reserve_log_record(draft) {
+            Ok(reserved) => reserved,
+            Err(e) => {
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+            }
+        };
+        let commit_end_lsn = reserved.end_lsn();
+        if let Err(e) = self
+            .shared
+            .handle
+            .stamp_dirty_pages_lsn(&pending_pages, commit_end_lsn)
         {
-            let _journal = self.lock_journal_mutex();
-            let commit_mark = match self.shared.handle.begin_txn() {
-                Ok(mark) => mark,
-                Err(e) => {
-                    return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
-                }
-            };
-            if let Err(e) = self.shared.handle.append_logical_txn(frame) {
-                return Err(self.cleanup_registered_pre_durable_failure(
-                    txn_id,
-                    slot,
-                    commit_mark,
-                    e,
-                ));
-            }
-            if cut == Phase0ProbeCut::AfterLogicalAppendBeforeChainCommit {
-                return Self::phase0_stop_before_recovery(report, txn);
-            }
-            if let Err(e) = txn.commit_chain_commit(&self.shared.handle, commit_ts) {
-                return Err(self.cleanup_registered_pre_durable_failure(
-                    txn_id,
-                    slot,
-                    commit_mark,
-                    e,
-                ));
-            }
-            if matches!(
-                cut,
-                Phase0ProbeCut::AfterChainCommitBeforeSecondaryInstall
-                    | Phase0ProbeCut::AfterChainCommitBeforeCommitTxn
-                    | Phase0ProbeCut::AfterStructuralBatchCommitBeforeFlush
-                    | Phase0ProbeCut::AfterStructuralBatchCommit
-            ) {
-                return Ok(report);
-            }
-            if !matches!(self.durability_mode, crate::DurabilityMode::FullSync) {
-                if let Err(e) = self.flush_under_journal_mutex() {
-                    return Err(self.cleanup_registered_pre_durable_failure(
-                        txn_id,
-                        slot,
-                        commit_mark,
-                        e,
-                    ));
-                }
-            }
+            return Err(self.poison_after_reserved_log_failure(&reserved, e));
+        }
+        let written_end_lsn = match reserved.write_and_mark() {
+            Ok(end_lsn) => end_lsn,
+            Err(e) => return Err(self.poison_after_log_manager_failure(e)),
+        };
+        debug_assert_eq!(written_end_lsn, commit_end_lsn);
+        if matches!(cut, Phase0ProbeCut::AfterLogRecordWriteBeforeDurabilityWait) {
+            return Ok(report);
         }
 
-        if matches!(self.durability_mode, crate::DurabilityMode::FullSync) {
-            self.fullsync_group_commit()?;
-        }
-        if matches!(
-            cut,
-            Phase0ProbeCut::AfterStructuralFlushBeforePublish
-                | Phase0ProbeCut::AfterFlushBeforeChainCommit
-                | Phase0ProbeCut::AfterCommitTxnBeforePublish
-        ) {
+        self.wait_for_commit_durability(commit_end_lsn)?;
+        if matches!(cut, Phase0ProbeCut::AfterDurabilityWaitBeforePublish) {
             return Ok(report);
         }
 

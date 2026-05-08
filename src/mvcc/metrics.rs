@@ -599,36 +599,6 @@ pub fn reset_lane_wait_ns() {
 }
 
 // ---------------------------------------------------------------------------
-// P3b — journal_mutex_wait_ns_total  (counter, cumulative nanoseconds)
-// ---------------------------------------------------------------------------
-
-/// Cumulative nanoseconds CRUD writers spent waiting to acquire the global
-/// `journal_mutex`. The caller samples `Instant::now()` before lock
-/// acquisition, then records the elapsed wait immediately after acquiring the
-/// guard with one lock-free atomic add.
-///
-/// Observation only — write-side updates are lock-free atomics; snapshot/reset
-/// calls are test/admin surfaces and must not race with active writers.
-pub static JOURNAL_MUTEX_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// Record N nanoseconds of journal_mutex-acquisition wait.
-pub fn record_journal_mutex_wait_ns(ns: u64) {
-    if ns > 0 {
-        JOURNAL_MUTEX_WAIT_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
-    }
-}
-
-/// Snapshot the journal_mutex-wait cumulative-nanoseconds counter.
-pub fn journal_mutex_wait_ns_snapshot() -> u64 {
-    JOURNAL_MUTEX_WAIT_NS_TOTAL.load(Ordering::Relaxed)
-}
-
-/// Reset the journal_mutex-wait counter.
-pub fn reset_journal_mutex_wait_ns() {
-    JOURNAL_MUTEX_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
-}
-
-// ---------------------------------------------------------------------------
 // P4a — recovery_legacy_page_frames_total  (counter)
 // ---------------------------------------------------------------------------
 
@@ -1038,9 +1008,9 @@ pub fn reset_recovery_page0_boundary_frames() {
 // (1) logical_txn_append_bytes_total — counter
 // ---------------------------------------------------------------------------
 
-/// Total bytes appended via `JournalManager::append_logical_txn`.
-/// Increments by the encoded frame size on every successful append
-/// (after the I/O completes; failures do not tick).
+/// Total logical payload bytes appended through the durable commit envelope.
+/// Increments by the encoded frame size on every successful append after I/O
+/// completes; failures do not tick.
 pub static LOGICAL_TXN_APPEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Record an append of `n` bytes.
@@ -1075,10 +1045,8 @@ pub fn reset_logical_txn_append_bytes() {
 //      slot. O(1).
 //   2. `recompute_logical_txn_append_percentiles()` sorts the 64-slot
 //      ring and stores p50/p95/p99 into the gauge atomics. Called
-//      OUTSIDE the journal critical section by an RAII guard
-//      declared before the journal_mutex guard so Rust's LIFO
-//      drop order makes recompute run with no mutex held (US-024
-//      AC#3 / §7 guardrail).
+//      after the hot append-envelope work by an RAII guard (US-024 AC#3 /
+//      §7 guardrail).
 //
 // Lock-free in both phases; uses three independent atomics for the
 // gauges so the recompute window can race without locking. Approximate
@@ -1099,17 +1067,16 @@ static APPEND_SAMPLE_RING_BUF: [AtomicU64; APPEND_SAMPLE_RING] =
     [ZERO_ATOMIC_U64; APPEND_SAMPLE_RING];
 static APPEND_SAMPLE_RING_INDEX: AtomicU64 = AtomicU64::new(0);
 
-/// Push one `append_logical_txn` duration sample (in milliseconds) into
+/// Push one logical append-envelope duration sample (in milliseconds) into
 /// the ring buffer. Cheap — only an atomic increment + atomic store.
-/// Safe to call inside the commit-envelope critical section (§7
-/// guardrail: keep work inside the journal_mutex minimal).
+/// Safe to call inside the commit-envelope hot path (§7 guardrail: keep
+/// post-append bookkeeping minimal).
 ///
 /// The percentile gauges are NOT updated by this function. The caller
-/// MUST call [`recompute_logical_txn_append_percentiles`] OUTSIDE the
-/// commit-envelope critical section to refresh the p50/p95/p99 gauges.
-/// This split keeps the lock-held work O(1) and the heavier sort/store
-/// work outside the critical section, per the §7 / US-024 AC#3
-/// constraint.
+/// MUST call [`recompute_logical_txn_append_percentiles`] after the hot
+/// append-envelope work to refresh the p50/p95/p99 gauges. This split keeps
+/// append bookkeeping O(1) and the heavier sort/store work outside the
+/// append path, per the §7 / US-024 AC#3 constraint.
 pub fn record_logical_txn_append_duration_ms(ms: u64) {
     let idx =
         APPEND_SAMPLE_RING_INDEX.fetch_add(1, Ordering::Relaxed) as usize % APPEND_SAMPLE_RING;
@@ -1118,9 +1085,8 @@ pub fn record_logical_txn_append_duration_ms(ms: u64) {
 
 /// Recompute the p50/p95/p99 gauges from the ring buffer. Sorts a
 /// 64-element u64 array in place — a few microseconds of work that
-/// MUST run outside the commit-envelope critical section so the
-/// journal_mutex holders do not pay for percentile maintenance
-/// (§7 guardrail / US-024 AC#3).
+/// MUST run outside the hot append-envelope work so committers do not pay for
+/// percentile maintenance (§7 guardrail / US-024 AC#3).
 ///
 /// Idempotent. Safe to call from any thread; lock-free recompute.
 pub fn recompute_logical_txn_append_percentiles() {
@@ -1470,16 +1436,6 @@ mod tests {
         assert_eq!(lane_wait_ns_snapshot(), 750);
         reset_lane_wait_ns();
         assert_eq!(lane_wait_ns_snapshot(), 0);
-    }
-
-    #[test]
-    fn journal_mutex_wait_ns_counter_unit() {
-        reset_journal_mutex_wait_ns();
-        record_journal_mutex_wait_ns(1000);
-        record_journal_mutex_wait_ns(0);
-        assert_eq!(journal_mutex_wait_ns_snapshot(), 1000);
-        reset_journal_mutex_wait_ns();
-        assert_eq!(journal_mutex_wait_ns_snapshot(), 0);
     }
 
     #[test]

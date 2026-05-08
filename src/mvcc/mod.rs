@@ -30,7 +30,6 @@ pub use metrics::{
     hlc_advance_events_snapshot,
     journal_chain_commit_frames_snapshot,
     journal_commits_snapshot,
-    journal_mutex_wait_ns_snapshot,
     lane_wait_ns_snapshot,
     // Phase 2 §7 / US-024 — logical-frame counters / gauges
     logical_txn_append_bytes_snapshot,
@@ -68,7 +67,6 @@ pub use metrics::{
     record_hlc_advance,
     record_journal_chain_commit_frame,
     record_journal_commit,
-    record_journal_mutex_wait_ns,
     record_lane_wait_ns,
     record_logical_txn_append_bytes,
     record_logical_txn_append_duration_ms,
@@ -108,7 +106,6 @@ pub use metrics::{
     reset_hlc_advance_events,
     reset_journal_chain_commit_frames,
     reset_journal_commits,
-    reset_journal_mutex_wait_ns,
     reset_lane_wait_ns,
     reset_logical_txn_append_bytes,
     reset_logical_txn_append_durations,

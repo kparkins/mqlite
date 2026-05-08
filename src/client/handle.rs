@@ -125,6 +125,25 @@ impl Client {
         self.inner.checkpoint()
     }
 
+    /// Reset Phase 8 benchmark-only journal sync counters.
+    ///
+    /// This hidden hook is used by release-profile benchmark targets. It is
+    /// not part of the stable application API.
+    #[doc(hidden)]
+    pub fn __phase8_bench_reset_sync_observations(&self) {
+        crate::journal::append_sync_test_probe::reset();
+    }
+
+    /// Return successful journal fsync boundaries observed since reset.
+    ///
+    /// This hidden hook is used by release-profile benchmark targets. It is
+    /// not part of the stable application API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __phase8_bench_journal_sync_os_boundaries(&self) -> u64 {
+        crate::journal::append_sync_test_probe::snapshot().journal_sync_os_boundaries
+    }
+
     // Test-only accessors (`__oracle_now`, `__published_visible_ts`,
     // `__published_catalog_gen`, `__published_sequencer_frontier`,
     // `__recovery_open_published_store_count`, `__recovered_max_commit_ts`,

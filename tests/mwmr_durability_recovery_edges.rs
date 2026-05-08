@@ -731,13 +731,22 @@ fn tc11_assert_phase6_logical_tail_checkpoint_contract() {
             .expect("checkpoint_after_reconcile_plan locatable");
     let checkpoint = tc11_strip_line_comments(&checkpoint);
     for token in [
-        "requires_logical_tail = true",
-        "sync_journal_under_journal_mutex",
-        "emergency_checkpoint()",
+        "requires_logical_tail",
+        "sync_journal_ready_prefix",
+        "LogRecordDraft::checkpoint_boundary",
+        "reserve_log_record",
+        "wait_journal_durable",
+        "advance_page_lifetime_checkpoint",
     ] {
         assert!(
             checkpoint.contains(token),
-            "Phase 6 checkpoint fallback must preserve `{token}`",
+            "checkpoint must preserve Phase 8 log-boundary contract token `{token}`",
+        );
+    }
+    for token in ["sync_journal_under_journal_mutex", "emergency_checkpoint()"] {
+        assert!(
+            !checkpoint.contains(token),
+            "checkpoint must not retain retired Phase 6 fallback token `{token}`",
         );
     }
 }

@@ -23,6 +23,7 @@
 )]
 
 use std::env;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bson::{doc, Document};
@@ -32,11 +33,23 @@ const NUM_COLLECTIONS: usize = 100;
 const LOGICAL_FRAMES: usize = 10_000;
 const BUDGET_MS: u64 = 500;
 const JOURNAL_HEADER_BYTES: u64 = 32;
+const CHECKPOINT_APPLIED_LSN_OFFSET: usize = 102;
+const CHECKPOINT_APPLIED_LSN_BYTES: usize = 8;
 
-fn journal_path(db_path: &std::path::Path) -> std::path::PathBuf {
+fn journal_path(db_path: &Path) -> PathBuf {
     let mut path = db_path.as_os_str().to_owned();
     path.push("-journal");
-    std::path::PathBuf::from(path)
+    PathBuf::from(path)
+}
+
+fn read_checkpoint_applied_lsn(db_path: &Path) -> u64 {
+    let bytes = std::fs::read(db_path).expect("read database header");
+    let end = CHECKPOINT_APPLIED_LSN_OFFSET + CHECKPOINT_APPLIED_LSN_BYTES;
+    u64::from_le_bytes(
+        bytes[CHECKPOINT_APPLIED_LSN_OFFSET..end]
+            .try_into()
+            .expect("checkpoint_applied_lsn bytes"),
+    )
 }
 
 fn budget() -> Duration {
@@ -115,7 +128,7 @@ fn test_post_open_validation_throughput_at_10k_logical_frames() {
 }
 
 #[test]
-fn checkpoint_compacts_fully_materialized_logical_tail() {
+fn checkpoint_marks_fully_materialized_logical_tail_applied() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checkpoint_tail.mqlite");
     let journal = journal_path(&path);
@@ -139,10 +152,16 @@ fn checkpoint_compacts_fully_materialized_logical_tail() {
         );
 
         client.checkpoint().expect("checkpoint");
+        let post_checkpoint_len = std::fs::metadata(&journal).unwrap().len();
+        let checkpoint_applied_lsn = read_checkpoint_applied_lsn(&path);
         assert_eq!(
-            std::fs::metadata(&journal).unwrap().len(),
-            JOURNAL_HEADER_BYTES,
-            "checkpoint should truncate a fully materialized logical tail"
+            checkpoint_applied_lsn, pre_checkpoint_len,
+            "checkpoint should mark the fully materialized logical tail as applied"
+        );
+        assert!(
+            post_checkpoint_len >= checkpoint_applied_lsn,
+            "Phase 8 retains valid prefix log bytes for recovery skip instead of \
+             physically trimming them"
         );
     }
 

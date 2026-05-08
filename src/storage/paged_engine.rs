@@ -34,11 +34,10 @@ mod crash_cut_test_probe;
 mod doc_helpers;
 mod doc_ops;
 /// Test-only engine-fatal probe — engine-fatal poison + sequencer + writer
-/// ticket handles. Kept in a separate module so intrusive test plumbing stays
-/// out of production paths.
+/// admission handles. Kept in a separate module so intrusive test plumbing
+/// stays out of production paths.
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod engine_fatal_test_probe;
-mod group_commit;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod group_commit_test_probe;
 mod index_build;
@@ -115,12 +114,13 @@ mod tests;
 #[path = "paged_engine/tests/unique_constraint_delta_tests.rs"]
 mod unique_constraint_delta_tests;
 #[cfg(test)]
-#[path = "paged_engine/tests/write_commit_sequence_tests.rs"]
-mod write_commit_sequence_tests;
+#[path = "paged_engine/tests/write_order_tests.rs"]
+mod write_order_tests;
 #[cfg(test)]
 #[path = "paged_engine/tests/write_visibility_epoch_tests.rs"]
 mod write_visibility_epoch_tests;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,10 @@ use super::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
 use super::engine::StorageEngine;
 use crate::error::{Error, Result, WriteConflictReason};
 use crate::index::{IndexInfo, IndexModel};
+use crate::journal::log_file::{
+    CatalogCommitKind, CatalogCommitPage, CatalogCommitPayload, JournalPageSize, LogRecordDraft,
+    PageId,
+};
 use crate::mvcc::transaction::WriteTxn;
 use crate::options::{
     DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
@@ -159,11 +163,10 @@ use self::index_maint::{
     install_pending_sec_index,
 };
 use self::publish::PublishDirty;
+use self::publish_sequencer::PublishSlotGuard;
 use self::state::{MetadataState, SharedState};
 use self::visibility::WriteVisibility;
 use crate::storage::catalog::IndexState;
-
-const FULLSYNC_GROUP_COMMIT_MAX_WAIT_MS: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // PagedEngine — public struct
@@ -199,12 +202,8 @@ pub(crate) struct PagedEngine {
     pub(crate) busy_timeout: Duration,
     /// Durability mode chosen at open time.
     durability_mode: DurabilityMode,
-}
-
-struct JournalMutexGuard<'a> {
-    _guard: parking_lot::MutexGuard<'a, ()>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    _scope: self::test_accessors::Us007JournalMutexScopeGuard,
+    /// Last interval-mode journal sync attempt. FullSync and None ignore it.
+    last_interval_sync: parking_lot::Mutex<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,25 +225,9 @@ struct IndexCatalogIdentity {
 /// RAII guard that records the logical-frame-append duration sample and
 /// recomputes the percentile gauges (p50/p95/p99) from the ring buffer.
 ///
-/// Duration sampling reads `Instant::now()` outside the journal critical
-/// section. This guard:
-///
-///   - Captures `start = Instant::now()` at construction (BEFORE
-///     the journal mutex is acquired in `run_write_existing` — the
-///     guard is declared before `_commit`, and Rust evaluates RHS in
-///     order so the `Instant::now()` call here happens first).
-///   - On `drop` (which runs AFTER the journal mutex is released
-///     because of LIFO drop order), samples `elapsed` and records it
-///     as one logical-frame-append duration sample, then recomputes
-///     the p50/p95/p99 gauges.
-///
-/// Both `Instant::now()` reads happen with NO journal mutex held.
-///
-/// The recorded duration spans the full journal critical section rather than
-/// just the journal-file I/O. Per §7 ("approximate latest-value gauge"), this
-/// is an acceptable approximation: the critical section is dominated by the
-/// logical transaction and ChainCommit journal writes, so the envelope duration
-/// tracks the append duration to within a few microseconds of overhead.
+/// The recorded duration now spans Phase 8 draft construction, reservation,
+/// positioned write, and ready marking. It is still a coarse append-envelope
+/// sample; percentile recomputation happens on drop after the hot write work.
 struct LogicalTxnAppendPercentileRefresh {
     start: std::time::Instant,
 }
@@ -316,49 +299,188 @@ impl PagedEngine {
             metadata_state: Arc::new(md),
             busy_timeout,
             durability_mode,
+            last_interval_sync: parking_lot::Mutex::new(Instant::now()),
         };
         engine.resume_building_indexes_after_open()?;
         Ok(engine)
     }
 
-    fn lock_journal_mutex(&self) -> JournalMutexGuard<'_> {
-        let wait_start = Instant::now();
-        let guard = self.shared.journal_mutex.lock();
-        let waited_ns = u64::try_from(wait_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        crate::mvcc::metrics::record_journal_mutex_wait_ns(waited_ns);
-        #[cfg(any(test, feature = "test-hooks"))]
-        let scope = self::test_accessors::us007_enter_journal_mutex_scope();
-        JournalMutexGuard {
-            _guard: guard,
-            #[cfg(any(test, feature = "test-hooks"))]
-            _scope: scope,
+    fn poison_after_log_manager_failure(&self, error: Error) -> Error {
+        if let Error::EngineFatal { reason } = error {
+            return state::poison_after_durable_commit(&self.shared, reason);
         }
+        error
     }
 
-    fn flush_under_journal_mutex(&self) -> Result<()> {
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::test_accessors::us007_record_flush();
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::test_accessors::us026_fail_if_armed(&self.shared, Us026PostRegisterFailpoint::Flush)?;
-        self.shared.handle.flush()
+    fn poison_after_reserved_log_failure(
+        &self,
+        reserved: &crate::journal::ReservedLogRecord,
+        error: Error,
+    ) -> Error {
+        if !reserved.is_journaled() {
+            return error;
+        }
+        let fatal = reserved.poison_slot(error);
+        self.poison_after_log_manager_failure(fatal)
     }
 
-    fn sync_journal_under_journal_mutex(&self) -> Result<()> {
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::test_accessors::us007_record_sync();
-        self.shared.handle.journal_sync()
+    fn wait_for_commit_durability(&self, end_lsn: u64) -> Result<()> {
+        let result = match self.durability_mode {
+            DurabilityMode::FullSync => self.shared.handle.wait_journal_durable(end_lsn),
+            DurabilityMode::Interval(_) | DurabilityMode::None => {
+                self.shared.handle.wait_journal_ready(end_lsn)
+            }
+        };
+        result.map_err(|error| self.poison_after_log_manager_failure(error))
     }
 
-    fn fullsync_group_commit(&self) -> Result<()> {
-        self.shared.group_commit.join_fsync_cohort(
+    pub(super) fn commit_catalog_batch_to_log(
+        &self,
+        kind: CatalogCommitKind,
+        catalog_generation_before: u64,
+        catalog_generation_after: u64,
+        slot: &PublishSlotGuard,
+        batch: StructuralPageBatch,
+    ) -> Result<()> {
+        let (payload, direct_dirty_pages) = self.catalog_commit_payload(
+            kind,
+            catalog_generation_before,
+            catalog_generation_after,
+            &batch,
+        )?;
+        let draft = LogRecordDraft::catalog(0, slot.publish_seq(), slot.commit_ts(), payload);
+        let reserved = self.shared.handle.reserve_log_record(draft)?;
+        let commit_end_lsn = reserved.end_lsn();
+
+        let mut base_store = new_store(&self.shared);
+        if let Err(error) =
+            batch.commit_lsn_fenced(&mut base_store, &self.shared.handle, commit_end_lsn)
+        {
+            return Err(self.poison_after_reserved_log_failure(&reserved, error));
+        }
+        if let Err(error) = self
+            .shared
+            .handle
+            .stamp_dirty_pages_lsn_all_pools(&direct_dirty_pages, commit_end_lsn)
+        {
+            return Err(self.poison_after_reserved_log_failure(&reserved, error));
+        }
+        let written_end_lsn = reserved
+            .write_and_mark()
+            .map_err(|error| self.poison_after_log_manager_failure(error))?;
+        debug_assert_eq!(written_end_lsn, commit_end_lsn);
+        self.wait_for_commit_durability(commit_end_lsn)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self::test_accessors::us026_fail_if_armed(
             &self.shared,
-            Duration::from_millis(FULLSYNC_GROUP_COMMIT_MAX_WAIT_MS),
-            || {
-                let _journal = self.lock_journal_mutex();
-                self.flush_under_journal_mutex()?;
-                self.sync_journal_under_journal_mutex()
-            },
+            Us026PostRegisterFailpoint::Flush,
         )
+        .is_err()
+        {
+            return Err(
+                self.engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)
+            );
+        }
+        Ok(())
+    }
+
+    fn catalog_commit_payload(
+        &self,
+        kind: CatalogCommitKind,
+        catalog_generation_before: u64,
+        catalog_generation_after: u64,
+        batch: &StructuralPageBatch,
+    ) -> Result<(Vec<u8>, Vec<u32>)> {
+        let header = self.shared.handle.allocator().with_header(Clone::clone)?;
+        let mut catalog_page_ids: BTreeSet<PageId> = {
+            let mut cat = catalog_lock(&self.metadata_state);
+            cat.collect_pages_by_size()?
+                .into_iter()
+                .map(|(page, _size)| PageId(page))
+                .collect()
+        };
+        if header.catalog_root_page != 0 {
+            catalog_page_ids.insert(PageId(header.catalog_root_page));
+        }
+        if header.catalog_root_backup != 0 {
+            catalog_page_ids.insert(PageId(header.catalog_root_backup));
+        }
+        if header.history_store_root_page != 0 {
+            catalog_page_ids.insert(PageId(header.history_store_root_page));
+        }
+
+        let direct_dirty = self
+            .shared
+            .handle
+            .dirty_frame_snapshots_for_pages(&catalog_page_ids)?;
+        let direct_dirty_pages: Vec<u32> = direct_dirty
+            .iter()
+            .map(|(page, _size, _data)| *page)
+            .collect();
+        let mut pages_by_key: BTreeMap<(u32, u8), CatalogCommitPage> = BTreeMap::new();
+        for (page_number, page_size, data) in direct_dirty {
+            let page_size = match page_size {
+                PageSize::Small4k => JournalPageSize::Small4k,
+                PageSize::Large32k => JournalPageSize::Large32k,
+            };
+            let size_order = match page_size {
+                JournalPageSize::Small4k => 0,
+                JournalPageSize::Large32k => 1,
+            };
+            pages_by_key.insert(
+                (page_number, size_order),
+                CatalogCommitPage {
+                    page_number,
+                    page_size,
+                    data,
+                },
+            );
+        }
+        for page in batch.page_images() {
+            let page_size = match page.page_size {
+                PageSize::Small4k => JournalPageSize::Small4k,
+                PageSize::Large32k => JournalPageSize::Large32k,
+            };
+            let size_order = match page_size {
+                JournalPageSize::Small4k => 0,
+                JournalPageSize::Large32k => 1,
+            };
+            pages_by_key.insert(
+                (page.page_number, size_order),
+                CatalogCommitPage {
+                    page_number: page.page_number,
+                    page_size,
+                    data: page.data,
+                },
+            );
+        }
+        let pages = pages_by_key.into_values().collect();
+        let payload = CatalogCommitPayload {
+            kind,
+            catalog_generation_before,
+            catalog_generation_after,
+            header,
+            pages,
+        }
+        .encode()?;
+        Ok((payload, direct_dirty_pages))
+    }
+
+    pub(super) fn maybe_sync_interval_after_publish(&self) -> Result<()> {
+        let DurabilityMode::Interval(interval) = self.durability_mode else {
+            return Ok(());
+        };
+        {
+            let mut last_sync = self.last_interval_sync.lock();
+            if last_sync.elapsed() < interval {
+                return Ok(());
+            }
+            *last_sync = Instant::now();
+        }
+        self.shared
+            .handle
+            .sync_journal_ready_prefix()
+            .map_err(|error| self.poison_after_log_manager_failure(error))
     }
 
     fn namespace_catalog_identity(
@@ -421,11 +543,9 @@ impl PagedEngine {
     /// CRUD write lifecycle.
     ///
     /// Drives: metadata.read() → bootstrap-if-missing → private logical
-    /// WriteTxn setup → body → install Pending deltas → journal_mutex {
-    /// logical/chain journal appends + non-FullSync final flush } → flip
-    /// Pending to Committed → publish.
-    /// FullSync flush/sync ownership is the explicit sync boundary after the
-    /// API write batch.
+    /// WriteTxn setup → body → install Pending deltas → Phase 8 LogRecord
+    /// reservation/write/durability gate → flip Pending to Committed →
+    /// ordered publish.
     fn run_write<F, R>(&self, ns: &str, f: F) -> Result<R>
     where
         F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
@@ -513,16 +633,15 @@ impl PagedEngine {
         // COMMIT-ENVELOPE-RESIDUE: A (visibility setup fails before journal append).
         let vis = self.write_visibility_after_capture(ns, captured_ns_id)?;
 
-        // Setup private logical write state. Journal rollback marks are
-        // captured later, inside `journal_mutex`, immediately before this
-        // transaction can append journal frames.
+        // Setup private logical write state. Pre-reservation failures are
+        // cleaned up without touching the log; post-reservation failures
+        // poison the reserved LSN slot.
         let txn_id = vis.read_view.txn_id;
         let mut txn = WriteTxn::new(txn_id);
 
         // S3: execute the write body under the CRUD metadata read guard. The
         // catalog itself is behind `Mutex<Catalog>`, while page latches and
         // expected-head checks serialize resident chain mutation.
-        // `journal_mutex` serializes only the durability envelope.
         #[cfg(any(test, feature = "test-hooks"))]
         self::test_accessors::write_body_entry_if_installed(&self.shared, ns);
         let body_result = f(&self.shared, &self.metadata_state, &mut txn, &vis);
@@ -536,9 +655,7 @@ impl PagedEngine {
                 let mut root_changing = txn.structural_tree_change();
 
                 // Refresh the logical-txn append-duration percentiles after
-                // the journal envelope releases.
-                // `LogicalTxnAppendPercentileRefresh::drop` runs the
-                // sort+store work outside the critical section.
+                // the Phase 8 log append envelope completes.
                 let _logical_txn_append_pct_refresh = LogicalTxnAppendPercentileRefresh::new();
 
                 let sec_writes = std::mem::take(&mut txn.pending_sec_index);
@@ -555,8 +672,8 @@ impl PagedEngine {
                 // identity, not an automatic conflict for unrelated DDL.
                 //
                 // This gate runs before `register_with_oracle`, before any
-                // Pending install, and before `journal_mutex` durability
-                // begins. Rollback is purely in-memory.
+                // Pending install, and before log reservation. Rollback is
+                // purely in-memory.
                 {
                     // Write-path direct load (§10.5 single-load gate is
                     // read-path only); see the matching note at the S1
@@ -591,10 +708,40 @@ impl PagedEngine {
                 );
                 drop(prev_published);
 
+                let dirty = txn.publish_dirty();
+
                 let frame =
                     txn.build_logical_txn_frame(&self.shared.handle, &primary_writes, &sec_writes);
 
-                let dirty = txn.publish_dirty();
+                let logical_payload = match frame.encode() {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        drop(txn);
+                        return Err(
+                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
+                        );
+                    }
+                };
+                let logical_payload_len = logical_payload.len();
+
+                let prepared =
+                    match txn.prepare_chain_commit_payload(&self.shared.handle, commit_ts) {
+                        Ok(prepared) => prepared,
+                        Err(e) => {
+                            return Err(
+                                self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
+                            );
+                        }
+                    };
+                let _pending = prepared.pending;
+                let _pending_sec_index = prepared.pending_sec_index;
+                let draft = LogRecordDraft::crud(
+                    txn_id,
+                    slot.publish_seq(),
+                    commit_ts,
+                    logical_payload,
+                    prepared.payload,
+                );
 
                 let sec_pages = match self.install_pending_sec_index_with_retry(
                     &self.metadata_state,
@@ -605,7 +752,6 @@ impl PagedEngine {
                 ) {
                     Ok(pages) => pages,
                     Err(e) => {
-                        drop(txn);
                         return Err(
                             self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
                         );
@@ -622,7 +768,6 @@ impl PagedEngine {
                 let (primary_pages, primary_structural_tree_change) = match primary_install {
                     Ok(result) => result,
                     Err(e) => {
-                        drop(txn);
                         return Err(
                             self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
                         );
@@ -632,121 +777,71 @@ impl PagedEngine {
                 let mut pending_pages = sec_pages;
                 pending_pages.extend(primary_pages);
 
-                {
-                    let _journal = self.lock_journal_mutex();
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    if let Err(e) = self::test_accessors::us026_fail_if_armed(
-                        &self.shared,
-                        Us026PostRegisterFailpoint::BeginTxnAfterRegister,
-                    ) {
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Err(e) = self::test_accessors::us026_fail_if_armed(
+                    &self.shared,
+                    Us026PostRegisterFailpoint::BeforeLogReservation,
+                ) {
+                    return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                self::test_accessors::phase8_before_reservation_if_installed(&self.shared);
+
+                let reserved = match self.shared.handle.reserve_log_record(draft) {
+                    Ok(reserved) => reserved,
+                    Err(e) => {
                         return Err(
                             self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
                         );
                     }
-                    let commit_mark = match self.shared.handle.begin_txn() {
-                        Ok(mark) => mark,
-                        Err(e) => {
-                            return Err(
-                                self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
-                            );
-                        }
-                    };
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    if let Err(e) =
-                        self::test_accessors::us007_after_begin_if_installed(&self.shared)
-                    {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            commit_mark,
-                            e,
-                        ));
-                    }
+                };
+                let commit_end_lsn = reserved.end_lsn();
 
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    self::test_accessors::phase3_abort_if_armed(
-                        Phase3CommitFailpoint::BeforeLogicalTxnAppend,
-                    );
-
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    if let Err(e) = self::test_accessors::us026_fail_if_armed(
-                        &self.shared,
-                        Us026PostRegisterFailpoint::EmitLogicalTxnFrame,
-                    ) {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            commit_mark,
-                            e,
-                        ));
-                    }
-                    if let Err(e) = self.shared.handle.append_logical_txn(frame) {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            commit_mark,
-                            e,
-                        ));
-                    }
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    self::test_accessors::phase3_abort_if_armed(
-                        Phase3CommitFailpoint::AfterLogicalTxnAppendBeforeFsync,
-                    );
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    self::test_accessors::phase3_abort_if_armed(
-                        Phase3CommitFailpoint::AfterLogicalTxnFsyncBeforeChainCommit,
-                    );
-
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    if let Err(e) = self::test_accessors::us026_fail_if_armed(
-                        &self.shared,
-                        Us026PostRegisterFailpoint::ChainCommitAppend,
-                    ) {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            commit_mark,
-                            e,
-                        ));
-                    }
-                    if let Err(e) = txn.commit_chain_commit(&self.shared.handle, commit_ts) {
-                        return Err(self.cleanup_registered_pre_durable_failure(
-                            txn_id,
-                            slot,
-                            commit_mark,
-                            e,
-                        ));
-                    }
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    self::test_accessors::phase3_abort_if_armed(
-                        Phase3CommitFailpoint::AfterChainCommitBeforeLegacyCommit,
-                    );
-
-                    // FullSync owns the final data flush at the explicit sync
-                    // boundary; non-FullSync preserves the existing
-                    // per-writer flush-before-publish behavior.
-                    if !matches!(self.durability_mode, DurabilityMode::FullSync) {
-                        if let Err(e) = self.flush_under_journal_mutex() {
-                            return Err(self.cleanup_registered_pre_durable_failure(
-                                txn_id,
-                                slot,
-                                commit_mark,
-                                e,
-                            ));
-                        }
-                    }
+                // §4.6 deviation: US-006 installs Pending pages as
+                // Unflushable before reservation; this post-reservation stamp
+                // is the first point where those pages become flushable by LSN.
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Err(e) =
+                    self::test_accessors::phase8_fail_dirty_lsn_stamp_if_armed(&self.shared)
+                {
+                    return Err(self.poison_after_reserved_log_failure(&reserved, e));
                 }
-
-                if matches!(self.durability_mode, DurabilityMode::FullSync) {
-                    if let Err(e) = self.fullsync_group_commit() {
-                        return Err(e);
-                    }
+                if let Err(e) = self
+                    .shared
+                    .handle
+                    .stamp_dirty_pages_lsn(&pending_pages, commit_end_lsn)
+                {
+                    return Err(self.poison_after_reserved_log_failure(&reserved, e));
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Err(e) =
+                    self::test_accessors::phase8_fail_after_dirty_lsn_stamp_if_armed(&self.shared)
+                {
+                    return Err(self.poison_after_reserved_log_failure(&reserved, e));
+                }
+                let written_end_lsn = match reserved.write_and_mark() {
+                    Ok(end_lsn) => end_lsn,
+                    Err(e) => return Err(self.poison_after_log_manager_failure(e)),
+                };
+                debug_assert_eq!(written_end_lsn, commit_end_lsn);
+                crate::mvcc::metrics::record_logical_txn_append_bytes(logical_payload_len as u64);
+                crate::mvcc::metrics::record_journal_chain_commit_frame();
+                self.wait_for_commit_durability(commit_end_lsn)?;
+                #[cfg(any(test, feature = "test-hooks"))]
+                if self::test_accessors::phase8_fail_after_durable_before_flip_if_armed(
+                    &self.shared,
+                )
+                .is_err()
+                {
+                    return Err(self.engine_fatal(
+                        crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
+                    ));
                 }
 
                 #[cfg(test)]
                 self::test_accessors::publish_pause_if_installed(&self.shared);
 
-                // S9: journal_mutex has been released before the
+                // S9: the log record is ready/durable before the
                 // Pending-to-Committed flip. The flip runs before publish so
                 // no reader can observe the new epoch with uncommitted heads.
                 flip_pending_to_committed_for(&self.shared, txn_id, commit_ts, &pending_pages)
@@ -805,6 +900,7 @@ impl PagedEngine {
                 } else {
                     crate::mvcc::metrics::record_crud_commit_root_neutral();
                 }
+                self.maybe_sync_interval_after_publish()?;
                 Ok(value)
             }
             Err(e) => {
@@ -824,20 +920,14 @@ impl PagedEngine {
         &self,
         txn_id: u64,
         slot: self::publish_sequencer::PublishSlotGuard,
-        mark: Option<u64>,
+        _mark: Option<u64>,
         error: Error,
     ) -> Error {
+        if let Error::EngineFatal { reason } = error {
+            return state::poison_after_durable_commit(&self.shared, reason);
+        }
         let _ = flip_pending_to_aborted_for(&self.shared, txn_id);
         self.shared.publish_sequencer.mark_aborted(slot);
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::test_accessors::us026_note_cleanup_rollback_attempt(&self.shared);
-        let rollback_result = self.shared.handle.rollback_txn(mark);
-        #[cfg(any(test, feature = "test-hooks"))]
-        let rollback_result = self::test_accessors::us026_maybe_force_cleanup_rollback_failure(
-            &self.shared,
-            rollback_result,
-        );
-        let _ = rollback_result;
         error
     }
 
@@ -1083,6 +1173,7 @@ impl StorageEngine for PagedEngine {
         // Force-expire ALL active ReadViews globally before freeing pages.
         self.shared.handle.read_view_registry().force_expire_all();
 
+        let catalog_generation_before = self.shared.published.load_full().catalog_generation;
         let reserved_gen = self
             .shared
             .next_catalog_gen
@@ -1093,88 +1184,65 @@ impl StorageEngine for PagedEngine {
             .publish_sequencer
             .register_with_oracle(&self.shared.oracle)?;
 
-        let mut durable = false;
-        let drop_result = (|| -> Result<()> {
-            let _journal = self.lock_journal_mutex();
-            let mark = self.shared.handle.begin_txn()?;
-            let mut batch = StructuralPageBatch::new(&self.shared.handle);
+        let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
-            let body = (|| -> Result<()> {
-                {
-                    let cat = catalog_lock(&self.metadata_state);
-                    let collection =
-                        cat.get_collection(ns)?
-                            .ok_or_else(|| Error::CollectionNotFound {
-                                name: ns.to_owned(),
-                            })?;
-                    if collection.id != ns_id {
-                        return Err(stale_target());
-                    }
-                }
-
-                self.free_tree_pages_exclusive(&mut batch, data_root, data_level)?;
-                for (root_page, root_level) in &index_roots {
-                    self.free_tree_pages_exclusive(&mut batch, *root_page, *root_level)?;
-                }
-
-                {
-                    let mut cat = catalog_lock(&self.metadata_state);
-                    let collection =
-                        cat.get_collection(ns)?
-                            .ok_or_else(|| Error::CollectionNotFound {
-                                name: ns.to_owned(),
-                            })?;
-                    if collection.id != ns_id {
-                        return Err(stale_target());
-                    }
-                    let dropped = cat.drop_collection(ns)?;
-                    if !dropped {
-                        return Err(Error::CollectionNotFound {
+        let body = (|| -> Result<()> {
+            {
+                let cat = catalog_lock(&self.metadata_state);
+                let collection =
+                    cat.get_collection(ns)?
+                        .ok_or_else(|| Error::CollectionNotFound {
                             name: ns.to_owned(),
-                        });
-                    }
-                }
-                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
-                self.shared.clear_dirty_collection(ns_id);
-                Ok(())
-            })();
-
-            match body {
-                Ok(()) => {
-                    let mut base_store = new_store(&self.shared);
-                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
-                    commit_result.map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    self.flush_under_journal_mutex().map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    durable = true;
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = batch.abort(&self.shared.handle);
-                    let _ = self.shared.handle.rollback_txn(mark);
-                    Err(e)
+                        })?;
+                if collection.id != ns_id {
+                    return Err(stale_target());
                 }
             }
+
+            self.free_tree_pages_exclusive(&mut batch, data_root, data_level)?;
+            for (root_page, root_level) in &index_roots {
+                self.free_tree_pages_exclusive(&mut batch, *root_page, *root_level)?;
+            }
+
+            {
+                let mut cat = catalog_lock(&self.metadata_state);
+                let collection =
+                    cat.get_collection(ns)?
+                        .ok_or_else(|| Error::CollectionNotFound {
+                            name: ns.to_owned(),
+                        })?;
+                if collection.id != ns_id {
+                    return Err(stale_target());
+                }
+                let dropped = cat.drop_collection(ns)?;
+                if !dropped {
+                    return Err(Error::CollectionNotFound {
+                        name: ns.to_owned(),
+                    });
+                }
+            }
+            sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
+            self.shared.clear_dirty_collection(ns_id);
+            Ok(())
         })();
 
-        match drop_result {
-            Ok(()) => {}
-            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
-            Err(_e) if durable => {
-                return Err(self
-                    .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));
-            }
-            Err(e) => {
+        if let Err(e) = body {
+            let _ = batch.abort(&self.shared.handle);
+            self.shared.publish_sequencer.mark_aborted(slot);
+            return Err(e);
+        }
+
+        if let Err(error) = self.commit_catalog_batch_to_log(
+            CatalogCommitKind::NamespaceDrop,
+            catalog_generation_before,
+            reserved_gen,
+            &slot,
+            batch,
+        ) {
+            if !matches!(error, Error::EngineFatal { .. }) {
                 self.shared.publish_sequencer.mark_aborted(slot);
-                return Err(e);
             }
+            return Err(error);
         }
 
         let dirty = PublishDirty {
@@ -1196,7 +1264,9 @@ impl StorageEngine for PagedEngine {
                 )
             });
         match publish_result {
-            Ok(()) => {}
+            Ok(()) => {
+                self.maybe_sync_interval_after_publish()?;
+            }
             Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_) => {
                 return Err(self
@@ -1374,8 +1444,30 @@ impl StorageEngine for PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us026_cleanup_observations(&self) -> self::test_accessors::Us026CleanupObservations {
-        self.test_us026_cleanup_observations()
+    fn phase8_journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
+        self.test_phase8_journal_lsn_snapshot()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn phase8_fail_next_dirty_lsn_stamp(&self) {
+        self.test_phase8_fail_next_dirty_lsn_stamp();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn phase8_fail_next_after_dirty_lsn_stamp(&self) {
+        self.test_phase8_fail_next_after_dirty_lsn_stamp();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn phase8_fail_next_after_durable_before_flip(&self) {
+        self.test_phase8_fail_next_after_durable_before_flip();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn install_phase8_before_reservation_hook(
+        &self,
+    ) -> self::test_accessors::Phase8BeforeReservationHookGuard {
+        self.test_install_phase8_before_reservation_hook()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1406,24 +1498,6 @@ impl StorageEngine for PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us007_install_journal_begin_hook(
-        &self,
-        fail_after_release: bool,
-    ) -> self::test_accessors::Us007JournalBeginHookGuard {
-        self.test_us007_install_journal_begin_hook(fail_after_release)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us007_reset_journal_observations(&self) {
-        self.test_us007_reset_journal_observations();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us007_journal_observations(&self) -> self::test_accessors::Us007JournalObservations {
-        self.test_us007_journal_observations()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
     fn us017_reset_group_commit_probe(&self) {
         self::group_commit_test_probe::reset();
     }
@@ -1449,7 +1523,7 @@ impl StorageEngine for PagedEngine {
     fn us017_group_commit_observations(
         &self,
     ) -> self::group_commit_test_probe::Us017GroupCommitObservations {
-        self::group_commit_test_probe::observations(&self.shared.group_commit)
+        self::group_commit_test_probe::observations()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1560,6 +1634,7 @@ impl PagedEngine {
             .metadata
             .write()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        let catalog_generation_before = self.shared.published.load_full().catalog_generation;
         let reserved_gen = self
             .shared
             .next_catalog_gen
@@ -1576,46 +1651,27 @@ impl PagedEngine {
 
         let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
-        let mut durable = false;
-        let journal_result = {
-            let _journal = self.lock_journal_mutex();
-            let mark = self.shared.handle.begin_txn()?;
-            match f(&self.shared, &self.metadata_state, &mut batch) {
-                Ok(value) => {
-                    let mut base_store = new_store(&self.shared);
-                    if let Err(e) = batch.commit(&mut base_store, &self.shared.handle) {
-                        return Err(match e {
-                            Error::EngineFatal { reason } => Error::EngineFatal { reason },
-                            _ => self.engine_fatal(
-                                crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                            ),
-                        });
-                    }
-                    self.flush_under_journal_mutex().map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    durable = true;
-                    Ok(value)
-                }
-                Err(e) => {
-                    batch.abort(&self.shared.handle)?;
-                    let _ = self.shared.handle.rollback_txn(mark);
-                    Err(e)
-                }
+        let value = match f(&self.shared, &self.metadata_state, &mut batch) {
+            Ok(value) => value,
+            Err(e) => {
+                batch.abort(&self.shared.handle)?;
+                self.shared.publish_sequencer.mark_aborted(slot);
+                return Err(e);
             }
         };
 
-        let value = match journal_result {
-            Ok(value) => value,
-            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
-            Err(_e) if durable => {
-                return Err(self
-                    .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));
+        if let Err(error) = self.commit_catalog_batch_to_log(
+            CatalogCommitKind::NamespaceCreate,
+            catalog_generation_before,
+            reserved_gen,
+            &slot,
+            batch,
+        ) {
+            if !matches!(error, Error::EngineFatal { .. }) {
+                self.shared.publish_sequencer.mark_aborted(slot);
             }
-            Err(e) => return Err(e),
-        };
+            return Err(error);
+        }
 
         let shared = Arc::clone(&self.shared);
         let metadata_state = Arc::clone(&self.metadata_state);
@@ -1632,7 +1688,10 @@ impl PagedEngine {
                 )
             });
         match publish_result {
-            Ok(()) => Ok(value),
+            Ok(()) => {
+                self.maybe_sync_interval_after_publish()?;
+                Ok(value)
+            }
             Err(Error::EngineFatal { reason }) => Err(Error::EngineFatal { reason }),
             Err(_) => {
                 Err(self

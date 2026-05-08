@@ -9,7 +9,8 @@ use super::super::{catalog_ops, PagedEngine};
 use super::apply_parsed_logical_frames;
 use crate::client::Client;
 use crate::journal::log_file::{
-    LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire, LOGICAL_TXN_FORMAT_VERSION,
+    ChainCommitFrame, LogRecordDraft, LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire,
+    LOGICAL_TXN_FORMAT_VERSION,
 };
 use crate::journal::JournalManager;
 use crate::journal::ParsedLogicalFrames;
@@ -149,6 +150,7 @@ fn append_bad_overflow_replay_frame(db_path: &Path) {
     let mut mgr =
         JournalManager::open_or_create(db_path, &header, &mut main_file).expect("open journal");
     let (salt1, salt2) = mgr.salts();
+    let publish_seq = mgr.recovered_max_publish_seq().unwrap_or(0) + 1;
     let bad_op = LogicalOp {
         op_ordinal: 1,
         kind: LogicalOpKind::PrimaryInsert {
@@ -170,10 +172,26 @@ fn append_bad_overflow_replay_frame(db_path: &Path) {
         flags: 0,
         ops: vec![primary_insert(1, 10, 0), bad_op],
     };
-
-    mgr.append_logical_txn(frame).expect("append logical");
-    mgr.append_chain_commit(OPEN_FAILURE_COMMIT_TS, vec![], vec![])
-        .expect("append chain commit");
+    let logical = frame.encode().expect("encode logical");
+    let chain = ChainCommitFrame {
+        salt1,
+        salt2,
+        commit_ts: OPEN_FAILURE_COMMIT_TS,
+        refcount_deltas: vec![],
+        page_writes: vec![],
+    }
+    .encode()
+    .expect("encode chain");
+    let record = mgr
+        .reserve_log_record(LogRecordDraft::crud(
+            42,
+            publish_seq,
+            OPEN_FAILURE_COMMIT_TS,
+            logical,
+            chain,
+        ))
+        .expect("reserve phase8 crud");
+    record.write_and_mark().expect("write phase8 crud");
     mgr.sync_journal().expect("sync journal");
 }
 

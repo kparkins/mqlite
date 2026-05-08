@@ -145,8 +145,8 @@ mod tests {
 
     #[test]
     fn test_journal_format_version_is_journal_header_field() {
-        assert_eq!(JOURNAL_FORMAT_VERSION, 2);
-        assert_eq!(RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS, &[1]);
+        assert_eq!(JOURNAL_FORMAT_VERSION, 3);
+        assert_eq!(RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS, &[1, 2]);
 
         let header = JournalHeader::new(TEST_SALT1, TEST_SALT2);
         let bytes = header.to_bytes();

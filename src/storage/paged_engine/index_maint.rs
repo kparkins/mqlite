@@ -6,6 +6,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result, WriteConflictReason};
+use crate::journal::log_file::CatalogCommitKind;
 use crate::keys::{compound_prefix_range_excluding_trailing_id, encode_compound_key, COMPOUND_SEP};
 use crate::mvcc::transaction::WriteTxn;
 use crate::query::planner::IndexCondition;
@@ -956,6 +957,7 @@ pub(super) fn drop_index(
         .shared
         .ns_writers
         .close_and_drain_guard(ns_id, engine.busy_timeout)?;
+    let catalog_generation_before = engine.shared.published.load_full().catalog_generation;
     let reserved_gen = engine
         .shared
         .next_catalog_gen
@@ -966,86 +968,64 @@ pub(super) fn drop_index(
         .publish_sequencer
         .register_with_oracle(&engine.shared.oracle)?;
 
-    let mut durable = false;
-    let drop_result = (|| -> Result<()> {
-        let _journal = engine.lock_journal_mutex();
-        let mark = engine.shared.handle.begin_txn()?;
-        let mut batch = StructuralPageBatch::new(&engine.shared.handle);
+    let mut batch = StructuralPageBatch::new(&engine.shared.handle);
 
-        let body = (|| -> Result<()> {
-            engine.free_index_pages_exclusive(&mut batch, &target_index)?;
+    let body = (|| -> Result<()> {
+        engine.free_index_pages_exclusive(&mut batch, &target_index)?;
+        {
+            let mut cat = catalog_lock(&engine.metadata_state);
+            let collection = cat
+                .get_collection(ns)?
+                .ok_or_else(|| Error::CollectionNotFound {
+                    name: ns.to_owned(),
+                })?;
+            if collection.id != ns_id {
+                return Err(stale_target());
+            }
+            let index = cat.get_index(ns, name)?.ok_or_else(|| {
+                Error::Internal(format!("index '{}' not found on '{}'", name, ns))
+            })?;
+            if index.id != target_index.id
+                || index.root_page != target_index.root_page
+                || index.root_level != target_index.root_level
             {
-                let mut cat = catalog_lock(&engine.metadata_state);
-                let collection =
-                    cat.get_collection(ns)?
-                        .ok_or_else(|| Error::CollectionNotFound {
-                            name: ns.to_owned(),
-                        })?;
-                if collection.id != ns_id {
-                    return Err(stale_target());
-                }
-                let index = cat.get_index(ns, name)?.ok_or_else(|| {
-                    Error::Internal(format!("index '{}' not found on '{}'", name, ns))
-                })?;
-                if index.id != target_index.id
-                    || index.root_page != target_index.root_page
-                    || index.root_level != target_index.root_level
-                {
-                    return Err(stale_target());
-                }
-                let removed = cat.drop_index(ns, name)?;
-                if !removed {
-                    return Err(Error::Internal(format!(
-                        "index '{}' not found on '{}'",
-                        name, ns
-                    )));
-                }
+                return Err(stale_target());
             }
-            sync_catalog_root_structural(&engine.shared, &engine.metadata_state, &mut batch)?;
-            engine.shared.clear_dirty_tree(&TreeIdent {
-                collection_id: ns_id,
-                kind: TreeKind::Secondary {
-                    index_id: target_index.id,
-                },
-            });
-            Ok(())
-        })();
-
-        match body {
-            Ok(()) => {
-                let mut base_store = new_store(&engine.shared);
-                let commit_result = batch.commit(&mut base_store, &engine.shared.handle);
-                commit_result.map_err(|_| {
-                    engine
-                        .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)
-                })?;
-                engine.flush_under_journal_mutex().map_err(|_| {
-                    engine
-                        .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)
-                })?;
-                durable = true;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = batch.abort(&engine.shared.handle);
-                let _ = engine.shared.handle.rollback_txn(mark);
-                Err(e)
+            let removed = cat.drop_index(ns, name)?;
+            if !removed {
+                return Err(Error::Internal(format!(
+                    "index '{}' not found on '{}'",
+                    name, ns
+                )));
             }
         }
+        sync_catalog_root_structural(&engine.shared, &engine.metadata_state, &mut batch)?;
+        engine.shared.clear_dirty_tree(&TreeIdent {
+            collection_id: ns_id,
+            kind: TreeKind::Secondary {
+                index_id: target_index.id,
+            },
+        });
+        Ok(())
     })();
 
-    match drop_result {
-        Ok(()) => {}
-        Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
-        Err(_e) if durable => {
-            return Err(
-                engine.engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)
-            );
-        }
-        Err(e) => {
+    if let Err(e) = body {
+        let _ = batch.abort(&engine.shared.handle);
+        engine.shared.publish_sequencer.mark_aborted(slot);
+        return Err(e);
+    }
+
+    if let Err(error) = engine.commit_catalog_batch_to_log(
+        CatalogCommitKind::IndexDrop,
+        catalog_generation_before,
+        reserved_gen,
+        &slot,
+        batch,
+    ) {
+        if !matches!(error, Error::EngineFatal { .. }) {
             engine.shared.publish_sequencer.mark_aborted(slot);
-            return Err(e);
         }
+        return Err(error);
     }
 
     let dirty = PublishDirty {
@@ -1067,7 +1047,9 @@ pub(super) fn drop_index(
             )
         });
     match publish_result {
-        Ok(()) => {}
+        Ok(()) => {
+            engine.maybe_sync_interval_after_publish()?;
+        }
         Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
         Err(_) => {
             return Err(

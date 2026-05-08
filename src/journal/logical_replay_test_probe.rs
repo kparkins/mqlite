@@ -11,7 +11,8 @@ use bson::{doc, Bson};
 
 use crate::error::Result;
 use crate::journal::log_file::{
-    LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire, LOGICAL_TXN_FORMAT_VERSION,
+    ChainCommitFrame, LogRecordDraft, LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire,
+    LOGICAL_TXN_FORMAT_VERSION,
 };
 use crate::journal::JournalManager;
 use crate::keys::encode_key;
@@ -56,10 +57,27 @@ pub fn append_logical_replay_frames(
     let header = read_main_header(db_path)?;
     let mut journal = JournalManager::open_or_create(db_path, &header, &mut main_file)?;
     let (salt1, salt2) = journal.salts();
-    for frame in frames {
+    let publish_seq_base = journal.recovered_max_publish_seq().unwrap_or(0);
+    for (idx, frame) in frames.iter().enumerate() {
         let commit_ts = frame.commit_ts();
-        journal.append_logical_txn(frame.to_logical_txn(salt1, salt2)?)?;
-        journal.append_chain_commit(commit_ts, Vec::new(), Vec::new())?;
+        let logical_payload = frame.to_logical_txn(salt1, salt2)?.encode()?;
+        let chain_payload = ChainCommitFrame {
+            salt1,
+            salt2,
+            commit_ts,
+            refcount_deltas: Vec::new(),
+            page_writes: Vec::new(),
+        }
+        .encode()?;
+        let draft = LogRecordDraft::crud(
+            u64::from(frame.op_ordinal),
+            publish_seq_base + idx as u64 + 1,
+            commit_ts,
+            logical_payload,
+            chain_payload,
+        );
+        let reserved = journal.reserve_log_record(draft)?;
+        reserved.write_and_mark()?;
     }
     journal.sync_journal()
 }

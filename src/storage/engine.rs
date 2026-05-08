@@ -33,8 +33,8 @@ use super::paged_engine::group_commit_test_probe::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use super::paged_engine::test_accessors::{
-    CreateIndexBuildHookGuard, Us007JournalBeginHookGuard, Us007JournalObservations,
-    Us026CleanupObservations, Us026PostRegisterFailpoint, WriteBodyEntryHookGuard,
+    CreateIndexBuildHookGuard, Phase8BeforeReservationHookGuard, Us026PostRegisterFailpoint,
+    WriteBodyEntryHookGuard,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::journal::append_sync_test_probe::Us039AppendSyncObservations;
@@ -256,8 +256,8 @@ pub trait StorageEngine: Send + Sync {
     /// Returns `(physical_ms, logical)` from the oracle's last-issued timestamp.
     /// After a commit the oracle's value is >= that commit's `commit_ts`, so
     /// callers can use this to observe a monotone lower-bound on "the highest
-    /// commit_ts issued so far".  Used by `recovery_timestamp_floor` to verify
-    /// Contract 3.4 without reaching into `pub(crate)` internals.
+    /// commit_ts issued so far". Used by recovery/frontier tests to verify the
+    /// reopen floor without reaching into `pub(crate)` internals.
     ///
     /// # Note
     ///
@@ -448,12 +448,32 @@ pub trait StorageEngine: Send + Sync {
     #[doc(hidden)]
     fn us026_arm_post_register_failpoint(&self, _failpoint: Us026PostRegisterFailpoint) {}
 
-    /// Hidden US-026 test hook: snapshot cleanup observations.
+    /// Hidden Phase 8 test hook: snapshot `(next_lsn, ready_lsn, durable_lsn)`.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    fn us026_cleanup_observations(&self) -> Us026CleanupObservations {
-        Us026CleanupObservations::default()
+    fn phase8_journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
+        Ok((0, 0, 0))
     }
+
+    /// Hidden Phase 8 test hook: fail after reservation before dirty LSN stamp.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn phase8_fail_next_dirty_lsn_stamp(&self) {}
+
+    /// Hidden Phase 8 test hook: fail after dirty LSN stamp before write.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn phase8_fail_next_after_dirty_lsn_stamp(&self) {}
+
+    /// Hidden Phase 8 test hook: fail after durability before Pending flip.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn phase8_fail_next_after_durable_before_flip(&self) {}
+
+    /// Hidden Phase 8 test hook: pause after Pending install before reservation.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    fn install_phase8_before_reservation_hook(&self) -> Phase8BeforeReservationHookGuard;
 
     /// Hidden US-021c test hook: pause the next write body for `ns`.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -482,32 +502,6 @@ pub trait StorageEngine: Send + Sync {
         ns: &str,
         index_name: &str,
     ) -> CreateIndexBuildHookGuard;
-
-    /// Hidden US-007 test hook: pause immediately after `begin_txn`
-    /// while `journal_mutex` is held.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    fn us007_install_journal_begin_hook(
-        &self,
-        _fail_after_release: bool,
-    ) -> Us007JournalBeginHookGuard;
-
-    /// Hidden US-007 test hook: reset journal-envelope counters.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    fn us007_reset_journal_observations(&self) {}
-
-    /// Hidden US-007 test hook: snapshot journal-envelope counters.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    fn us007_journal_observations(&self) -> Us007JournalObservations {
-        Us007JournalObservations {
-            guarded_flushes: 0,
-            unguarded_flushes: 0,
-            guarded_syncs: 0,
-            unguarded_syncs: 0,
-        }
-    }
 
     /// Hidden US-039 test hook: reset append/sync ownership counters.
     #[cfg(any(test, feature = "test-hooks"))]

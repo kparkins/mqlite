@@ -3,20 +3,25 @@
 //! This submodule owns the `recover_existing` entry point called from
 //! [`JournalManager::open_or_create`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
 use crate::storage::header::FileHeader;
 
 use super::log_file::{
-    read_chain_commit_at_cursor, JournalHeader, LogicalTxnFrame, JOURNAL_FORMAT_VERSION,
-    JOURNAL_HEADER_SIZE, JOURNAL_MAGIC, RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
+    read_chain_commit_at_cursor, CatalogCommitPayload, ChainCommitFrame, CheckpointBoundaryPayload,
+    DecodeCtx, JournalHeader, LogRecord, LogRecordKind, LogRecordPayload, LogicalTxnFrame,
+    JOURNAL_FORMAT_VERSION, JOURNAL_HEADER_SIZE, JOURNAL_MAGIC, LOG_RECORD_HEADER_LEN,
+    LOG_RECORD_MAGIC, LOG_RECORD_TOTAL_LEN_OFFSET, MAX_LOG_RECORD_BYTES,
+    RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
 };
 use super::shm::JournalIndex;
+use super::write_page_to_main;
 use super::CheckpointRecoveryFrameKind;
 use super::JournalManager;
 
@@ -63,7 +68,319 @@ fn _assert_parsed_logical_frames_send() {
     assert_send::<ParsedLogicalFrames>();
 }
 
+#[derive(Debug)]
+struct Phase8RecoveredRecord {
+    record: LogRecord,
+    logical_frame: Option<LogicalTxnFrame>,
+    checkpoint_applied_lsn: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct Phase8RecoveryScan {
+    valid_end_lsn: u64,
+    parsed_logical: ParsedLogicalFrames,
+    recovered_max_commit_ts: Option<Ts>,
+    recovered_max_publish_seq: Option<u64>,
+    applied_catalog_commit: bool,
+}
+
 impl JournalManager {
+    fn recover_phase8_existing(
+        journal_path: &Path,
+        mut journal_file: File,
+        main_file: &mut File,
+        main_header: &FileHeader,
+        salt1: u32,
+        salt2: u32,
+        checkpoint_seq: u32,
+    ) -> Result<Option<JournalManager>> {
+        let scan = Self::scan_phase8_log_records(
+            journal_path,
+            &mut journal_file,
+            main_file,
+            main_header,
+            salt1,
+            salt2,
+        )?;
+        if scan.applied_catalog_commit {
+            main_file.flush().map_err(Error::Io)?;
+        }
+        Self::truncate_tail_to_valid_end_lsn(&mut journal_file, scan.valid_end_lsn)?;
+        let log_manager_file = journal_file.try_clone().map_err(Error::Io)?;
+
+        Ok(Some(JournalManager {
+            journal_path: journal_path.to_path_buf(),
+            journal_file,
+            index: JournalIndex::new(),
+            salt1,
+            salt2,
+            checkpoint_seq,
+            write_cursor: scan.valid_end_lsn,
+            log_manager: Arc::new(super::LogManager::new(log_manager_file, scan.valid_end_lsn)),
+            last_committed_db_page_count: None,
+            recovered_max_commit_ts: scan.recovered_max_commit_ts,
+            recovered_max_publish_seq: scan.recovered_max_publish_seq,
+            parsed_logical_frames: scan.parsed_logical,
+            legacy_pending_start_offset: None,
+            last_legacy_commit_end_offset: scan.valid_end_lsn,
+            checkpoint_batch_active: None,
+            next_checkpoint_batch_id: 1,
+            checkpoint_frame_tags: std::collections::BTreeMap::new(),
+        }))
+    }
+
+    fn phase8_log_records_present(journal_file: &mut File, journal_len: u64) -> Result<bool> {
+        let first_record_lsn = JOURNAL_HEADER_SIZE as u64;
+        if journal_len <= first_record_lsn {
+            return Ok(true);
+        }
+
+        if journal_len - first_record_lsn < 4 {
+            return Ok(true);
+        }
+
+        let mut magic = [0u8; 4];
+        journal_file
+            .seek(SeekFrom::Start(first_record_lsn))
+            .map_err(Error::Io)?;
+        journal_file.read_exact(&mut magic).map_err(Error::Io)?;
+        Ok(u32::from_le_bytes(magic) == LOG_RECORD_MAGIC)
+    }
+
+    fn scan_phase8_log_records(
+        journal_path: &Path,
+        journal_file: &mut File,
+        main_file: &mut File,
+        main_header: &FileHeader,
+        salt1: u32,
+        salt2: u32,
+    ) -> Result<Phase8RecoveryScan> {
+        let journal_len = journal_file.metadata().map_err(Error::Io)?.len();
+        let mut cursor = JOURNAL_HEADER_SIZE as u64;
+        let mut accepted = Vec::new();
+
+        while cursor < journal_len {
+            let Some(record) =
+                Self::read_phase8_record_at(journal_file, cursor, journal_len, salt1, salt2)?
+            else {
+                break;
+            };
+            cursor = record.record.end_lsn;
+            accepted.push(record);
+        }
+
+        let checkpoint_applied_lsn = main_header.checkpoint_applied_lsn;
+
+        let mut apply_set: Vec<_> = accepted
+            .iter()
+            .filter(|record| record.record.end_lsn > checkpoint_applied_lsn)
+            .filter(|record| record.record.kind != LogRecordKind::CheckpointBoundary)
+            .collect();
+        apply_set.sort_by_key(|record| record.record.publish_seq);
+
+        let mut seen_publish_seq = BTreeSet::new();
+        let mut parsed_logical = ParsedLogicalFrames::default();
+        let mut recovered_max_commit_ts = (main_header.last_checkpoint_ts != Ts::default())
+            .then_some(main_header.last_checkpoint_ts);
+        let mut recovered_max_publish_seq = None;
+        let mut applied_catalog_commit = false;
+        let mut recovered_header = main_header.clone();
+
+        for record in apply_set {
+            if !seen_publish_seq.insert(record.record.publish_seq) {
+                return Err(Self::phase8_recovery_corruption(
+                    journal_path,
+                    format!(
+                        "duplicate Phase 8 LogRecord publish_seq {}",
+                        record.record.publish_seq
+                    ),
+                ));
+            }
+
+            recovered_max_commit_ts = Some(
+                recovered_max_commit_ts.map_or(record.record.commit_ts, |prev: Ts| {
+                    prev.max(record.record.commit_ts)
+                }),
+            );
+            recovered_max_publish_seq = Some(
+                recovered_max_publish_seq.map_or(record.record.publish_seq, |prev: u64| {
+                    prev.max(record.record.publish_seq)
+                }),
+            );
+
+            match &record.record.payload {
+                LogRecordPayload::CrudCommit { .. } => {
+                    if let Some(frame) = &record.logical_frame {
+                        if parsed_logical.seen_commit_ts.insert(frame.commit_ts) {
+                            parsed_logical
+                                .frames
+                                .push((record.record.start_lsn, frame.clone()));
+                        }
+                    }
+                }
+                LogRecordPayload::CatalogCommit(payload) => {
+                    let catalog = CatalogCommitPayload::decode(payload).map_err(|error| {
+                        Self::phase8_recovery_corruption(
+                            journal_path,
+                            format!("invalid Phase 8 CatalogCommit payload: {error}"),
+                        )
+                    })?;
+                    for page in &catalog.pages {
+                        write_page_to_main(
+                            main_file,
+                            page.page_number,
+                            page.page_size.bytes(),
+                            &page.data,
+                        )?;
+                    }
+                    let mut header = catalog.header.clone();
+                    header.last_checkpoint_ts = header
+                        .last_checkpoint_ts
+                        .max(recovered_header.last_checkpoint_ts);
+                    header.checkpoint_applied_lsn = header
+                        .checkpoint_applied_lsn
+                        .max(recovered_header.checkpoint_applied_lsn);
+                    let header = header.to_bytes();
+                    write_page_to_main(main_file, 0, header.len(), &header)?;
+                    recovered_header = FileHeader::from_bytes(&header)?;
+                    applied_catalog_commit = true;
+                }
+                LogRecordPayload::CheckpointBoundary(_) => {}
+            }
+        }
+
+        Ok(Phase8RecoveryScan {
+            valid_end_lsn: cursor,
+            parsed_logical,
+            recovered_max_commit_ts,
+            recovered_max_publish_seq,
+            applied_catalog_commit,
+        })
+    }
+
+    fn read_phase8_record_at(
+        journal_file: &mut File,
+        cursor: u64,
+        journal_len: u64,
+        salt1: u32,
+        salt2: u32,
+    ) -> Result<Option<Phase8RecoveredRecord>> {
+        if journal_len.saturating_sub(cursor) < LOG_RECORD_HEADER_LEN as u64 {
+            return Ok(None);
+        }
+
+        journal_file
+            .seek(SeekFrom::Start(cursor))
+            .map_err(Error::Io)?;
+        let mut header = [0u8; LOG_RECORD_HEADER_LEN];
+        journal_file.read_exact(&mut header).map_err(Error::Io)?;
+
+        let total_len = u32::from_le_bytes(
+            header[LOG_RECORD_TOTAL_LEN_OFFSET..LOG_RECORD_TOTAL_LEN_OFFSET + 4]
+                .try_into()
+                .expect("4 bytes"),
+        ) as usize;
+        if !(LOG_RECORD_HEADER_LEN..=MAX_LOG_RECORD_BYTES).contains(&total_len) {
+            return Ok(None);
+        }
+
+        let Some(record_end_lsn) = cursor.checked_add(total_len as u64) else {
+            return Ok(None);
+        };
+        if record_end_lsn > journal_len {
+            return Ok(None);
+        }
+
+        let mut bytes = vec![0u8; total_len];
+        bytes[..LOG_RECORD_HEADER_LEN].copy_from_slice(&header);
+        journal_file
+            .read_exact(&mut bytes[LOG_RECORD_HEADER_LEN..])
+            .map_err(Error::Io)?;
+
+        let Ok(record) = LogRecord::decode(&bytes) else {
+            return Ok(None);
+        };
+        if record.start_lsn != cursor {
+            return Ok(None);
+        }
+
+        Ok(Self::decode_phase8_recovery_payload(record, salt1, salt2))
+    }
+
+    fn decode_phase8_recovery_payload(
+        record: LogRecord,
+        salt1: u32,
+        salt2: u32,
+    ) -> Option<Phase8RecoveredRecord> {
+        match &record.payload {
+            LogRecordPayload::CrudCommit {
+                logical_payload,
+                chain_payload,
+            } => {
+                let logical_frame = LogicalTxnFrame::decode(
+                    logical_payload,
+                    salt1,
+                    salt2,
+                    DecodeCtx::MidStream { follower: true },
+                )
+                .ok()
+                .flatten()?;
+                let chain_frame = ChainCommitFrame::decode(chain_payload, salt1, salt2)
+                    .ok()
+                    .flatten()?;
+                if logical_frame.commit_ts != record.commit_ts
+                    || chain_frame.commit_ts != record.commit_ts
+                {
+                    return None;
+                }
+                Some(Phase8RecoveredRecord {
+                    record,
+                    logical_frame: Some(logical_frame),
+                    checkpoint_applied_lsn: None,
+                })
+            }
+            LogRecordPayload::CatalogCommit(_) => Some(Phase8RecoveredRecord {
+                record,
+                logical_frame: None,
+                checkpoint_applied_lsn: None,
+            }),
+            LogRecordPayload::CheckpointBoundary(payload) => {
+                let checkpoint = CheckpointBoundaryPayload::decode(payload).ok()?;
+                let checkpoint_applied_lsn = checkpoint.checkpoint_applied_lsn;
+                if checkpoint_applied_lsn < JOURNAL_HEADER_SIZE as u64
+                    || checkpoint_applied_lsn > record.end_lsn
+                {
+                    return None;
+                }
+                Some(Phase8RecoveredRecord {
+                    record,
+                    logical_frame: None,
+                    checkpoint_applied_lsn: Some(checkpoint_applied_lsn),
+                })
+            }
+        }
+    }
+
+    fn truncate_tail_to_valid_end_lsn(journal_file: &mut File, valid_end_lsn: u64) -> Result<()> {
+        let journal_len = journal_file.metadata().map_err(Error::Io)?.len();
+        if valid_end_lsn < journal_len {
+            journal_file.set_len(valid_end_lsn).map_err(Error::Io)?;
+            journal_file.sync_data().map_err(Error::Io)?;
+        }
+        journal_file
+            .seek(SeekFrom::Start(valid_end_lsn))
+            .map_err(Error::Io)?;
+        Ok(())
+    }
+
+    fn phase8_recovery_corruption(path: &Path, detail: impl Into<String>) -> Error {
+        Error::CorruptDatabase {
+            path: path.to_path_buf(),
+            detail: detail.into(),
+            recoverable: false,
+        }
+    }
+
     /// Replay an existing journal into the main file.
     ///
     /// Returns `None` if the journal is stale (salt mismatch) and was deleted.
@@ -126,6 +443,19 @@ impl JournalManager {
         }
 
         let checkpoint_seq = journal_header.checkpoint_seq;
+
+        let journal_len = journal_file.metadata().map_err(Error::Io)?.len();
+        if Self::phase8_log_records_present(&mut journal_file, journal_len)? {
+            return Self::recover_phase8_existing(
+                journal_path,
+                journal_file,
+                main_file,
+                main_header,
+                salt1,
+                salt2,
+                checkpoint_seq,
+            );
+        }
 
         #[cfg(feature = "tracing")]
         let _rec_start = std::time::Instant::now();
@@ -406,6 +736,7 @@ impl JournalManager {
         journal_file
             .seek(SeekFrom::Start(write_cursor))
             .map_err(Error::Io)?;
+        let log_manager_file = journal_file.try_clone().map_err(Error::Io)?;
 
         #[cfg(feature = "tracing")]
         {
@@ -426,8 +757,10 @@ impl JournalManager {
             salt2,
             checkpoint_seq,
             write_cursor,
+            log_manager: Arc::new(super::LogManager::new(log_manager_file, write_cursor)),
             last_committed_db_page_count,
             recovered_max_commit_ts: max_commit_ts,
+            recovered_max_publish_seq: None,
             parsed_logical_frames: parsed_logical,
             legacy_pending_start_offset: None,
             last_legacy_commit_end_offset: write_cursor,
@@ -440,5 +773,397 @@ impl JournalManager {
         }
 
         Ok(Some(manager))
+    }
+}
+
+#[cfg(test)]
+mod phase8_tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    use crate::journal::log_file::{
+        CatalogCommitKind, CatalogCommitPayload, ChainCommitFrame, CheckpointBoundaryPayload,
+        FinalizedLogRecord, LogRecordDraft, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
+        LOG_RECORD_HEADER_CRC32C_OFFSET, LOG_RECORD_HEADER_LEN, LOG_RECORD_KIND_OFFSET,
+    };
+    use crate::journal::{journal_path_for, JournalManager};
+    use crate::mvcc::timestamp::Ts;
+    use crate::storage::header::FileHeader;
+
+    use super::*;
+
+    const SALT1: u32 = 0xA11C_E001;
+    const SALT2: u32 = 0xB22D_E002;
+
+    struct DbFixture {
+        _dir: tempfile::TempDir,
+        db_path: PathBuf,
+        header: FileHeader,
+        main_file: std::fs::File,
+    }
+
+    fn make_db_file() -> DbFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("phase8.mqlite");
+        let header = FileHeader::new(123, SALT1, SALT2);
+        make_db_file_with_header(dir, db_path, header)
+    }
+
+    fn make_db_file_with_checkpoint_applied_lsn(checkpoint_applied_lsn: u64) -> DbFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("phase8.mqlite");
+        let mut header = FileHeader::new(123, SALT1, SALT2);
+        header.checkpoint_applied_lsn = checkpoint_applied_lsn;
+        make_db_file_with_header(dir, db_path, header)
+    }
+
+    fn make_db_file_with_header(
+        dir: tempfile::TempDir,
+        db_path: PathBuf,
+        header: FileHeader,
+    ) -> DbFixture {
+        let mut main_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&db_path)
+            .expect("create db");
+        main_file
+            .write_all(&header.to_bytes())
+            .expect("write header");
+        DbFixture {
+            _dir: dir,
+            db_path,
+            header,
+            main_file,
+        }
+    }
+
+    fn write_journal(db_path: &Path, chunks: &[&[u8]]) {
+        let journal_path = journal_path_for(db_path);
+        let mut journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(journal_path)
+            .expect("create journal");
+        journal
+            .write_all(&JournalHeader::new(SALT1, SALT2).to_bytes())
+            .expect("write journal header");
+        for chunk in chunks {
+            journal.write_all(chunk).expect("write journal chunk");
+        }
+        journal.sync_all().expect("sync journal");
+    }
+
+    fn ts(physical_ms: u64, logical: u32) -> Ts {
+        Ts {
+            physical_ms,
+            logical,
+        }
+    }
+
+    fn logical_frame(commit_ts: Ts, txn_id: u64) -> LogicalTxnFrame {
+        LogicalTxnFrame {
+            salt1: SALT1,
+            salt2: SALT2,
+            commit_ts,
+            diagnostic_txn_id: txn_id,
+            format_version: LOGICAL_TXN_FORMAT_VERSION,
+            flags: 0,
+            ops: vec![],
+        }
+    }
+
+    fn crud_record(
+        start_lsn: u64,
+        txn_id: u64,
+        publish_seq: u64,
+        commit_ts: Ts,
+    ) -> FinalizedLogRecord {
+        let logical = logical_frame(commit_ts, txn_id)
+            .encode()
+            .expect("encode logical");
+        let chain = ChainCommitFrame {
+            salt1: SALT1,
+            salt2: SALT2,
+            commit_ts,
+            refcount_deltas: vec![],
+            page_writes: vec![],
+        }
+        .encode()
+        .expect("encode chain");
+        LogRecordDraft::crud(txn_id, publish_seq, commit_ts, logical, chain)
+            .finalize(start_lsn)
+            .expect("finalize crud")
+    }
+
+    fn catalog_record(
+        start_lsn: u64,
+        txn_id: u64,
+        publish_seq: u64,
+        commit_ts: Ts,
+    ) -> FinalizedLogRecord {
+        LogRecordDraft::catalog(txn_id, publish_seq, commit_ts, b"catalog".to_vec())
+            .finalize(start_lsn)
+            .expect("finalize catalog")
+    }
+
+    fn typed_catalog_record(
+        start_lsn: u64,
+        txn_id: u64,
+        publish_seq: u64,
+        commit_ts: Ts,
+        header: FileHeader,
+    ) -> FinalizedLogRecord {
+        let payload = CatalogCommitPayload {
+            kind: CatalogCommitKind::NamespaceCreate,
+            catalog_generation_before: 1,
+            catalog_generation_after: 2,
+            header,
+            pages: vec![],
+        }
+        .encode()
+        .expect("encode catalog payload");
+        LogRecordDraft::catalog(txn_id, publish_seq, commit_ts, payload)
+            .finalize(start_lsn)
+            .expect("finalize catalog")
+    }
+
+    fn checkpoint_record(
+        start_lsn: u64,
+        txn_id: u64,
+        commit_ts: Ts,
+        checkpoint_applied_lsn: u64,
+    ) -> FinalizedLogRecord {
+        let mut header = FileHeader::new(123, SALT1, SALT2);
+        header.checkpoint_applied_lsn = checkpoint_applied_lsn;
+        let payload = CheckpointBoundaryPayload {
+            checkpoint_applied_lsn,
+            header,
+        }
+        .encode()
+        .expect("encode checkpoint boundary");
+        LogRecordDraft::checkpoint_boundary(txn_id, commit_ts, payload)
+            .finalize(start_lsn)
+            .expect("finalize checkpoint")
+    }
+
+    fn recover(mut fixture: DbFixture) -> JournalManager {
+        JournalManager::open_or_create(&fixture.db_path, &fixture.header, &mut fixture.main_file)
+            .expect("recover phase8 journal")
+    }
+
+    fn read_main_header(path: &Path) -> FileHeader {
+        let mut file = OpenOptions::new().read(true).open(path).expect("open db");
+        let mut bytes = [0u8; crate::storage::header::HEADER_PAGE_SIZE];
+        std::io::Read::read_exact(&mut file, &mut bytes).expect("read header");
+        FileHeader::from_bytes(&bytes).expect("parse header")
+    }
+
+    #[test]
+    fn phase8_recovery_applies_crud_records_by_publish_seq_not_lsn() {
+        let fixture = make_db_file();
+        let first_lsn = JOURNAL_HEADER_SIZE as u64;
+        let later_publish = crud_record(first_lsn, 20, 2, ts(20, 0));
+        let earlier_publish = crud_record(later_publish.end_lsn(), 10, 1, ts(10, 0));
+        let valid_end = earlier_publish.end_lsn();
+
+        write_journal(
+            &fixture.db_path,
+            &[later_publish.bytes(), earlier_publish.bytes()],
+        );
+        let mut manager = recover(fixture);
+        let parsed = manager.take_parsed_logical_frames();
+
+        assert_eq!(manager.write_cursor(), valid_end);
+        assert_eq!(manager.log_manager.ready_lsn(), valid_end);
+        assert_eq!(manager.log_manager.durable_lsn(), valid_end);
+        assert_eq!(manager.recovered_max_commit_ts(), Some(ts(20, 0)));
+        assert_eq!(manager.recovered_max_publish_seq(), Some(2));
+        assert_eq!(parsed.frames.len(), 2);
+        assert_eq!(parsed.frames[0].0, earlier_publish.start_lsn());
+        assert_eq!(parsed.frames[1].0, later_publish.start_lsn());
+
+        let slot = manager.log_manager.reserve(1).expect("reserve next lsn");
+        assert_eq!(slot.start_lsn(), valid_end);
+    }
+
+    #[test]
+    fn phase8_recovery_truncates_torn_tail_before_later_bytes() {
+        let fixture = make_db_file();
+        let first = crud_record(JOURNAL_HEADER_SIZE as u64, 1, 1, ts(10, 0));
+        let torn = crud_record(first.end_lsn(), 2, 2, ts(20, 0));
+        let post_torn = crud_record(torn.end_lsn(), 3, 3, ts(30, 0));
+        let torn_prefix = &torn.bytes()[..torn.bytes().len() - 3];
+
+        write_journal(
+            &fixture.db_path,
+            &[first.bytes(), torn_prefix, post_torn.bytes()],
+        );
+        let mut manager = recover(fixture);
+        let parsed = manager.take_parsed_logical_frames();
+
+        assert_eq!(manager.write_cursor(), first.end_lsn());
+        assert_eq!(manager.recovered_max_commit_ts(), Some(ts(10, 0)));
+        assert_eq!(manager.recovered_max_publish_seq(), Some(1));
+        assert_eq!(parsed.frames.len(), 1);
+    }
+
+    #[test]
+    fn phase8_recovery_truncates_bad_crc_tail() {
+        let fixture = make_db_file();
+        let first = crud_record(JOURNAL_HEADER_SIZE as u64, 1, 1, ts(10, 0));
+        let bad = crud_record(first.end_lsn(), 2, 2, ts(20, 0));
+        let mut bad_bytes = bad.bytes().to_vec();
+        let last = bad_bytes.len() - 1;
+        bad_bytes[last] ^= 0x55;
+
+        write_journal(&fixture.db_path, &[first.bytes(), &bad_bytes]);
+        let manager = recover(fixture);
+
+        assert_eq!(manager.write_cursor(), first.end_lsn());
+        assert_eq!(manager.recovered_max_commit_ts(), Some(ts(10, 0)));
+    }
+
+    #[test]
+    fn phase8_recovery_truncates_unknown_kind_at_previous_valid_lsn() {
+        let fixture = make_db_file();
+        let first = crud_record(JOURNAL_HEADER_SIZE as u64, 1, 1, ts(10, 0));
+        let unknown = catalog_record(first.end_lsn(), 2, 2, ts(20, 0));
+        let mut unknown_bytes = unknown.bytes().to_vec();
+        unknown_bytes[LOG_RECORD_KIND_OFFSET..LOG_RECORD_KIND_OFFSET + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        unknown_bytes[LOG_RECORD_HEADER_CRC32C_OFFSET..LOG_RECORD_HEADER_CRC32C_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        let header_crc = crc32c::crc32c(&unknown_bytes[..LOG_RECORD_HEADER_LEN]);
+        unknown_bytes[LOG_RECORD_HEADER_CRC32C_OFFSET..LOG_RECORD_HEADER_CRC32C_OFFSET + 4]
+            .copy_from_slice(&header_crc.to_le_bytes());
+
+        write_journal(&fixture.db_path, &[first.bytes(), &unknown_bytes]);
+        let manager = recover(fixture);
+
+        assert_eq!(manager.write_cursor(), first.end_lsn());
+        assert_eq!(manager.recovered_max_commit_ts(), Some(ts(10, 0)));
+    }
+
+    #[test]
+    fn phase8_recovery_truncates_valid_prefix_plus_garbage() {
+        let fixture = make_db_file();
+        let first = crud_record(JOURNAL_HEADER_SIZE as u64, 1, 1, ts(10, 0));
+
+        write_journal(&fixture.db_path, &[first.bytes(), b"garbage tail"]);
+        let manager = recover(fixture);
+
+        assert_eq!(manager.write_cursor(), first.end_lsn());
+        assert_eq!(manager.recovered_max_commit_ts(), Some(ts(10, 0)));
+    }
+
+    #[test]
+    fn phase8_recovery_skips_checkpoint_applied_records_and_control_floors() {
+        let skipped = crud_record(JOURNAL_HEADER_SIZE as u64, 1, 1, ts(10, 0));
+        let fixture = make_db_file_with_checkpoint_applied_lsn(skipped.end_lsn());
+        let boundary = checkpoint_record(skipped.end_lsn(), 2, ts(999, 0), skipped.end_lsn());
+        let applied = crud_record(boundary.end_lsn(), 3, 3, ts(30, 0));
+
+        write_journal(
+            &fixture.db_path,
+            &[skipped.bytes(), boundary.bytes(), applied.bytes()],
+        );
+        let mut manager = recover(fixture);
+        let parsed = manager.take_parsed_logical_frames();
+
+        assert_eq!(manager.write_cursor(), applied.end_lsn());
+        assert_eq!(manager.recovered_max_commit_ts(), Some(ts(30, 0)));
+        assert_eq!(manager.recovered_max_publish_seq(), Some(3));
+        assert_eq!(
+            parsed.frames,
+            vec![(applied.start_lsn(), logical_frame(ts(30, 0), 3))]
+        );
+    }
+
+    #[test]
+    fn phase8_recovery_seeds_hlc_from_main_checkpoint_ts_without_apply_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("phase8.mqlite");
+        let mut header = FileHeader::new(123, SALT1, SALT2);
+        header.last_checkpoint_ts = ts(900, 7);
+        header.checkpoint_applied_lsn = JOURNAL_HEADER_SIZE as u64;
+        let fixture = make_db_file_with_header(dir, db_path, header.clone());
+        let boundary = checkpoint_record(
+            JOURNAL_HEADER_SIZE as u64,
+            2,
+            ts(999, 0),
+            header.checkpoint_applied_lsn,
+        );
+
+        write_journal(&fixture.db_path, &[boundary.bytes()]);
+        let manager = recover(fixture);
+
+        assert_eq!(
+            manager.recovered_max_commit_ts(),
+            Some(header.last_checkpoint_ts)
+        );
+        assert_eq!(manager.recovered_max_publish_seq(), None);
+    }
+
+    #[test]
+    fn phase8_catalog_replay_preserves_main_checkpoint_frontier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("phase8.mqlite");
+        let mut header = FileHeader::new(123, SALT1, SALT2);
+        header.last_checkpoint_ts = ts(700, 3);
+        header.checkpoint_applied_lsn = JOURNAL_HEADER_SIZE as u64;
+        let mut fixture = make_db_file_with_header(dir, db_path, header.clone());
+        let stale_catalog_header = FileHeader::new(123, SALT1, SALT2);
+        let catalog = typed_catalog_record(
+            JOURNAL_HEADER_SIZE as u64,
+            10,
+            1,
+            ts(710, 0),
+            stale_catalog_header,
+        );
+
+        write_journal(&fixture.db_path, &[catalog.bytes()]);
+        let manager = JournalManager::open_or_create(
+            &fixture.db_path,
+            &fixture.header,
+            &mut fixture.main_file,
+        )
+        .expect("recover phase8 journal");
+        let recovered = read_main_header(&fixture.db_path);
+
+        assert_eq!(recovered.last_checkpoint_ts, header.last_checkpoint_ts);
+        assert_eq!(
+            recovered.checkpoint_applied_lsn,
+            header.checkpoint_applied_lsn
+        );
+        assert_eq!(manager.recovered_max_commit_ts(), Some(ts(710, 0)));
+    }
+
+    #[test]
+    fn phase8_recovery_rejects_duplicate_publish_seq_after_prefix_validation() {
+        let mut fixture = make_db_file();
+        let first = crud_record(JOURNAL_HEADER_SIZE as u64, 1, 7, ts(10, 0));
+        let duplicate = crud_record(first.end_lsn(), 2, 7, ts(20, 0));
+
+        write_journal(&fixture.db_path, &[first.bytes(), duplicate.bytes()]);
+        let err = match JournalManager::open_or_create(
+            &fixture.db_path,
+            &fixture.header,
+            &mut fixture.main_file,
+        ) {
+            Ok(_) => panic!("duplicate publish_seq must reject recovery"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::CorruptDatabase { detail, .. } => {
+                assert!(detail.contains("duplicate Phase 8 LogRecord publish_seq 7"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

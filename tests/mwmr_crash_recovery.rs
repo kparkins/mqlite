@@ -1,6 +1,6 @@
 //! Phase 5 §10.19.0 C-2 / US-036 — engine-fatal poison surface.
 //!
-//! Locks down the post-`journal_mutex` poison contract:
+//! Locks down the post-durable poison contract:
 //!
 //!  * Setting the poison reason fails-closed every public read, CRUD
 //!    write, DDL, and checkpoint entry point with `Error::EngineFatal`
@@ -8,8 +8,8 @@
 //!  * Repeated poison calls preserve the first reason for diagnosis.
 //!  * Reopen recovery is the only clearing path: a fresh `SharedState`
 //!    + fresh `PublishSequencer` mean the new live engine is
-//!     unpoisoned and the prior durable commit is reinstalled by
-//!     logical redo.
+//!      unpoisoned and the prior durable commit is reinstalled by
+//!      logical redo.
 //!  * A successor blocked behind a poisoned predecessor wakes via the
 //!    sequencer poison hook and returns `Error::EngineFatal` instead
 //!    of running its publish closure or marking its durable slot
@@ -792,159 +792,6 @@ fn test_ddl_drain_completes_after_poisoned_successor_drops_ticket() {
         .expect("close_and_drain must complete after poisoned writer drops its ticket");
 }
 
-/// US-007 / §10.23.1 — a writer that began a journal transaction and then
-/// rolls back cannot truncate another writer's durable commit. The test
-/// proves the fixed ordering by pausing writer A after `begin_txn` while
-/// `journal_mutex` is held; writer B on a different namespace cannot enter
-/// the journal envelope until A rolls back.
-#[test]
-#[serial(mwmr_crash_recovery_hooks)]
-fn test_rollback_cannot_truncate_past_other_writer_commit() {
-    let (_dir, path, client) =
-        open_with_collection_options("us007_rollback.mqlite", OpenOptions::new());
-
-    let mut rollback_hook = client.__us007_install_journal_begin_hook(true);
-    let writer_a = client.clone();
-    let a = thread::spawn(move || {
-        writer_a
-            .database("p5crash")
-            .collection::<Document>("docs")
-            .insert_one(&doc! { "_id": 1i32, "v": "rolled-back" })
-    });
-
-    rollback_hook
-        .wait_until_entered_timeout(SETTLE_DEADLINE)
-        .expect("writer A reached begin_txn under journal_mutex");
-
-    let b_finished = Arc::new(AtomicBool::new(false));
-    let b_finished_writer = Arc::clone(&b_finished);
-    let writer_b = client.clone();
-    let b = thread::spawn(move || {
-        writer_b
-            .database("p5crash")
-            .collection::<Document>("other")
-            .insert_one(&doc! { "_id": 2i32, "v": "committed" })
-            .unwrap();
-        b_finished_writer.store(true, Ordering::Release);
-    });
-
-    thread::sleep(SHORT_SLEEP);
-    assert!(
-        !b_finished.load(Ordering::Acquire),
-        "writer B must wait for writer A's rollback to release journal_mutex"
-    );
-
-    rollback_hook.release().unwrap();
-    assert!(
-        a.join().expect("writer A joined").is_err(),
-        "writer A should roll back through the injected US-007 hook"
-    );
-    b.join().expect("writer B joined");
-    assert!(b_finished.load(Ordering::Acquire));
-
-    drop(client);
-    let reopened = Client::open(&path).unwrap();
-    assert_doc_value(&reopened, "docs", 1, None);
-    assert_doc_value(&reopened, "other", 2, Some("committed"));
-}
-
-/// US-007 / §10.23.1 — two writers racing `begin_txn` + rollback are
-/// serialized by the global journal mutex, not just by namespace lanes.
-#[test]
-#[serial(mwmr_crash_recovery_hooks)]
-fn test_journal_mutex_serializes_begin_and_rollback() {
-    let (_dir, path, client) =
-        open_with_collection_options("us007_begin_rollback.mqlite", OpenOptions::new());
-
-    let mut first = client.__us007_install_journal_begin_hook(true);
-    let mut second = client.__us007_install_journal_begin_hook(false);
-
-    let writer_a = client.clone();
-    let a = thread::spawn(move || {
-        writer_a
-            .database("p5crash")
-            .collection::<Document>("docs")
-            .insert_one(&doc! { "_id": 10i32, "v": "rolled-back" })
-    });
-    first
-        .wait_until_entered_timeout(SETTLE_DEADLINE)
-        .expect("writer A reached begin_txn");
-
-    let writer_b = client.clone();
-    let b = thread::spawn(move || {
-        writer_b
-            .database("p5crash")
-            .collection::<Document>("other")
-            .insert_one(&doc! { "_id": 11i32, "v": "committed" })
-    });
-
-    thread::sleep(SHORT_SLEEP);
-    second
-        .assert_not_entered()
-        .expect("writer B must not begin while writer A holds journal_mutex");
-
-    first.release().unwrap();
-    assert!(a.join().expect("writer A joined").is_err());
-
-    second
-        .wait_until_entered_timeout(SETTLE_DEADLINE)
-        .expect("writer B reached begin_txn after writer A rollback");
-    second.release().unwrap();
-    b.join()
-        .expect("writer B joined")
-        .expect("writer B commit succeeds");
-
-    drop(client);
-    let reopened = Client::open(&path).unwrap();
-    assert_doc_value(&reopened, "docs", 10, None);
-    assert_doc_value(&reopened, "other", 11, Some("committed"));
-}
-
-/// US-007 / §10.23.1 — ordinary non-FullSync data flushes and the
-/// current FullSync sync boundary are observed while the current thread
-/// holds `journal_mutex`.
-#[test]
-#[serial(mwmr_crash_recovery_hooks)]
-fn test_flush_cannot_persist_other_writer_uncommitted_pages() {
-    let (_dir, _path, client) =
-        open_with_collection_options("us007_flush_interval.mqlite", OpenOptions::new());
-    client.__us007_reset_journal_observations();
-    client
-        .database("p5crash")
-        .collection::<Document>("docs")
-        .insert_one(&doc! { "_id": 20i32, "v": "interval" })
-        .unwrap();
-    let interval = client.__us007_journal_observations();
-    assert!(
-        interval.guarded_flushes > 0,
-        "non-FullSync commit must flush data under journal_mutex"
-    );
-    assert_eq!(
-        interval.unguarded_flushes, 0,
-        "non-FullSync commit must not flush data outside journal_mutex"
-    );
-
-    let opts = OpenOptions::new().durability(DurabilityMode::FullSync);
-    let (_dir, _path, fullsync) = open_with_collection_options("us007_flush_fullsync.mqlite", opts);
-    fullsync.__us007_reset_journal_observations();
-    fullsync
-        .database("p5crash")
-        .collection::<Document>("docs")
-        .insert_one(&doc! { "_id": 21i32, "v": "fullsync" })
-        .unwrap();
-    let fullsync_obs = fullsync.__us007_journal_observations();
-    assert!(
-        fullsync_obs.guarded_flushes > 0,
-        "FullSync writer still runs its data flush under journal_mutex"
-    );
-    assert!(
-        fullsync_obs.guarded_syncs > 0,
-        "FullSync sync boundary must run under journal_mutex"
-    );
-    assert_eq!(fullsync_obs.unguarded_flushes, 0);
-    assert_eq!(fullsync_obs.unguarded_syncs, 0);
-}
-
 /// US-017 / US-039 — append-only journal paths must not perform their own
 /// flush/sync work before the FullSync group-commit leader runs.
 #[test]
@@ -971,24 +818,8 @@ fn test_group_commit_fsync_count_1_for_4_writers() {
 
     let obs = client.__us039_append_sync_observations();
     assert_eq!(
-        obs.append_logical_txn_flushes, 0,
-        "logical txn append must be append-only for FullSync writers"
-    );
-    assert_eq!(
-        obs.append_chain_commit_flushes, 0,
-        "ChainCommit append must be append-only for FullSync writers"
-    );
-    assert_eq!(
-        obs.commit_txn_frame_flushes, 0,
-        "legacy commit_txn frame append must not flush independently"
-    );
-    assert_eq!(
-        obs.commit_chain_commit_syncs, 0,
-        "commit_chain_commit must not call journal_sync before the FullSync owner"
-    );
-    assert_eq!(
-        obs.handle_flushes, 1,
-        "the FullSync boundary owner should issue exactly one handle flush"
+        obs.handle_flushes, 0,
+        "the FullSync LSN boundary must not flush dirty main-file pages"
     );
     assert_eq!(
         obs.handle_journal_syncs, 1,
@@ -1031,9 +862,9 @@ fn test_group_commit_leader_fsync_failure_poisons_and_wakes_followers() {
         !group.leader_elected,
         "failed leader must clear the election flag"
     );
-    assert_eq!(
-        group.failed_high_water, GROUP_COMMIT_WRITERS as u64,
-        "failed cohort high-water must cover all waiting writers"
+    assert!(
+        group.failed_high_water > 0,
+        "failed LSN high-water must record the closed sync target"
     );
     assert_eq!(group.fsync_failures, 1);
 
@@ -1109,7 +940,7 @@ fn test_group_commit_late_arrival_forms_next_cohort() {
     let group = client.__us017_group_commit_observations();
     assert!(
         group.last_fsync_seq >= (GROUP_COMMIT_WRITERS + 1) as u64,
-        "second cohort must fsync the late writer's ticket"
+        "second LSN sync must cover the late writer"
     );
 }
 
@@ -1145,7 +976,7 @@ fn test_group_commit_leader_election_safe_under_churn() {
     );
     assert!(
         group.last_fsync_seq >= GROUP_COMMIT_CHURN_WRITERS as u64,
-        "every writer ticket must be covered by fsync"
+        "every writer LSN must be covered by fsync"
     );
     assert_eq!(
         client

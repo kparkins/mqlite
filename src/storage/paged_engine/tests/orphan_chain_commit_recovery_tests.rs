@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::client::Client;
@@ -26,6 +26,7 @@ const ORPHAN_TS: Ts = Ts {
     physical_ms: 12_000,
     logical: 0,
 };
+const MIN_SYNTHETIC_COMMIT_TS_OFFSET_MS: u64 = 1;
 
 fn open_main_file(db_path: &Path) -> File {
     OpenOptions::new()
@@ -54,9 +55,32 @@ fn seed_database(db_path: &Path) {
     let client =
         Client::open_with_options(db_path, DbOpenOptions::new()).expect("open setup client");
     client.close().expect("checkpoint setup database");
+
+    let mut recovered_header = read_main_header(db_path);
+    recovered_header.last_checkpoint_ts = FRONTIER_TS;
+    write_main_header(db_path, &recovered_header);
+
+    match fs::remove_file(journal_path_for(db_path)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => panic!("remove phase8 seed journal: {error}"),
+    }
 }
 
-fn append_orphan_chain_commit(db_path: &Path, commit_ts: Ts) -> u64 {
+fn synthetic_uncheckpointed_ts(header: &FileHeader, requested: Ts) -> Ts {
+    if requested > header.last_checkpoint_ts {
+        return requested;
+    }
+    Ts {
+        physical_ms: header
+            .last_checkpoint_ts
+            .physical_ms
+            .saturating_add(requested.physical_ms.max(MIN_SYNTHETIC_COMMIT_TS_OFFSET_MS)),
+        logical: requested.logical,
+    }
+}
+
+fn append_orphan_chain_commit_at(db_path: &Path, commit_ts: Ts) -> (u64, Ts) {
     let mut main_file = open_main_file(db_path);
     let header = read_main_header(db_path);
     let mut journal =
@@ -65,19 +89,26 @@ fn append_orphan_chain_commit(db_path: &Path, commit_ts: Ts) -> u64 {
         .append_chain_commit(commit_ts, vec![], vec![])
         .expect("append orphan chain commit");
     journal.sync_journal().expect("sync journal");
-    offset
+    (offset, commit_ts)
 }
 
-fn append_clean_logical_then_orphan(db_path: &Path) -> u64 {
+fn append_orphan_chain_commit(db_path: &Path, commit_ts: Ts) -> (u64, Ts) {
+    let header = read_main_header(db_path);
+    append_orphan_chain_commit_at(db_path, synthetic_uncheckpointed_ts(&header, commit_ts))
+}
+
+fn append_clean_logical_then_orphan(db_path: &Path) -> (u64, Ts) {
     let mut main_file = open_main_file(db_path);
     let header = read_main_header(db_path);
     let mut journal =
         JournalManager::open_or_create(db_path, &header, &mut main_file).expect("open journal");
     let (salt1, salt2) = journal.salts();
+    let clean_ts = synthetic_uncheckpointed_ts(&header, CLEAN_TS);
+    let orphan_ts = synthetic_uncheckpointed_ts(&header, ORPHAN_TS);
     let frame = LogicalTxnFrame {
         salt1,
         salt2,
-        commit_ts: CLEAN_TS,
+        commit_ts: clean_ts,
         diagnostic_txn_id: 1,
         format_version: LOGICAL_TXN_FORMAT_VERSION,
         flags: 0,
@@ -86,13 +117,13 @@ fn append_clean_logical_then_orphan(db_path: &Path) -> u64 {
 
     journal.append_logical_txn(frame).expect("append logical");
     journal
-        .append_chain_commit(CLEAN_TS, vec![], vec![])
+        .append_chain_commit(clean_ts, vec![], vec![])
         .expect("append matching chain commit");
     let orphan_offset = journal
-        .append_chain_commit(ORPHAN_TS, vec![], vec![])
+        .append_chain_commit(orphan_ts, vec![], vec![])
         .expect("append orphan chain commit");
     journal.sync_journal().expect("sync journal");
-    orphan_offset
+    (orphan_offset, orphan_ts)
 }
 
 fn expect_recovery_error(db_path: &Path) -> String {
@@ -109,14 +140,14 @@ fn test_phase7_case_c_is_hard_error() {
     let db_path = dir.path().join("phase7-us009-hard-error.mqlite");
     seed_database(&db_path);
 
-    let offset = append_orphan_chain_commit(&db_path, ORPHAN_TS);
+    let (offset, orphan_ts) = append_orphan_chain_commit(&db_path, ORPHAN_TS);
     let mut main_file = open_main_file(&db_path);
     let header = read_main_header(&db_path);
     let mut journal =
         JournalManager::open_or_create(&db_path, &header, &mut main_file).expect("parse journal");
     let parsed = journal.take_parsed_logical_frames();
     assert_eq!(parsed.case_c_candidates.len(), 1);
-    assert_eq!(parsed.case_c_candidates[0].commit_ts, ORPHAN_TS);
+    assert_eq!(parsed.case_c_candidates[0].commit_ts, orphan_ts);
     assert_eq!(parsed.case_c_candidates[0].chain_commit_offset, offset);
     drop(journal);
     drop(main_file);
@@ -133,11 +164,7 @@ fn test_phase7_case_c_does_not_trip_for_pre_frontier_chain_commits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("phase7-us009-pre-frontier.mqlite");
     seed_database(&db_path);
-
-    let mut recovered_header = read_main_header(&db_path);
-    recovered_header.last_checkpoint_ts = FRONTIER_TS;
-    write_main_header(&db_path, &recovered_header);
-    append_orphan_chain_commit(&db_path, PRE_FRONTIER_TS);
+    append_orphan_chain_commit_at(&db_path, PRE_FRONTIER_TS);
 
     let client = Client::open_with_options(&db_path, DbOpenOptions::new())
         .expect("pre-frontier case-c candidate must be checkpoint-covered");
@@ -150,7 +177,7 @@ fn test_phase7_case_c_error_detail_includes_chain_commit_offset() {
     let db_path = dir.path().join("phase7-us009-offset-detail.mqlite");
     seed_database(&db_path);
 
-    let offset = append_orphan_chain_commit(&db_path, ORPHAN_TS);
+    let (offset, _) = append_orphan_chain_commit(&db_path, ORPHAN_TS);
     let detail = expect_recovery_error(&db_path);
     let expected_prefix = format!("chain_commit_offset={offset}:");
     assert!(
@@ -165,7 +192,7 @@ fn test_phase7_case_c_refuses_open_when_only_orphan_chain_commit_differs() {
     let db_path = dir.path().join("phase7-us009-only-orphan-differs.mqlite");
     seed_database(&db_path);
 
-    let orphan_offset = append_clean_logical_then_orphan(&db_path);
+    let (orphan_offset, _) = append_clean_logical_then_orphan(&db_path);
     let main_before = fs::read(&db_path).expect("read main before failed open");
     let journal_path = journal_path_for(&db_path);
     let journal_before = fs::read(&journal_path).expect("read journal before failed open");
@@ -193,7 +220,7 @@ fn test_phase7_case_c_read_only_open_refuses_orphan_chain_commit() {
     let db_path = dir.path().join("phase7-us012-read-only-case-c.mqlite");
     seed_database(&db_path);
 
-    let orphan_offset = append_orphan_chain_commit(&db_path, ORPHAN_TS);
+    let (orphan_offset, _) = append_orphan_chain_commit(&db_path, ORPHAN_TS);
     let detail = match Client::open_with_options(&db_path, DbOpenOptions::new().read_only(true)) {
         Ok(_) => panic!("read-only open must fail with Error::Recovery"),
         Err(Error::Recovery { detail }) => detail,

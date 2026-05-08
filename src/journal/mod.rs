@@ -33,7 +33,6 @@
 // boundary so denylist-mode CI does not trip on the pre-existing pattern.
 #![allow(clippy::expect_used)]
 
-#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod append_sync_test_probe;
 #[allow(dead_code)]
 pub(crate) mod log_file;
@@ -47,22 +46,30 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use crate::error::{Error, Result};
+use parking_lot::{Condvar, Mutex as ParkingMutex};
+
+use crate::error::{EngineFatalReason, Error, Result};
 use crate::mvcc::timestamp::Ts;
 use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 use crate::storage::page::PAGE_SIZE_LEAF;
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::storage::paged_engine::group_commit_test_probe;
 
 use self::shm::JournalIndex;
 
 pub(crate) use self::recovery::ParsedLogicalFrames;
 
+#[cfg(any(test, feature = "test-hooks"))]
+use self::log_file::LogicalTxnFrame;
 use self::log_file::{
     read_chain_commit_at_cursor, try_skip_logical_txn, write_page_frame_record,
-    CheckpointBatchPageRecord, JournalHeader, JournalOffset, JournalPageSize, LogicalTxnFrame,
-    Page0BoundaryRecord, PageId, JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
+    CheckpointBatchPageRecord, JournalHeader, JournalOffset, JournalPageSize, Page0BoundaryRecord,
+    PageId, PositionedLogFile, JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +106,621 @@ impl BoundaryAppended {
     #[allow(dead_code)]
     pub(crate) fn checkpoint_ts(&self) -> Ts {
         self.checkpoint_ts
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 LogManager
+// ---------------------------------------------------------------------------
+
+/// Byte-LSN range reserved for exactly one Phase 8 log record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogSlot {
+    start_lsn: u64,
+    end_lsn: u64,
+    bytes_len: usize,
+}
+
+impl LogSlot {
+    /// Inclusive byte offset where this record must be written.
+    pub(crate) fn start_lsn(&self) -> u64 {
+        self.start_lsn
+    }
+
+    /// Exclusive byte offset just past this record.
+    pub(crate) fn end_lsn(&self) -> u64 {
+        self.end_lsn
+    }
+
+    /// Exact byte length reserved for this record.
+    pub(crate) fn bytes_len(&self) -> usize {
+        self.bytes_len
+    }
+}
+
+/// Result of marking a reserved slot written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogWriteReceipt {
+    end_lsn: u64,
+    ready_lsn: u64,
+}
+
+impl LogWriteReceipt {
+    /// Exclusive end LSN of the slot just marked written.
+    pub(crate) fn end_lsn(&self) -> u64 {
+        self.end_lsn
+    }
+
+    /// Contiguous ready frontier after this mark operation.
+    pub(crate) fn ready_lsn(&self) -> u64 {
+        self.ready_lsn
+    }
+}
+
+/// Reserved Phase 8 log record plus the manager slot that owns its byte range.
+pub(crate) struct ReservedLogRecord {
+    log_manager: Option<Arc<LogManager>>,
+    slot: Option<LogSlot>,
+    record: log_file::FinalizedLogRecord,
+}
+
+impl ReservedLogRecord {
+    fn journaled(
+        log_manager: Arc<LogManager>,
+        slot: LogSlot,
+        record: log_file::FinalizedLogRecord,
+    ) -> Self {
+        Self {
+            log_manager: Some(log_manager),
+            slot: Some(slot),
+            record,
+        }
+    }
+
+    pub(crate) fn journalless(record: log_file::FinalizedLogRecord) -> Self {
+        Self {
+            log_manager: None,
+            slot: None,
+            record,
+        }
+    }
+
+    /// Exclusive end LSN of this complete record.
+    pub(crate) fn end_lsn(&self) -> u64 {
+        self.record.end_lsn()
+    }
+
+    /// Returns `true` when this record owns a real log-manager slot.
+    pub(crate) fn is_journaled(&self) -> bool {
+        self.log_manager.is_some()
+    }
+
+    /// Poison this reserved record's slot after a post-reservation failure.
+    pub(crate) fn poison_slot(&self, error: Error) -> Error {
+        match (&self.log_manager, &self.slot) {
+            (Some(log_manager), Some(slot)) => log_manager.poison_slot(slot, error),
+            _ => error,
+        }
+    }
+
+    /// Write the finalized bytes and mark the record written.
+    pub(crate) fn write_and_mark(&self) -> Result<u64> {
+        match (&self.log_manager, &self.slot) {
+            (Some(log_manager), Some(slot)) => {
+                log_manager.write_reserved(slot, self.record.bytes())?;
+                let receipt = log_manager.mark_written(slot)?;
+                Ok(receipt.end_lsn())
+            }
+            _ => Ok(self.record.end_lsn()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LogPoison {
+    reason: EngineFatalReason,
+    _source: String,
+}
+
+#[derive(Debug)]
+enum LogSlotState {
+    Reserved { end_lsn: u64 },
+    Writing { end_lsn: u64 },
+    WriteComplete { end_lsn: u64 },
+    Written { end_lsn: u64 },
+    Poisoned { end_lsn: u64 },
+}
+
+impl LogSlotState {
+    fn end_lsn(&self) -> u64 {
+        match self {
+            Self::Reserved { end_lsn }
+            | Self::Writing { end_lsn }
+            | Self::WriteComplete { end_lsn }
+            | Self::Written { end_lsn }
+            | Self::Poisoned { end_lsn } => *end_lsn,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LogSlotMap {
+    slots: BTreeMap<u64, LogSlotState>,
+    poisoned: Option<LogPoison>,
+}
+
+const LSN_GROUP_COMMIT_WAIT_POLL_MS: u64 = 1;
+const LSN_GROUP_COMMIT_MAX_WAIT_MS: u64 = 2;
+#[cfg(any(test, feature = "test-hooks"))]
+const LSN_GROUP_COMMIT_TEST_HOOK_WAIT_MS: u64 = 5_000;
+
+/// Phase 8 byte-LSN reservation and positioned-write manager.
+///
+/// `LogManager` owns byte-range reservation independently of commit metadata:
+/// [`reserve`](Self::reserve) depends only on a record length, while callers
+/// finalize and write their already-built record bytes into the returned slot.
+pub(crate) struct LogManager {
+    next_lsn: AtomicU64,
+    ready_lsn: AtomicU64,
+    durable_lsn: AtomicU64,
+    slots: ParkingMutex<LogSlotMap>,
+    sync_cv: Condvar,
+    sync_in_progress: AtomicBool,
+    file: PositionedLogFile,
+    #[cfg(any(test, feature = "test-hooks"))]
+    probe_id: u64,
+}
+
+impl LogManager {
+    /// Create a log manager over `file`, seeded at `initial_lsn`.
+    pub(crate) fn new(file: File, initial_lsn: u64) -> Self {
+        Self::from_positioned_file(PositionedLogFile::new(file), initial_lsn)
+    }
+
+    /// Create a log manager from an explicit positioned I/O adapter.
+    pub(crate) fn from_positioned_file(file: PositionedLogFile, initial_lsn: u64) -> Self {
+        Self {
+            next_lsn: AtomicU64::new(initial_lsn),
+            ready_lsn: AtomicU64::new(initial_lsn),
+            durable_lsn: AtomicU64::new(initial_lsn),
+            slots: ParkingMutex::new(LogSlotMap::default()),
+            sync_cv: Condvar::new(),
+            sync_in_progress: AtomicBool::new(false),
+            file,
+            #[cfg(any(test, feature = "test-hooks"))]
+            probe_id: group_commit_test_probe::next_probe_id(),
+        }
+    }
+
+    /// Reserve a disjoint byte-LSN range for a record of `bytes_len` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if `bytes_len` is zero or the LSN range
+    /// would overflow. Returns [`Error::EngineFatal`] after the manager is
+    /// poisoned.
+    pub(crate) fn reserve(&self, bytes_len: usize) -> Result<LogSlot> {
+        if bytes_len == 0 {
+            return Err(Error::Internal(
+                "log reservation length must be non-zero".into(),
+            ));
+        }
+        let bytes_len_u64 = u64::try_from(bytes_len)
+            .map_err(|_| Error::Internal("log reservation length overflows u64".into()))?;
+
+        let mut state = self.slots.lock();
+        Self::check_poisoned_locked(&state)?;
+
+        let start_lsn = self.next_lsn.load(Ordering::Acquire);
+        let end_lsn = start_lsn
+            .checked_add(bytes_len_u64)
+            .ok_or_else(|| Error::Internal("log reservation LSN overflow".into()))?;
+        if state
+            .slots
+            .insert(start_lsn, LogSlotState::Reserved { end_lsn })
+            .is_some()
+        {
+            return Err(Error::Internal(format!(
+                "duplicate log slot reservation at LSN {start_lsn}"
+            )));
+        }
+        self.next_lsn.store(end_lsn, Ordering::Release);
+
+        Ok(LogSlot {
+            start_lsn,
+            end_lsn,
+            bytes_len,
+        })
+    }
+
+    /// Write `bytes` into `slot` using absolute-offset file I/O.
+    ///
+    /// The slot is not made ready by this call. Call
+    /// [`mark_written`](Self::mark_written) after this returns successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EngineFatal`] and poisons the manager if the write
+    /// fails after reservation or the reserved slot is no longer in the
+    /// expected state. Returns [`Error::Internal`] for an unknown slot.
+    pub(crate) fn write_reserved(&self, slot: &LogSlot, bytes: &[u8]) -> Result<()> {
+        if bytes.len() != slot.bytes_len {
+            let error = Error::Internal(format!(
+                "log slot length mismatch: reserved {} bytes, got {}",
+                slot.bytes_len,
+                bytes.len()
+            ));
+            return Err(self.poison_slot(slot, error));
+        }
+
+        {
+            let mut state = self.slots.lock();
+            Self::check_poisoned_locked(&state)?;
+            let slot_state = Self::slot_state_mut(&mut state, slot)?;
+            match slot_state {
+                LogSlotState::Reserved { end_lsn } if *end_lsn == slot.end_lsn => {
+                    *slot_state = LogSlotState::Writing {
+                        end_lsn: slot.end_lsn,
+                    };
+                }
+                _ => return Err(self.poison_bad_slot_state_locked(&mut state, slot)),
+            }
+        }
+
+        if let Err(error) = self.file.write_all_at(slot.start_lsn, bytes) {
+            return Err(self.poison_slot(slot, Error::Io(error)));
+        }
+
+        let mut state = self.slots.lock();
+        Self::check_poisoned_locked(&state)?;
+        let slot_state = Self::slot_state_mut(&mut state, slot)?;
+        match slot_state {
+            LogSlotState::Writing { end_lsn } if *end_lsn == slot.end_lsn => {
+                *slot_state = LogSlotState::WriteComplete {
+                    end_lsn: slot.end_lsn,
+                };
+                Ok(())
+            }
+            LogSlotState::Poisoned { .. } => Err(Self::fatal_error(
+                &EngineFatalReason::PostReservationLogWriteFailure,
+            )),
+            _ => Err(self.poison_bad_slot_state_locked(&mut state, slot)),
+        }
+    }
+
+    /// Mark a fully written slot ready and advance the contiguous ready LSN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EngineFatal`] if the slot was not successfully written
+    /// after reservation or after any slot poisons the manager. Returns
+    /// [`Error::Internal`] for an unknown slot.
+    pub(crate) fn mark_written(&self, slot: &LogSlot) -> Result<LogWriteReceipt> {
+        let mut state = self.slots.lock();
+        Self::check_poisoned_locked(&state)?;
+
+        let slot_state = Self::slot_state_mut(&mut state, slot)?;
+        match slot_state {
+            LogSlotState::WriteComplete { end_lsn } if *end_lsn == slot.end_lsn => {
+                *slot_state = LogSlotState::Written {
+                    end_lsn: slot.end_lsn,
+                };
+            }
+            _ => return Err(self.poison_bad_slot_state_locked(&mut state, slot)),
+        }
+
+        let ready_before = self.ready_lsn.load(Ordering::Acquire);
+        let mut ready = ready_before;
+        while matches!(state.slots.get(&ready), Some(LogSlotState::Written { .. })) {
+            let end_lsn = state
+                .slots
+                .remove(&ready)
+                .expect("ready slot exists")
+                .end_lsn();
+            ready = end_lsn;
+        }
+        if ready != ready_before {
+            self.ready_lsn.store(ready, Ordering::Release);
+        }
+        drop(state);
+        self.sync_cv.notify_all();
+
+        Ok(LogWriteReceipt {
+            end_lsn: slot.end_lsn,
+            ready_lsn: ready,
+        })
+    }
+
+    /// Poison a reserved slot and wake every waiter.
+    ///
+    /// # Errors
+    ///
+    /// This method returns the [`Error::EngineFatal`] value callers should
+    /// propagate. It does not itself return a `Result`.
+    pub(crate) fn poison_slot(&self, slot: &LogSlot, error: Error) -> Error {
+        self.poison(
+            EngineFatalReason::PostReservationLogWriteFailure,
+            error.to_string(),
+            Some(slot),
+        )
+    }
+
+    /// Wait until the contiguous ready LSN covers `end_lsn`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EngineFatal`] if any slot has poisoned the manager.
+    pub(crate) fn wait_ready(&self, end_lsn: u64) -> Result<()> {
+        let mut state = self.slots.lock();
+        loop {
+            Self::check_poisoned_locked(&state)?;
+            if self.ready_lsn.load(Ordering::Acquire) >= end_lsn {
+                return Ok(());
+            }
+            self.sync_cv.wait(&mut state);
+        }
+    }
+
+    /// Sync the log through `target_lsn` once it is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EngineFatal`] if a write or sync failure poisons the
+    /// manager, or the underlying I/O error wrapped by that fatal state.
+    pub(crate) fn ensure_sync(&self, target_lsn: u64) -> Result<()> {
+        self.wait_ready(target_lsn)?;
+        loop {
+            if self.durable_lsn() >= target_lsn {
+                return Ok(());
+            }
+            self.check_poisoned()?;
+
+            if self
+                .sync_in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                #[cfg(any(test, feature = "test-hooks"))]
+                let leader_guard = group_commit_test_probe::leader_entered();
+
+                let sync_target = match self.close_sync_target_after_wait() {
+                    Ok(target) => target,
+                    Err(error) => {
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        drop(leader_guard);
+                        self.sync_in_progress.store(false, Ordering::Release);
+                        self.sync_cv.notify_all();
+                        return Err(error);
+                    }
+                };
+                #[cfg(any(test, feature = "test-hooks"))]
+                let result = if group_commit_test_probe::take_fail_next_fsync() {
+                    Err(Error::Internal(
+                        "US-017 injected group-commit fsync failure".into(),
+                    ))
+                } else {
+                    self.file.sync_data().map_err(Error::Io)
+                };
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                let result = self.file.sync_data().map_err(Error::Io);
+                match result {
+                    Ok(()) => {
+                        let durable_target = sync_target.min(self.ready_lsn());
+                        self.durable_lsn.store(durable_target, Ordering::Release);
+                        self::append_sync_test_probe::record_handle_journal_sync();
+                        self::append_sync_test_probe::record_journal_sync_os_boundary();
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        group_commit_test_probe::record_fsync_success(durable_target);
+                        self.sync_in_progress.store(false, Ordering::Release);
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        drop(leader_guard);
+                        self.sync_cv.notify_all();
+                    }
+                    Err(error) => {
+                        #[cfg(any(test, feature = "test-hooks"))]
+                        {
+                            group_commit_test_probe::record_fsync_failure(sync_target);
+                            drop(leader_guard);
+                        }
+                        return Err(self.poison(
+                            EngineFatalReason::PostDurablePublishFailure,
+                            error.to_string(),
+                            None,
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            let mut state = self.slots.lock();
+            while self.durable_lsn() < target_lsn && self.sync_in_progress.load(Ordering::Acquire) {
+                Self::check_poisoned_locked(&state)?;
+                self.sync_cv.wait(&mut state);
+            }
+        }
+    }
+
+    fn close_sync_target_after_wait(&self) -> Result<u64> {
+        let production_deadline =
+            Instant::now() + Duration::from_millis(LSN_GROUP_COMMIT_MAX_WAIT_MS);
+        #[cfg(any(test, feature = "test-hooks"))]
+        let test_deadline =
+            Instant::now() + Duration::from_millis(LSN_GROUP_COMMIT_TEST_HOOK_WAIT_MS);
+        let mut state = self.slots.lock();
+
+        loop {
+            Self::check_poisoned_locked(&state)?;
+
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let Some(expected) = group_commit_test_probe::expected_cohort_size() {
+                if group_commit_test_probe::active_waiters() >= expected {
+                    group_commit_test_probe::clear_expected_cohort_size();
+                    break;
+                }
+                if Instant::now() < test_deadline {
+                    self.sync_cv.wait_for(
+                        &mut state,
+                        Duration::from_millis(LSN_GROUP_COMMIT_WAIT_POLL_MS),
+                    );
+                    continue;
+                }
+            }
+
+            if Instant::now() >= production_deadline {
+                break;
+            }
+            self.sync_cv.wait_for(
+                &mut state,
+                Duration::from_millis(LSN_GROUP_COMMIT_WAIT_POLL_MS),
+            );
+        }
+
+        let sync_target = self.ready_lsn();
+        drop(state);
+        #[cfg(any(test, feature = "test-hooks"))]
+        group_commit_test_probe::pause_after_close_if_installed(self.probe_id, sync_target);
+        Ok(sync_target)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn probe_id(&self) -> u64 {
+        self.probe_id
+    }
+
+    /// Wait until `end_lsn` is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EngineFatal`] if a write or sync failure poisons the
+    /// manager.
+    pub(crate) fn wait_durable(&self, end_lsn: u64) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        let _waiter_guard = group_commit_test_probe::waiter_entered();
+        self.ensure_sync(end_lsn)
+    }
+
+    /// Reset all LSN frontiers after rollback, recovery truncation, or
+    /// checkpoint log truncation.
+    pub(crate) fn reset_to(&self, lsn: u64) {
+        let mut state = self.slots.lock();
+        state.slots.clear();
+        state.poisoned = None;
+        self.next_lsn.store(lsn, Ordering::Release);
+        self.ready_lsn.store(lsn, Ordering::Release);
+        self.durable_lsn.store(lsn, Ordering::Release);
+        drop(state);
+        self.sync_cv.notify_all();
+    }
+
+    /// Reset reservation and ready frontiers after a cursor-based write that
+    /// has not been synced yet.
+    pub(crate) fn reset_ready_to_unsynced(&self, lsn: u64) {
+        let mut state = self.slots.lock();
+        state.slots.clear();
+        state.poisoned = None;
+        self.next_lsn.store(lsn, Ordering::Release);
+        self.ready_lsn.store(lsn, Ordering::Release);
+        let durable_lsn = self.durable_lsn.load(Ordering::Acquire).min(lsn);
+        self.durable_lsn.store(durable_lsn, Ordering::Release);
+        drop(state);
+        self.sync_cv.notify_all();
+    }
+
+    /// Return the contiguous fully written byte frontier.
+    pub(crate) fn ready_lsn(&self) -> u64 {
+        self.ready_lsn.load(Ordering::Acquire)
+    }
+
+    /// Return the next byte-LSN reservation frontier.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn next_lsn(&self) -> u64 {
+        self.next_lsn.load(Ordering::Acquire)
+    }
+
+    /// Return the synced byte frontier.
+    pub(crate) fn durable_lsn(&self) -> u64 {
+        self.durable_lsn.load(Ordering::Acquire)
+    }
+
+    fn check_poisoned(&self) -> Result<()> {
+        let state = self.slots.lock();
+        Self::check_poisoned_locked(&state)
+    }
+
+    fn check_poisoned_locked(state: &LogSlotMap) -> Result<()> {
+        if let Some(poison) = &state.poisoned {
+            return Err(Self::fatal_error(&poison.reason));
+        }
+        Ok(())
+    }
+
+    fn fatal_error(reason: &EngineFatalReason) -> Error {
+        Error::EngineFatal {
+            reason: reason.clone(),
+        }
+    }
+
+    fn poison(&self, reason: EngineFatalReason, source: String, slot: Option<&LogSlot>) -> Error {
+        let mut state = self.slots.lock();
+        let error = self.poison_locked(&mut state, reason, source, slot);
+        drop(state);
+        self.sync_cv.notify_all();
+        error
+    }
+
+    fn poison_bad_slot_state_locked(&self, state: &mut LogSlotMap, slot: &LogSlot) -> Error {
+        self.poison_locked(
+            state,
+            EngineFatalReason::PostReservationLogWriteFailure,
+            Self::bad_slot_state(slot).to_string(),
+            Some(slot),
+        )
+    }
+
+    fn poison_locked(
+        &self,
+        state: &mut LogSlotMap,
+        reason: EngineFatalReason,
+        source: String,
+        slot: Option<&LogSlot>,
+    ) -> Error {
+        if state.poisoned.is_none() {
+            state.poisoned = Some(LogPoison {
+                reason: reason.clone(),
+                _source: source,
+            });
+        }
+        if let Some(slot) = slot {
+            state.slots.insert(
+                slot.start_lsn,
+                LogSlotState::Poisoned {
+                    end_lsn: slot.end_lsn,
+                },
+            );
+        }
+        self.sync_in_progress.store(false, Ordering::Release);
+        self.sync_cv.notify_all();
+        Self::fatal_error(&reason)
+    }
+
+    fn slot_state_mut<'a>(
+        state: &'a mut LogSlotMap,
+        slot: &LogSlot,
+    ) -> Result<&'a mut LogSlotState> {
+        let Some(slot_state) = state.slots.get_mut(&slot.start_lsn) else {
+            return Err(Self::bad_slot_state(slot));
+        };
+        if slot_state.end_lsn() != slot.end_lsn {
+            return Err(Self::bad_slot_state(slot));
+        }
+        Ok(slot_state)
+    }
+
+    fn bad_slot_state(slot: &LogSlot) -> Error {
+        Error::Internal(format!(
+            "log slot [{}, {}) is not in the expected state",
+            slot.start_lsn, slot.end_lsn
+        ))
     }
 }
 
@@ -252,6 +874,8 @@ pub(crate) struct JournalManager {
     pub(super) checkpoint_seq: u32,
     /// Byte offset of the next frame to write (append cursor).
     pub(super) write_cursor: u64,
+    /// Phase 8 byte-LSN reservation manager for ordinary commit-log appends.
+    log_manager: Arc<LogManager>,
     /// Total database page count as of the last committed journal frame.
     /// Carried forward across commits; `None` if no commit has occurred yet
     /// in this journal.
@@ -263,6 +887,10 @@ pub(crate) struct JournalManager {
     /// to floor [`TimestampOracle`] so every post-recovery commit is strictly
     /// greater than any durable commit from the previous lifetime.
     pub(super) recovered_max_commit_ts: Option<Ts>,
+    /// Highest non-control Phase 8 `publish_seq` accepted during recovery.
+    /// The MVCC backend uses this to start the live publish sequencer above
+    /// every durable pre-crash publish slot.
+    pub(super) recovered_max_publish_seq: Option<u64>,
     /// Phase 2 §5.1 Pass 1 hand-off: logical frames collected during
     /// `recover_existing`, consumed exactly once by
     /// [`SharedState::new`](crate::storage::paged_engine::state::SharedState::new)
@@ -330,6 +958,7 @@ impl JournalManager {
             .write_all(&header.to_bytes())
             .map_err(Error::Io)?;
         journal_file.flush().map_err(Error::Io)?;
+        let log_manager_file = journal_file.try_clone().map_err(Error::Io)?;
 
         Ok(Self {
             journal_path,
@@ -339,8 +968,13 @@ impl JournalManager {
             salt2,
             checkpoint_seq: 0,
             write_cursor: JOURNAL_HEADER_SIZE as u64,
+            log_manager: Arc::new(LogManager::new(
+                log_manager_file,
+                JOURNAL_HEADER_SIZE as u64,
+            )),
             last_committed_db_page_count: None,
             recovered_max_commit_ts: None,
+            recovered_max_publish_seq: None,
             parsed_logical_frames: ParsedLogicalFrames::default(),
             legacy_pending_start_offset: None,
             last_legacy_commit_end_offset: JOURNAL_HEADER_SIZE as u64,
@@ -479,19 +1113,48 @@ impl JournalManager {
     /// Append an MVCC `ChainCommit` frame to the journal.
     ///
     /// Emits one `ChainCommitFrame` carrying `commit_ts`, `refcount_deltas`,
-    /// and zero or more `page_writes`. The frame is written at the current
-    /// `write_cursor`; the cursor advances past the encoded frame. Durability
-    /// belongs to the caller's explicit sync boundary, not to this append path.
+    /// and zero or more `page_writes`. The frame reserves a byte-LSN slot and
+    /// writes at that absolute offset; the compatibility cursor follows the
+    /// ready LSN after the write. Durability belongs to the caller's explicit
+    /// sync boundary, not to this append path.
     ///
     /// The in-memory index is NOT updated — `ChainCommit` frames carry no
     /// single page number (every `page_writes` entry has its own). Recovery
     /// scans `ChainCommit` frames linearly.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn append_chain_commit(
+        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
         &mut self,
         commit_ts: crate::mvcc::timestamp::Ts,
         refcount_deltas: Vec<(u32, i32)>,
         page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
     ) -> Result<u64> {
+        let (frame_offset, _end_lsn) =
+            self.append_chain_commit_record(commit_ts, refcount_deltas, page_writes)?;
+        Ok(frame_offset)
+    }
+
+    /// Append a `ChainCommit` frame and return its exclusive end LSN.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn append_chain_commit_end_lsn(
+        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
+        &mut self,
+        commit_ts: crate::mvcc::timestamp::Ts,
+        refcount_deltas: Vec<(u32, i32)>,
+        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
+    ) -> Result<u64> {
+        let (_frame_offset, end_lsn) =
+            self.append_chain_commit_record(commit_ts, refcount_deltas, page_writes)?;
+        Ok(end_lsn)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn append_chain_commit_record(
+        &mut self,
+        commit_ts: crate::mvcc::timestamp::Ts,
+        refcount_deltas: Vec<(u32, i32)>,
+        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
+    ) -> Result<(u64, u64)> {
         if self.checkpoint_batch_active.is_some() {
             return Err(Error::Internal(
                 "chain commit cannot be appended inside checkpoint batch".into(),
@@ -505,13 +1168,12 @@ impl JournalManager {
             page_writes,
         };
         let bytes = frame.encode()?;
-        let frame_offset = self.write_cursor;
-        self.journal_file
-            .seek(SeekFrom::Start(frame_offset))
-            .map_err(Error::Io)?;
-        self.journal_file.write_all(&bytes).map_err(Error::Io)?;
-        self.write_cursor += bytes.len() as u64;
-        Ok(frame_offset)
+        let slot = self.log_manager.reserve(bytes.len())?;
+        let frame_offset = slot.start_lsn();
+        self.log_manager.write_reserved(&slot, &bytes)?;
+        let receipt = self.log_manager.mark_written(&slot)?;
+        self.write_cursor = receipt.ready_lsn();
+        Ok((frame_offset, receipt.end_lsn()))
     }
 
     /// Append a `LogicalTxnFrame` to the journal (§6.4). Returns the byte
@@ -522,27 +1184,27 @@ impl JournalManager {
     ///
     /// The in-memory [`JournalIndex`] is not updated: logical frames carry
     /// no `page_number` and recovery scans them linearly (§5).
-    pub(crate) fn append_logical_txn(&mut self, frame: LogicalTxnFrame) -> Result<u64> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn append_logical_txn(
+        // allow-phase8-legacy-audit: test-only retired logical append probe
+        &mut self,
+        frame: LogicalTxnFrame,
+    ) -> Result<u64> {
         if self.checkpoint_batch_active.is_some() {
             return Err(Error::Internal(
                 "logical transaction cannot be appended inside checkpoint batch".into(),
             ));
         }
         let bytes = frame.encode()?;
-        let frame_offset = self.write_cursor;
-        self.journal_file
-            .seek(SeekFrom::Start(frame_offset))
-            .map_err(Error::Io)?;
-        self.journal_file.write_all(&bytes).map_err(Error::Io)?;
-        self.write_cursor += bytes.len() as u64;
+        let slot = self.log_manager.reserve(bytes.len())?;
+        let frame_offset = slot.start_lsn();
+        self.log_manager.write_reserved(&slot, &bytes)?;
+        let receipt = self.log_manager.mark_written(&slot)?;
+        self.write_cursor = receipt.ready_lsn();
         crate::mvcc::metrics::record_logical_txn_append_bytes(bytes.len() as u64);
-        // §7 / US-024 AC#3 — duration timing is sampled OUTSIDE the
-        // journal critical section by `LogicalTxnAppendPercentileRefresh`
-        // in `src/storage/paged_engine.rs::run_write_existing`. The
-        // RAII guard captures `Instant::now()` BEFORE acquiring the
-        // journal_mutex and samples elapsed AFTER releasing it
-        // (LIFO drop order). No `Instant::now()` inside the journal
-        // critical section.
+        // allow-phase8-legacy-audit: this retired append helper is test-only.
+        // Production CRUD uses one Phase 8 LogRecord; the percentile guard in
+        // `PagedEngine` samples the full draft/reserve/write/ready envelope.
         Ok(frame_offset)
     }
 
@@ -557,6 +1219,7 @@ impl JournalManager {
         checkpoint_batch: CheckpointBatchCursor,
     ) -> Result<BoundaryAppended> {
         self.validate_active_checkpoint_batch_before_boundary(&checkpoint_batch)?;
+        self.log_manager.check_poisoned()?;
         let record = Page0BoundaryRecord::new(self.salt1, self.salt2, staged_header.clone());
         let frame_offset = self.write_cursor;
         self.journal_file
@@ -565,6 +1228,7 @@ impl JournalManager {
         record.write(&mut self.journal_file).map_err(Error::Io)?;
         self.journal_file.flush().map_err(Error::Io)?;
         self.write_cursor += (JOURNAL_FRAME_HEADER_SIZE + JournalPageSize::Small4k.bytes()) as u64;
+        self.log_manager.reset_ready_to_unsynced(self.write_cursor);
         self.last_committed_db_page_count = Some(staged_header.total_page_count);
         self.checkpoint_batch_active = None;
         // Keep checkpoint frame provenance until the journal is truncated so
@@ -631,6 +1295,7 @@ impl JournalManager {
                 "ordinary page frame cannot be appended inside checkpoint batch".into(),
             ));
         }
+        self.log_manager.check_poisoned()?;
         let frame_offset = self.write_cursor;
         self.journal_file
             .seek(SeekFrom::Start(frame_offset))
@@ -662,6 +1327,7 @@ impl JournalManager {
         };
 
         self.write_cursor += frame_size as u64;
+        self.log_manager.reset_ready_to_unsynced(self.write_cursor);
 
         if let Some(tag) = checkpoint_tag {
             self.checkpoint_frame_tags.insert(frame_offset, tag);
@@ -887,14 +1553,12 @@ impl JournalManager {
 
     /// fsync the journal file, making all committed-but-unsynced frames durable.
     ///
-    /// Calls `sync_data()` (fdatasync) which is sufficient to guarantee that
-    /// journal frame data survives a process crash. Main-file contents are NOT
-    /// touched — this is the FullSync hot path, not a checkpoint.
+    /// The Phase 8 log manager waits for the ready prefix, calls
+    /// `sync_data()` (fdatasync), and advances `durable_lsn` through the synced
+    /// frontier. Main-file contents are NOT touched — this is the FullSync hot
+    /// path, not a checkpoint.
     pub(crate) fn sync_journal(&self) -> Result<()> {
-        self.journal_file.sync_data().map_err(Error::Io)?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::append_sync_test_probe::record_journal_sync_os_boundary();
-        Ok(())
+        self.log_manager.ensure_sync(self.write_cursor)
     }
 
     // -----------------------------------------------------------------------
@@ -906,10 +1570,49 @@ impl JournalManager {
         self.write_cursor
     }
 
+    /// Return the shared log manager for ready/durable LSN waits that must
+    /// not hold the journal append mutex while waiting or syncing.
+    pub(crate) fn log_manager(&self) -> Arc<LogManager> {
+        Arc::clone(&self.log_manager)
+    }
+
+    /// Reserve and finalize one Phase 8 log record.
+    ///
+    /// The journal-manager mutex protects `write_cursor` while reservation
+    /// advances the append frontier, so legacy DDL appenders cannot overwrite
+    /// a byte range already handed to `LogManager`.
+    pub(crate) fn reserve_log_record(
+        &mut self,
+        draft: log_file::LogRecordDraft,
+    ) -> Result<ReservedLogRecord> {
+        let bytes_len = draft.encoded_len()?;
+        let slot = self.log_manager.reserve(bytes_len)?;
+        let record = match draft.finalize(slot.start_lsn()) {
+            Ok(record) => record,
+            Err(error) => return Err(self.log_manager.poison_slot(&slot, error)),
+        };
+        if record.end_lsn() != slot.end_lsn() {
+            let error = Error::Internal(format!(
+                "finalized log record [{}, {}) did not match reserved slot [{}, {})",
+                record.start_lsn(),
+                record.end_lsn(),
+                slot.start_lsn(),
+                slot.end_lsn()
+            ));
+            return Err(self.log_manager.poison_slot(&slot, error));
+        }
+        self.write_cursor = self.write_cursor.max(slot.end_lsn());
+        self.last_legacy_commit_end_offset = self.write_cursor;
+        Ok(ReservedLogRecord::journaled(
+            Arc::clone(&self.log_manager),
+            slot,
+            record,
+        ))
+    }
+
     /// Return the journal's database-lifetime salt values `(salt1, salt2)`
-    /// for callers (e.g. `WriteTxn::emit_logical_txn_frame`) that need to
-    /// stamp a [`LogicalTxnFrame`] before handing it off to
-    /// [`append_logical_txn`](Self::append_logical_txn).
+    /// for callers that need to stamp legacy logical-frame probes or Phase 8
+    /// payloads with the database salts.
     pub(crate) fn salts(&self) -> (u32, u32) {
         (self.salt1, self.salt2)
     }
@@ -926,6 +1629,11 @@ impl JournalManager {
     /// strictly greater than any durable commit from the previous lifetime.
     pub(crate) fn recovered_max_commit_ts(&self) -> Option<Ts> {
         self.recovered_max_commit_ts
+    }
+
+    /// Highest non-control Phase 8 `publish_seq` observed during recovery.
+    pub(crate) fn recovered_max_publish_seq(&self) -> Option<u64> {
+        self.recovered_max_publish_seq
     }
 
     /// Take the `ParsedLogicalFrames` collected during Pass 1 recovery
@@ -959,10 +1667,19 @@ impl JournalManager {
     /// primitive used by [`crate::storage::paged_engine::PagedEngine`] when a
     /// mutator returns an error.
     ///
+    /// A poisoned Phase 8 log manager is fatal to the live engine and cannot
+    /// be cleared by rollback. Reopen/recovery owns any truncation after that
+    /// point.
+    ///
     /// The index is rebuilt by a linear scan over the surviving frame
     /// range — O(surviving frames) — which is correct regardless of whether
     /// the dropped frames were commit or non-commit frames.
-    pub(crate) fn truncate_to(&mut self, cursor: u64) -> Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn truncate_to(
+        // allow-phase8-legacy-audit: test-only retired live-tail rollback probe
+        &mut self,
+        cursor: u64,
+    ) -> Result<()> {
         if cursor < JOURNAL_HEADER_SIZE as u64 || cursor > self.write_cursor {
             return Err(Error::Internal(format!(
                 "journal truncate_to: cursor {cursor} out of range \
@@ -970,10 +1687,12 @@ impl JournalManager {
                 self.write_cursor
             )));
         }
+        self.log_manager.check_poisoned()?;
 
         self.journal_file.set_len(cursor).map_err(Error::Io)?;
         self.journal_file.flush().map_err(Error::Io)?;
         self.write_cursor = cursor;
+        self.log_manager.reset_to(cursor);
 
         self.index.clear_index();
         self.journal_file
@@ -1185,6 +1904,7 @@ impl JournalManager {
     /// Truncate the journal file to just its 32-byte header and reposition the
     /// write cursor.
     fn truncate_journal(&mut self) -> Result<()> {
+        self.log_manager.check_poisoned()?;
         self.journal_file
             .seek(SeekFrom::Start(0))
             .map_err(Error::Io)?;
@@ -1202,6 +1922,7 @@ impl JournalManager {
         self.journal_file.flush().map_err(Error::Io)?;
 
         self.write_cursor = JOURNAL_HEADER_SIZE as u64;
+        self.log_manager.reset_to(self.write_cursor);
         self.legacy_pending_start_offset = None;
         self.last_legacy_commit_end_offset = self.write_cursor;
         self.checkpoint_batch_active = None;

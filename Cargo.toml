@@ -144,6 +144,10 @@ harness = false
 name = "same_collection_multiwriter"
 harness = false
 
+[[bench]]
+name = "group_commit_lsn"
+harness = false
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 missing_docs = "warn"

@@ -56,7 +56,7 @@ mod partition;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -641,6 +641,7 @@ pub(crate) struct BufferPool {
     delta_bearing_frames_warn_threshold: f64,
     #[allow(dead_code)]
     delta_bearing_frames_warn_above_threshold: AtomicBool,
+    main_file_flush_lsn: AtomicU64,
 }
 
 /// Point-in-time buffer-pool occupancy metrics.
@@ -700,6 +701,7 @@ impl BufferPool {
             total_pool_frames,
             delta_bearing_frames_warn_threshold: threshold,
             delta_bearing_frames_warn_above_threshold: AtomicBool::new(false),
+            main_file_flush_lsn: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -707,6 +709,16 @@ impl BufferPool {
     #[allow(dead_code)]
     pub(crate) fn max_pool_bytes(&self) -> usize {
         self.max_pool_bytes
+    }
+
+    /// Update the durable log frontier that main-file writes may materialize.
+    pub(crate) fn set_main_file_flush_lsn(&self, durable_lsn: u64) {
+        self.main_file_flush_lsn
+            .store(durable_lsn, Ordering::Release);
+    }
+
+    fn main_file_flush_lsn(&self) -> u64 {
+        self.main_file_flush_lsn.load(Ordering::Acquire)
     }
 
     /// Return a point-in-time occupancy snapshot and publish its metrics.
@@ -805,7 +817,12 @@ impl BufferPool {
             .lock()
             .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
 
-        let idx = guard.pin_page(page_number, self.io.as_ref(), size_enum)?;
+        let idx = guard.pin_page(
+            page_number,
+            self.io.as_ref(),
+            size_enum,
+            self.main_file_flush_lsn(),
+        )?;
 
         let snapshot = guard.data_snapshot(idx);
 
@@ -975,7 +992,7 @@ impl BufferPool {
         }
         frame.data.store(Arc::new(new_base));
         frame.deltas = retained_chains;
-        frame.dirty = true;
+        frame.mark_unflushable_if_clean();
 
         Ok(())
     }
@@ -1024,7 +1041,13 @@ impl BufferPool {
                 .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
             let mut blocked = 0usize;
             let (idx, dropped) = loop {
-                match guard.pin_page_reconciling(page_number, ort, self.io.as_ref(), size_enum) {
+                match guard.pin_page_reconciling(
+                    page_number,
+                    ort,
+                    self.io.as_ref(),
+                    size_enum,
+                    self.main_file_flush_lsn(),
+                ) {
                     Ok(result) => break result,
                     Err(Error::BufferPoolEvictionBlocked { page, reason }) => {
                         blocked += 1;
@@ -1175,7 +1198,8 @@ impl BufferPool {
             let mut guard = lock
                 .lock()
                 .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-            let idx = guard.pin_page(page_id, self.io.as_ref(), size)?;
+            let idx =
+                guard.pin_page(page_id, self.io.as_ref(), size, self.main_file_flush_lsn())?;
             let frame = guard.frames[idx].as_ref().ok_or_else(|| {
                 Error::Internal("page_map invariant: frame must exist at mapped slot".into())
             })?;
@@ -1276,6 +1300,7 @@ impl BufferPool {
     ///
     /// Must be called before a WAL checkpoint or `Database::close` to ensure
     /// in-flight modifications reach stable storage.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn flush(&self) -> Result<()> {
         self.inner_4k
             .lock()
@@ -1286,6 +1311,21 @@ impl BufferPool {
             .lock()
             .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
             .flush_all(self.io.as_ref(), PageSize::Large32k)?;
+
+        Ok(())
+    }
+
+    /// Write only dirty pages whose `last_lsn` is covered by `durable_lsn`.
+    pub(crate) fn flush_lsn_fenced(&self, durable_lsn: u64) -> Result<()> {
+        self.inner_4k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
+            .flush_all_lsn_fenced(self.io.as_ref(), PageSize::Small4k, durable_lsn)?;
+
+        self.inner_32k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
+            .flush_all_lsn_fenced(self.io.as_ref(), PageSize::Large32k, durable_lsn)?;
 
         Ok(())
     }
@@ -1318,6 +1358,46 @@ impl BufferPool {
         Ok(pages)
     }
 
+    /// Snapshot dirty resident frames for the requested page ids.
+    pub(crate) fn dirty_frame_snapshots_for_pages(
+        &self,
+        pages: &BTreeSet<PageId>,
+    ) -> Result<Vec<(u32, PageSize, Vec<u8>)>> {
+        let mut frames = Vec::new();
+        {
+            let guard = self
+                .inner_32k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            frames.extend(
+                guard
+                    .dirty_frame_snapshots(PageSize::Large32k)
+                    .into_iter()
+                    .filter(|(page, _, _)| pages.contains(&PageId(*page))),
+            );
+        }
+        {
+            let guard = self
+                .inner_4k
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            frames.extend(
+                guard
+                    .dirty_frame_snapshots(PageSize::Small4k)
+                    .into_iter()
+                    .filter(|(page, _, _)| pages.contains(&PageId(*page))),
+            );
+        }
+        frames.sort_by_key(|(page, size, _data)| {
+            let size_order = match size {
+                PageSize::Small4k => 0u8,
+                PageSize::Large32k => 1u8,
+            };
+            (*page, size_order)
+        });
+        Ok(frames)
+    }
+
     /// Snapshot checkpoint-owned dirty frames without clearing dirty bits.
     ///
     /// # Errors
@@ -1332,6 +1412,7 @@ impl BufferPool {
         &self,
         owned_pages: &BTreeSet<PageId>,
         excluded_future_dirty_pages: &BTreeSet<PageId>,
+        checkpoint_applied_lsn: u64,
     ) -> Result<Vec<(u32, PageSize, Vec<u8>)>> {
         let mut frames = Vec::new();
         {
@@ -1339,14 +1420,18 @@ impl BufferPool {
                 .inner_32k
                 .lock()
                 .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-            frames.extend(guard.dirty_frame_snapshots(PageSize::Large32k));
+            frames.extend(
+                guard.dirty_frame_snapshots_lsn_fenced(PageSize::Large32k, checkpoint_applied_lsn),
+            );
         }
         {
             let guard = self
                 .inner_4k
                 .lock()
                 .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-            frames.extend(guard.dirty_frame_snapshots(PageSize::Small4k));
+            frames.extend(
+                guard.dirty_frame_snapshots_lsn_fenced(PageSize::Small4k, checkpoint_applied_lsn),
+            );
         }
 
         let mut checkpoint_frames = Vec::new();
@@ -1370,22 +1455,41 @@ impl BufferPool {
         Ok(checkpoint_frames)
     }
 
-    /// Discard all dirty, unpinned frames in both partitions without writing
-    /// them to disk.
-    ///
-    /// Called by the journal rollback path after [`crate::journal::JournalManager::truncate_to`] so
-    /// that stale in-memory writes are not mistaken for committed data.
-    pub(crate) fn drop_all_dirty(&self) -> Result<()> {
-        self.inner_4k
-            .lock()
-            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
-            .drop_dirty_unpinned();
+    /// Stamp resident dirty pages with the commit record end LSN.
+    pub(crate) fn stamp_dirty_pages_lsn(&self, page_ids: &[u32], last_lsn: u64) -> Result<()> {
+        let mut pages = page_ids.to_vec();
+        pages.sort_unstable();
+        pages.dedup();
+        for page_id in pages {
+            let size = self.detect_page_size(page_id);
+            let lock = match size {
+                PageSize::Small4k => &self.inner_4k,
+                PageSize::Large32k => &self.inner_32k,
+            };
+            let guard = lock
+                .lock()
+                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
+            let Some(&idx) = guard.page_map.get(&page_id) else {
+                continue;
+            };
+            let frame = guard.frames[idx].as_ref().ok_or_else(|| {
+                Error::Internal("page_map invariant: frame must exist at mapped slot".into())
+            })?;
+            frame.stamp_last_lsn(last_lsn);
+        }
+        Ok(())
+    }
 
+    /// Stamp every resident unflushable dirty frame with `last_lsn`.
+    pub(crate) fn stamp_unflushable_dirty_lsn(&self, last_lsn: u64) -> Result<()> {
         self.inner_32k
             .lock()
             .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
-            .drop_dirty_unpinned();
-
+            .stamp_unflushable_dirty_lsn(last_lsn);
+        self.inner_4k
+            .lock()
+            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?
+            .stamp_unflushable_dirty_lsn(last_lsn);
         Ok(())
     }
 

@@ -8,6 +8,8 @@
 //! live frontier provider, so advancing the sequencer frontier *without*
 //! rebuilding the epoch flips visibility for the same view.
 
+#![doc = "Integration test requiring the test-hooks feature."]
+#![cfg(feature = "test-hooks")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -307,12 +309,12 @@ fn test_sequencer_tolerates_large_hlc_gaps_and_monotonic_regression() -> Result<
 }
 
 #[test]
-fn test_closure_failure_after_journal_mutex_produces_engine_fatal_not_aborted_slot() -> Result<()> {
+fn test_post_durable_closure_failure_produces_engine_fatal_not_aborted_slot() -> Result<()> {
     let sequencer = Us020PublishSequencer::new();
     let slot1 = sequencer.register()?;
     let err = sequencer
         .mark_ready_failing(slot1)
-        .expect_err("injected post-journal publish failure must surface");
+        .expect_err("injected post-durable publish failure must surface");
     assert!(
         matches!(err, Error::Internal(_)),
         "raw closure failure is translated by the caller-side poison path",

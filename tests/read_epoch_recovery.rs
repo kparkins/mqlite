@@ -18,7 +18,7 @@
 //! #25: durable ids are monotonic across crashes.
 //! #26: an aborted id allocation may leak, but the next allocation
 //!      never reuses it.
-//! #27: crash between ChainCommit durability and `published.store`
+//! #27: crash between log-record durability and `published.store`
 //!      loses only the publish — recovery completes it.
 
 #[path = "crash_harness.rs"]
@@ -56,7 +56,7 @@ fn reopen_rebuilds_read_epoch_from_oracle_now() {
     let (client, recovery) = crash_harness::reopen_inspect(&path).expect("reopen");
     let max = recovery
         .recovered_max_commit_ts
-        .expect("recovery must see ChainCommit");
+        .expect("recovery must see durable commit timestamp");
     let visible = client.__published_visible_ts();
     assert!(
         visible >= max,
@@ -192,11 +192,8 @@ fn header_id_counters_do_not_regress_across_reopen() {
     );
 }
 
-/// §10.8 #27: a Cut-6 probe (after `commit_txn`, before publish) is
-/// durable on disk — the ChainCommit frame was appended and the
-/// header was written. Reopen must recover the commit (documents
-/// visible) even though the in-memory publish never ran before the
-/// crash.
+/// §10.8 #27: a pre-publish probe with a durable log record must recover
+/// the commit even though the in-memory publish never ran before the crash.
 #[test]
 fn crash_between_chain_commit_and_publish_loses_publish_only() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -216,13 +213,13 @@ fn crash_between_chain_commit_and_publish_loses_publish_only() {
         .unwrap();
     client.checkpoint().expect("checkpoint baseline");
 
-    // Drive a probe insert stopped AFTER commit_txn but BEFORE
-    // publish. The ChainCommit frame exists, the header was updated.
+    // Drive a probe insert stopped after log-record durability but before
+    // publish.
     let _ = client
         .__crash_cut_probe_insert(
             "db.c",
             doc! { "_id": 99i32, "kind": "probe" },
-            Phase0ProbeCut::AfterCommitTxnBeforePublish,
+            Phase0ProbeCut::AfterDurabilityWaitBeforePublish,
         )
         .expect("probe");
     std::mem::forget(client);

@@ -245,7 +245,7 @@ impl Drop for PublishSlotGuard {
 impl PublishSequencer {
     /// Construct a fresh sequencer with `published_frontier == Ts::default()`.
     pub(crate) fn new() -> Arc<Self> {
-        Self::new_inner(Ts::default())
+        Self::new_inner(Ts::default(), 1)
     }
 
     /// Construct a fresh sequencer for reopen recovery (§10.29 rule 3).
@@ -255,14 +255,22 @@ impl PublishSequencer {
     /// timestamps never seed the dense slot counter; only the
     /// lock-free `published_frontier` carries the recovered HLC value.
     pub(crate) fn new_from(recovered_max_commit_ts: Ts) -> Arc<Self> {
-        Self::new_inner(recovered_max_commit_ts)
+        Self::new_inner(recovered_max_commit_ts, 1)
     }
 
-    fn new_inner(initial_frontier: Ts) -> Arc<Self> {
+    /// Construct a sequencer from Phase 8 recovery floors.
+    pub(crate) fn new_from_recovered_floors(
+        recovered_max_commit_ts: Ts,
+        next_publish_seq: u64,
+    ) -> Arc<Self> {
+        Self::new_inner(recovered_max_commit_ts, next_publish_seq)
+    }
+
+    fn new_inner(initial_frontier: Ts, next_seq: u64) -> Arc<Self> {
         Arc::new(Self {
             inner: SequencerMutex::new(PublishSeqInner {
-                next_seq: 1,
-                last_published: 0,
+                next_seq,
+                last_published: next_seq.saturating_sub(1),
                 pending: BTreeMap::new(),
                 poisoned: None,
             }),

@@ -907,7 +907,6 @@ fn publish_commit_root_neutral_reuses_catalog_arc() {
     // Force a publish with no published-catalog dirty. `publish_commit`
     // must clone the previous catalog Arc rather than build a new one.
     let _md_r = e.metadata.read().unwrap();
-    let _journal = e.shared.journal_mutex.lock();
     let next_ts = e.shared.oracle.commit().unwrap();
     let new_epoch = {
         let cat = e.metadata_state.catalog.lock().unwrap();
@@ -938,7 +937,6 @@ fn publish_commit_dirty_path_builds_new_catalog_arc() {
     let prev_catalog_arc = Arc::clone(&prev.catalog);
 
     let _md_r = e.metadata.read().unwrap();
-    let _journal = e.shared.journal_mutex.lock();
     let next_ts = e.shared.oracle.commit().unwrap();
     let dirty = PublishDirty {
         published_catalog_dirty: true,
@@ -977,7 +975,6 @@ fn publish_commit_rejects_stale_visible_ts() {
     // Inject a stale Ts (equal to the current one) — must panic via
     // the monotonicity debug_assert.
     let _md_r = e.metadata.read().unwrap();
-    let _journal = e.shared.journal_mutex.lock();
     let cat = e.metadata_state.catalog.lock().unwrap();
     let _ = publish_commit(
         &e.shared,

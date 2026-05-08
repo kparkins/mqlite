@@ -49,7 +49,7 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
-use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
+use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF, PAGE_TYPE_OVERFLOW};
 
 const INTERNAL_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 const LEAF_SIZE: usize = PAGE_SIZE_LEAF as usize;
@@ -179,9 +179,10 @@ impl AllocatorLifetimeBatch {
             .retain(|allocated| allocated.page != page || allocated.size != size);
     }
 
-    fn commit(self, handle: &BufferPoolHandle) -> Result<()> {
+    fn commit_lsn_fenced(self, handle: &BufferPoolHandle, last_lsn: u64) -> Result<()> {
         for page in self.deferred_free_pages {
             handle.free_page(page, PageSize::Large32k)?;
+            handle.stamp_unflushable_dirty_pages_lsn(last_lsn)?;
         }
         Ok(())
     }
@@ -227,23 +228,51 @@ impl StructuralPageWrites {
         Self::default()
     }
 
-    /// Apply every staged page to the shared buffer-pool frames via
-    /// `base`.
-    ///
-    /// Called at structural commit time while the writer still holds the
-    /// journal envelope mutex. Consumes the staged bytes.
-    ///
-    /// `base` is a fresh `BufferPoolPageStore` pointing at the same
-    /// `BufferPoolHandle` the txn used — passing it in rather than
-    /// re-creating one inside here keeps the commit free of any handle
-    /// lookup; the caller already has one handy.
-    pub(crate) fn commit(mut self, base: &mut BufferPoolPageStore) -> Result<()> {
+    fn page_images(&self) -> Vec<StructuralPageImage> {
+        let mut images = Vec::with_capacity(self.touched_4k.len() + self.touched_32k.len());
+        for page_number in &self.touched_4k {
+            if let Some(bytes) = self.staged_4k.get(page_number) {
+                images.push(StructuralPageImage {
+                    page_number: *page_number,
+                    page_size: PageSize::Small4k,
+                    data: bytes.to_vec(),
+                });
+            }
+        }
+        for page_number in &self.touched_32k {
+            if let Some(bytes) = self.staged_32k.get(page_number) {
+                images.push(StructuralPageImage {
+                    page_number: *page_number,
+                    page_size: PageSize::Large32k,
+                    data: bytes.to_vec(),
+                });
+            }
+        }
+        images
+    }
+
+    pub(crate) fn commit_lsn_fenced(
+        self,
+        base: &mut BufferPoolPageStore,
+        handle: &BufferPoolHandle,
+        last_lsn: u64,
+    ) -> Result<()> {
+        self.commit_inner(base, handle, last_lsn)
+    }
+
+    fn commit_inner(
+        mut self,
+        base: &mut BufferPoolPageStore,
+        handle: &BufferPoolHandle,
+        last_lsn: u64,
+    ) -> Result<()> {
         // Internal first, then leaf. Within each size, honor insertion
         // order to keep replay deterministic.
         let touched_4k = std::mem::take(&mut self.touched_4k);
         for page in touched_4k {
             if let Some(buf) = self.staged_4k.remove(&page) {
                 base.write_internal(page, &buf)?;
+                handle.stamp_dirty_pages_lsn(&[page], last_lsn)?;
             }
         }
         let touched_32k = std::mem::take(&mut self.touched_32k);
@@ -254,10 +283,22 @@ impl StructuralPageWrites {
                     buf.len(),
                 );
                 base.write_leaf_structural(page, &buf)?;
+                handle.stamp_dirty_pages_lsn(&[page], last_lsn)?;
             }
         }
         Ok(())
     }
+}
+
+/// Page image staged by a structural catalog/DDL batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StructuralPageImage {
+    /// Page number in the main file.
+    pub(crate) page_number: u32,
+    /// Physical page size for `data`.
+    pub(crate) page_size: PageSize,
+    /// Full page bytes staged by the structural batch.
+    pub(crate) data: Vec<u8>,
 }
 
 /// Final owner for structural page-byte batches.
@@ -286,14 +327,21 @@ impl StructuralPageBatch {
         StructuralBatchStore::new(base, &mut self.writes, &mut self.lifetime)
     }
 
-    /// Apply staged page bytes to the shared buffer-pool frames.
-    pub(crate) fn commit(
+    /// Return the structural page images that a typed catalog log record must
+    /// carry for recovery replay.
+    pub(crate) fn page_images(&self) -> Vec<StructuralPageImage> {
+        self.writes.page_images()
+    }
+
+    /// Apply staged page bytes with an explicit page-LSN fence.
+    pub(crate) fn commit_lsn_fenced(
         self,
         base: &mut BufferPoolPageStore,
         handle: &BufferPoolHandle,
+        last_lsn: u64,
     ) -> Result<()> {
-        self.writes.commit(base)?;
-        self.lifetime.commit(handle)
+        self.writes.commit_lsn_fenced(base, handle, last_lsn)?;
+        self.lifetime.commit_lsn_fenced(handle, last_lsn)
     }
 
     /// Abort staged structural pages and restore allocator/header state.
@@ -394,6 +442,12 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
         if !existed {
             self.writes.touched_32k.push(page);
         }
+        if data[0] == PAGE_TYPE_OVERFLOW {
+            self.base
+                .handle()
+                .pool()
+                .invalidate_page(page, PageSize::Large32k)?;
+        }
         Ok(())
     }
 
@@ -419,6 +473,10 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
         self.writes.staged_4k.insert(page, Box::new(seed));
         self.writes.touched_4k.push(page);
         self.lifetime.record_new_alloc(page, PageSize::Small4k);
+        self.base
+            .handle()
+            .pool()
+            .invalidate_page(page, PageSize::Small4k)?;
         Ok(page)
     }
 

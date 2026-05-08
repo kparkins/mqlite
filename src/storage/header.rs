@@ -37,12 +37,13 @@
 //!  89      8    Next index id: u64 LE (Phase 1 §10.7 durable id counter; reserved = 0)
 //!  97      4    History store root page: u32 LE (Phase 1 §10.7; persisted root of HistoryStore)
 //! 101      1    History store root level: u8
-//! 102     26    Reserved (zero-filled; future: encryption metadata, etc.)
+//! 102      8    Checkpoint applied LSN: u64 LE (Phase 8)
+//! 110     18    Reserved (zero-filled; future: encryption metadata, etc.)
 //! 128   3968    Unused padding to 4096 bytes
 //! ```
 //!
 //! The **header checksum** at offset 64 is a CRC32C over bytes 0–63 and
-//! 76–101. The checksum field itself and WAL salts at 68–75 are excluded.
+//! 76–109. The checksum field itself and WAL salts at 68–75 are excluded.
 //!
 //! ## WAL stale detection
 //!
@@ -76,7 +77,7 @@ const CHECKSUM_FIRST_RANGE_END: usize = 64;
 const CHECKSUM_SECOND_RANGE_START: usize = 76;
 
 /// End offset of the second header checksum segment.
-const CHECKSUM_SECOND_RANGE_END: usize = 102;
+const CHECKSUM_SECOND_RANGE_END: usize = 110;
 
 /// Number of header bytes fed into the checksum.
 const CHECKSUM_COVERED_LEN: usize =
@@ -178,7 +179,10 @@ pub(crate) struct FileHeader {
     /// so reopen can locate an existing non-leaf history tree without
     /// rebuilding it.
     pub history_store_root_level: u8,
-    // offsets 102–127: reserved, zero-filled
+    // offset 102
+    /// Highest byte-LSN durably materialized into the main file by checkpoint.
+    pub checkpoint_applied_lsn: u64,
+    // offsets 110–127: reserved, zero-filled
     // offsets 128–4095: unused padding
 }
 
@@ -218,6 +222,7 @@ impl FileHeader {
             // the empty root on fresh-DB init and writes the id back.
             history_store_root_page: 0,
             history_store_root_level: 0,
+            checkpoint_applied_lsn: 0,
         }
     }
 
@@ -237,7 +242,7 @@ impl FileHeader {
     }
 
     /// Compute the header checksum: CRC32C of bytes `[0, 64)` and
-    /// `[76, 102)` of the serialized header.
+    /// `[76, 110)` of the serialized header.
     ///
     /// The checksum field at offset 64–67 and WAL salts at 68–75 are not
     /// included.
@@ -252,7 +257,7 @@ impl FileHeader {
     /// Serialize the header to a full [`HEADER_PAGE_SIZE`]-byte buffer.
     ///
     /// The checksum at offset 64 is computed and written during serialization.
-    /// All reserved bytes (102–127) and padding (128–4095) are zero-filled.
+    /// All reserved bytes (110–127) and padding (128–4095) are zero-filled.
     pub(crate) fn to_bytes(&self) -> [u8; HEADER_PAGE_SIZE] {
         let mut buf = [0u8; HEADER_PAGE_SIZE];
         self.write_fields(&mut buf);
@@ -269,7 +274,7 @@ impl FileHeader {
     /// 1. Magic bytes equal `"MQLT"`.
     /// 2. Format version is `1` (the only version this build supports).
     /// 3. Page sizes match the compile-time constants.
-    /// 4. Header checksum (CRC32C over bytes `[0, 64)` and `[76, 102)`)
+    /// 4. Header checksum (CRC32C over bytes `[0, 64)` and `[76, 110)`)
     ///    matches stored value.
     ///
     /// Returns [`Error::CorruptDatabase`] on any validation failure.
@@ -322,7 +327,7 @@ impl FileHeader {
             });
         }
 
-        // 4. Header checksum: CRC32C of bytes [0,64) and [76,102).
+        // 4. Header checksum: CRC32C of bytes [0,64) and [76,110).
         let computed = Self::compute_checksum(buf);
         let stored = u32::from_le_bytes(
             buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
@@ -371,6 +376,7 @@ impl FileHeader {
             next_index_id: u64::from_le_bytes(buf[89..97].try_into().expect("8 bytes")),
             history_store_root_page: u32::from_le_bytes(buf[97..101].try_into().expect("4 bytes")),
             history_store_root_level: buf[101],
+            checkpoint_applied_lsn: u64::from_le_bytes(buf[102..110].try_into().expect("8 bytes")),
         })
     }
 
@@ -435,7 +441,8 @@ impl FileHeader {
         buf[89..97].copy_from_slice(&self.next_index_id.to_le_bytes());
         buf[97..101].copy_from_slice(&self.history_store_root_page.to_le_bytes());
         buf[101] = self.history_store_root_level;
-        // offsets 102–127: reserved, already zero-filled by array init
+        buf[102..110].copy_from_slice(&self.checkpoint_applied_lsn.to_le_bytes());
+        // offsets 110–127: reserved, already zero-filled by array init
         // offsets 128–4095: padding, already zero-filled
     }
 }
@@ -542,6 +549,7 @@ mod tests {
         assert_eq!(decoded.wal_salt1, 0xDEAD_BEEF);
         assert_eq!(decoded.wal_salt2, 0xCAFE_BABE);
         assert_eq!(decoded.catalog_root_backup, 0);
+        assert_eq!(decoded.checkpoint_applied_lsn, 0);
     }
 
     #[test]
@@ -554,6 +562,7 @@ mod tests {
         h.free_page_count_4k = 10;
         h.free_page_count_32k = 5;
         h.catalog_root_backup = 99;
+        h.checkpoint_applied_lsn = 123_456;
         h.last_checkpoint_ts = Ts {
             physical_ms: 1_700_000_050_000,
             logical: 42,
@@ -566,6 +575,7 @@ mod tests {
         assert_eq!(decoded.free_list_head_4k, 12);
         assert_eq!(decoded.total_page_count, 500);
         assert_eq!(decoded.catalog_root_backup, 99);
+        assert_eq!(decoded.checkpoint_applied_lsn, 123_456);
         assert_eq!(
             decoded.last_checkpoint_ts,
             Ts {
@@ -596,15 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn reserved_bytes_102_to_127_are_zero() {
-        // Phase 4 US-011 — offsets 81..102 now carry `next_namespace_id`,
-        // `next_index_id`, `history_store_root_page`, and
-        // `history_store_root_level`. The reserved zero-fill region now
-        // spans 102..128.
+    fn reserved_bytes_110_to_127_are_zero() {
+        // Phase 8 US-007 — offsets 102..110 now carry checkpoint_applied_lsn.
         let bytes = fresh_header().to_bytes();
         assert!(
-            bytes[102..128].iter().all(|&b| b == 0),
-            "reserved region 102..128 must be zero-filled"
+            bytes[110..128].iter().all(|&b| b == 0),
+            "reserved region 110..128 must be zero-filled"
         );
     }
 
@@ -618,6 +625,7 @@ mod tests {
         h.next_index_id = 99;
         h.history_store_root_page = 314;
         h.history_store_root_level = 2;
+        h.checkpoint_applied_lsn = 2718;
 
         let bytes = h.to_bytes();
         let decoded = FileHeader::from_bytes(&bytes).expect("parse");
@@ -625,6 +633,7 @@ mod tests {
         assert_eq!(decoded.next_index_id, 99);
         assert_eq!(decoded.history_store_root_page, 314);
         assert_eq!(decoded.history_store_root_level, 2);
+        assert_eq!(decoded.checkpoint_applied_lsn, 2718);
     }
 
     #[test]
@@ -636,6 +645,7 @@ mod tests {
         assert_eq!(h.next_index_id, 1);
         assert_eq!(h.history_store_root_page, 0);
         assert_eq!(h.history_store_root_level, 0);
+        assert_eq!(h.checkpoint_applied_lsn, 0);
     }
 
     // -----------------------------------------------------------------------

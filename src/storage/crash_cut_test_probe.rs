@@ -1,8 +1,8 @@
-//! Phase 0 integration-test probes.
+//! Integration-test crash probes for the current write envelope.
 //!
 //! This module is deliberately separate from the production storage engine
-//! contract. It exists only because Phase 0 integration tests need to freeze
-//! specific crash points in the current write envelope.
+//! contract. It exists only because integration tests need to freeze specific
+//! crash points in the current write envelope.
 
 /// Phase 0 write-envelope probe cut point.
 ///
@@ -11,36 +11,18 @@
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase0ProbeCut {
-    /// Complete the write, but sample visibility immediately before publish.
-    CompleteWithPrePublishProbe,
-    /// Stop after S3 body staging, before S4 `allocate_commit_ts`.
+    /// Stop after body staging, before `allocate_commit_ts`.
     AfterStageBeforeCommitTs,
-    /// Stop after S4 `allocate_commit_ts`, before S5 logical-frame build.
+    /// Stop after `allocate_commit_ts`, before logical-frame build.
     AfterCommitTsBeforeLogicalFrame,
-    /// Stop after S5 logical-frame build, before S6 logical append/fsync.
-    AfterLogicalFrameBeforeAppend,
-    /// Stop after S6 logical append/fsync, before S7 `ChainCommit`.
-    AfterLogicalAppendBeforeChainCommit,
-    /// Stop after S7 `ChainCommit`, before S8 secondary-index install.
-    AfterChainCommitBeforeSecondaryInstall,
-    /// Stop after S9 primary install, before S10 structural batch commit.
-    AfterPrimaryInstallBeforeStructuralBatchCommit,
-    /// Stop after S10 structural batch commit, before S11 flush.
-    AfterStructuralBatchCommitBeforeFlush,
-    /// Stop after S11 flush, before S12 publish.
-    AfterStructuralFlushBeforePublish,
-    /// Pre-Phase-3 cut: after `allocate_commit_ts`, before primary install.
-    AfterAllocateCommitTs,
-    /// Pre-Phase-3 cut: after primary install, before structural batch commit.
-    AfterInstallPendingPrimary,
-    /// Pre-Phase-3 cut: after structural batch commit, before journal flush.
-    AfterStructuralBatchCommit,
-    /// Pre-Phase-3 cut: after journal flush, before `ChainCommit`.
-    AfterFlushBeforeChainCommit,
-    /// Pre-Phase-3 cut: after `ChainCommit`, before `commit_txn`.
-    AfterChainCommitBeforeCommitTxn,
-    /// Pre-Phase-3 cut: after `commit_txn`, before publish.
-    AfterCommitTxnBeforePublish,
+    /// Stop after logical-frame build, before log-record reservation.
+    AfterLogicalFrameBeforeReservation,
+    /// Stop after pending primary/index install, before log-record reservation.
+    AfterPendingInstallBeforeReservation,
+    /// Stop after the log record is written, before waiting for durability.
+    AfterLogRecordWriteBeforeDurabilityWait,
+    /// Stop after the log record is durable, before publish.
+    AfterDurabilityWaitBeforePublish,
 }
 
 /// Result returned by the hidden Phase 0 write-envelope probe.

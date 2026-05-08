@@ -9,11 +9,11 @@
 #![doc = "Integration test requiring the test-hooks feature."]
 #![cfg(feature = "test-hooks")]
 
-//! Crash-cut matrix for the ordered logical write envelope.
+//! Crash-cut matrix for the ordered Phase 8 write envelope.
 //!
 //! Each active test is an invariant-class predicate: preceding committed
 //! writes remain visible, and the cut write is visible after reopen only once
-//! the logical frame and ChainCommit are both durable.
+//! the authoritative log record exists.
 
 #[path = "crash_harness.rs"]
 mod crash_harness;
@@ -42,60 +42,46 @@ struct CrashCut {
     truncate_unflushed_journal_tail: bool,
 }
 
-const REBASELINE_CUTS: [CrashCut; 8] = [
+const REBASELINE_CUTS: [CrashCut; 6] = [
     CrashCut {
-        cut_id: "0a",
-        source_range: "§10.16 S5→S6",
-        probe_cut: Phase0ProbeCut::AfterLogicalFrameBeforeAppend,
-        cut_commit_visible_expected: false,
-        truncate_unflushed_journal_tail: false,
-    },
-    CrashCut {
-        cut_id: "0b",
-        source_range: "§10.16 S6→S7",
-        probe_cut: Phase0ProbeCut::AfterLogicalAppendBeforeChainCommit,
-        cut_commit_visible_expected: false,
-        truncate_unflushed_journal_tail: false,
-    },
-    CrashCut {
-        cut_id: "1",
-        source_range: "§10.16 S3→S4",
+        cut_id: "stage",
+        source_range: "staged body before commit timestamp",
         probe_cut: Phase0ProbeCut::AfterStageBeforeCommitTs,
         cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: "2",
-        source_range: "§10.16 S4→S5",
+        cut_id: "timestamp",
+        source_range: "commit timestamp before logical frame",
         probe_cut: Phase0ProbeCut::AfterCommitTsBeforeLogicalFrame,
         cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: "2b",
-        source_range: "§10.16 S7→S8",
-        probe_cut: Phase0ProbeCut::AfterChainCommitBeforeSecondaryInstall,
-        cut_commit_visible_expected: true,
-        truncate_unflushed_journal_tail: false,
-    },
-    CrashCut {
-        cut_id: "3",
-        source_range: "pre-durable Pending install",
-        probe_cut: Phase0ProbeCut::AfterPrimaryInstallBeforeStructuralBatchCommit,
+        cut_id: "logical",
+        source_range: "logical frame before log reservation",
+        probe_cut: Phase0ProbeCut::AfterLogicalFrameBeforeReservation,
         cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: "4",
-        source_range: "§10.16 S10→S11",
-        probe_cut: Phase0ProbeCut::AfterStructuralBatchCommitBeforeFlush,
+        cut_id: "pending",
+        source_range: "pending install before log reservation",
+        probe_cut: Phase0ProbeCut::AfterPendingInstallBeforeReservation,
+        cut_commit_visible_expected: false,
+        truncate_unflushed_journal_tail: false,
+    },
+    CrashCut {
+        cut_id: "written",
+        source_range: "log record write before durability wait",
+        probe_cut: Phase0ProbeCut::AfterLogRecordWriteBeforeDurabilityWait,
         cut_commit_visible_expected: true,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
-        cut_id: "6",
-        source_range: "§10.16 S11→S12",
-        probe_cut: Phase0ProbeCut::AfterStructuralFlushBeforePublish,
+        cut_id: "durable",
+        source_range: "durable log record before publish",
+        probe_cut: Phase0ProbeCut::AfterDurabilityWaitBeforePublish,
         cut_commit_visible_expected: true,
         truncate_unflushed_journal_tail: false,
     },
@@ -187,7 +173,7 @@ fn assert_cut_absent(cut: CrashCut, ids: &BTreeSet<i32>) {
 fn assert_cut_visible(cut: CrashCut, ids: &BTreeSet<i32>) {
     assert!(
         ids.contains(&CUT_COMMIT_ID),
-        "cut {} ({}) invariant failed: durable logical+ChainCommit evidence \
+        "cut {} ({}) invariant failed: durable log-record evidence \
          must make cut commit _id={} visible after reopen",
         cut.cut_id,
         cut.source_range,
@@ -210,41 +196,31 @@ fn run_invariant(cut: CrashCut) {
 }
 
 #[test]
-fn cut0a_invariant_logical_frame_not_durable_reopens_without_cut_write() {
+fn cut_stage_invariant_staged_body_without_commit_ts_reopens_without_cut_write() {
     run_invariant(REBASELINE_CUTS[0]);
 }
 
 #[test]
-fn cut0b_invariant_orphan_logical_frame_reopens_without_cut_write() {
+fn cut_timestamp_invariant_allocated_ts_without_logical_frame_reopens_without_cut_write() {
     run_invariant(REBASELINE_CUTS[1]);
 }
 
 #[test]
-fn cut1_invariant_staged_body_without_commit_ts_reopens_without_cut_write() {
+fn cut_logical_invariant_logical_frame_without_log_record_reopens_without_cut_write() {
     run_invariant(REBASELINE_CUTS[2]);
 }
 
 #[test]
-fn cut2_invariant_allocated_ts_without_logical_frame_reopens_without_cut_write() {
+fn cut_pending_invariant_pending_install_without_log_record_reopens_without_cut_write() {
     run_invariant(REBASELINE_CUTS[3]);
 }
 
 #[test]
-fn cut2b_invariant_durable_commit_replays_from_logical_frame() {
+fn cut_written_invariant_log_record_write_replays_commit() {
     run_invariant(REBASELINE_CUTS[4]);
 }
 
 #[test]
-fn cut3_invariant_post_primary_install_without_durable_frame_reopens_without_cut_write() {
+fn cut_durable_invariant_pre_publish_durable_commit_replays() {
     run_invariant(REBASELINE_CUTS[5]);
-}
-
-#[test]
-fn cut4_invariant_post_structural_batch_commit_replays_from_logical_frame() {
-    run_invariant(REBASELINE_CUTS[6]);
-}
-
-#[test]
-fn cut6_invariant_pre_publish_durable_commit_replays_from_logical_frame() {
-    run_invariant(REBASELINE_CUTS[7]);
 }

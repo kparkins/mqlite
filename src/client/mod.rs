@@ -54,3 +54,6 @@ pub use collection::{
 pub use database::Database;
 pub use handle::Client;
 pub(crate) use inner::ClientInner;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use test_accessors::{Phase8CatalogCommitKind, Phase8LogRecordKind, Phase8LogRecordSummary};

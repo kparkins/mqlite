@@ -6,6 +6,7 @@
 //! routes calls to the appropriate partition.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -21,6 +22,59 @@ use super::{PageSize, PageSource};
 // Frame (internal)
 // ---------------------------------------------------------------------------
 
+const PAGE_DIRTY_CLEAN: u64 = u64::MAX;
+const PAGE_DIRTY_UNFLUSHABLE: u64 = u64::MAX - 1;
+const MAX_PAGE_DIRTY_LSN: u64 = PAGE_DIRTY_UNFLUSHABLE - 1;
+
+/// LSN fence for dirty page bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageDirtyLsn {
+    /// The resident page image has no unflushed dirty bytes.
+    Clean,
+    /// The page was dirtied before the covering commit `end_lsn` was known.
+    Unflushable,
+    /// The page may be written after the log is durable through `last_lsn`.
+    Dirty {
+        /// Exclusive end LSN of the newest commit represented by the page.
+        last_lsn: u64,
+    },
+}
+
+impl PageDirtyLsn {
+    fn decode(raw: u64) -> Self {
+        match raw {
+            PAGE_DIRTY_CLEAN => Self::Clean,
+            PAGE_DIRTY_UNFLUSHABLE => Self::Unflushable,
+            last_lsn => Self::Dirty { last_lsn },
+        }
+    }
+
+    fn encode(self) -> u64 {
+        match self {
+            Self::Clean => PAGE_DIRTY_CLEAN,
+            Self::Unflushable => PAGE_DIRTY_UNFLUSHABLE,
+            Self::Dirty { last_lsn } => {
+                debug_assert!(
+                    last_lsn <= MAX_PAGE_DIRTY_LSN,
+                    "page dirty LSN cannot collide with sentinel states"
+                );
+                last_lsn.min(MAX_PAGE_DIRTY_LSN)
+            }
+        }
+    }
+
+    fn is_dirty(self) -> bool {
+        !matches!(self, Self::Clean)
+    }
+
+    fn flushable_last_lsn(self, durable_lsn: u64) -> Option<u64> {
+        match self {
+            Self::Dirty { last_lsn } if last_lsn <= durable_lsn => Some(last_lsn),
+            Self::Clean | Self::Unflushable | Self::Dirty { .. } => None,
+        }
+    }
+}
+
 pub(super) struct Frame {
     pub(super) page_number: u32,
     /// Atomically published page bytes; length equals the partition's page size.
@@ -30,7 +84,7 @@ pub(super) struct Frame {
     /// observe an in-place half-write of a B-tree page.
     pub(super) data: ArcSwap<Vec<u8>>,
     pub(super) pin_count: u32,
-    pub(super) dirty: bool,
+    dirty_lsn: AtomicU64,
     pub(super) ref_bit: bool,
     /// Ordered per-key MVCC version chains keyed by B+ tree cell key bytes.
     /// Ordering is lexicographic on the raw key bytes — identical to the
@@ -51,6 +105,93 @@ pub(super) struct Frame {
     /// the new page (§10.18 rule 1 — `PageLatch` is bound to the Frame).
     #[allow(dead_code)]
     pub(super) latch: PageLatch,
+}
+
+impl Frame {
+    pub(super) fn clean_dirty_lsn() -> AtomicU64 {
+        AtomicU64::new(PAGE_DIRTY_CLEAN)
+    }
+
+    pub(super) fn dirty_lsn(&self) -> PageDirtyLsn {
+        PageDirtyLsn::decode(self.dirty_lsn.load(Ordering::Acquire))
+    }
+
+    pub(super) fn is_dirty(&self) -> bool {
+        self.dirty_lsn().is_dirty()
+    }
+
+    pub(super) fn can_flush_at(&self, durable_lsn: u64) -> bool {
+        !self.is_dirty() || self.dirty_lsn().flushable_last_lsn(durable_lsn).is_some()
+    }
+
+    pub(super) fn flushable_last_lsn(&self, durable_lsn: u64) -> Option<u64> {
+        self.dirty_lsn().flushable_last_lsn(durable_lsn)
+    }
+
+    pub(super) fn mark_unflushable(&self) {
+        self.dirty_lsn
+            .store(PageDirtyLsn::Unflushable.encode(), Ordering::Release);
+    }
+
+    pub(super) fn mark_unflushable_if_clean(&self) {
+        let _ = self.dirty_lsn.compare_exchange(
+            PageDirtyLsn::Clean.encode(),
+            PageDirtyLsn::Unflushable.encode(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(super) fn stamp_last_lsn(&self, last_lsn: u64) {
+        let mut current = self.dirty_lsn.load(Ordering::Acquire);
+        loop {
+            let next = match PageDirtyLsn::decode(current) {
+                PageDirtyLsn::Clean => return,
+                PageDirtyLsn::Unflushable => PageDirtyLsn::Dirty { last_lsn }.encode(),
+                PageDirtyLsn::Dirty {
+                    last_lsn: current_lsn,
+                } => {
+                    if current_lsn >= last_lsn {
+                        return;
+                    }
+                    PageDirtyLsn::Dirty { last_lsn }.encode()
+                }
+            };
+            match self.dirty_lsn.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(super) fn stamp_unflushable_last_lsn(&self, last_lsn: u64) {
+        let mut current = self.dirty_lsn.load(Ordering::Acquire);
+        loop {
+            match PageDirtyLsn::decode(current) {
+                PageDirtyLsn::Unflushable => {}
+                PageDirtyLsn::Clean | PageDirtyLsn::Dirty { .. } => return,
+            }
+            match self.dirty_lsn.compare_exchange(
+                current,
+                PageDirtyLsn::Dirty { last_lsn }.encode(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(super) fn clear_dirty(&self) {
+        self.dirty_lsn
+            .store(PageDirtyLsn::Clean.encode(), Ordering::Release);
+    }
 }
 
 fn has_live_committed_head(frame: &Frame) -> bool {
@@ -112,7 +253,7 @@ impl Partition {
     ///
     /// Scans at most `2 * capacity` frames (two full sweeps) before giving up.
     /// Returns `None` if all frames are pinned.
-    fn find_victim(&mut self) -> Option<usize> {
+    fn find_victim(&mut self, durable_lsn: u64) -> Option<usize> {
         let n = self.capacity;
         for _ in 0..(2 * n) {
             let idx = self.clock_hand;
@@ -125,6 +266,9 @@ impl Partition {
                         continue;
                     }
                     if frame.latch.is_exclusively_held() {
+                        continue;
+                    }
+                    if !frame.can_flush_at(durable_lsn) {
                         continue;
                     }
                     if frame.ref_bit {
@@ -147,12 +291,23 @@ impl Partition {
     /// `BufferPool::reconcile`). Registry (position 5) is below the
     /// partition mutex / page-latch positions (3/3a/3b) in the total order,
     /// so re-acquiring it while holding those locks is forbidden.
-    fn evict_frame(&mut self, idx: usize, io: &dyn PageSource, size: PageSize) -> Result<()> {
+    fn evict_frame(
+        &mut self,
+        idx: usize,
+        io: &dyn PageSource,
+        size: PageSize,
+        durable_lsn: u64,
+    ) -> Result<()> {
         if let Some(frame) = &self.frames[idx] {
-            let was_dirty = frame.dirty;
-            if was_dirty {
+            let was_dirty = frame.is_dirty();
+            if let Some(_last_lsn) = frame.flushable_last_lsn(durable_lsn) {
                 let data = frame.data.load_full();
                 io.write_page(frame.page_number, size, data.as_slice())?;
+                frame.clear_dirty();
+            } else if was_dirty {
+                return Err(Error::PoolExhausted {
+                    reason: PoolExhaustedReason::AllFramesPinned,
+                });
             }
             self.page_map.remove(&frame.page_number);
             #[cfg(feature = "tracing")]
@@ -172,6 +327,7 @@ impl Partition {
         page_number: u32,
         io: &dyn PageSource,
         size: PageSize,
+        durable_lsn: u64,
     ) -> Result<usize> {
         // Cache hit path
         if let Some(&idx) = self.page_map.get(&page_number) {
@@ -184,12 +340,12 @@ impl Partition {
         }
 
         // Cache miss — find a victim
-        let idx = self.find_victim().ok_or(Error::PoolExhausted {
+        let idx = self.find_victim(durable_lsn).ok_or(Error::PoolExhausted {
             reason: PoolExhaustedReason::AllFramesPinned,
         })?;
 
         // Evict current occupant (if any)
-        self.evict_frame(idx, io, size)?;
+        self.evict_frame(idx, io, size, durable_lsn)?;
 
         // Load from disk
         let mut data = vec![0u8; self.page_size];
@@ -199,7 +355,7 @@ impl Partition {
             page_number,
             data: ArcSwap::from_pointee(data),
             pin_count: 1,
-            dirty: false,
+            dirty_lsn: Frame::clean_dirty_lsn(),
             ref_bit: true,
             deltas: BTreeMap::new(),
             latch: PageLatch::new(),
@@ -221,6 +377,7 @@ impl Partition {
         ort: Ts,
         io: &dyn PageSource,
         size: PageSize,
+        durable_lsn: u64,
     ) -> Result<(usize, usize)> {
         // Cache hit — no victim, no reconciliation.
         if let Some(&idx) = self.page_map.get(&page_number) {
@@ -232,7 +389,7 @@ impl Partition {
             return Ok((idx, 0));
         }
 
-        let idx = self.find_victim().ok_or(Error::PoolExhausted {
+        let idx = self.find_victim(durable_lsn).ok_or(Error::PoolExhausted {
             reason: PoolExhaustedReason::AllFramesPinned,
         })?;
 
@@ -252,7 +409,7 @@ impl Partition {
         let dropped = self.reconcile_frame_at(idx, ort);
 
         // Evict current occupant (if any)
-        self.evict_frame(idx, io, size)?;
+        self.evict_frame(idx, io, size, durable_lsn)?;
 
         // Load from disk
         let mut data = vec![0u8; self.page_size];
@@ -262,7 +419,7 @@ impl Partition {
             page_number,
             data: ArcSwap::from_pointee(data),
             pin_count: 1,
-            dirty: false,
+            dirty_lsn: Frame::clean_dirty_lsn(),
             ref_bit: true,
             deltas: BTreeMap::new(),
             latch: PageLatch::new(),
@@ -333,18 +490,36 @@ impl Partition {
                 }
                 frame.data.store(Arc::new(data));
             }
-            frame.dirty = true;
+            frame.mark_unflushable();
         }
         Ok(())
     }
 
     /// Write every dirty frame to disk and clear their dirty bits.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn flush_all(&mut self, io: &dyn PageSource, size: PageSize) -> Result<()> {
         for slot in self.frames.iter_mut().flatten() {
-            if slot.dirty {
+            if slot.is_dirty() {
                 let data = slot.data.load_full();
                 io.write_page(slot.page_number, size, data.as_slice())?;
-                slot.dirty = false;
+                slot.clear_dirty();
+            }
+        }
+        Ok(())
+    }
+
+    /// Write dirty frames whose page LSN is covered by `durable_lsn`.
+    pub(super) fn flush_all_lsn_fenced(
+        &mut self,
+        io: &dyn PageSource,
+        size: PageSize,
+        durable_lsn: u64,
+    ) -> Result<()> {
+        for slot in self.frames.iter_mut().flatten() {
+            if slot.flushable_last_lsn(durable_lsn).is_some() {
+                let data = slot.data.load_full();
+                io.write_page(slot.page_number, size, data.as_slice())?;
+                slot.clear_dirty();
             }
         }
         Ok(())
@@ -359,7 +534,7 @@ impl Partition {
         self.frames
             .iter()
             .flatten()
-            .filter(|frame| frame.dirty)
+            .filter(|frame| frame.is_dirty())
             .map(|frame| {
                 (
                     frame.page_number,
@@ -368,6 +543,33 @@ impl Partition {
                 )
             })
             .collect()
+    }
+
+    /// Return dirty resident frame snapshots covered by `checkpoint_applied_lsn`.
+    pub(super) fn dirty_frame_snapshots_lsn_fenced(
+        &self,
+        size: PageSize,
+        checkpoint_applied_lsn: u64,
+    ) -> Vec<(u32, PageSize, Vec<u8>)> {
+        self.frames
+            .iter()
+            .flatten()
+            .filter(|frame| frame.flushable_last_lsn(checkpoint_applied_lsn).is_some())
+            .map(|frame| {
+                (
+                    frame.page_number,
+                    size,
+                    frame.data.load_full().as_ref().clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Stamp all unflushable dirty frames in this partition with `last_lsn`.
+    pub(super) fn stamp_unflushable_dirty_lsn(&self, last_lsn: u64) {
+        for frame in self.frames.iter().flatten() {
+            frame.stamp_unflushable_last_lsn(last_lsn);
+        }
     }
 
     /// Return occupancy counts for resident frames in this partition.
@@ -384,22 +586,6 @@ impl Partition {
             }
         }
         snapshot
-    }
-
-    /// Discard all dirty, unpinned frames without writing them to disk.
-    ///
-    /// Used by the WAL rollback path: frames written during an aborted
-    /// transaction must be evicted so subsequent reads fetch clean data from
-    /// the WAL/file rather than seeing partial writes.
-    pub(super) fn drop_dirty_unpinned(&mut self) {
-        for idx in 0..self.frames.len() {
-            let page_number = match &self.frames[idx] {
-                Some(frame) if frame.dirty && frame.pin_count == 0 => frame.page_number,
-                _ => continue,
-            };
-            self.frames[idx] = None;
-            self.page_map.remove(&page_number);
-        }
     }
 
     /// Return an atomic snapshot of the frame's current page bytes.
@@ -424,7 +610,7 @@ impl Partition {
     #[cfg(test)]
     pub(super) fn is_dirty(&self, page_number: u32) -> Option<bool> {
         let idx = *self.page_map.get(&page_number)?;
-        self.frames[idx].as_ref().map(|f| f.dirty)
+        self.frames[idx].as_ref().map(Frame::is_dirty)
     }
 
     #[cfg(test)]

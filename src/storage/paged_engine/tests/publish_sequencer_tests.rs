@@ -251,7 +251,7 @@ fn test_sequencer_tolerates_large_hlc_gaps_and_monotonic_regression() {
     assert_eq!(seq.last_published_seq(), 3);
 }
 
-/// AC #8 / §10.19.0 C-2 — post-`journal_mutex` closure failure
+/// AC #8 / §10.19.0 C-2 — post-durable closure failure
 /// produces `Error::EngineFatal` rather than silently flipping a
 /// durable slot to Aborted.
 ///
@@ -261,7 +261,7 @@ fn test_sequencer_tolerates_large_hlc_gaps_and_monotonic_regression() {
 /// the caller runs the poison hook, and the next register / mark_ready
 /// observes EngineFatal.
 #[test]
-fn test_closure_failure_after_journal_mutex_produces_engine_fatal_not_aborted_slot() {
+fn test_post_durable_closure_failure_produces_engine_fatal_not_aborted_slot() {
     let seq = PublishSequencer::new();
     let oracle = TimestampOracle::new();
     let g1 = seq.register_with_oracle(&oracle).expect("g1");

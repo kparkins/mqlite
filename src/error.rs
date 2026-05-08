@@ -460,10 +460,16 @@ pub enum Error {
 ///
 /// Distinguishes post-durable in-memory failures that escalate to engine
 /// poison. The discriminants are part of the public contract and cover every
-/// post-durable failure boundary: CRUD publish, Pending→Committed flip, DDL
-/// publish, and checkpoint post-mutation.
+/// failure boundary that cannot be represented as a normal abort: log-slot
+/// reservation, CRUD publish, Pending→Committed flip, DDL publish, and
+/// checkpoint post-mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineFatalReason {
+    /// A Phase 8 log writer failed after reserving a byte-LSN range and before
+    /// marking the record written. The live process must not skip the gap or
+    /// let later records become durable; reopen recovery owns truncation to the
+    /// last valid prefix.
+    PostReservationLogWriteFailure,
     /// A post-durable failure during the ordinary CRUD `mark_ready`
     /// publish closure or its surrounding post-durable scope. The
     /// `journal_mutex` envelope has already completed when this is

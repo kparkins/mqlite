@@ -45,6 +45,7 @@ use bson::{doc, DateTime, Document};
 use crate::error::{Error, Result};
 use crate::index::IndexModel;
 use crate::storage::btree::{BTree, BTreePageStore, MemPageStore};
+use crate::storage::buffer_pool::PageSize;
 use crate::storage::root_snapshot::{IndexId, NamespaceId};
 
 // ---------------------------------------------------------------------------
@@ -433,6 +434,11 @@ impl<S: BTreePageStore> Catalog<S> {
     /// Level of the current catalog root (0 = leaf, >0 = internal at that level).
     pub(crate) fn root_level(&self) -> u8 {
         self.tree.root_level
+    }
+
+    /// Return every page currently occupied by the catalog B+ tree.
+    pub(crate) fn collect_pages_by_size(&mut self) -> Result<Vec<(u32, PageSize)>> {
+        self.tree.collect_pages_by_size()
     }
 
     // -----------------------------------------------------------------------

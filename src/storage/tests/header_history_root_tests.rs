@@ -5,7 +5,8 @@ use super::*;
 const TEST_TS: u64 = 1_700_000_000_000;
 const HISTORY_ROOT_PAGE_OFFSET: usize = 97;
 const HISTORY_ROOT_LEVEL_OFFSET: usize = 101;
-const RESERVED_START: usize = 102;
+const CHECKPOINT_APPLIED_LSN_OFFSET: usize = 102;
+const RESERVED_START: usize = 110;
 const RESERVED_END: usize = 128;
 
 fn fresh_header() -> FileHeader {
@@ -27,7 +28,7 @@ fn history_store_root_level_roundtrips_at_offset_101() {
     assert_eq!(bytes[HISTORY_ROOT_LEVEL_OFFSET], 3);
     assert!(
         bytes[RESERVED_START..RESERVED_END].iter().all(|&b| b == 0),
-        "reserved bytes 102..128 must stay zero-filled"
+        "reserved bytes 110..128 must stay zero-filled"
     );
 
     let decoded = FileHeader::from_bytes(&bytes).expect("valid US-011 header");
@@ -64,6 +65,13 @@ fn checksum_covers_header_fields_after_wal_salts_but_not_reserved_tail() {
     reserved_tail[RESERVED_START] ^= 0x01;
     assert!(
         FileHeader::from_bytes(&reserved_tail).is_ok(),
-        "reserved bytes from 102 onward remain outside the checksum"
+        "reserved bytes from 110 onward remain outside the checksum"
+    );
+
+    let mut covered_checkpoint_lsn = header.to_bytes();
+    covered_checkpoint_lsn[CHECKPOINT_APPLIED_LSN_OFFSET] ^= 0x01;
+    assert!(
+        FileHeader::from_bytes(&covered_checkpoint_lsn).is_err(),
+        "checkpoint_applied_lsn at 102..110 must be covered by the checksum"
     );
 }

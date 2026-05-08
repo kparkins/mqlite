@@ -74,9 +74,9 @@ new `ReadView`s.
 
 **Lock acquisition on the write path** (see `src/storage/paged_engine.rs`):
 
-1. `PagedEngine::metadata: RwLock<()>` — shared read guard held across the private write body, resident Pending install, durable journal envelope, and ordered publish. This blocks DDL while allowing ordinary CRUD writers to overlap.
+1. `PagedEngine::metadata: RwLock<()>` — shared read guard held across the private write body, resident Pending install, durable LSN log envelope, and ordered publish. This blocks DDL while allowing ordinary CRUD writers to overlap.
 2. Page latches — protect resident per-leaf version chains and structural mutation windows.
-3. `journal_mutex` plus `PublishSequencer` — serialize the durable envelope and publish slots so `commit_ts`, journal-append order, and `publish_ts` always agree across concurrent commits.
+3. `LogManager` plus `PublishSequencer` — reserve disjoint byte-LSN ranges, advance `ready_lsn` only over written contiguous records, advance `durable_lsn` after high-water group commit sync, and publish slots in persisted `publish_seq` order.
 
 **Reads take none of the above locks.** A read loads `shared.published:
 ArcSwap<PublishedSnapshot>` atomically, opens B-trees at the snapshot's

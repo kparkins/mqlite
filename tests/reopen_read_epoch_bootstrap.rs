@@ -33,8 +33,7 @@ fn reopen_initial_read_epoch_visible_ts_is_floored_above_max_commit() {
     let path = dir.path().join("reopen_boot.mqlite");
 
     // One durable commit, then abandon the client without running
-    // Drop so ChainCommit frames survive in the journal (same pattern
-    // as tests/crash_harness_smoke.rs).
+    // Drop so the durable commit record survives in the journal.
     let client = Client::open(&path).unwrap();
     client
         .database("db")

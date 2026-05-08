@@ -123,7 +123,7 @@ fn test_evict_blocked_when_frame_has_live_committed_head() {
     let io = ZeroIo;
 
     partition
-        .pin_page_reconciling(DELTA_PAGE, Ts::MAX, &io, PageSize::Large32k)
+        .pin_page_reconciling(DELTA_PAGE, Ts::MAX, &io, PageSize::Large32k, u64::MAX)
         .unwrap();
     partition.unpin_page(DELTA_PAGE, false, None).unwrap();
     let frame = partition.frames[0].as_mut().unwrap();
@@ -133,7 +133,7 @@ fn test_evict_blocked_when_frame_has_live_committed_head() {
     );
 
     let err = partition
-        .pin_page_reconciling(PRESSURE_PAGE, Ts::MAX, &io, PageSize::Large32k)
+        .pin_page_reconciling(PRESSURE_PAGE, Ts::MAX, &io, PageSize::Large32k, u64::MAX)
         .unwrap_err();
 
     match err {

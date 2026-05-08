@@ -2,8 +2,13 @@
 # will have compiled files and executables
 debug
 target
-.omc/
-.omx/
+.omc/*
+!.omc/phase-08-prd.json
+.omx/*
+!.omx/plans/
+.omx/plans/*
+!.omx/plans/prd-phase-08-wt-journal-group-commit.md
+!.omx/plans/test-spec-phase-08-wt-journal-group-commit.md
 omc/
 .qwen/
 .designs/
@@ -55,6 +60,7 @@ proptest-regressions/
 # Local planning / generated project docs
 docs/STORAGE-CONTRACTS-FROZEN.md
 docs/STORAGE-UPGRADE*.md
+!docs/STORAGE-UPGRADE-PHASE-08-WT-JOURNAL-GROUP-COMMIT.md
 docs/cck.md
 progress.txt
 

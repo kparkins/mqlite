@@ -12,9 +12,12 @@
 )]
 mod tests {
     use super::super::*;
+    use crate::journal::log_file::{PositionedLogFile, PositionedLogIo};
     use crate::storage::header::FileHeader;
     use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
     use std::io::{Read, Seek, SeekFrom};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex as StdMutex};
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------------
@@ -44,6 +47,95 @@ mod tests {
 
     fn make_page_32k(fill: u8) -> Vec<u8> {
         vec![fill; PAGE_SIZE_LEAF as usize]
+    }
+
+    fn make_log_manager(initial_lsn: u64) -> (TempDir, LogManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("phase8-log.mqlite-log");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        (dir, LogManager::new(file, initial_lsn))
+    }
+
+    #[derive(Clone)]
+    struct TestPositionedLogIo {
+        inner: Arc<TestPositionedLogIoInner>,
+    }
+
+    struct TestPositionedLogIoInner {
+        data: StdMutex<Vec<u8>>,
+        max_write: usize,
+        fail_offset: Option<u64>,
+        write_calls: AtomicUsize,
+        sync_calls: AtomicUsize,
+    }
+
+    impl TestPositionedLogIo {
+        fn new(max_write: usize, fail_offset: Option<u64>) -> Self {
+            Self {
+                inner: Arc::new(TestPositionedLogIoInner {
+                    data: StdMutex::new(Vec::new()),
+                    max_write,
+                    fail_offset,
+                    write_calls: AtomicUsize::new(0),
+                    sync_calls: AtomicUsize::new(0),
+                }),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.inner.data.lock().unwrap().clone()
+        }
+
+        fn write_calls(&self) -> usize {
+            self.inner.write_calls.load(Ordering::Acquire)
+        }
+
+        fn sync_calls(&self) -> usize {
+            self.inner.sync_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl PositionedLogIo for TestPositionedLogIo {
+        fn write_at(&self, offset: u64, data: &[u8]) -> std::io::Result<usize> {
+            self.inner.write_calls.fetch_add(1, Ordering::AcqRel);
+            if self.inner.fail_offset == Some(offset) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected positioned write failure",
+                ));
+            }
+            let written = data.len().min(self.inner.max_write);
+            if written == 0 {
+                return Ok(0);
+            }
+
+            let mut buf = self.inner.data.lock().unwrap();
+            let start = offset as usize;
+            let end = start + written;
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[start..end].copy_from_slice(&data[..written]);
+            Ok(written)
+        }
+
+        fn sync_data(&self) -> std::io::Result<()> {
+            self.inner.sync_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    fn log_manager_from_io(io: TestPositionedLogIo, initial_lsn: u64) -> Arc<LogManager> {
+        Arc::new(LogManager::from_positioned_file(
+            PositionedLogFile::from_io(Box::new(io)),
+            initial_lsn,
+        ))
     }
 
     fn append_test_page0_boundary(
@@ -86,6 +178,382 @@ mod tests {
         staged_header.last_checkpoint_ts = checkpoint_ts;
         mgr.append_checkpoint_commit_boundary(&staged_header, cursor)
             .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8 LogManager slot reservation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn phase8_journal_log_manager_concurrent_reservations_are_disjoint_monotonic() {
+        let (_dir, manager) = make_log_manager(100);
+        let manager = Arc::new(manager);
+        let workers = 8usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+
+        for len in 1..=workers {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                manager.reserve(len).unwrap()
+            }));
+        }
+
+        let mut slots: Vec<LogSlot> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        slots.sort_by_key(LogSlot::start_lsn);
+
+        assert_eq!(slots[0].start_lsn(), 100);
+        for pair in slots.windows(2) {
+            assert_eq!(
+                pair[0].end_lsn(),
+                pair[1].start_lsn(),
+                "reservations must be contiguous and non-overlapping"
+            );
+        }
+        let total_reserved: u64 = slots.iter().map(|slot| slot.bytes_len() as u64).sum();
+        assert_eq!(slots.last().unwrap().end_lsn(), 100 + total_reserved);
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_reserve_does_not_mutate_record_metadata() {
+        use crate::journal::log_file::{LogRecord, LogRecordDraft};
+        use crate::mvcc::timestamp::Ts;
+
+        let (_dir, manager) = make_log_manager(4096);
+        let commit_ts = Ts {
+            physical_ms: 1_700_000_000_123,
+            logical: 7,
+        };
+        let draft = LogRecordDraft::crud(99, 42, commit_ts, b"logical".to_vec(), b"chain".to_vec());
+        let slot = manager.reserve(draft.encoded_len().unwrap()).unwrap();
+        let record = draft.finalize(slot.start_lsn()).unwrap();
+        let decoded = LogRecord::decode(record.bytes()).unwrap();
+
+        assert_eq!(decoded.start_lsn, slot.start_lsn());
+        assert_eq!(decoded.end_lsn, slot.end_lsn());
+        assert_eq!(decoded.txn_id, 99);
+        assert_eq!(decoded.publish_seq, 42);
+        assert_eq!(decoded.commit_ts, commit_ts);
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_ready_lsn_advances_only_contiguous_slots() {
+        let io = TestPositionedLogIo::new(usize::MAX, None);
+        let manager = log_manager_from_io(io, 0);
+        let first = manager.reserve(4).unwrap();
+        let second = manager.reserve(6).unwrap();
+
+        manager.write_reserved(&second, b"second").unwrap();
+        let receipt = manager.mark_written(&second).unwrap();
+        assert_eq!(receipt.ready_lsn(), 0);
+        assert_eq!(manager.ready_lsn(), 0);
+
+        manager.write_reserved(&first, b"frst").unwrap();
+        let receipt = manager.mark_written(&first).unwrap();
+        assert_eq!(receipt.end_lsn(), first.end_lsn());
+        assert_eq!(receipt.ready_lsn(), second.end_lsn());
+        assert_eq!(manager.ready_lsn(), second.end_lsn());
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_mark_before_write_poisons_gap_and_waiters() {
+        let io = TestPositionedLogIo::new(usize::MAX, None);
+        let manager = log_manager_from_io(io, 0);
+        let first = manager.reserve(4).unwrap();
+        let second = manager.reserve(6).unwrap();
+
+        manager.write_reserved(&second, b"second").unwrap();
+        manager.mark_written(&second).unwrap();
+        assert_eq!(manager.ready_lsn(), 0);
+
+        let waiter_manager = Arc::clone(&manager);
+        let waiter = std::thread::spawn(move || waiter_manager.wait_ready(second.end_lsn()));
+
+        let err = manager
+            .mark_written(&first)
+            .expect_err("marking an unwritten reservation must poison the gap");
+        assert!(matches!(
+            err,
+            Error::EngineFatal {
+                reason: EngineFatalReason::PostReservationLogWriteFailure
+            }
+        ));
+        assert_eq!(manager.ready_lsn(), 0);
+
+        let waiter_err = waiter.join().unwrap().expect_err("waiter must wake fatal");
+        assert!(matches!(
+            waiter_err,
+            Error::EngineFatal {
+                reason: EngineFatalReason::PostReservationLogWriteFailure
+            }
+        ));
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_short_positioned_writes_retry_before_mark() {
+        let io = TestPositionedLogIo::new(2, None);
+        let manager = log_manager_from_io(io.clone(), 0);
+        let slot = manager.reserve(5).unwrap();
+
+        manager.write_reserved(&slot, b"abcde").unwrap();
+        assert_eq!(
+            manager.ready_lsn(),
+            0,
+            "write_reserved must not mark the slot ready"
+        );
+        assert!(
+            io.write_calls() >= 3,
+            "short positioned writes must be retried"
+        );
+
+        let receipt = manager.mark_written(&slot).unwrap();
+        assert_eq!(receipt.ready_lsn(), slot.end_lsn());
+        assert_eq!(
+            &io.snapshot()[slot.start_lsn() as usize..slot.end_lsn() as usize],
+            b"abcde"
+        );
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_write_failure_poisons_gap_and_waiters() {
+        let io = TestPositionedLogIo::new(usize::MAX, Some(0));
+        let manager = log_manager_from_io(io.clone(), 0);
+        let first = manager.reserve(4).unwrap();
+        let second = manager.reserve(5).unwrap();
+
+        manager.write_reserved(&second, b"valid").unwrap();
+        manager.mark_written(&second).unwrap();
+        assert_eq!(manager.ready_lsn(), 0);
+
+        let waiter_manager = Arc::clone(&manager);
+        let waiter = std::thread::spawn(move || waiter_manager.wait_ready(second.end_lsn()));
+
+        let err = manager
+            .write_reserved(&first, b"fail")
+            .expect_err("failed positioned write must poison the log manager");
+        assert!(matches!(
+            err,
+            Error::EngineFatal {
+                reason: EngineFatalReason::PostReservationLogWriteFailure
+            }
+        ));
+        assert_eq!(manager.ready_lsn(), 0);
+
+        let waiter_err = waiter.join().unwrap().expect_err("waiter must wake fatal");
+        assert!(matches!(
+            waiter_err,
+            Error::EngineFatal {
+                reason: EngineFatalReason::PostReservationLogWriteFailure
+            }
+        ));
+
+        let snapshot = io.snapshot();
+        assert_eq!(
+            &snapshot[second.start_lsn() as usize..second.end_lsn() as usize],
+            b"valid",
+            "later valid bytes remain in place but cannot hide the poisoned gap"
+        );
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_partial_failure_preserves_neighbor_records() {
+        let io = TestPositionedLogIo::new(2, Some(6));
+        let manager = log_manager_from_io(io.clone(), 0);
+        let first = manager.reserve(4).unwrap();
+        let failed = manager.reserve(6).unwrap();
+        let later = manager.reserve(5).unwrap();
+
+        manager.write_reserved(&first, b"good").unwrap();
+        manager.mark_written(&first).unwrap();
+        assert_eq!(manager.ready_lsn(), first.end_lsn());
+
+        manager.write_reserved(&later, b"later").unwrap();
+        manager.mark_written(&later).unwrap();
+        assert_eq!(
+            manager.ready_lsn(),
+            first.end_lsn(),
+            "later record cannot advance ready_lsn across the unwritten gap"
+        );
+
+        let err = manager
+            .write_reserved(&failed, b"broken")
+            .expect_err("partial positioned write failure must poison the log manager");
+        assert!(matches!(
+            err,
+            Error::EngineFatal {
+                reason: EngineFatalReason::PostReservationLogWriteFailure
+            }
+        ));
+        assert_eq!(manager.ready_lsn(), first.end_lsn());
+
+        let snapshot = io.snapshot();
+        assert_eq!(
+            &snapshot[first.start_lsn() as usize..first.end_lsn() as usize],
+            b"good",
+            "partial failed writer must not overwrite the preceding ready record"
+        );
+        assert_eq!(
+            &snapshot[later.start_lsn() as usize..later.end_lsn() as usize],
+            b"later",
+            "partial failed writer must not hide the later valid record bytes"
+        );
+        assert_eq!(
+            &snapshot[failed.start_lsn() as usize..failed.start_lsn() as usize + 2],
+            b"br",
+            "test setup must cover a partial post-reservation write before failure"
+        );
+    }
+
+    #[test]
+    fn phase8_journal_poisoned_log_manager_blocks_truncate_rollback() {
+        let (_dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        let rollback_mark = mgr.write_cursor();
+        let first = mgr.log_manager.reserve(4).unwrap();
+        let second = mgr.log_manager.reserve(5).unwrap();
+
+        mgr.log_manager.write_reserved(&second, b"valid").unwrap();
+        mgr.log_manager.mark_written(&second).unwrap();
+        let err = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "injected post-reservation failure",
+        ));
+        let err = mgr.log_manager.poison_slot(&first, err);
+        assert!(matches!(
+            err,
+            Error::EngineFatal {
+                reason: EngineFatalReason::PostReservationLogWriteFailure
+            }
+        ));
+
+        let truncate_err = mgr
+            .truncate_to(rollback_mark)
+            .expect_err("poisoned log manager must reject rollback truncation");
+        assert!(matches!(
+            truncate_err,
+            Error::EngineFatal {
+                reason: EngineFatalReason::PostReservationLogWriteFailure
+            }
+        ));
+        assert!(
+            mgr.journal_file.metadata().unwrap().len() >= second.end_lsn(),
+            "rollback must not truncate away another writer's valid reserved bytes"
+        );
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_wait_durable_syncs_ready_prefix() {
+        let io = TestPositionedLogIo::new(usize::MAX, None);
+        let manager = log_manager_from_io(io.clone(), 0);
+        let slot = manager.reserve(3).unwrap();
+        manager.write_reserved(&slot, b"abc").unwrap();
+        manager.mark_written(&slot).unwrap();
+
+        manager.wait_durable(slot.end_lsn()).unwrap();
+
+        assert_eq!(manager.ready_lsn(), slot.end_lsn());
+        assert_eq!(manager.durable_lsn(), slot.end_lsn());
+        assert_eq!(io.sync_calls(), 1);
+    }
+
+    #[test]
+    fn phase8_journal_log_manager_durable_lsn_stays_at_closed_sync_target() {
+        crate::storage::paged_engine::group_commit_test_probe::reset();
+        let io = TestPositionedLogIo::new(usize::MAX, None);
+        let manager = log_manager_from_io(io.clone(), 0);
+        let first = manager.reserve(3).unwrap();
+        let second = manager.reserve(3).unwrap();
+
+        manager.write_reserved(&first, b"abc").unwrap();
+        manager.mark_written(&first).unwrap();
+        manager.write_reserved(&second, b"def").unwrap();
+
+        let mut pause =
+            crate::storage::paged_engine::group_commit_test_probe::install_pause_after_close_for(
+                manager.probe_id(),
+            );
+        let sync_manager = Arc::clone(&manager);
+        let sync_target = first.end_lsn();
+        let leader = std::thread::spawn(move || sync_manager.ensure_sync(sync_target));
+        pause
+            .wait_until_paused_timeout(std::time::Duration::from_secs(5))
+            .expect("leader paused after closing sync target");
+
+        manager.mark_written(&second).unwrap();
+        assert_eq!(manager.ready_lsn(), second.end_lsn());
+
+        pause.release().unwrap();
+        leader.join().unwrap().unwrap();
+
+        assert_eq!(manager.ready_lsn(), second.end_lsn());
+        assert_eq!(
+            manager.durable_lsn(),
+            first.end_lsn(),
+            "leader must not advance durability beyond its closed target"
+        );
+        assert!(manager.durable_lsn() <= manager.ready_lsn());
+        assert_eq!(io.sync_calls(), 1);
+        crate::storage::paged_engine::group_commit_test_probe::reset();
+    }
+
+    #[test]
+    fn phase8_journal_sync_journal_advances_log_manager_durable_lsn() {
+        let (_dir, db_path, mut main_file) = make_db_file();
+        let header = make_header();
+        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        let durable_before = mgr.log_manager.durable_lsn();
+        let commit_ts = crate::mvcc::timestamp::Ts {
+            physical_ms: 1_700_000_000_321,
+            logical: 2,
+        };
+
+        let frame_offset = mgr.append_chain_commit(commit_ts, vec![], vec![]).unwrap();
+        let write_cursor = mgr.write_cursor();
+
+        assert_eq!(frame_offset, durable_before);
+        assert_eq!(mgr.log_manager.ready_lsn(), write_cursor);
+        assert_eq!(
+            mgr.log_manager.durable_lsn(),
+            durable_before,
+            "append must not claim durability before the sync boundary"
+        );
+
+        mgr.sync_journal().unwrap();
+
+        assert_eq!(mgr.log_manager.durable_lsn(), write_cursor);
+    }
+
+    #[test]
+    fn phase8_journal_commit_append_uses_log_manager_not_seek_write_all() {
+        let source = include_str!("mod.rs");
+        let chain_body = source
+            .split("fn append_chain_commit_record")
+            .nth(1)
+            .unwrap()
+            .split("/// Append a `LogicalTxnFrame`")
+            .next()
+            .unwrap();
+        let logical_body = source
+            .split("pub(crate) fn append_logical_txn")
+            .nth(1)
+            .unwrap()
+            .split("/// Append a page-0 checkpoint commit boundary")
+            .next()
+            .unwrap();
+
+        for body in [chain_body, logical_body] {
+            assert!(body.contains("self.log_manager.reserve(bytes.len())"));
+            assert!(body.contains("self.log_manager.write_reserved(&slot, &bytes)"));
+            assert!(body.contains("self.log_manager.mark_written(&slot)"));
+            assert!(!body.contains(".seek("));
+            assert!(!body.contains(".write_all("));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1897,7 +2365,8 @@ mod tests {
 
     fn append_pass2_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
         use crate::journal::log_file::{
-            LogicalOp, LogicalOpKind, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
+            ChainCommitFrame, LogRecordDraft, LogicalOp, LogicalOpKind, LogicalTxnFrame,
+            LOGICAL_TXN_FORMAT_VERSION,
         };
         use crate::storage::header::HEADER_PAGE_SIZE;
 
@@ -1916,6 +2385,7 @@ mod tests {
             .expect("open journal manager");
         let (salt1, salt2) = mgr.salts();
         let commit_ts = synthetic_uncheckpointed_ts(&header, commit_ts);
+        let publish_seq = mgr.recovered_max_publish_seq().unwrap_or(0) + 1;
         let frame = LogicalTxnFrame {
             salt1,
             salt2,
@@ -1933,10 +2403,26 @@ mod tests {
                 },
             }],
         };
-
-        mgr.append_logical_txn(frame).expect("append logical");
-        mgr.append_chain_commit(commit_ts, vec![], vec![])
-            .expect("append chain commit");
+        let logical = frame.encode().expect("encode logical");
+        let chain = ChainCommitFrame {
+            salt1,
+            salt2,
+            commit_ts,
+            refcount_deltas: vec![],
+            page_writes: vec![],
+        }
+        .encode()
+        .expect("encode chain");
+        let record = mgr
+            .reserve_log_record(LogRecordDraft::crud(
+                ns_id as u64,
+                publish_seq,
+                commit_ts,
+                logical,
+                chain,
+            ))
+            .expect("reserve phase8 crud");
+        record.write_and_mark().expect("write phase8 crud");
         mgr.sync_journal().expect("sync journal");
     }
 
@@ -2563,6 +3049,301 @@ mod crash_recovery_tests {
                 total,
                 failures.join("\n")
             );
+        }
+    }
+
+    mod phase8_log_record_codec_tests {
+        use crate::journal::log_file::{
+            FinalizedLogRecord, LogRecord, LogRecordDraft, LogRecordFlags, LogRecordKind,
+            LogRecordPayload, JOURNAL_FORMAT_VERSION, LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET,
+            LOG_RECORD_COMMIT_TS_PHYSICAL_OFFSET, LOG_RECORD_END_LSN_OFFSET,
+            LOG_RECORD_FLAGS_OFFSET, LOG_RECORD_FORMAT_VERSION, LOG_RECORD_FORMAT_VERSION_OFFSET,
+            LOG_RECORD_HEADER_CRC32C_OFFSET, LOG_RECORD_HEADER_LEN, LOG_RECORD_HEADER_LEN_OFFSET,
+            LOG_RECORD_KIND_OFFSET, LOG_RECORD_MAGIC, LOG_RECORD_MAGIC_OFFSET,
+            LOG_RECORD_PAYLOAD_CRC32C_OFFSET, LOG_RECORD_PAYLOAD_LEN_OFFSET,
+            LOG_RECORD_PUBLISH_SEQ_OFFSET, LOG_RECORD_START_LSN_OFFSET,
+            LOG_RECORD_TOTAL_LEN_OFFSET, LOG_RECORD_TXN_ID_OFFSET, MAX_LOG_RECORD_BYTES,
+            RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
+        };
+        use crate::mvcc::timestamp::Ts;
+
+        const START_LSN: u64 = 4096;
+
+        fn sample_ts() -> Ts {
+            Ts {
+                physical_ms: 1_700_000_123_456,
+                logical: 42,
+            }
+        }
+
+        fn sample_crud_record() -> FinalizedLogRecord {
+            let draft = LogRecordDraft::crud(
+                0xAABB_CCDD_EEFF_0011,
+                9,
+                sample_ts(),
+                b"logical-txn".to_vec(),
+                b"chain-refcount-pages".to_vec(),
+            );
+            assert_eq!(
+                draft.encoded_len().unwrap(),
+                LOG_RECORD_HEADER_LEN + 8 + b"logical-txn".len() + b"chain-refcount-pages".len()
+            );
+            draft.finalize(START_LSN).unwrap()
+        }
+
+        fn decode(bytes: &[u8]) -> LogRecord {
+            LogRecord::decode(bytes).expect("Phase 8 LogRecord must decode")
+        }
+
+        fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn get_u32(bytes: &[u8], offset: usize) -> u32 {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        }
+
+        fn recompute_header_crc(bytes: &mut [u8]) {
+            put_u32(bytes, LOG_RECORD_HEADER_CRC32C_OFFSET, 0);
+            let crc = crc32c::crc32c(&bytes[..LOG_RECORD_HEADER_LEN]);
+            put_u32(bytes, LOG_RECORD_HEADER_CRC32C_OFFSET, crc);
+        }
+
+        fn recompute_payload_crc_and_header_crc(bytes: &mut [u8]) {
+            let payload_len = get_u32(bytes, LOG_RECORD_PAYLOAD_LEN_OFFSET) as usize;
+            let payload_end = LOG_RECORD_HEADER_LEN + payload_len;
+            let crc = crc32c::crc32c(&bytes[LOG_RECORD_HEADER_LEN..payload_end]);
+            put_u32(bytes, LOG_RECORD_PAYLOAD_CRC32C_OFFSET, crc);
+            recompute_header_crc(bytes);
+        }
+
+        #[test]
+        fn phase8_journal_format_version_is_bumped() {
+            assert_eq!(JOURNAL_FORMAT_VERSION, 3);
+            assert_eq!(RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS, &[1, 2]);
+        }
+
+        #[test]
+        fn log_record_constants_match_phase8_wire_contract() {
+            assert_eq!(LOG_RECORD_MAGIC.to_le_bytes(), *b"MQL8");
+            assert_eq!(LOG_RECORD_FORMAT_VERSION, 1);
+            assert_eq!(LOG_RECORD_HEADER_LEN, 72);
+            assert_eq!(MAX_LOG_RECORD_BYTES, 64 * 1024 * 1024);
+            assert_eq!(LogRecordFlags::HAS_LOGICAL_PAYLOAD.bits(), 0x0001);
+            assert_eq!(LogRecordFlags::HAS_CHAIN_PAYLOAD.bits(), 0x0002);
+            assert_eq!(LogRecordFlags::HAS_CATALOG_PAYLOAD.bits(), 0x0004);
+            assert_eq!(LogRecordFlags::CHECKPOINT_BOUNDARY.bits(), 0x0008);
+        }
+
+        #[test]
+        fn log_record_crud_round_trip_finalizes_lsn_and_crc_fields() {
+            let finalized = sample_crud_record();
+            let bytes = finalized.bytes();
+            let decoded = decode(bytes);
+
+            assert_eq!(finalized.start_lsn(), START_LSN);
+            assert_eq!(finalized.end_lsn(), START_LSN + bytes.len() as u64);
+            assert_eq!(decoded.start_lsn, START_LSN);
+            assert_eq!(decoded.end_lsn, finalized.end_lsn());
+            assert_eq!(decoded.total_len, bytes.len());
+            assert_eq!(decoded.payload_len, bytes.len() - LOG_RECORD_HEADER_LEN);
+            assert_eq!(decoded.txn_id, 0xAABB_CCDD_EEFF_0011);
+            assert_eq!(decoded.publish_seq, 9);
+            assert_eq!(decoded.commit_ts, sample_ts());
+            assert_eq!(decoded.kind, LogRecordKind::CrudCommit);
+            assert_eq!(decoded.flags.bits(), 0x0003);
+            assert_eq!(
+                decoded.payload,
+                LogRecordPayload::CrudCommit {
+                    logical_payload: b"logical-txn".to_vec(),
+                    chain_payload: b"chain-refcount-pages".to_vec(),
+                }
+            );
+
+            let mut header = [0u8; LOG_RECORD_HEADER_LEN];
+            header.copy_from_slice(&bytes[..LOG_RECORD_HEADER_LEN]);
+            put_u32(&mut header, LOG_RECORD_HEADER_CRC32C_OFFSET, 0);
+            assert_eq!(decoded.header_crc32c, crc32c::crc32c(&header));
+            assert_eq!(
+                decoded.payload_crc32c,
+                crc32c::crc32c(&bytes[LOG_RECORD_HEADER_LEN..])
+            );
+        }
+
+        #[test]
+        fn log_record_catalog_and_checkpoint_round_trip() {
+            let catalog = LogRecordDraft::catalog(11, 12, sample_ts(), b"catalog".to_vec())
+                .finalize(100)
+                .unwrap();
+            let catalog = decode(catalog.bytes());
+            assert_eq!(catalog.kind, LogRecordKind::CatalogCommit);
+            assert_eq!(catalog.flags.bits(), 0x0004);
+            assert_eq!(catalog.publish_seq, 12);
+            assert_eq!(
+                catalog.payload,
+                LogRecordPayload::CatalogCommit(b"catalog".to_vec())
+            );
+
+            let checkpoint =
+                LogRecordDraft::checkpoint_boundary(13, sample_ts(), b"frontier".to_vec())
+                    .finalize(200)
+                    .unwrap();
+            let checkpoint = decode(checkpoint.bytes());
+            assert_eq!(checkpoint.kind, LogRecordKind::CheckpointBoundary);
+            assert_eq!(checkpoint.flags.bits(), 0x0008);
+            assert_eq!(checkpoint.publish_seq, 0);
+            assert_eq!(
+                checkpoint.payload,
+                LogRecordPayload::CheckpointBoundary(b"frontier".to_vec())
+            );
+        }
+
+        #[test]
+        fn log_record_rejects_bad_magic_and_version() {
+            let mut bad_magic = sample_crud_record().bytes().to_vec();
+            put_u32(&mut bad_magic, LOG_RECORD_MAGIC_OFFSET, 0xDEAD_BEEF);
+            recompute_header_crc(&mut bad_magic);
+            assert!(LogRecord::decode(&bad_magic).is_err());
+
+            let mut bad_version = sample_crud_record().bytes().to_vec();
+            put_u16(
+                &mut bad_version,
+                LOG_RECORD_FORMAT_VERSION_OFFSET,
+                LOG_RECORD_FORMAT_VERSION + 1,
+            );
+            recompute_header_crc(&mut bad_version);
+            assert!(LogRecord::decode(&bad_version).is_err());
+        }
+
+        #[test]
+        fn log_record_rejects_unknown_kind_flag_and_invalid_combination() {
+            let mut unknown_kind = sample_crud_record().bytes().to_vec();
+            put_u16(&mut unknown_kind, LOG_RECORD_KIND_OFFSET, 99);
+            recompute_header_crc(&mut unknown_kind);
+            assert!(LogRecord::decode(&unknown_kind).is_err());
+
+            let mut unknown_flag = sample_crud_record().bytes().to_vec();
+            put_u16(&mut unknown_flag, LOG_RECORD_FLAGS_OFFSET, 0x8003);
+            recompute_header_crc(&mut unknown_flag);
+            assert!(LogRecord::decode(&unknown_flag).is_err());
+
+            let mut invalid_combo = sample_crud_record().bytes().to_vec();
+            put_u16(&mut invalid_combo, LOG_RECORD_FLAGS_OFFSET, 0x0004);
+            recompute_header_crc(&mut invalid_combo);
+            assert!(LogRecord::decode(&invalid_combo).is_err());
+        }
+
+        #[test]
+        fn log_record_header_crc_covers_every_header_field() {
+            let base = sample_crud_record().bytes().to_vec();
+            let covered_offsets = [
+                LOG_RECORD_MAGIC_OFFSET,
+                LOG_RECORD_FORMAT_VERSION_OFFSET,
+                LOG_RECORD_HEADER_LEN_OFFSET,
+                LOG_RECORD_KIND_OFFSET,
+                LOG_RECORD_FLAGS_OFFSET,
+                LOG_RECORD_TOTAL_LEN_OFFSET,
+                LOG_RECORD_START_LSN_OFFSET,
+                LOG_RECORD_END_LSN_OFFSET,
+                LOG_RECORD_TXN_ID_OFFSET,
+                LOG_RECORD_PUBLISH_SEQ_OFFSET,
+                LOG_RECORD_COMMIT_TS_PHYSICAL_OFFSET,
+                LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET,
+                LOG_RECORD_PAYLOAD_LEN_OFFSET,
+                LOG_RECORD_HEADER_CRC32C_OFFSET,
+                LOG_RECORD_PAYLOAD_CRC32C_OFFSET,
+            ];
+
+            for offset in covered_offsets {
+                let mut bytes = base.clone();
+                bytes[offset] ^= 0x01;
+                assert!(
+                    LogRecord::decode(&bytes).is_err(),
+                    "header mutation at offset {offset} must be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn log_record_rejects_bad_payload_crc() {
+            let mut bytes = sample_crud_record().bytes().to_vec();
+            bytes[LOG_RECORD_HEADER_LEN] ^= 0x01;
+            assert!(LogRecord::decode(&bytes).is_err());
+        }
+
+        #[test]
+        fn log_record_rejects_truncated_header_and_payload() {
+            let bytes = sample_crud_record().bytes().to_vec();
+            assert!(LogRecord::decode(&bytes[..LOG_RECORD_HEADER_LEN - 1]).is_err());
+            assert!(LogRecord::decode(&bytes[..bytes.len() - 1]).is_err());
+        }
+
+        #[test]
+        fn log_record_rejects_mismatched_lengths_and_lsn() {
+            let base = sample_crud_record().bytes().to_vec();
+
+            let mut bad_total = base.clone();
+            let total_len = get_u32(&bad_total, LOG_RECORD_TOTAL_LEN_OFFSET);
+            put_u32(&mut bad_total, LOG_RECORD_TOTAL_LEN_OFFSET, total_len + 1);
+            recompute_header_crc(&mut bad_total);
+            assert!(LogRecord::decode(&bad_total).is_err());
+
+            let mut bad_lsn = base;
+            put_u64(&mut bad_lsn, LOG_RECORD_END_LSN_OFFSET, START_LSN + 1);
+            recompute_header_crc(&mut bad_lsn);
+            assert!(LogRecord::decode(&bad_lsn).is_err());
+        }
+
+        #[test]
+        fn log_record_rejects_invalid_crud_payload_split() {
+            let mut bytes = sample_crud_record().bytes().to_vec();
+            let logical_len = get_u32(&bytes, LOG_RECORD_HEADER_LEN) + 1;
+            put_u32(&mut bytes, LOG_RECORD_HEADER_LEN, logical_len);
+            recompute_payload_crc_and_header_crc(&mut bytes);
+            assert!(LogRecord::decode(&bytes).is_err());
+        }
+
+        #[test]
+        fn log_record_rejects_publish_seq_control_record_violations() {
+            assert!(LogRecordDraft::crud(
+                1,
+                0,
+                sample_ts(),
+                b"logical".to_vec(),
+                b"chain".to_vec()
+            )
+            .encoded_len()
+            .is_err());
+            assert!(
+                LogRecordDraft::catalog(1, 0, sample_ts(), b"catalog".to_vec())
+                    .encoded_len()
+                    .is_err()
+            );
+
+            let mut checkpoint =
+                LogRecordDraft::checkpoint_boundary(1, sample_ts(), b"frontier".to_vec())
+                    .finalize(START_LSN)
+                    .unwrap()
+                    .bytes()
+                    .to_vec();
+            put_u64(&mut checkpoint, LOG_RECORD_PUBLISH_SEQ_OFFSET, 7);
+            recompute_header_crc(&mut checkpoint);
+            assert!(LogRecord::decode(&checkpoint).is_err());
+        }
+
+        #[test]
+        fn log_record_oversize_fails_from_encoded_len_before_finalize() {
+            let payload = vec![0u8; MAX_LOG_RECORD_BYTES - LOG_RECORD_HEADER_LEN + 1];
+            let draft = LogRecordDraft::catalog(1, 1, sample_ts(), payload);
+            assert!(draft.encoded_len().is_err());
         }
     }
 }

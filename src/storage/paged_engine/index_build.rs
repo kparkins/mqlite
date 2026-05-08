@@ -12,6 +12,7 @@
 
 use crate::error::{Error, Result, WriteConflictReason};
 use crate::index::IndexModel;
+use crate::journal::log_file::CatalogCommitKind;
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::catalog::{IndexEntry, IndexState};
@@ -124,6 +125,7 @@ impl PagedEngine {
             None
         };
 
+        let catalog_generation_before = self.shared.published.load_full().catalog_generation;
         let reserved_gen = self
             .shared
             .next_catalog_gen
@@ -134,97 +136,77 @@ impl PagedEngine {
             .publish_sequencer
             .register_with_oracle(&self.shared.oracle)?;
 
-        let reserve_result = (|| -> Result<()> {
-            let _journal = self.lock_journal_mutex();
-            let mark = self.shared.handle.begin_txn()?;
-            let mut batch = StructuralPageBatch::new(&self.shared.handle);
+        let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
-            let body = (|| {
-                let mut cat = catalog_lock(&self.metadata_state);
-                if cat.get_collection(ns)?.is_none() {
-                    // Allocate a durable namespace id.
-                    let ns_id = cat.allocate_namespace_id();
-                    let data_root =
-                        cat.create_collection(ns, ns_id, bson::doc! {}, now_millis())?;
-                    drop(cat);
-                    sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
-                    let data_store = new_structural_store(&self.shared, &mut batch);
-                    BTree::create_at(data_store, data_root)?;
-                    cat = catalog_lock(&self.metadata_state);
-                    cat.get_collection(ns)?.ok_or_else(|| {
-                        Error::Internal(format!(
-                            "collection '{}' missing after index bootstrap",
-                            ns
-                        ))
-                    })?;
-                }
-
-                // Allocate a durable index id.
-                let ns_id = cat
-                    .get_collection(ns)?
-                    .ok_or_else(|| {
-                        Error::Internal(format!(
-                            "collection '{}' missing before index reservation",
-                            ns
-                        ))
-                    })?
-                    .id;
-                let idx_id = cat.allocate_index_id();
-                let idx_root = cat.create_index(ns, idx_id, model, name)?;
-                // `catalog.create_index` defaults `state` to `Ready`. Flip
-                // to `Building` so the published snapshot marks this index
-                // as not-yet-queryable.
-                let mut entry = cat
-                    .get_index(ns, name)?
-                    .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
-                entry.state = IndexState::Building;
-                cat.update_index(&entry)?;
-                reservation = Some(CreateIndexReservation {
-                    ns_id,
-                    index_id: entry.id,
-                    root_page: entry.root_page,
-                    root_level: entry.root_level,
-                });
+        let body = (|| {
+            let mut cat = catalog_lock(&self.metadata_state);
+            if cat.get_collection(ns)?.is_none() {
+                // Allocate a durable namespace id.
+                let ns_id = cat.allocate_namespace_id();
+                let data_root = cat.create_collection(ns, ns_id, bson::doc! {}, now_millis())?;
                 drop(cat);
                 sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
-
-                // Initialize the freshly-allocated leaf page so the index
-                // tree is valid to open for writes during the build step.
-                let idx_store = new_structural_store(&self.shared, &mut batch);
-                BTree::create_at(idx_store, idx_root)?;
-                Ok(())
-            })();
-
-            match body {
-                Ok(()) => {
-                    let mut base_store = new_store(&self.shared);
-                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
-                    commit_result.map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    self.flush_under_journal_mutex().map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = batch.abort(&self.shared.handle);
-                    let _ = self.shared.handle.rollback_txn(mark);
-                    Err(e)
-                }
+                let data_store = new_structural_store(&self.shared, &mut batch);
+                BTree::create_at(data_store, data_root)?;
+                cat = catalog_lock(&self.metadata_state);
+                cat.get_collection(ns)?.ok_or_else(|| {
+                    Error::Internal(format!("collection '{}' missing after index bootstrap", ns))
+                })?;
             }
+
+            // Allocate a durable index id.
+            let ns_id = cat
+                .get_collection(ns)?
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "collection '{}' missing before index reservation",
+                        ns
+                    ))
+                })?
+                .id;
+            let idx_id = cat.allocate_index_id();
+            let idx_root = cat.create_index(ns, idx_id, model, name)?;
+            // `catalog.create_index` defaults `state` to `Ready`. Flip
+            // to `Building` so the published snapshot marks this index
+            // as not-yet-queryable.
+            let mut entry = cat
+                .get_index(ns, name)?
+                .ok_or_else(|| Error::Internal("index entry missing after create".into()))?;
+            entry.state = IndexState::Building;
+            cat.update_index(&entry)?;
+            reservation = Some(CreateIndexReservation {
+                ns_id,
+                index_id: entry.id,
+                root_page: entry.root_page,
+                root_level: entry.root_level,
+            });
+            drop(cat);
+            sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
+
+            // Initialize the freshly-allocated leaf page so the index
+            // tree is valid to open for writes during the build step.
+            let idx_store = new_structural_store(&self.shared, &mut batch);
+            BTree::create_at(idx_store, idx_root)?;
+            Ok(())
         })();
 
-        if let Err(e) = reserve_result {
-            if matches!(e, Error::EngineFatal { .. }) {
-                return Err(e);
-            }
+        if let Err(e) = body {
+            let _ = batch.abort(&self.shared.handle);
             self.shared.publish_sequencer.mark_aborted(slot);
             return Err(e);
+        }
+
+        if let Err(error) = self.commit_catalog_batch_to_log(
+            CatalogCommitKind::IndexReserve,
+            catalog_generation_before,
+            reserved_gen,
+            &slot,
+            batch,
+        ) {
+            if !matches!(error, Error::EngineFatal { .. }) {
+                self.shared.publish_sequencer.mark_aborted(slot);
+            }
+            return Err(error);
         }
 
         let dirty = PublishDirty {
@@ -246,7 +228,9 @@ impl PagedEngine {
                 )
             });
         match publish_result {
-            Ok(()) => {}
+            Ok(()) => {
+                self.maybe_sync_interval_after_publish()?;
+            }
             Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_) => {
                 return Err(self
@@ -410,29 +394,38 @@ impl PagedEngine {
 
         match body {
             Ok(()) => {
-                // Commit the build txn. No timestamp is allocated (the
-                // build step has no primary writes), and no publish is
-                // performed. The data flush still runs under
-                // `journal_mutex` so all page-store flush paths share the
-                // same rollback/persist exclusion.
-                let mut base = new_store(&self.shared);
-                if let Err(e) = batch.commit(&mut base, &self.shared.handle) {
-                    return Err(match e {
-                        Error::EngineFatal { reason } => Error::EngineFatal { reason },
-                        _ => self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        ),
-                    });
+                let catalog_generation = self.shared.published.load_full().catalog_generation;
+                let slot = self
+                    .shared
+                    .publish_sequencer
+                    .register_with_oracle(&self.shared.oracle)?;
+                if let Err(error) = self.commit_catalog_batch_to_log(
+                    CatalogCommitKind::IndexBuild,
+                    catalog_generation,
+                    catalog_generation,
+                    &slot,
+                    batch,
+                ) {
+                    if !matches!(error, Error::EngineFatal { .. }) {
+                        self.shared.publish_sequencer.mark_aborted(slot);
+                    }
+                    return Err(error);
                 }
-                {
-                    let _journal = self.lock_journal_mutex();
-                    if let Err(e) = self.flush_under_journal_mutex() {
-                        return Err(match e {
-                            Error::EngineFatal { reason } => Error::EngineFatal { reason },
-                            _ => self.engine_fatal(
-                                crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                            ),
-                        });
+                let publish_result = self
+                    .shared
+                    .publish_sequencer
+                    .mark_ready(slot, |_publish_ts| Ok(()));
+                match publish_result {
+                    Ok(()) => {
+                        self.maybe_sync_interval_after_publish()?;
+                    }
+                    Err(Error::EngineFatal { reason }) => {
+                        return Err(Error::EngineFatal { reason });
+                    }
+                    Err(_) => {
+                        return Err(self.engine_fatal(
+                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
+                        ));
                     }
                 }
                 Ok(())
@@ -504,6 +497,7 @@ impl PagedEngine {
             }
         }
 
+        let catalog_generation_before = self.shared.published.load_full().catalog_generation;
         let reserved_gen = self
             .shared
             .next_catalog_gen
@@ -514,72 +508,49 @@ impl PagedEngine {
             .publish_sequencer
             .register_with_oracle(&self.shared.oracle)?;
 
-        let mut durable = false;
-        let commit_result = (|| -> Result<()> {
-            let _journal = self.lock_journal_mutex();
-            let mark = self.shared.handle.begin_txn()?;
-            let mut batch = StructuralPageBatch::new(&self.shared.handle);
+        let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
-            let body = (|| -> Result<()> {
-                {
-                    let mut cat = catalog_lock(&self.metadata_state);
-                    let collection =
-                        cat.get_collection(ns)?
-                            .ok_or_else(|| Error::CollectionNotFound {
-                                name: ns.to_owned(),
-                            })?;
-                    if collection.id != target.ns_id {
-                        return Err(stale_target());
-                    }
-                    let mut entry = cat.get_index(ns, name)?.ok_or_else(stale_target)?;
-                    if entry.id != target.index_id || entry.state != IndexState::Building {
-                        return Err(stale_target());
-                    }
-                    entry.state = IndexState::Ready;
-                    if !cat.update_index(&entry)? {
-                        return Err(stale_target());
-                    }
+        let body = (|| -> Result<()> {
+            {
+                let mut cat = catalog_lock(&self.metadata_state);
+                let collection =
+                    cat.get_collection(ns)?
+                        .ok_or_else(|| Error::CollectionNotFound {
+                            name: ns.to_owned(),
+                        })?;
+                if collection.id != target.ns_id {
+                    return Err(stale_target());
                 }
-                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
-                Ok(())
-            })();
-
-            match body {
-                Ok(()) => {
-                    let mut base_store = new_store(&self.shared);
-                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
-                    commit_result.map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    self.flush_under_journal_mutex().map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    durable = true;
-                    Ok(())
+                let mut entry = cat.get_index(ns, name)?.ok_or_else(stale_target)?;
+                if entry.id != target.index_id || entry.state != IndexState::Building {
+                    return Err(stale_target());
                 }
-                Err(e) => {
-                    let _ = batch.abort(&self.shared.handle);
-                    let _ = self.shared.handle.rollback_txn(mark);
-                    Err(e)
+                entry.state = IndexState::Ready;
+                if !cat.update_index(&entry)? {
+                    return Err(stale_target());
                 }
             }
+            sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
+            Ok(())
         })();
 
-        match commit_result {
-            Ok(()) => {}
-            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
-            Err(_e) if durable => {
-                return Err(self
-                    .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));
-            }
-            Err(e) => {
+        if let Err(e) = body {
+            let _ = batch.abort(&self.shared.handle);
+            self.shared.publish_sequencer.mark_aborted(slot);
+            return Err(e);
+        }
+
+        if let Err(error) = self.commit_catalog_batch_to_log(
+            CatalogCommitKind::IndexBuildCommit,
+            catalog_generation_before,
+            reserved_gen,
+            &slot,
+            batch,
+        ) {
+            if !matches!(error, Error::EngineFatal { .. }) {
                 self.shared.publish_sequencer.mark_aborted(slot);
-                return Err(e);
             }
+            return Err(error);
         }
 
         let dirty = PublishDirty {
@@ -601,7 +572,9 @@ impl PagedEngine {
                 )
             });
         match publish_result {
-            Ok(()) => {}
+            Ok(()) => {
+                self.maybe_sync_interval_after_publish()?;
+            }
             Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_) => {
                 return Err(self
@@ -762,6 +735,7 @@ impl PagedEngine {
             index
         };
 
+        let catalog_generation_before = self.shared.published.load_full().catalog_generation;
         let reserved_gen = self
             .shared
             .next_catalog_gen
@@ -772,67 +746,44 @@ impl PagedEngine {
             .publish_sequencer
             .register_with_oracle(&self.shared.oracle)?;
 
-        let mut durable = false;
-        let cleanup_result = (|| -> Result<()> {
-            let _journal = self.lock_journal_mutex();
-            let mark = self.shared.handle.begin_txn()?;
-            let mut batch = StructuralPageBatch::new(&self.shared.handle);
+        let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
-            let body = (|| -> Result<()> {
-                self.free_index_pages_exclusive(&mut batch, &target_index)?;
-                {
-                    let mut cat = catalog_lock(&self.metadata_state);
-                    let removed = cat.drop_index(ns, name)?;
-                    if !removed {
-                        return Ok(());
-                    }
-                }
-                sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
-                self.shared.clear_dirty_tree(&TreeIdent {
-                    collection_id: target.ns_id,
-                    kind: TreeKind::Secondary {
-                        index_id: target.index_id,
-                    },
-                });
-                Ok(())
-            })();
-
-            match body {
-                Ok(()) => {
-                    let mut base_store = new_store(&self.shared);
-                    let commit_result = batch.commit(&mut base_store, &self.shared.handle);
-                    commit_result.map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    self.flush_under_journal_mutex().map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurableDdlPublishFailure,
-                        )
-                    })?;
-                    durable = true;
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = batch.abort(&self.shared.handle);
-                    let _ = self.shared.handle.rollback_txn(mark);
-                    Err(e)
+        let body = (|| -> Result<()> {
+            self.free_index_pages_exclusive(&mut batch, &target_index)?;
+            {
+                let mut cat = catalog_lock(&self.metadata_state);
+                let removed = cat.drop_index(ns, name)?;
+                if !removed {
+                    return Ok(());
                 }
             }
+            sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
+            self.shared.clear_dirty_tree(&TreeIdent {
+                collection_id: target.ns_id,
+                kind: TreeKind::Secondary {
+                    index_id: target.index_id,
+                },
+            });
+            Ok(())
         })();
 
-        match cleanup_result {
-            Ok(()) => {}
-            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
-            Err(_e) if durable => {
-                return Err(self
-                    .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure));
-            }
-            Err(e) => {
+        if let Err(e) = body {
+            let _ = batch.abort(&self.shared.handle);
+            self.shared.publish_sequencer.mark_aborted(slot);
+            return Err(e);
+        }
+
+        if let Err(error) = self.commit_catalog_batch_to_log(
+            CatalogCommitKind::IndexCleanup,
+            catalog_generation_before,
+            reserved_gen,
+            &slot,
+            batch,
+        ) {
+            if !matches!(error, Error::EngineFatal { .. }) {
                 self.shared.publish_sequencer.mark_aborted(slot);
-                return Err(e);
             }
+            return Err(error);
         }
 
         let dirty = PublishDirty {
@@ -854,7 +805,9 @@ impl PagedEngine {
                 )
             });
         match publish_result {
-            Ok(()) => {}
+            Ok(()) => {
+                self.maybe_sync_interval_after_publish()?;
+            }
             Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
             Err(_) => {
                 return Err(self

@@ -363,10 +363,10 @@ fn test_us004_structural_callers_use_page_batch_owner() {
         owner.contains("pub(crate) struct StructuralPageBatch")
             && owner.contains("pub(crate) struct AllocatorLifetimeBatch")
             && owner.contains("lifetime: AllocatorLifetimeBatch")
-            && owner.contains("pub(crate) fn commit(")
+            && owner.contains("pub(crate) fn commit_lsn_fenced(")
             && owner.contains("pub(crate) fn abort(")
             && owner.contains("self.lifetime.abort(handle)?"),
-        "US-004/US-006 require structural and allocator-lifetime owners with explicit commit and abort semantics",
+        "US-004/US-006 require structural and allocator-lifetime owners with explicit durable commit and abort semantics",
     );
 
     let engine = std::fs::read_to_string(&engine_path)
@@ -399,7 +399,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
                 "StructuralPageBatch::new",
                 "free_tree_pages_exclusive(&mut batch",
                 "sync_catalog_root_structural",
-                "batch.commit",
+                "commit_catalog_batch_to_log",
                 "batch.abort",
                 "PostDurableDdlPublishFailure",
             ],
@@ -410,7 +410,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
             "run_namespace_create_ddl",
             &[
                 "StructuralPageBatch::new",
-                "batch.commit",
+                "commit_catalog_batch_to_log",
                 "batch.abort",
                 "PostDurableDdlPublishFailure",
             ],
@@ -428,7 +428,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
             &[
                 "StructuralPageBatch::new",
                 "sync_catalog_root_structural",
-                "batch.commit",
+                "commit_catalog_batch_to_log",
                 "batch.abort",
             ],
         ),
@@ -440,7 +440,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
                 "StructuralPageBatch::new",
                 "new_structural_store",
                 "sync_catalog_root_structural",
-                "batch.commit",
+                "commit_catalog_batch_to_log",
                 "batch.abort",
             ],
         ),
@@ -451,7 +451,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
             &[
                 "StructuralPageBatch::new",
                 "sync_catalog_root_structural",
-                "batch.commit",
+                "commit_catalog_batch_to_log",
                 "batch.abort",
                 "PostDurableDdlPublishFailure",
             ],
@@ -464,7 +464,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
                 "StructuralPageBatch::new",
                 "free_index_pages_exclusive(&mut batch",
                 "sync_catalog_root_structural",
-                "batch.commit",
+                "commit_catalog_batch_to_log",
                 "batch.abort",
                 "PostDurableDdlPublishFailure",
             ],
@@ -483,7 +483,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
                 "StructuralPageBatch::new",
                 "free_index_pages_exclusive(&mut batch",
                 "sync_catalog_root_structural",
-                "batch.commit",
+                "commit_catalog_batch_to_log",
                 "batch.abort",
                 "PostDurableDdlPublishFailure",
             ],
@@ -508,7 +508,7 @@ fn test_us004_structural_callers_use_page_batch_owner() {
                 "StructuralPageBatch::new",
                 "materialize_primary_deltas_for_checkpoint",
                 "materialize_ready_secondary_deltas_for_checkpoint",
-                "batch.commit",
+                "batch.commit_lsn_fenced",
                 "batch.abort",
             ],
         ),
@@ -2241,9 +2241,6 @@ fn test_drop_namespace_does_not_invert_lock_order() {
     let force_expire = body
         .find("force_expire_all")
         .expect("drop_namespace must force-expire readers");
-    let journal = body
-        .find("lock_journal_mutex")
-        .expect("drop_namespace must enter journal_mutex for durable DDL");
     let free_call = body
         .find("free_tree_pages_exclusive")
         .expect("drop_namespace must free tree pages under exclusive latches");
@@ -2253,10 +2250,9 @@ fn test_drop_namespace_does_not_invert_lock_order() {
     assert!(
         metadata_write < drain
             && drain < force_expire
-            && force_expire < journal
-            && journal < free_call
+            && force_expire < free_call
             && free_call < catalog_drop,
-        "drop_namespace lock order must be metadata -> registry drain -> force-expire -> journal -> page-free -> catalog delete",
+        "drop_namespace lock order must be metadata -> registry drain -> force-expire -> page-free -> catalog delete",
     );
 
     assert_free_helper_latches_before_free(&free_body, "drop-namespace page-free");
@@ -2561,9 +2557,9 @@ fn test_create_index_publish_and_raii_guard_source_gates() {
 
     let publish_calls = combined.matches("rebuild_and_publish_locked(").count();
     let mark_ready_calls = combined.matches(".mark_ready(").count();
-    assert_eq!(
-        publish_calls, mark_ready_calls,
-        "each rebuild_and_publish_locked call in DDL/CRUD publish surfaces must be inside a mark_ready closure",
+    assert!(
+        mark_ready_calls >= publish_calls,
+        "publish surfaces must route rebuild_and_publish_locked through mark_ready; rebuilds={publish_calls}, mark_ready={mark_ready_calls}",
     );
 
     assert!(

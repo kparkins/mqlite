@@ -132,6 +132,10 @@ fn append_durable_boundary(fixture: &BoundaryFixture) -> Result<FileHeader> {
             .fetch_page(CHECKPOINT_PAGE, PageSize::Large32k)?;
         page.data_mut().fill(CHECKPOINT_FILL);
     }
+    let checkpoint_applied_lsn = fixture.handle.current_journal_durable_lsn()?;
+    fixture
+        .handle
+        .stamp_unflushable_dirty_pages_lsn(checkpoint_applied_lsn)?;
     let batch_id = fixture.handle.next_checkpoint_batch_id()?;
     let flush_set = CheckpointFlushSet::new(
         batch_id,

@@ -26,7 +26,6 @@ use crate::storage::reconcile::plan::{DirtyReason, LeafState, TreeIdent};
 use crate::storage::root_snapshot::PublishedEpoch;
 
 use super::catalog_ops::catalog_lock;
-use super::group_commit::GroupCommitManager;
 use super::publish::build_published_catalog;
 use super::publish_sequencer::PublishSequencer;
 use super::recovery_apply::{
@@ -206,15 +205,6 @@ pub(crate) struct SharedState {
     /// before taking the freeze window; CRUD writers enter here before
     /// namespace admission and drop the token after publish or abort.
     pub(crate) checkpoint_admission: Arc<CheckpointAdmissionGate>,
-    /// Journal-envelope mutex. Namespace-create DDL paths use this so
-    /// bootstrap and standalone create can reserve a sequencer slot, complete
-    /// the durable envelope, release journal serialization, and only then
-    /// publish the catalog generation through `mark_ready`.
-    pub(crate) journal_mutex: parking_lot::Mutex<()>,
-    /// FullSync group-commit coordinator. Ordinary CRUD writers append their
-    /// durable journal records under `journal_mutex`, then join a short fsync
-    /// cohort before any Pending entry can flip to Committed or publish.
-    pub(crate) group_commit: GroupCommitManager,
     /// Stale-SMO classification retry cap.
     pub(crate) smo_classification_retry_cap: u32,
     /// Monotonic transaction identifier source shared by readers and writers.
@@ -260,16 +250,18 @@ pub(crate) struct SharedState {
     /// Test-only US-026 one-shot post-register cleanup failpoint.
     #[cfg(any(test, feature = "test-hooks"))]
     pub us026_post_register_failpoint: AtomicU8,
-    /// Test-only US-026 flag that forces cleanup rollback to report a
-    /// failure after the real rollback work runs.
+    /// Test-only Phase 8 failure injected after log reservation and before
+    /// dirty pages can be stamped with the reserved record's end LSN.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub us026_force_cleanup_rollback_failure: AtomicU8,
-    /// Test-only US-026 cleanup rollback attempts.
+    pub phase8_fail_next_dirty_lsn_stamp: AtomicU8,
+    /// Test-only Phase 8 failure injected after dirty pages are stamped with
+    /// the reserved record's end LSN and before the record bytes are written.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub us026_cleanup_rollback_attempts: AtomicU64,
-    /// Test-only US-026 forced rollback failure returns.
+    pub phase8_fail_next_after_dirty_lsn_stamp: AtomicU8,
+    /// Test-only Phase 8 failure injected after the commit record is durable
+    /// and before Pending heads flip to Committed.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub us026_forced_rollback_failures: AtomicU64,
+    pub phase8_fail_next_after_durable_before_flip: AtomicU8,
     /// Test-only namespace-keyed write-body entry rendezvous hooks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub write_body_entry_hooks: std::sync::Mutex<
@@ -278,6 +270,11 @@ pub(crate) struct SharedState {
             std::collections::VecDeque<super::test_accessors::WriteBodyEntryHook>,
         >,
     >,
+    /// Test-only one-shot pause after Pending install and before log
+    /// reservation.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub phase8_before_reservation_hook:
+        std::sync::Mutex<Option<super::test_accessors::Phase8BeforeReservationHook>>,
     /// Test-only create-index build-scan rendezvous hooks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub create_index_build_hooks: std::sync::Mutex<
@@ -289,11 +286,6 @@ pub(crate) struct SharedState {
     /// Monotonic ids for test-only write-body entry hooks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub write_body_entry_hook_next_id: AtomicU64,
-    /// Test-only hooks consumed after `begin_txn` while `journal_mutex`
-    /// is held.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us007_journal_begin_hooks:
-        std::sync::Mutex<std::collections::VecDeque<super::test_accessors::Us007JournalBeginHook>>,
 }
 
 impl SharedState {
@@ -421,7 +413,7 @@ impl SharedState {
     }
 }
 
-/// Poison the live engine after a post-`journal_mutex` failure and
+/// Poison the live engine after a post-durable commit failure and
 /// return [`Error::EngineFatal`] with `reason`.
 ///
 /// §10.19.0 C-2 / US-036 escalation helper:
@@ -507,9 +499,10 @@ impl Drop for ReadOpScope {
 /// `Mutex<Catalog>`.
 ///
 /// CRUD order: `metadata.read()` is held across the private write body,
-/// resident-chain mutation, durable envelope, and ordered publish. Page latches
-/// protect resident-chain mutation, `journal_mutex` owns the durable envelope,
-/// and `PublishSequencer` publishes slots in order. DO NOT grab
+/// resident-chain mutation, durable log envelope, and ordered publish. Page
+/// latches protect resident-chain mutation, the Phase 8 log manager owns
+/// byte-LSN reservation/durability, and `PublishSequencer` publishes slots in
+/// order. DO NOT grab
 /// `metadata.write()` while holding the catalog mutex; that would invert the
 /// order relative to a reader that already holds `metadata.read()` and is
 /// waiting for the catalog mutex.
@@ -693,6 +686,13 @@ impl MetadataState {
         // `successor()` (saturated `Ts::MAX`) is a hard error per plan.
         let oracle = TimestampOracle::new();
         let recovered_max_commit_ts = handle.recovered_max_commit_ts()?;
+        let recovered_max_publish_seq = handle.recovered_max_publish_seq()?;
+        let next_publish_seq = match recovered_max_publish_seq {
+            Some(seq) => seq.checked_add(1).ok_or_else(|| {
+                Error::Internal("recovered publish_seq floor overflows u64".into())
+            })?,
+            None => 1,
+        };
         if let Some(max_ts) = recovered_max_commit_ts {
             match max_ts.successor() {
                 Some(next) => oracle.set_min(next),
@@ -743,18 +743,16 @@ impl MetadataState {
             oracle,
             published: ArcSwap::from_pointee(initial_epoch),
             engine_poisoned: PlMutex::new(None),
-            // §10.29 rule 3 / §10.19 C-1: reopen recovery initializes
-            // the lock-free `published_frontier` with the recovered HLC
-            // floor while leaving the dense `publish_seq` window fresh
-            // (`next_seq = 1`, `last_published = 0`, empty `pending`).
-            // A fresh DB passes `Ts::default()` here.
-            publish_sequencer: PublishSequencer::new_from(
+            // Phase 8 recovery initializes the lock-free
+            // `published_frontier` with the recovered HLC floor and starts
+            // the live `publish_seq` window above the highest accepted
+            // non-control record. A fresh DB uses the default floors.
+            publish_sequencer: PublishSequencer::new_from_recovered_floors(
                 recovered_max_commit_ts.unwrap_or_default(),
+                next_publish_seq,
             ),
             ns_writers: Arc::new(NsWriterRegistry::new()),
             checkpoint_admission: Arc::new(CheckpointAdmissionGate::new()),
-            journal_mutex: parking_lot::Mutex::new(()),
-            group_commit: GroupCommitManager::new(),
             smo_classification_retry_cap,
             txn_counter: AtomicU64::new(1),
             // §10.17.1 — start the DDL reservation counter at the live
@@ -782,19 +780,19 @@ impl MetadataState {
             #[cfg(any(test, feature = "test-hooks"))]
             us026_post_register_failpoint: AtomicU8::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
-            us026_force_cleanup_rollback_failure: AtomicU8::new(0),
+            phase8_fail_next_dirty_lsn_stamp: AtomicU8::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
-            us026_cleanup_rollback_attempts: AtomicU64::new(0),
+            phase8_fail_next_after_dirty_lsn_stamp: AtomicU8::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
-            us026_forced_rollback_failures: AtomicU64::new(0),
+            phase8_fail_next_after_durable_before_flip: AtomicU8::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             write_body_entry_hooks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            phase8_before_reservation_hook: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             create_index_build_hooks: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(any(test, feature = "test-hooks"))]
             write_body_entry_hook_next_id: AtomicU64::new(1),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us007_journal_begin_hooks: std::sync::Mutex::new(std::collections::VecDeque::new()),
         });
         let weak_shared = Arc::downgrade(&shared);
         shared

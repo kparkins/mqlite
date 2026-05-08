@@ -139,7 +139,7 @@ fn structural_batch_commit_frees_deferred_lifetime_page() {
     assert_eq!(handle.allocator().page_lifetime_queue().depth(), 0);
 
     let mut base = BufferPoolPageStore::new(Arc::clone(&handle));
-    batch.commit(&mut base, &handle).unwrap();
+    batch.commit_lsn_fenced(&mut base, &handle, 1).unwrap();
 
     let header = handle.allocator().with_header(Clone::clone).unwrap();
     assert_eq!(header.free_list_head_32k, 7);
