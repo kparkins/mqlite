@@ -1,7 +1,6 @@
 //! Phase 5 US-010 structural-modification classification and latch planning.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use crate::error::{Error, Result, WriteConflictReason};
 use crate::mvcc::{PrimaryOp, SecIndexOp};
@@ -138,7 +137,7 @@ pub(crate) fn classify_write(
         op: op.clone(),
         unique_prefix_range: None,
     };
-    let shape = classify_leaf_bytes(data.as_slice(), false, &[], &target)?;
+    let shape = classify_leaf_bytes(data.as_slice(), false, &target)?;
     #[cfg(any(test, feature = "test-hooks"))]
     super::smo_classification_observations::record_classification("shared", &shape);
     #[cfg(any(test, feature = "test-hooks"))]
@@ -204,14 +203,9 @@ fn plan_targets(shared: &SharedState, targets: &[SmoWriteTarget]) -> Result<Vec<
         let leaf = path
             .last()
             .ok_or_else(|| Error::Internal("empty B-tree path".into()))?;
-        let shape = classify_write_from_leaf(
-            shared,
-            leaf.page_id,
-            target.root_level == 0,
-            &path,
-            target,
-            "shared",
-        )?;
+        let leaf_page = leaf.page_id;
+        let is_root_leaf = target.root_level == 0;
+        let shape = classify_write_from_leaf(shared, leaf_page, is_root_leaf, target)?;
         planned.push(PlannedWrite {
             target: target.clone(),
             path,
@@ -225,26 +219,17 @@ fn classify_write_from_leaf(
     shared: &SharedState,
     leaf: u32,
     is_root_leaf: bool,
-    path: &[BTreePathStep],
     target: &SmoWriteTarget,
-    phase: &'static str,
 ) -> Result<WriteShape> {
-    let _page = if phase == "shared" {
-        Some(shared.handle.pool().pin_for_read(leaf)?)
-    } else {
-        None
-    };
-    let snapshot = _page
-        .as_ref()
-        .map(LatchedPinnedPage::data_snapshot)
-        .unwrap_or_else(|| Arc::new(Vec::new()));
+    let page = shared.handle.pool().pin_for_read(leaf)?;
+    let snapshot = page.data_snapshot();
     let data = snapshot.as_slice();
-    let shape = classify_leaf_bytes(data, is_root_leaf, path, target)?;
+    let shape = classify_leaf_bytes(data, is_root_leaf, target)?;
     #[cfg(any(test, feature = "test-hooks"))]
     {
-        super::smo_classification_observations::record_classification(phase, &shape);
+        super::smo_classification_observations::record_classification("shared", &shape);
         if let Some(override_shape) =
-            super::smo_classification_observations::override_classification(phase)
+            super::smo_classification_observations::override_classification("shared")
         {
             return Ok(override_shape);
         }
@@ -255,7 +240,6 @@ fn classify_write_from_leaf(
 fn classify_leaf_bytes(
     data: &[u8],
     is_root_leaf: bool,
-    _path: &[BTreePathStep],
     target: &SmoWriteTarget,
 ) -> Result<WriteShape> {
     if let Some((start, end)) = &target.unique_prefix_range {
@@ -371,8 +355,8 @@ fn reclassify_exclusive(
             .ok_or_else(|| Error::Internal(format!("missing exclusive page {leaf}")))?;
         let snapshot = page.data_snapshot();
         let data = snapshot.as_slice();
-        let shape =
-            classify_leaf_bytes(data, plan.target.root_level == 0, &plan.path, &plan.target)?;
+        let is_root_leaf = plan.target.root_level == 0;
+        let shape = classify_leaf_bytes(data, is_root_leaf, &plan.target)?;
         #[cfg(any(test, feature = "test-hooks"))]
         {
             super::smo_classification_observations::record_classification("exclusive", &shape);

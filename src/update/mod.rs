@@ -54,11 +54,6 @@ pub(crate) fn apply_update(doc: &mut Document, update: &Document, is_insert: boo
             "$set" | "$unset" | "$inc" | "$mul" | "$rename" | "$min" | "$max" | "$push"
             | "$pull" | "$pullAll" | "$addToSet" | "$pop" | "$currentDate" | "$setOnInsert" => {} // supported — fall through to args parse
 
-            "$bit" => {
-                return Err(Error::UnsupportedOperator {
-                    operator: "$bit".into(),
-                });
-            }
             other if other.starts_with('$') => {
                 return Err(Error::UnsupportedOperator {
                     operator: other.to_owned(),
@@ -78,22 +73,22 @@ pub(crate) fn apply_update(doc: &mut Document, update: &Document, is_insert: boo
         })?;
 
         match op.as_str() {
-            "$set" => apply_set(doc, args_doc)?,
-            "$unset" => apply_unset(doc, args_doc)?,
+            "$set" => apply_set(doc, args_doc),
+            "$unset" => apply_unset(doc, args_doc),
             "$inc" => apply_inc(doc, args_doc)?,
             "$mul" => apply_mul(doc, args_doc)?,
             "$rename" => apply_rename(doc, args_doc)?,
-            "$min" => apply_min(doc, args_doc)?,
-            "$max" => apply_max(doc, args_doc)?,
+            "$min" => apply_min(doc, args_doc),
+            "$max" => apply_max(doc, args_doc),
             "$push" => apply_push(doc, args_doc)?,
-            "$pull" => apply_pull(doc, args_doc)?,
+            "$pull" => apply_pull(doc, args_doc),
             "$pullAll" => apply_pull_all(doc, args_doc)?,
             "$addToSet" => apply_add_to_set(doc, args_doc)?,
             "$pop" => apply_pop(doc, args_doc)?,
-            "$currentDate" => apply_current_date(doc, args_doc)?,
+            "$currentDate" => apply_current_date(doc, args_doc),
             "$setOnInsert" => {
                 if is_insert {
-                    apply_set(doc, args_doc)?;
+                    apply_set(doc, args_doc);
                 }
             }
             _ => {
@@ -208,22 +203,20 @@ fn numeric_result(existing: Option<&Bson>, result: f64) -> Bson {
 // $set
 // ---------------------------------------------------------------------------
 
-fn apply_set(doc: &mut Document, args: &Document) -> Result<()> {
+fn apply_set(doc: &mut Document, args: &Document) {
     for (path, value) in args {
         set_nested(doc, path, value.clone());
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // $unset
 // ---------------------------------------------------------------------------
 
-fn apply_unset(doc: &mut Document, args: &Document) -> Result<()> {
+fn apply_unset(doc: &mut Document, args: &Document) {
     for (path, _) in args {
         remove_nested(doc, path);
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +289,7 @@ fn bson_cmp(a: &Bson, b: &Bson) -> std::cmp::Ordering {
     encode_key(a).cmp(&encode_key(b))
 }
 
-fn apply_min(doc: &mut Document, args: &Document) -> Result<()> {
+fn apply_min(doc: &mut Document, args: &Document) {
     for (path, new_val) in args {
         let should_set = match get_nested_field(doc, path) {
             None => true,
@@ -306,10 +299,9 @@ fn apply_min(doc: &mut Document, args: &Document) -> Result<()> {
             set_nested(doc, path, new_val.clone());
         }
     }
-    Ok(())
 }
 
-fn apply_max(doc: &mut Document, args: &Document) -> Result<()> {
+fn apply_max(doc: &mut Document, args: &Document) {
     for (path, new_val) in args {
         let should_set = match get_nested_field(doc, path) {
             None => true,
@@ -319,7 +311,6 @@ fn apply_max(doc: &mut Document, args: &Document) -> Result<()> {
             set_nested(doc, path, new_val.clone());
         }
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -496,7 +487,7 @@ fn slice_bson_array(arr: &mut Vec<Bson>, n: i64) {
 // $pull
 // ---------------------------------------------------------------------------
 
-fn apply_pull(doc: &mut Document, args: &Document) -> Result<()> {
+fn apply_pull(doc: &mut Document, args: &Document) {
     for (path, condition) in args {
         let field = get_nested_field(doc, path).cloned();
 
@@ -509,7 +500,6 @@ fn apply_pull(doc: &mut Document, args: &Document) -> Result<()> {
         }
         // If field doesn't exist or isn't an array, $pull is a no-op.
     }
-    Ok(())
 }
 
 /// Returns `true` if `elem` matches the `$pull` condition.
@@ -629,7 +619,7 @@ fn apply_pop(doc: &mut Document, args: &Document) -> Result<()> {
 // $currentDate
 // ---------------------------------------------------------------------------
 
-fn apply_current_date(doc: &mut Document, args: &Document) -> Result<()> {
+fn apply_current_date(doc: &mut Document, args: &Document) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -656,7 +646,6 @@ fn apply_current_date(doc: &mut Document, args: &Document) -> Result<()> {
         };
         set_nested(doc, path, value);
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

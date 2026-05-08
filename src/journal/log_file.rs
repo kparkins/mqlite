@@ -1151,15 +1151,15 @@ fn invalid_log_record(detail: impl Into<String>) -> Error {
 }
 
 // ---------------------------------------------------------------------------
-// FrameKind
+// Frame kinds
 // ---------------------------------------------------------------------------
 //
-// The journal distinguishes legacy page-write commit frames from MVCC
-// `ChainCommit` frames used for version-chain installations. Byte layout
-// for `ChainCommit`:
+// Frame-kind bytes identify MVCC `ChainCommit` and logical-transaction frames.
+// Retired page-write records keep their original page-frame layout and do not
+// carry a frame-kind byte at a known position. Byte layout for `ChainCommit`:
 //
 //   offset  size  field
-//    0       1    frame_kind: u8 (0x02 = CHAIN_COMMIT; 0x01 = legacy commit)
+//    0       1    frame_kind: u8 (0x02 = CHAIN_COMMIT)
 //    1       3    reserved: [u8; 3] (MUST be 0)
 //    4       4    total_frame_bytes: u32 LE (length prefix)
 //    8       4    salt1: u32 LE
@@ -1170,13 +1170,6 @@ fn invalid_log_record(detail: impl Into<String>) -> Error {
 //   32+N     4    page_write_count: u32 LE
 //   36+N     M    page_writes[]
 //   36+N+M   4    checksum_crc32: u32 LE (covers bytes 0..36+N+M)
-
-/// Discriminant byte at offset 0 of a legacy page-write commit frame.
-///
-/// Retired page-write records do not carry this byte at a known position. The
-/// `ChainCommit` discriminant remains distinct from ordinary page identifiers.
-#[allow(dead_code)]
-pub(crate) const FRAME_KIND_LEGACY_COMMIT: u8 = 0x01;
 
 /// Frame-kind discriminant for MVCC chain-commit frames.
 #[allow(dead_code)]

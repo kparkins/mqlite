@@ -92,7 +92,7 @@ pub(crate) struct Us017LeaderGuard;
 
 impl Drop for Us017LeaderGuard {
     fn drop(&mut self) {
-        ACTIVE_LEADERS.fetch_sub(1, Ordering::AcqRel);
+        decrement_if_active(&ACTIVE_LEADERS);
     }
 }
 
@@ -100,7 +100,7 @@ pub(crate) struct Us017WaiterGuard;
 
 impl Drop for Us017WaiterGuard {
     fn drop(&mut self) {
-        ACTIVE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+        decrement_if_active(&ACTIVE_WAITERS);
     }
 }
 
@@ -232,4 +232,10 @@ fn update_max_active_leaders(active: u64) {
             Err(next) => current = next,
         }
     }
+}
+
+fn decrement_if_active(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        active.checked_sub(1)
+    });
 }

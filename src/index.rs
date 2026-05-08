@@ -50,11 +50,8 @@ impl IndexModel {
 impl<S> IndexModelBuilder<S> {
     /// Set the index options.
     #[must_use]
-    pub fn options(self, options: IndexOptions) -> IndexModelBuilder<S> {
-        IndexModelBuilder {
-            options,
-            state: self.state,
-        }
+    pub fn options(self, options: IndexOptions) -> Self {
+        Self { options, ..self }
     }
 }
 
@@ -70,14 +67,14 @@ impl IndexModelBuilder<NoKeys> {
 }
 
 impl IndexModelBuilder<HasKeys> {
-    /// Build the [`IndexModel`]. Infallible — the typestate guarantees keys are present.
+    /// Build the [`IndexModel`]. Infallible: the typestate guarantees keys are present.
     #[must_use]
     pub fn build(self) -> IndexModel {
-        let HasKeys(keys) = self.state;
-        IndexModel {
-            keys,
-            options: self.options,
-        }
+        let IndexModelBuilder {
+            options,
+            state: HasKeys(keys),
+        } = self;
+        IndexModel { keys, options }
     }
 }
 

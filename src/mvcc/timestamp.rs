@@ -61,8 +61,8 @@ impl Ts {
     pub fn successor(self) -> Option<Ts> {
         if self.logical < u32::MAX {
             Some(Ts {
-                physical_ms: self.physical_ms,
                 logical: self.logical + 1,
+                ..self
             })
         } else if self.physical_ms < u64::MAX {
             Some(Ts {
@@ -213,7 +213,7 @@ impl AtomicTs {
 /// Exposed publicly (read-only via `TimestampOracle::now`) so tests and
 /// recovery code can observe the oracle without round-tripping through
 /// `commit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HlcState {
     /// Last issued (or observed) physical millisecond.
     pub physical_ms: u64,
@@ -288,10 +288,7 @@ impl<C: WallClock> TimestampOracle<C> {
     #[must_use]
     pub fn with_clock(clock: C) -> Self {
         Self {
-            hlc: Mutex::new(HlcState {
-                physical_ms: 0,
-                logical: 0,
-            }),
+            hlc: Mutex::new(HlcState::default()),
             clock,
         }
     }

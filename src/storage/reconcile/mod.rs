@@ -1,7 +1,4 @@
-//! Phase 4 reconcile scaffolding.
-//!
-//! This module is intentionally narrow for US-001. Later stories fill in the
-//! planner, driver, and page synthesis behavior behind this module boundary.
+//! Reconcile planning, driving, and page synthesis.
 
 pub(crate) mod driver;
 pub(crate) mod plan;

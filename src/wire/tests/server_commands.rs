@@ -1062,7 +1062,6 @@ fn update_one_modifies_single_document() {
 #[test]
 fn update_many_modifies_all_matching() {
     let state = ServerState::default();
-    let cursors = dummy_cursors();
     handle_insert(
         &doc! { "insert": "multcoll", "documents": [{"x": 1i32}, {"x": 1i32}, {"x": 2i32}], "$db": "local" },
         &state,
@@ -2037,17 +2036,7 @@ fn create_indexes_numbers_correct_on_buffered_backend() {
     let db_path = dir.path().join("t21.mqlite");
     let client = Client::open(&db_path).expect("open buffered client");
 
-    // Build ServerState manually to wire the file-backed Client's inner
-    // into the CRUD handlers (mirrors ServerState::new_with_db).
-    let state = ServerState {
-        start_time: Arc::new(std::time::Instant::now()),
-        next_connection_id: Arc::new(AtomicI32::new(1)),
-        db_path: Some(db_path),
-        topology_process_id: ObjectId::new(),
-        database: Arc::clone(&client.inner),
-        #[cfg(test)]
-        _tempdir: None,
-    };
+    let state = ServerState::new_with_db(&client);
 
     let result = handle_create_indexes(
         &doc! {

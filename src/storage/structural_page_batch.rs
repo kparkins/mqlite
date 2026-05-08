@@ -102,10 +102,6 @@ pub(crate) struct HeaderCatalogRootBatch {
 }
 
 impl HeaderCatalogRootBatch {
-    fn new() -> Self {
-        Self::default()
-    }
-
     /// Mutate the allocator-owned file header and capture rollback metadata.
     pub(crate) fn update_header<F>(&mut self, handle: &BufferPoolHandle, f: F) -> Result<()>
     where
@@ -115,18 +111,10 @@ impl HeaderCatalogRootBatch {
             let before = CatalogRootHeaderState::from_header(header);
             f(header);
             let after = CatalogRootHeaderState::from_header(header);
-            self.capture_change_once(before, after);
+            if before != after && self.change.is_none() {
+                self.change = Some(HeaderChange { before, after });
+            }
         })
-    }
-
-    fn capture_change_once(
-        &mut self,
-        before: CatalogRootHeaderState,
-        after: CatalogRootHeaderState,
-    ) {
-        if before != after && self.change.is_none() {
-            self.change = Some(HeaderChange { before, after });
-        }
     }
 
     fn abort(self, handle: &BufferPoolHandle) -> Result<()> {
@@ -252,15 +240,6 @@ impl StructuralPageWrites {
     }
 
     pub(crate) fn commit_lsn_fenced(
-        self,
-        base: &mut BufferPoolPageStore,
-        handle: &BufferPoolHandle,
-        last_lsn: u64,
-    ) -> Result<()> {
-        self.commit_inner(base, handle, last_lsn)
-    }
-
-    fn commit_inner(
         mut self,
         base: &mut BufferPoolPageStore,
         handle: &BufferPoolHandle,
@@ -318,7 +297,7 @@ impl StructuralPageBatch {
         Self {
             writes: StructuralPageWrites::new(),
             lifetime: AllocatorLifetimeBatch::new(handle),
-            header: HeaderCatalogRootBatch::new(),
+            header: HeaderCatalogRootBatch::default(),
         }
     }
 

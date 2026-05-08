@@ -64,7 +64,7 @@ impl Client {
     /// Used by [`super::open`] after it has assembled the engine, buffer pool,
     /// and file lock.
     pub(super) fn from_inner(inner: Arc<ClientInner>) -> Self {
-        Client { inner }
+        Self { inner }
     }
 
     /// Get a handle to a named database.
@@ -143,14 +143,6 @@ impl Client {
     pub fn __phase8_bench_journal_sync_os_boundaries(&self) -> u64 {
         crate::journal::append_sync_observations::snapshot().journal_sync_os_boundaries
     }
-
-    // Test-only accessors (`__oracle_now`, `__published_visible_ts`,
-    // `__published_catalog_gen`, `__published_sequencer_frontier`,
-    // `__recovery_open_published_store_count`, `__recovered_max_commit_ts`,
-    // `__read_view_registry`) live in a dedicated module:
-    // `src/client/tests/hidden_accessors.rs`. Keeping them out of this file
-    // makes the boundary between production API and test scaffolding
-    // unambiguous.
 }
 
 impl Drop for Client {

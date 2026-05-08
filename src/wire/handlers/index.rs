@@ -1,9 +1,11 @@
 // === Command handlers: index operations ===
 
-use bson::{doc, Document};
+use bson::{doc, Bson, Document};
 
 use super::super::errors::{err_bad_value, err_from_mqlite};
 use super::super::server::ServerState;
+use crate::index::IndexModel;
+use crate::options::IndexOptions;
 
 /// Extract the database name from a command body's `$db` field.
 fn extract_db_name(body: &Document) -> String {
@@ -32,12 +34,13 @@ fn qualified_coll(body: &Document, coll_name: &str) -> String {
 /// index (always present in every MongoDB collection).
 pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Document {
     let coll_name = match body.get_str("createIndexes") {
-        Ok(s) => s.to_owned(),
+        Ok(s) => s,
         Err(_) => return err_bad_value("createIndexes requires a collection name string"),
     };
+    let namespace = qualified_coll(body, coll_name);
 
     let indexes_arr = match body.get_array("indexes") {
-        Ok(arr) => arr.clone(),
+        Ok(arr) => arr,
         Err(_) => return err_bad_value("createIndexes requires an \"indexes\" array"),
     };
 
@@ -45,11 +48,11 @@ pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Doc
     // Add 1 for the always-present synthetic `_id_` index.
     let num_before = state
         .database
-        .list_indexes(&qualified_coll(body, &coll_name))
+        .list_indexes(&namespace)
         .map(|idxs| idxs.len() as i32 + 1)
         .unwrap_or(1);
 
-    for idx_bson in &indexes_arr {
+    for idx_bson in indexes_arr {
         let spec = match idx_bson.as_document() {
             Some(d) => d,
             None => continue,
@@ -67,7 +70,7 @@ pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Doc
             return err_bad_value("cannot manually create _id_ index");
         }
 
-        let mut opts = crate::options::IndexOptions::new();
+        let mut opts = IndexOptions::new();
         if let Ok(b) = spec.get_bool("unique") {
             opts = opts.unique(b);
         }
@@ -78,14 +81,11 @@ pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Doc
             opts = opts.name(name);
         }
 
-        let model = crate::index::IndexModel {
+        let model = IndexModel {
             keys: key,
             options: opts,
         };
-        if let Err(e) = state
-            .database
-            .create_index(&qualified_coll(body, &coll_name), model)
-        {
+        if let Err(e) = state.database.create_index(&namespace, model) {
             return err_from_mqlite(e);
         }
     }
@@ -93,7 +93,7 @@ pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Doc
     // Count user-created indexes after creation (+1 for synthetic `_id_`).
     let num_after = state
         .database
-        .list_indexes(&qualified_coll(body, &coll_name))
+        .list_indexes(&namespace)
         .map(|idxs| idxs.len() as i32 + 1)
         .unwrap_or(1);
 
@@ -117,31 +117,26 @@ pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Doc
 /// ```
 pub(super) fn handle_drop_indexes(body: &Document, state: &ServerState) -> Document {
     let coll_name = match body.get_str("dropIndexes") {
-        Ok(s) => s.to_owned(),
+        Ok(s) => s,
         Err(_) => return err_bad_value("dropIndexes requires a collection name string"),
     };
+    let namespace = qualified_coll(body, coll_name);
 
     match body.get("index") {
-        Some(bson::Bson::String(name)) if name == "*" => {
+        Some(Bson::String(name)) if name == "*" => {
             // Drop all user-created indexes.
-            let indexes = match state
-                .database
-                .list_indexes(&qualified_coll(body, &coll_name))
-            {
+            let indexes = match state.database.list_indexes(&namespace) {
                 Ok(idxs) => idxs,
                 Err(e) => return err_from_mqlite(e),
             };
             for idx in &indexes {
-                if let Err(e) = state
-                    .database
-                    .drop_index(&qualified_coll(body, &coll_name), &idx.name)
-                {
+                if let Err(e) = state.database.drop_index(&namespace, &idx.name) {
                     return err_from_mqlite(e);
                 }
             }
             doc! { "ok": 1.0_f64 }
         }
-        Some(bson::Bson::String(name)) if name == "_id_" => {
+        Some(Bson::String(name)) if name == "_id_" => {
             // Reject attempts to drop the immutable _id_ index.
             doc! {
                 "ok": 0.0_f64,
@@ -150,21 +145,17 @@ pub(super) fn handle_drop_indexes(body: &Document, state: &ServerState) -> Docum
                 "codeName": "IndexNotFound",
             }
         }
-        Some(bson::Bson::String(name)) => {
+        Some(Bson::String(name)) => {
             // Drop a specific index by name.
-            match state
-                .database
-                .drop_index(&qualified_coll(body, &coll_name), name)
-            {
+            match state.database.drop_index(&namespace, name) {
                 Ok(_) => doc! { "ok": 1.0_f64 },
                 Err(e) => err_from_mqlite(e),
             }
         }
-        Some(bson::Bson::Document(key_doc)) => {
+        Some(Bson::Document(key_doc)) => {
             // Drop by key pattern — find the index whose key matches.
-            let key_doc = key_doc.clone();
             // Reject attempts to drop the immutable _id index by key pattern.
-            if key_doc == doc! { "_id": 1i32 } {
+            if key_doc == &doc! { "_id": 1i32 } {
                 return doc! {
                     "ok": 0.0_f64,
                     "errmsg": "cannot drop _id index",
@@ -172,18 +163,12 @@ pub(super) fn handle_drop_indexes(body: &Document, state: &ServerState) -> Docum
                     "codeName": "IndexNotFound",
                 };
             }
-            let indexes = match state
-                .database
-                .list_indexes(&qualified_coll(body, &coll_name))
-            {
+            let indexes = match state.database.list_indexes(&namespace) {
                 Ok(idxs) => idxs,
                 Err(e) => return err_from_mqlite(e),
             };
-            match indexes.iter().find(|idx| idx.keys == key_doc) {
-                Some(idx) => match state
-                    .database
-                    .drop_index(&qualified_coll(body, &coll_name), &idx.name.clone())
-                {
+            match indexes.iter().find(|idx| idx.keys.eq(key_doc)) {
+                Some(idx) => match state.database.drop_index(&namespace, &idx.name) {
                     Ok(_) => doc! { "ok": 1.0_f64 },
                     Err(e) => err_from_mqlite(e),
                 },
@@ -212,14 +197,12 @@ pub(super) fn handle_drop_indexes(body: &Document, state: &ServerState) -> Docum
 /// ```
 pub(super) fn handle_list_indexes(body: &Document, state: &ServerState) -> Document {
     let coll_name = match body.get_str("listIndexes") {
-        Ok(s) => s.to_owned(),
+        Ok(s) => s,
         Err(_) => return err_bad_value("listIndexes requires a collection name string"),
     };
+    let namespace = qualified_coll(body, coll_name);
 
-    let indexes = match state
-        .database
-        .list_indexes(&qualified_coll(body, &coll_name))
-    {
+    let indexes = match state.database.list_indexes(&namespace) {
         Ok(idxs) => idxs,
         Err(e) => return err_from_mqlite(e),
     };
@@ -246,12 +229,11 @@ pub(super) fn handle_list_indexes(body: &Document, state: &ServerState) -> Docum
         first_batch.push(bson::Bson::Document(idx_doc));
     }
 
-    let ns = format!("{}.{}", extract_db_name(body), coll_name);
     doc! {
         "cursor": {
             "firstBatch": first_batch,
             "id": bson::Bson::Int64(0i64),
-            "ns": ns,
+            "ns": namespace,
         },
         "ok": 1.0_f64,
     }

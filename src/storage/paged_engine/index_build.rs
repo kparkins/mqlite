@@ -326,8 +326,6 @@ impl PagedEngine {
             let epoch = self.shared.load_published_coherent();
             let read_view = open_snapshot_read_view(&self.shared, epoch);
             let primary_history = primary_history_probe(&self.shared, data_entry.id);
-            let original_root_page = idx_entry.root_page;
-            let original_root_level = idx_entry.root_level;
             let (root_page, root_level, any_multikey) = {
                 let idx_store = new_structural_store(&self.shared, &mut batch);
                 let mut idx_tree = if rebuild_derived_pages {
@@ -346,7 +344,8 @@ impl PagedEngine {
             };
             if rebuild_derived_pages {
                 let old_store = new_structural_store(&self.shared, &mut batch);
-                BTree::open(old_store, original_root_page, original_root_level).free_all_pages()?;
+                BTree::open(old_store, idx_entry.root_page, idx_entry.root_level)
+                    .free_all_pages()?;
             }
 
             // Persist the possibly-updated root + multikey flag. Note:

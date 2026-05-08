@@ -49,15 +49,8 @@ pub(super) fn eval_eq(field_value: Option<&Bson>, target: &Bson) -> Result<bool>
         }
         Some(Bson::Array(arr)) => {
             // Match the whole array exactly, OR any element.
-            if bson_eq(&Bson::Array(arr.clone()), target) {
-                return Ok(true);
-            }
-            for elem in arr {
-                if bson_eq(elem, target) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            Ok(bson_eq(&Bson::Array(arr.clone()), target)
+                || arr.iter().any(|elem| bson_eq(elem, target)))
         }
         Some(val) => Ok(bson_eq(val, target)),
     }
@@ -82,14 +75,9 @@ pub(super) fn eval_cmp(
 ) -> Result<bool> {
     match field_value {
         None => Ok(false),
-        Some(Bson::Array(arr)) => {
-            for elem in arr {
-                if cmp_satisfies(elem, comparand, direction, allow_equal) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
+        Some(Bson::Array(arr)) => Ok(arr
+            .iter()
+            .any(|elem| cmp_satisfies(elem, comparand, direction, allow_equal))),
         Some(val) => Ok(cmp_satisfies(val, comparand, direction, allow_equal)),
     }
 }
@@ -112,36 +100,16 @@ pub(super) fn eval_in(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
     match field_value {
         None => {
             // Missing field: matches null in $in list.
-            for item in list {
-                if matches!(item, Bson::Null) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            Ok(list.iter().any(|item| matches!(item, Bson::Null)))
         }
         Some(Bson::Array(arr)) => {
             // Array field: match if the whole array OR any element is in the list.
             let field_arr = Bson::Array(arr.clone());
-            for target in list {
-                if bson_eq(&field_arr, target) {
-                    return Ok(true);
-                }
-                for elem in arr {
-                    if bson_eq(elem, target) {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
+            Ok(list.iter().any(|target| {
+                bson_eq(&field_arr, target) || arr.iter().any(|elem| bson_eq(elem, target))
+            }))
         }
-        Some(val) => {
-            for target in list {
-                if bson_eq(val, target) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
+        Some(val) => Ok(list.iter().any(|target| bson_eq(val, target))),
     }
 }
 
@@ -414,14 +382,9 @@ pub(super) fn eval_regex(field_value: Option<&Bson>, pattern: &str, options: &st
         Some(Bson::String(s)) => Ok(re.is_match(s)),
         Some(Bson::Array(arr)) => {
             // Array field: match if any string element matches.
-            for elem in arr {
-                if let Bson::String(s) = elem {
-                    if re.is_match(s) {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
+            Ok(arr
+                .iter()
+                .any(|elem| matches!(elem, Bson::String(s) if re.is_match(s))))
         }
         Some(_) => Ok(false), // non-string, non-array — no match
     }

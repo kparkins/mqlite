@@ -48,7 +48,7 @@ const LEAF_SIZE: usize = PAGE_SIZE_LEAF as usize;
 
 /// Adapts [`BufferPoolHandle`] to the [`BTreePageStore`] trait.
 ///
-/// Pass one of these to [`BTree::new`] or [`BTree::open`] to back a B+ tree
+/// Pass one of these to [`BTree::create`] or [`BTree::open`] to back a B+ tree
 /// with the shared buffer pool.
 ///
 /// See the module-level documentation for design details.
@@ -85,7 +85,6 @@ impl BufferPoolPageStore {
     }
 
     /// Borrow the underlying [`BufferPoolHandle`].
-    #[allow(dead_code)]
     pub(crate) fn handle(&self) -> &Arc<BufferPoolHandle> {
         &self.handle
     }

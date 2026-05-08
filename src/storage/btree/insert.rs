@@ -123,27 +123,23 @@ impl<S: BTreePageStore> BTree<S> {
         };
         let cell_size = new_cell.encoded_size();
 
-        // Check for duplicate.
-        if node.binary_search(key).is_ok() {
-            return Err(Error::DuplicateKey {
-                detail: format!("key already exists (len={})", key.len()),
-            });
-        }
-
-        if node.can_insert(cell_size) {
-            // Insert and keep sorted.
-            let Err(pos) = node.binary_search(key) else {
+        let insert_pos = match node.binary_search(key) {
+            Ok(_) => {
                 return Err(Error::DuplicateKey {
                     detail: format!("key already exists (len={})", key.len()),
                 });
-            };
-            node.cells.insert(pos, new_cell);
+            }
+            Err(pos) => pos,
+        };
+
+        if node.can_insert(cell_size) {
+            node.cells.insert(insert_pos, new_cell);
             let encoded = node.encode()?;
             self.store.write_leaf_structural(page, &encoded)?;
             Ok(None)
         } else {
             // Leaf is full: split.
-            self.split_leaf(page, node, new_cell)
+            self.split_leaf(page, node, insert_pos, new_cell)
         }
     }
 
@@ -152,15 +148,10 @@ impl<S: BTreePageStore> BTree<S> {
         &mut self,
         left_page: u32,
         mut left_node: LeafNode,
+        insert_pos: usize,
         new_cell: LeafCell,
     ) -> Result<Option<SplitResult>> {
-        // Insert new_cell into the cell list (maintaining sorted order).
-        let Err(pos) = left_node.binary_search(&new_cell.key) else {
-            return Err(Error::DuplicateKey {
-                detail: format!("key already exists (len={})", new_cell.key.len()),
-            });
-        };
-        left_node.cells.insert(pos, new_cell);
+        left_node.cells.insert(insert_pos, new_cell);
 
         let total = left_node.cells.len();
         let split_at = total / 2; // right half starts here

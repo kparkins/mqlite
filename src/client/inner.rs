@@ -42,7 +42,7 @@ impl ClientInner {
         file_lock: Arc<AnyFileLock>,
         engine: Box<dyn StorageEngine>,
     ) -> Self {
-        ClientInner {
+        Self {
             path,
             file_lock,
             engine,

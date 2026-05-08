@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use bson::oid::ObjectId;
-use bson::Bson;
+use bson::{oid::ObjectId, Bson};
 
 /// Result returned by `Collection::insert_one`.
 #[non_exhaustive]
@@ -25,9 +24,9 @@ pub struct BulkWriteError {
 
 /// Result returned by `Collection::insert_many`.
 ///
-/// For ordered inserts (`InsertManyOptions::ordered = true`, the default), execution stops
-/// at the first error. For unordered inserts, all documents are attempted and all errors
-/// are collected in `errors`.
+/// For ordered inserts (`InsertManyOptions::ordered = true`, the default),
+/// execution stops at the first error. For unordered inserts, all documents
+/// are attempted and all errors are collected in `errors`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct InsertManyResult {

@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use bson::{doc, oid::ObjectId, Document};
+use bson::{oid::ObjectId, Document};
 
 use super::protocol::{MsgHeader, OpMsg, Section, MAX_MESSAGE_SIZE};
 use crate::{
@@ -38,11 +38,23 @@ use crate::{
     error::Result,
 };
 
+#[cfg(test)]
 pub(super) use super::framing::{read_message, write_message};
 use super::handlers;
 
+#[cfg(test)]
+use super::handlers::get_i64;
+#[cfg(test)]
+use super::handlers::{
+    handle_build_info, handle_create, handle_create_indexes, handle_delete, handle_drop,
+    handle_drop_indexes, handle_find, handle_find_and_modify, handle_get_more, handle_hello,
+    handle_insert, handle_kill_cursors, handle_list_collections, handle_list_databases,
+    handle_list_indexes, handle_server_status, handle_update,
+};
 pub(crate) use cursors::{cursor_sweep_task, ConnectionCursors};
 use op_query::{build_op_reply, parse_op_query_body, parse_op_query_db_name};
+#[cfg(test)]
+use op_query::{check_db_field, OP_REPLY};
 
 // ---------------------------------------------------------------------------
 // Legacy opcodes (not in protocol.rs — used only for handshake interop)
@@ -92,7 +104,7 @@ pub(crate) struct ServerState {
     /// Only populated when `ServerState` is constructed without an explicit
     /// database path (i.e., in tests via `default()` or `new()`).
     #[cfg(test)]
-    pub(crate) _tempdir: Option<tempfile::TempDir>,
+    pub(crate) _tempdir: Option<Arc<tempfile::TempDir>>,
 }
 
 #[cfg(test)]
@@ -108,31 +120,12 @@ impl Default for ServerState {
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
             cancel: CancellationToken::new(),
-            _tempdir: Some(tempdir),
+            _tempdir: Some(Arc::new(tempdir)),
         }
     }
 }
 
 impl ServerState {
-    /// Create state backed by a tempdir-scoped [`Client`] for use in tests.
-    /// `db_path` is recorded as-is so callers can pass an explicit path or
-    /// `None` when the exact path does not matter.
-    #[cfg(test)]
-    pub(crate) fn new(db_path: Option<std::path::PathBuf>) -> Self {
-        let tempdir = tempfile::TempDir::new().expect("create tempdir for ServerState::new");
-        let tmp_db_path = tempdir.path().join("mqlite_test.db");
-        let client = Client::open(&tmp_db_path).expect("open tempdir-backed client");
-        ServerState {
-            start_time: std::time::Instant::now(),
-            next_connection_id: Arc::new(AtomicI32::new(1)),
-            db_path: Some(db_path.unwrap_or(tmp_db_path)),
-            topology_process_id: ObjectId::new(),
-            database: Arc::clone(&client.inner),
-            cancel: CancellationToken::new(),
-            _tempdir: Some(tempdir),
-        }
-    }
-
     /// Create state backed by a real [`Client`] instance.
     ///
     /// Used by [`WireProtocol::bind`] to wire CRUD handlers to the actual client.
@@ -181,33 +174,6 @@ impl ServerState {
             .load(Ordering::Relaxed)
             .saturating_sub(1)
     }
-}
-
-// ---------------------------------------------------------------------------
-// $db routing helpers
-// ---------------------------------------------------------------------------
-
-/// Extract the database name from a command body's `$db` field.
-///
-/// Falls back to `"test"` when the field is absent — this matches mongosh's
-/// default database (i.e., `use mydb` in mongosh sends subsequent commands
-/// with `$db: "mydb"`).  Any non-empty string is accepted; there is no
-/// server-side database name restriction in the multi-database wire protocol.
-fn extract_db_name(body: &Document) -> String {
-    body.get_str("$db")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("test")
-        .to_owned()
-}
-
-/// Fully-qualify a collection name as `<db_name>.<coll_name>` using the
-/// `$db` field from the command body.
-///
-/// This matches the engine's internal namespace format (`Database` and
-/// `Collection<T>` handles store collections as `"db.collection"`).
-fn qualified_coll(body: &Document, coll_name: &str) -> String {
-    format!("{}.{}", extract_db_name(body), coll_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +344,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
         tokio::select! {
             result = read_header => {
                 match result {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(_)) => {}
                     _ => break, // timeout or I/O error
                 }
             }
@@ -399,7 +365,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
         let remainder = declared_len - MsgHeader::SIZE;
         let mut rest = vec![0u8; remainder];
         match tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut rest)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             _ => break, // timeout or I/O error
         }
 
@@ -588,8 +554,6 @@ fn route_command(
             "mqlite::wire::command"
         );
     }
-
-    let _ = body;
 
     result
 }

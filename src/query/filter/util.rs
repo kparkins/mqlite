@@ -36,18 +36,7 @@ pub(crate) fn get_nested_field<'a>(doc: &'a Document, path: &str) -> Option<&'a 
             Bson::Array(arr) => {
                 // Try numeric index first.
                 if let Ok(idx) = rest.parse::<usize>() {
-                    let elem = arr.get(idx)?;
-                    // If there are more path segments, recurse.
-                    let after_idx = rest.split_once('.').map(|x| x.1);
-                    if let Some(more) = after_idx {
-                        if let Bson::Document(sub_doc) = elem {
-                            get_nested_field(sub_doc, more)
-                        } else {
-                            None
-                        }
-                    } else {
-                        Some(elem)
-                    }
+                    arr.get(idx)
                 } else {
                     // Non-numeric key in an array position — no match.
                     None
@@ -80,7 +69,7 @@ pub(super) fn bson_eq(a: &Bson, b: &Bson) -> bool {
 // Argument validation helpers
 // ---------------------------------------------------------------------------
 
-pub(super) fn require_array<'a>(op: &str, val: &'a Bson) -> Result<&'a Vec<Bson>> {
+pub(super) fn require_array<'a>(op: &str, val: &'a Bson) -> Result<&'a [Bson]> {
     match val {
         Bson::Array(arr) => Ok(arr),
         _ => Err(bad_value(&format!(

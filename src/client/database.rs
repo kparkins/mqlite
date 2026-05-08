@@ -73,14 +73,6 @@ impl Database {
         &self.db_name
     }
 
-    /// Build the fully-qualified engine key for a collection in this database.
-    ///
-    /// The qualified name is `<db_name>.<collection_name>` — the same format
-    /// used by the MongoDB wire protocol for namespaces.
-    pub(crate) fn qualified(&self, collection_name: &str) -> String {
-        format!("{}.{}", self.db_name, collection_name)
-    }
-
     // -------------------------------------------------------------------------
     // Collection access
     // -------------------------------------------------------------------------
@@ -114,11 +106,10 @@ impl Database {
     pub fn list_collection_names(&self) -> Result<Vec<String>> {
         let prefix = format!("{}.", self.db_name);
         let all = self.inner.list_collection_names()?;
-        let filtered = all
+        Ok(all
             .into_iter()
             .filter_map(|n| n.strip_prefix(&prefix).map(str::to_owned))
-            .collect();
-        Ok(filtered)
+            .collect())
     }
 
     /// Drop a collection and all its indexes.
@@ -127,7 +118,8 @@ impl Database {
     ///
     /// Returns an error if the collection cannot be dropped.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
-        self.inner.drop_collection(&self.qualified(name))
+        self.inner
+            .drop_collection(&format!("{}.{}", self.db_name, name))
     }
 
     /// Create a collection explicitly.
@@ -138,7 +130,8 @@ impl Database {
     ///
     /// Returns an error if the collection cannot be created.
     pub fn create_collection(&self, name: &str) -> Result<()> {
-        self.inner.create_collection(&self.qualified(name))
+        self.inner
+            .create_collection(&format!("{}.{}", self.db_name, name))
     }
 
     // -------------------------------------------------------------------------

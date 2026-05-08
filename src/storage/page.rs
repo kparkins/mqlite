@@ -10,10 +10,12 @@
 //!
 //! ## Checksum policy
 //!
-//! Every page stores a CRC32C checksum in a 4-byte field at **offset 4–7**.
-//! The checksum covers bytes **0–3** and bytes **8 onward** (the checksum field
-//! itself is excluded). Callers must recompute and store the checksum before
-//! writing a page to disk, and must verify it after reading.
+//! Internal and leaf pages store a CRC32C checksum at **offset 4–7**. The
+//! checksum covers bytes **0–3** and bytes **8 onward** (the checksum field
+//! itself is excluded). Overflow pages store the checksum at **offset 8–11**;
+//! their checksum also excludes the atomic refcount field at **offset 4–7**.
+//! Callers must recompute and store the checksum before writing a page to disk,
+//! and must verify it after reading.
 
 use crate::error::{Error, Result};
 
@@ -378,9 +380,7 @@ impl OverflowPageHeader {
     /// Serialize the header into the first [`OVERFLOW_HEADER_SIZE`] bytes of `buf`.
     pub(crate) fn write_to(&self, buf: &mut [u8]) {
         buf[0] = self.page_type;
-        buf[1] = 0; // reserved
-        buf[2] = 0;
-        buf[3] = 0;
+        buf[1..4].fill(0);
         buf[4..8].copy_from_slice(&self.refcount.to_le_bytes());
         buf[8..12].copy_from_slice(&self.checksum.to_le_bytes());
         buf[12..16].copy_from_slice(&self.next_overflow_page.to_le_bytes());

@@ -40,10 +40,6 @@
 //! - x86_64 writes  → aarch64 reads
 //! - aarch64 writes → x86_64 reads
 
-// Binaries use clippy::expect_used in fixed-size slice conversions that are
-// always correct by construction.  Prefer explicit ? propagation elsewhere.
-#![allow(clippy::expect_used)]
-
 use bson::{doc, Document};
 use crc32c::crc32c;
 use std::{

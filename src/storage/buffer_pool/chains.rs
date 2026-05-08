@@ -65,33 +65,6 @@ impl BufferPool {
         Ok(frame.deltas.remove(key))
     }
 
-    /// Return the delta chain for `key` on leaf page `page`, creating an
-    /// empty caller-owned chain when no resident chain exists yet.
-    #[allow(dead_code)]
-    pub(crate) fn get_or_create_chain(
-        &self,
-        page: u32,
-        key: &[u8],
-    ) -> Result<Arc<VecDeque<VersionEntry>>> {
-        let guard = self
-            .inner_32k
-            .lock()
-            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-        let idx = guard.page_map.get(&page).copied().ok_or_else(|| {
-            Error::Internal(format!(
-                "buffer pool get_or_create_chain: page {page} is not resident"
-            ))
-        })?;
-        let frame = guard.frames[idx].as_ref().ok_or_else(|| {
-            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
-        })?;
-        Ok(frame
-            .deltas
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(VecDeque::new())))
-    }
-
     /// Install a delta chain for `key` on leaf page `page`.
     pub(crate) fn put_chain(
         &self,

@@ -72,12 +72,6 @@ pub(crate) struct CheckpointLifetimeDrain {
 }
 
 impl CheckpointLifetimeDrain {
-    /// Create a staged drain from checkpoint-safe lifetime entries.
-    #[must_use]
-    pub(crate) fn new(entries: Vec<PageLifetimeEntry>) -> Self {
-        Self { entries }
-    }
-
     /// Publish the staged lifetime-free deltas by consuming this drain.
     pub(crate) fn publish(self) {
         drop(self.entries);
@@ -129,15 +123,15 @@ impl PageLifetimeQueue {
     pub(crate) fn take_eligible(&self, checkpoint_fence: u64) -> Vec<PageLifetimeEntry> {
         #[allow(clippy::unwrap_used)]
         let mut q = self.pending.lock().unwrap();
-        let entries = std::mem::take(&mut *q);
         let mut eligible = Vec::new();
-        for entry in entries {
+        q.retain(|entry| {
             if entry.is_fence_eligible(checkpoint_fence) {
-                eligible.push(entry);
+                eligible.push(*entry);
+                false
             } else {
-                q.push(entry);
+                true
             }
-        }
+        });
         eligible
     }
 

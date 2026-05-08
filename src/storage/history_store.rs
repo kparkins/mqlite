@@ -56,8 +56,7 @@
 //!
 //! Inline payload: `len: u32 LE` || bytes.
 //! Overflow payload: `first_page: u32 LE` || `total_length: u64 LE`.
-//! Overflow rehydration needs an allocator handle and is deferred to the
-//! caller.
+//! Overflow rehydration requires a caller-supplied allocator handle.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -735,16 +734,11 @@ impl<S: BTreePageStore> HistoryStore<S> {
             result.entries_deleted += 1;
             if let Some((first_page, total_length)) = overflow {
                 if let Some(alloc) = self.overflow_allocator.as_deref() {
-                    {
-                        let _oref = OverflowRef::from_existing_refcount(
-                            first_page,
-                            total_length,
-                            alloc.clone(),
-                        );
-                        // `_oref` drops at the end of this scope; Drop runs
-                        // `decref_overflow` and enqueues for deferred free
-                        // on refcount 0.
-                    }
+                    drop(OverflowRef::from_existing_refcount(
+                        first_page,
+                        total_length,
+                        alloc.clone(),
+                    ));
                     if alloc.overflow_refcount(first_page) == 0 {
                         result.pages_freed += 1;
                     }

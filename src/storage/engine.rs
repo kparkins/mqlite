@@ -247,7 +247,7 @@ pub trait StorageEngine: Send + Sync {
     /// Test-only accessor for the MVCC `ReadViewRegistry`.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    fn read_view_registry(&self) -> Option<std::sync::Arc<crate::mvcc::ReadViewRegistry>> {
+    fn read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
         None
     }
 
@@ -665,7 +665,7 @@ pub trait StorageEngine: Send + Sync {
     /// poisoned.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    fn us036_test_namespace_id(&self, _ns: &str) -> crate::error::Result<Option<i64>> {
+    fn us036_test_namespace_id(&self, _ns: &str) -> Result<Option<i64>> {
         Ok(None)
     }
 }

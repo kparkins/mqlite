@@ -468,7 +468,8 @@ impl<'pool> LatchedPinnedPage<'pool> {
         chain: Arc<VecDeque<VersionEntry>>,
     ) -> Result<()> {
         self.require_exclusive("put_chain")?;
-        // SAFETY: see `take_chain`.
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The exclusive page latch serializes delta-map mutation.
         let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
         frame.deltas.insert(key, chain);
         Ok(())
@@ -517,7 +518,8 @@ impl<'pool> LatchedPinnedPage<'pool> {
         commit_ts: Option<Ts>,
     ) -> Result<usize> {
         self.require_exclusive("flip_pending_for_txn")?;
-        // SAFETY: see `take_chain`.
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The exclusive page latch serializes delta-map mutation.
         let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
         let mut flipped = 0usize;
         for chain_arc in frame.deltas.values_mut() {
@@ -810,9 +812,9 @@ impl BufferPool {
     /// - All frames in the partition are currently pinned.
     /// - I/O backend error during load or eviction.
     pub(crate) fn pin(&self, page_number: u32, size: PageSize) -> Result<PinnedPage<'_>> {
-        let (lock, size_enum) = match size {
-            PageSize::Small4k => (&self.inner_4k, PageSize::Small4k),
-            PageSize::Large32k => (&self.inner_32k, PageSize::Large32k),
+        let lock = match size {
+            PageSize::Small4k => &self.inner_4k,
+            PageSize::Large32k => &self.inner_32k,
         };
 
         let mut guard = lock
@@ -822,7 +824,7 @@ impl BufferPool {
         let idx = guard.pin_page(
             page_number,
             self.io.as_ref(),
-            size_enum,
+            size,
             self.main_file_flush_lsn(),
         )?;
 
@@ -831,7 +833,7 @@ impl BufferPool {
         Ok(PinnedPage {
             pool: self,
             page_number,
-            page_size: size_enum,
+            page_size: size,
             snapshot,
             write_buf: None,
             dirty: false,
@@ -1031,9 +1033,9 @@ impl BufferPool {
         // 1. Snapshot the horizon BEFORE any partition latch.
         let ort = registry.oldest_required_ts();
 
-        let (lock, size_enum) = match size {
-            PageSize::Small4k => (&self.inner_4k, PageSize::Small4k),
-            PageSize::Large32k => (&self.inner_32k, PageSize::Large32k),
+        let lock = match size {
+            PageSize::Small4k => &self.inner_4k,
+            PageSize::Large32k => &self.inner_32k,
         };
 
         // 2. Pin + reconcile victim under the partition lock.
@@ -1047,7 +1049,7 @@ impl BufferPool {
                     page_number,
                     ort,
                     self.io.as_ref(),
-                    size_enum,
+                    size,
                     self.main_file_flush_lsn(),
                 ) {
                     Ok(result) => break result,
@@ -1083,7 +1085,7 @@ impl BufferPool {
         Ok(PinnedPage {
             pool: self,
             page_number,
-            page_size: size_enum,
+            page_size: size,
             snapshot,
             write_buf: None,
             dirty: false,

@@ -31,7 +31,7 @@
 //!   checksum : uint32  – CRC-32C over all preceding bytes in the message
 //! ```
 
-use bson::{Document, RawDocumentBuf};
+use bson::Document;
 use smallvec::SmallVec;
 
 use crate::error::{Error, Result};
@@ -403,7 +403,7 @@ fn parse_sections(mut buf: &[u8]) -> Result<SmallVec<[Section; 1]>> {
 
                 // Remaining bytes are BSON documents.
                 let mut doc_buf = &section_buf[null_pos + 1..];
-                let mut documents: SmallVec<[Document; 1]> = SmallVec::new();
+                let mut documents = Vec::new();
                 while !doc_buf.is_empty() {
                     let doc = read_bson_document(&mut doc_buf)?;
                     documents.push(doc);
@@ -411,7 +411,7 @@ fn parse_sections(mut buf: &[u8]) -> Result<SmallVec<[Section; 1]>> {
 
                 sections.push(Section::DocSequence {
                     identifier,
-                    documents: documents.into_vec(),
+                    documents,
                 });
             }
             other => {
@@ -454,13 +454,8 @@ fn read_bson_document(buf: &mut &[u8]) -> Result<Document> {
             ),
         });
     }
-    let doc_bytes = &buf[..size];
-    let raw =
-        RawDocumentBuf::from_bytes(doc_bytes.to_vec()).map_err(|e| Error::InvalidWireMessage {
-            detail: format!("invalid BSON in section: {}", e),
-        })?;
     let doc =
-        bson::from_slice::<Document>(raw.as_bytes()).map_err(|e| Error::InvalidWireMessage {
+        bson::from_slice::<Document>(&buf[..size]).map_err(|e| Error::InvalidWireMessage {
             detail: format!("BSON deserialisation failed: {}", e),
         })?;
     *buf = &buf[size..];
@@ -706,8 +701,9 @@ mod tests {
         };
         let mut docs_bytes: Vec<u8> = Vec::with_capacity(docs.len() * 128);
         for d in docs.iter() {
-            bson::to_writer(&mut docs_bytes, d)
-                .expect("BSON serialisation should not fail in test");
+            docs_bytes.extend_from_slice(
+                &bson::to_vec(d).expect("BSON serialisation should not fail in test"),
+            );
         }
         // size field (4) + identifier + docs
         let section_payload_size = 4 + id_bytes.len() + docs_bytes.len();

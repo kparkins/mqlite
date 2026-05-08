@@ -64,7 +64,7 @@ impl ClientInner {
         let mut inserted_ids: HashMap<usize, Bson> = HashMap::with_capacity(docs.len());
         let mut errors: Vec<BulkWriteError> = Vec::with_capacity(docs.len());
 
-        'outer: for (i, doc) in docs.iter().enumerate() {
+        for (i, doc) in docs.iter().enumerate() {
             let bson_doc = match bson::to_document(doc).map_err(Error::BsonSerialization) {
                 Ok(d) => d,
                 Err(e) => {
@@ -74,7 +74,7 @@ impl ClientInner {
                         message: e.to_string(),
                     });
                     if opts.ordered {
-                        break 'outer;
+                        break;
                     }
                     continue;
                 }
@@ -90,7 +90,7 @@ impl ClientInner {
                         message: e.to_string(),
                     });
                     if opts.ordered {
-                        break 'outer;
+                        break;
                     }
                 }
             }
@@ -183,7 +183,7 @@ impl ClientInner {
         self.engine.delete(name, &filter, true)
     }
 
-    pub(crate) fn find_one_and_update_with_options<T: Serialize + DeserializeOwned>(
+    pub(crate) fn find_one_and_update_with_options<T: DeserializeOwned>(
         &self,
         name: &str,
         filter: Document,
@@ -275,12 +275,10 @@ impl ClientInner {
     }
 
     pub(crate) fn backup(&self, dest: &Path) -> Result<()> {
-        let src_path = match &self.path {
-            Some(p) => p.as_path(),
-            None => {
-                return Err(Error::Internal("backup: no source path available".into()));
-            }
-        };
+        let src_path = self
+            .path
+            .as_deref()
+            .ok_or_else(|| Error::Internal("backup: no source path available".into()))?;
 
         // Security: reject symlinks at the destination path.
         reject_symlink(dest)?;
@@ -299,9 +297,6 @@ impl ClientInner {
                 ));
             }
         }
-
-        // Acquire the in-process writer lock so no writes can interleave with
-        // our checkpoint and copy.
 
         // Checkpoint: flush dirty buffer-pool pages to the journal, then move all
         // journal frames into the main file.  After this, the main file contains

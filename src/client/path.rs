@@ -64,12 +64,12 @@ pub(super) fn write_initial_header(lock: &dyn crate::storage::lock::FileLock) ->
 fn enrich_path(e: Error, path: &Path) -> Error {
     match e {
         Error::CorruptDatabase {
-            path: ref p,
-            ref detail,
+            path: error_path,
+            detail,
             recoverable,
-        } if p == std::path::Path::new("") => Error::CorruptDatabase {
+        } if error_path.as_os_str().is_empty() => Error::CorruptDatabase {
             path: path.to_owned(),
-            detail: detail.clone(),
+            detail,
             recoverable,
         },
         other => other,

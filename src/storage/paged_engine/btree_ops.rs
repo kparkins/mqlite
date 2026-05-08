@@ -33,7 +33,7 @@ pub(super) fn prepare_insert_document<S: BTreePageStore>(
     validate_document(doc)?;
     let id_bson = ensure_id(doc);
     // Check declared unique constraints before touching the tree.
-    let history: Option<&dyn HistoryProbe> = Some(&vis.primary_history);
+    let history = Some(&vis.primary_history as &dyn HistoryProbe);
     check_unique_constraints_mvcc(
         tree,
         unique_specs,
@@ -66,7 +66,7 @@ pub(super) fn btree_collscan<S: BTreePageStore>(
     tree: &BTree<S>,
     filter: &Document,
     view: &ReadView,
-    history: Option<&dyn crate::storage::btree::HistoryProbe>,
+    history: Option<&dyn HistoryProbe>,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
     let pairs = tree.range_scan_mvcc(None, None, view, history)?;
     let mut result = Vec::with_capacity(pairs.len());

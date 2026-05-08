@@ -22,7 +22,7 @@
 //! | 11 | `mvcc.history_store.gc_passes_total` | counter |
 //! | 12 | `mvcc.deferred_free_queue_depth` | gauge |
 //!
-//! ## 5 diagnostic counters
+//! ## 6 diagnostic counters
 //!
 //! - `mvcc.reconcile.duration_ms_p99` — gauge
 //! - `mvcc.chain_migration.entries_moved_total` — counter

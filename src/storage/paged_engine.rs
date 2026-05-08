@@ -235,13 +235,13 @@ struct IndexCatalogIdentity {
 /// positioned write, and ready marking. It is still a coarse append-envelope
 /// sample; percentile recomputation happens on drop after the hot write work.
 struct LogicalTxnAppendPercentileRefresh {
-    start: std::time::Instant,
+    start: Instant,
 }
 
 impl LogicalTxnAppendPercentileRefresh {
     fn new() -> Self {
         Self {
-            start: std::time::Instant::now(),
+            start: Instant::now(),
         }
     }
 }
@@ -730,8 +730,6 @@ impl PagedEngine {
                             );
                         }
                     };
-                let _pending = prepared.pending;
-                let _pending_sec_index = prepared.pending_sec_index;
                 let draft = LogRecordDraft::crud(
                     txn_id,
                     slot.publish_seq(),
@@ -983,8 +981,8 @@ impl StorageEngine for PagedEngine {
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
         let opts = FindOptions::new();
-        let (mut results, _explain) = doc_ops::find_documents(self, ns, filter, &opts)?;
-        Ok((!results.is_empty()).then(|| results.remove(0)))
+        let (results, _explain) = doc_ops::find_documents(self, ns, filter, &opts)?;
+        Ok(results.into_iter().next())
     }
 
     fn update(

@@ -71,13 +71,6 @@ impl FoldedLeafCell {
         };
         CELL_KEY_LEN_BYTES + self.key.len() + CELL_VALUE_TYPE_BYTES + value_bytes
     }
-
-    fn to_leaf_cell(&self) -> LeafCell {
-        LeafCell {
-            key: self.key.clone(),
-            value: self.value.clone(),
-        }
-    }
 }
 
 /// Sibling links to preserve when encoding a replacement folded leaf.
@@ -124,7 +117,13 @@ pub(crate) fn encode_folded_leaf(
     winners: &[FoldedLeafCell],
     links: FoldedLeafLinks,
 ) -> Result<Vec<u8>> {
-    let cells = winners.iter().map(FoldedLeafCell::to_leaf_cell).collect();
+    let cells = winners
+        .iter()
+        .map(|cell| LeafCell {
+            key: cell.key.clone(),
+            value: cell.value.clone(),
+        })
+        .collect();
     let node = LeafNode {
         flags: 0,
         next_leaf_page: links.next_leaf_page,

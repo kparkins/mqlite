@@ -49,34 +49,20 @@ use crate::error::{Error, Result};
 // Type discriminant bytes (MongoDB canonical ordering)
 // ---------------------------------------------------------------------------
 
-/// Type discriminant for `MinKey`.
-pub(crate) const TYPE_MIN_KEY: u8 = 0x00;
-/// Type discriminant for `Null` and `Undefined`.
-pub(crate) const TYPE_NULL: u8 = 0x05;
-/// Shared type discriminant for all numeric types (Int32, Int64, Double, Decimal128).
-pub(crate) const TYPE_NUMBER: u8 = 0x10;
-/// Type discriminant for `Symbol` (deprecated in MongoDB 4.0+).
-pub(crate) const TYPE_SYMBOL: u8 = 0x15;
-/// Type discriminant for UTF-8 `String`.
-pub(crate) const TYPE_STRING: u8 = 0x20;
-/// Type discriminant for embedded `Document` (Object).
-pub(crate) const TYPE_OBJECT: u8 = 0x30;
-/// Type discriminant for `Array`.
-pub(crate) const TYPE_ARRAY: u8 = 0x40;
-/// Type discriminant for `Binary` data.
-pub(crate) const TYPE_BIN_DATA: u8 = 0x50;
-/// Type discriminant for `ObjectId`.
-pub(crate) const TYPE_OBJECT_ID: u8 = 0x60;
-/// Type discriminant for `Boolean`.
-pub(crate) const TYPE_BOOLEAN: u8 = 0x70;
-/// Type discriminant for `DateTime`.
-pub(crate) const TYPE_DATE: u8 = 0x80;
-/// Type discriminant for `Timestamp`.
-pub(crate) const TYPE_TIMESTAMP: u8 = 0x85;
-/// Type discriminant for `RegularExpression`.
-pub(crate) const TYPE_REGEXP: u8 = 0x90;
-/// Type discriminant for `MaxKey`.
-pub(crate) const TYPE_MAX_KEY: u8 = 0xFF;
+const TYPE_MIN_KEY: u8 = 0x00;
+const TYPE_NULL: u8 = 0x05;
+const TYPE_NUMBER: u8 = 0x10;
+const TYPE_SYMBOL: u8 = 0x15;
+const TYPE_STRING: u8 = 0x20;
+const TYPE_OBJECT: u8 = 0x30;
+const TYPE_ARRAY: u8 = 0x40;
+const TYPE_BIN_DATA: u8 = 0x50;
+const TYPE_OBJECT_ID: u8 = 0x60;
+const TYPE_BOOLEAN: u8 = 0x70;
+const TYPE_DATE: u8 = 0x80;
+const TYPE_TIMESTAMP: u8 = 0x85;
+const TYPE_REGEXP: u8 = 0x90;
+const TYPE_MAX_KEY: u8 = 0xFF;
 
 // Numeric sub-class bytes (within `TYPE_NUMBER` block).
 // Ordering: NAN < NEG < ZERO < POS.
@@ -145,11 +131,11 @@ pub fn encode_compound_key(fields: &[(&Bson, bool)]) -> Vec<u8> {
         if i > 0 {
             buf.push(COMPOUND_SEP);
         }
-        let mut field_bytes = Vec::with_capacity(32);
-        encode_into(&mut field_bytes, value);
         if *ascending {
-            buf.extend_from_slice(&field_bytes);
+            encode_into(&mut buf, value);
         } else {
+            let mut field_bytes = Vec::with_capacity(32);
+            encode_into(&mut field_bytes, value);
             for b in &mut field_bytes {
                 *b = !*b;
             }

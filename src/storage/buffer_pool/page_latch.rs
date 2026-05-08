@@ -3,9 +3,9 @@
 //! This module owns the bare latch primitive only. The buffer-pool
 //! integration (`Frame::latch`, `LatchedPinnedPage` pin-plus-latch RAII
 //! handle, lock-order checks against partition mutexes, and eviction
-//! coordination) lives in US-029 and US-015 — this file is intentionally
-//! standalone so the upgrade-race contract can be tested in isolation
-//! before any storage code references it.
+//! coordination) lives in US-029 and US-015. This file keeps the latch
+//! primitive narrow so the upgrade-race contract can be tested in
+//! isolation.
 //!
 //! The latch wraps a `parking_lot::RwLock<()>` (or `loom::sync::RwLock<()>`
 //! under `cfg(loom)`) plus a single `AtomicU32` (`upgrade_intent`) that
@@ -228,17 +228,17 @@ impl Drop for UpgradeUnwindGuard<'_> {
 /// RAII guard for an exclusive `PageLatch` hold. Drops release the
 /// underlying write guard.
 pub(crate) struct PageLatchExclusive<'a> {
-    /// Held for symmetry with `PageLatchShared` and to keep the latch
-    /// reachable from future getters (e.g. observability / debug). The
-    /// underlying write guard is what enforces exclusion.
-    #[allow(dead_code)]
+    #[cfg(loom)]
     latch: &'a PageLatch,
     guard: Option<PageLatchWriteGuard<'a, ()>>,
 }
 
 impl<'a> PageLatchExclusive<'a> {
     fn new(latch: &'a PageLatch, guard: PageLatchWriteGuard<'a, ()>) -> Self {
+        #[cfg(not(loom))]
+        let _ = latch;
         Self {
+            #[cfg(loom)]
             latch,
             guard: Some(guard),
         }

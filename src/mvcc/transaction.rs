@@ -212,9 +212,6 @@ pub(crate) enum PrimaryOp {
 ///   `emit_logical_txn_frame` helper consumes the Cell exactly once via
 ///   take-once semantics (reads, then sets back to `None`) so any double
 ///   emit panics loudly.
-/// - `finalized` flips to `true` at the top of `commit()` so `Drop` knows
-///   not to decref `pending` — the entries have been moved into the durable
-///   chain state.
 #[derive(Debug)]
 pub(crate) struct WriteTxn {
     /// Per-oracle transaction identifier used for self-visibility on
@@ -264,10 +261,6 @@ pub(crate) struct WriteTxn {
     /// True when this CRUD body had to perform structural primary B-tree
     /// work even if the published catalog root stayed stable.
     structural_tree_change: bool,
-    /// True after `commit()` has transferred `pending` ownership into the
-    /// durable chain. `Drop` checks this to avoid decrementing refcounts
-    /// that now belong to installed chains.
-    finalized: bool,
 }
 
 impl WriteTxn {
@@ -287,7 +280,6 @@ impl WriteTxn {
             pending_primary: SmallVec::new(),
             publish_dirty: PublishDirty::default(),
             structural_tree_change: false,
-            finalized: false,
         }
     }
 
@@ -567,9 +559,6 @@ impl WriteTxn {
     ///    chain. The returned `Vec<OverflowRef>` must be consumed by the
     ///    caller; otherwise the refcounts decref on vec drop and the newly
     ///    committed chain becomes dangling.
-    /// 4. Flip `finalized = true` so `Drop` no longer decrefs `pending`
-    ///    (the entries have already been moved out).
-    ///
     /// Returns `(commit_ts, pending, pending_sec_index)`. Callers that
     /// stage no overflow data may drop the returned vecs, which runs
     /// `OverflowRef::Drop` on every entry — correct for no-op commits.
@@ -604,7 +593,7 @@ impl WriteTxn {
     /// `refcount_deltas`, and `pending_sec_index` are moved out of `self`
     /// BEFORE journaling so a journal failure leaves the caller with
     /// `pending` refcount ownership. Returns `(pending, pending_sec_index)`
-    /// on success; flips `finalized` so `Drop` skips the refcount decref.
+    /// on success.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn commit_with_ts(
         // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
@@ -638,7 +627,6 @@ impl WriteTxn {
         let end_lsn =
             journal.append_chain_commit_end_lsn(commit_ts, refcount_deltas, page_writes)?;
 
-        self.finalized = true;
         Ok((pending, pending_sec_index, end_lsn))
     }
 
@@ -662,7 +650,6 @@ impl WriteTxn {
         }
         .encode()?;
 
-        self.finalized = true;
         Ok(PreparedChainCommit {
             pending,
             pending_sec_index,
@@ -675,16 +662,6 @@ impl WriteTxn {
     /// `Drop` runs on return, decrementing every `pending` refcount.
     pub(crate) fn rollback(self) {
         // Drop glue handles the decrefs.
-    }
-}
-
-impl Drop for WriteTxn {
-    fn drop(&mut self) {
-        // Commit path (`self.finalized == true`): ownership of `pending`
-        // has already been moved out via `std::mem::take` — nothing to do.
-        // Abort path: `Vec<OverflowRef>` drop runs `OverflowRef::drop` on
-        // every entry. Each decref is atomic; a 0-post-decrement transitions
-        // the page into the page-lifetime queue (lock-order position 1.5).
     }
 }
 

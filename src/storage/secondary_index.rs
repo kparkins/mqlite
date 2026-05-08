@@ -118,18 +118,18 @@ pub(crate) fn build_index_keys(
     doc_id: &Bson,
     sparse: bool,
 ) -> Result<(Vec<Vec<u8>>, bool)> {
-    // Collect (field_name, value, ascending) for each key field.
-    let fields: Vec<(String, Option<&Bson>, bool)> = key_pattern
+    // Collect (value, ascending) for each key field.
+    let fields: Vec<(Option<&Bson>, bool)> = key_pattern
         .iter()
         .map(|(field, dir)| {
             let ascending = !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
             let val = extract_field_value(doc, field);
-            (field.clone(), val, ascending)
+            (val, ascending)
         })
         .collect();
 
     // Sparse index: skip if any indexed field is absent.
-    if sparse && fields.iter().any(|(_, v, _)| v.is_none()) {
+    if sparse && fields.iter().any(|(v, _)| v.is_none()) {
         return Ok((vec![], false));
     }
 
@@ -137,7 +137,7 @@ pub(crate) fn build_index_keys(
 
     // Detect multikey (array) fields.
     let mut array_field_idx: Option<usize> = None;
-    for (i, (_, val, _)) in fields.iter().enumerate() {
+    for (i, (val, _)) in fields.iter().enumerate() {
         if matches!(val, Some(Bson::Array(_))) {
             if array_field_idx.is_some() {
                 // Compound index with two array fields is a MongoDB error.
@@ -151,8 +151,8 @@ pub(crate) fn build_index_keys(
 
     if let Some(arr_idx) = array_field_idx {
         // Multikey: generate one entry per array element. The invariant set
-        // above guarantees that `fields[arr_idx].1` is `Some(Bson::Array(_))`.
-        let arr = match fields[arr_idx].1 {
+        // above guarantees that `fields[arr_idx].0` is `Some(Bson::Array(_))`.
+        let arr = match fields[arr_idx].0 {
             Some(Bson::Array(a)) => a,
             _ => {
                 return Err(Error::Internal(
@@ -166,7 +166,7 @@ pub(crate) fn build_index_keys(
             let mut entry: Vec<(&Bson, bool)> = fields
                 .iter()
                 .enumerate()
-                .map(|(i, (_, val, ascending))| {
+                .map(|(i, (val, ascending))| {
                     if i == arr_idx {
                         (elem, *ascending)
                     } else {
@@ -182,7 +182,7 @@ pub(crate) fn build_index_keys(
         // Single entry (including non-array single-field or compound).
         let mut entry: Vec<(&Bson, bool)> = fields
             .iter()
-            .map(|(_, val, ascending)| (val.unwrap_or(&null_bson), *ascending))
+            .map(|(val, ascending)| (val.unwrap_or(&null_bson), *ascending))
             .collect();
         entry.push((doc_id, true));
         Ok((vec![encode_compound_key(&entry)], false))
@@ -346,7 +346,7 @@ fn index_payload_id(id_bytes: &[u8]) -> Result<Bson> {
 
 /// Stage index-insert entries for a newly inserted document (MVCC T5').
 ///
-/// Runtime runtime path: keys are computed, unique-constraint pre-check runs
+/// Runtime path: keys are computed, unique-constraint pre-check runs
 /// against the durable `index_tree`, and the resulting writes are staged into
 /// the active `WriteTxn`. The `install_pending_sec_index` pass at commit time
 /// drains the buffer and performs the actual `BTree::insert` on each key.
@@ -411,7 +411,7 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
     // on the second insert. In the staged model we dedupe up front so the
     // commit-time install doesn't see duplicates from the same doc.
     let staged_keys: Vec<Vec<u8>> = if is_multikey {
-        let mut seen = std::collections::HashSet::with_capacity(keys.len());
+        let mut seen = HashSet::with_capacity(keys.len());
         keys.into_iter()
             .filter(|k| seen.insert(k.clone()))
             .collect()

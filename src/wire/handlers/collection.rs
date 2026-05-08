@@ -29,15 +29,16 @@ fn qualified_coll(body: &Document, coll_name: &str) -> String {
 /// ```
 pub(super) fn handle_create(body: &Document, state: &ServerState) -> Document {
     let coll_name = match body.get_str("create") {
-        Ok(s) => s.to_owned(),
+        Ok(s) => s,
         Err(_) => return err_bad_value("create requires a collection name string"),
     };
 
     match state
         .database
-        .create_collection(&qualified_coll(body, &coll_name))
+        .create_collection(&qualified_coll(body, coll_name))
     {
         Ok(_) => doc! { "ok": 1.0_f64 },
+        Err(crate::error::Error::DuplicateKey { .. }) => doc! { "ok": 1.0_f64 },
         Err(e) => err_from_mqlite(e),
     }
 }
@@ -53,13 +54,13 @@ pub(super) fn handle_create(body: &Document, state: &ServerState) -> Document {
 /// ```
 pub(super) fn handle_drop(body: &Document, state: &ServerState) -> Document {
     let coll_name = match body.get_str("drop") {
-        Ok(s) => s.to_owned(),
+        Ok(s) => s,
         Err(_) => return err_bad_value("drop requires a collection name string"),
     };
 
     match state
         .database
-        .drop_collection(&qualified_coll(body, &coll_name))
+        .drop_collection(&qualified_coll(body, coll_name))
     {
         Ok(_) => doc! { "ok": 1.0_f64 },
         Err(e) => err_from_mqlite(e),
@@ -77,11 +78,10 @@ pub(super) fn handle_drop(body: &Document, state: &ServerState) -> Document {
 pub(super) fn handle_list_collections(body: &Document, state: &ServerState) -> Document {
     // Optional `filter: {name: "<name>"}` — only a simple equality filter on `name`
     // is supported.
-    let name_filter: Option<String> = body
+    let name_filter = body
         .get_document("filter")
         .ok()
-        .and_then(|f| f.get_str("name").ok())
-        .map(|s| s.to_owned());
+        .and_then(|f| f.get_str("name").ok());
 
     let all_names = match state.database.list_collection_names() {
         Ok(n) => n,
@@ -91,19 +91,15 @@ pub(super) fn handle_list_collections(body: &Document, state: &ServerState) -> D
     // Filter to collections in the database named by `$db`.
     let db_name = extract_db_name(body);
     let db_prefix = format!("{db_name}.");
-    let names: Vec<String> = all_names
+    let first_batch: bson::Array = all_names
         .into_iter()
-        .filter_map(|n| {
+        .filter_map(|name| {
             // Names are stored as "db.collection" — strip the db prefix.
-            n.strip_prefix(&db_prefix).map(|s| s.to_owned())
-        })
-        .collect();
-
-    let first_batch: bson::Array = names
-        .into_iter()
-        .filter(|name| name_filter.as_ref().map_or(true, |filter| name == filter))
-        .map(|name| {
-            bson::Bson::Document(doc! {
+            let name = name.strip_prefix(&db_prefix)?;
+            if name_filter.map_or(false, |filter| name != filter) {
+                return None;
+            }
+            Some(bson::Bson::Document(doc! {
                 "name": &name,
                 "type": "collection",
                 "options": {},
@@ -115,7 +111,7 @@ pub(super) fn handle_list_collections(body: &Document, state: &ServerState) -> D
                 "info": {
                     "readOnly": false,
                 },
-            })
+            }))
         })
         .collect();
 

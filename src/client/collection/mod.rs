@@ -6,9 +6,10 @@ pub use actions::{
 
 use bson::Document;
 use serde::{de::DeserializeOwned, Serialize};
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
+    client::ClientInner,
     error::Result,
     index::{IndexInfo, IndexModel},
     options::{
@@ -49,17 +50,17 @@ use crate::{
 pub struct Collection<T> {
     pub(crate) db_name: String,
     pub(crate) name: String,
-    pub(crate) inner: Arc<crate::client::ClientInner>,
-    pub(crate) _phantom: std::marker::PhantomData<T>,
+    pub(crate) inner: Arc<ClientInner>,
+    pub(crate) _phantom: PhantomData<T>,
 }
 
 impl<T> Clone for Collection<T> {
     fn clone(&self) -> Self {
-        Collection {
+        Self {
             db_name: self.db_name.clone(),
             name: self.name.clone(),
             inner: Arc::clone(&self.inner),
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 }

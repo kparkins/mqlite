@@ -69,11 +69,6 @@ use util::{bad_value, require_array, require_document};
 /// operators receive arguments of the wrong type (e.g., `$and` given a
 /// non-array value).
 pub(crate) fn eval_filter(doc: &Document, filter: &Document) -> Result<bool> {
-    // Empty filter {} matches everything.
-    if filter.is_empty() {
-        return Ok(true);
-    }
-
     // Reject collation (MongoDB error code 2 = BadValue).
     if filter.contains_key("collation") {
         return Err(bad_value("Collation is not supported by mqlite"));
@@ -206,7 +201,7 @@ fn eval_field_condition(field_value: Option<&Bson>, condition: &Bson) -> Result<
 /// `$options` is only meaningful alongside `$regex`.
 pub(super) fn eval_operator_document(field_value: Option<&Bson>, ops: &Document) -> Result<bool> {
     // Handle $regex/$options as a unit before iterating the rest.
-    if let Some(pattern_bson) = ops.get("$regex") {
+    let skip_regex_options = if let Some(pattern_bson) = ops.get("$regex") {
         let pattern: &str = match pattern_bson {
             Bson::String(s) => s.as_str(),
             Bson::RegularExpression(re) => re.pattern.as_str(),
@@ -220,24 +215,17 @@ pub(super) fn eval_operator_document(field_value: Option<&Bson>, ops: &Document)
         if !eval_regex(field_value, pattern, options)? {
             return Ok(false);
         }
-        // Process remaining operators, skipping $regex/$options.
-        for (op, arg) in ops.iter() {
-            if op == "$regex" || op == "$options" {
-                continue;
-            }
-            if !eval_single_op(field_value, op.as_str(), arg)? {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
-    }
-
-    // $options without $regex is an error.
-    if ops.contains_key("$options") {
+        true
+    } else if ops.contains_key("$options") {
         return Err(bad_value("$options is only valid when used with $regex"));
-    }
+    } else {
+        false
+    };
 
     for (op, arg) in ops.iter() {
+        if skip_regex_options && (op == "$regex" || op == "$options") {
+            continue;
+        }
         if !eval_single_op(field_value, op.as_str(), arg)? {
             return Ok(false);
         }
@@ -269,17 +257,10 @@ fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bo
         "$elemMatch" => eval_elem_match(field_value, arg),
         "$all" => eval_all(field_value, arg),
         "$size" => eval_size(field_value, arg),
-        // ---- Evaluation operators ($regex/$options handled by eval_operator_document) ----
-        "$regex" | "$options" => {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(target: "mqlite", operator = op, "mqlite::unsupported_op");
-            Err(Error::UnsupportedOperator {
-                operator: op.to_owned(),
-            })
-        }
         // ---- Explicitly unsupported operators (error code 9) ----
         // These are named individually to ensure they are never silently ignored.
-        "$expr"           // Aggregation-expression passthrough — explicitly forbidden.
+        "$regex" | "$options" // Evaluation pair — handled by eval_operator_document.
+        | "$expr"         // Aggregation-expression passthrough — explicitly forbidden.
         | "$jsonSchema"   // JSON Schema validation — not implemented.
         | "$mod"          // Modulo arithmetic — not implemented.
         | "$text"         // Full-text search — not implemented.

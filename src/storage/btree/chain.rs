@@ -96,7 +96,7 @@ pub(super) fn free_overflow_chain<S: BTreePageStore>(store: &mut S, first_page: 
 }
 
 pub(super) fn collect_overflow_pages<S: BTreePageStore>(
-    store: &mut S,
+    store: &S,
     first_page: u32,
     pages: &mut Vec<(u32, PageSize)>,
 ) -> Result<()> {
@@ -111,7 +111,7 @@ pub(super) fn collect_overflow_pages<S: BTreePageStore>(
 }
 
 pub(super) fn collect_subtree_pages<S: BTreePageStore>(
-    store: &mut S,
+    store: &S,
     page: u32,
     level: u8,
     pages: &mut Vec<(u32, PageSize)>,
@@ -126,15 +126,16 @@ pub(super) fn collect_subtree_pages<S: BTreePageStore>(
             }
         }
         pages.push((page, PageSize::Large32k));
-    } else {
-        let buf = store.read_internal(page)?;
-        let node = InternalNode::parse(&buf[..])?;
-        for &(_, child) in &node.entries {
-            collect_subtree_pages(store, child, level - 1, pages)?;
-        }
-        collect_subtree_pages(store, node.rightmost_child, level - 1, pages)?;
-        pages.push((page, PageSize::Small4k));
+        return Ok(());
     }
+
+    let buf = store.read_internal(page)?;
+    let node = InternalNode::parse(&buf[..])?;
+    for &(_, child) in &node.entries {
+        collect_subtree_pages(store, child, level - 1, pages)?;
+    }
+    collect_subtree_pages(store, node.rightmost_child, level - 1, pages)?;
+    pages.push((page, PageSize::Small4k));
     Ok(())
 }
 
@@ -146,7 +147,6 @@ pub(super) fn collect_subtree_pages<S: BTreePageStore>(
 pub(super) fn free_subtree<S: BTreePageStore>(store: &mut S, page: u32, level: u8) -> Result<()> {
     use super::InternalNode;
     if level == 0 {
-        // Leaf node: free any overflow chains, then free the leaf page.
         // We do NOT follow `next_leaf_page` here — the parent's child-pointer
         // traversal already enumerates every leaf exactly once.
         let (buf, _) = store.read_leaf(page)?;
@@ -157,15 +157,15 @@ pub(super) fn free_subtree<S: BTreePageStore>(store: &mut S, page: u32, level: u
             }
         }
         store.free_leaf(page)?;
-    } else {
-        // Internal node: recurse into each child, then free this page.
-        let buf = store.read_internal(page)?;
-        let node = InternalNode::parse(&buf[..])?;
-        for &(_, child) in &node.entries {
-            free_subtree(store, child, level - 1)?;
-        }
-        free_subtree(store, node.rightmost_child, level - 1)?;
-        store.free_internal(page)?;
+        return Ok(());
     }
+
+    let buf = store.read_internal(page)?;
+    let node = InternalNode::parse(&buf[..])?;
+    for &(_, child) in &node.entries {
+        free_subtree(store, child, level - 1)?;
+    }
+    free_subtree(store, node.rightmost_child, level - 1)?;
+    store.free_internal(page)?;
     Ok(())
 }

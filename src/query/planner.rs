@@ -115,15 +115,21 @@ pub(crate) fn select_plan(filter: &Document, indexes: &[IndexMeta<'_>]) -> ScanP
     if let Some(condition) = extract_primary_key_condition(filter) {
         return ScanPlan::PrimaryKeyLookup { condition };
     }
+
     for idx in indexes {
-        if let Some((primary_field, condition)) = index_can_accelerate(filter, idx.keys) {
+        let Some((first_field, _)) = idx.keys.iter().next() else {
+            continue;
+        };
+
+        if let Some(condition) = extract_field_condition(filter, first_field) {
             return ScanPlan::IndexScan {
                 index_name: idx.name.to_owned(),
-                primary_field,
+                primary_field: first_field.clone(),
                 condition,
             };
         }
     }
+
     ScanPlan::CollScan
 }
 
@@ -141,18 +147,6 @@ fn extract_primary_key_condition(filter: &Document) -> Option<PrimaryKeyConditio
         IndexCondition::In(vals) => Some(PrimaryKeyCondition::In(vals)),
         IndexCondition::Range { .. } | IndexCondition::Any => None,
     }
-}
-
-/// Check whether `index_keys` can accelerate `filter`.
-///
-/// Returns `Some((field, condition))` if the leftmost index key appears in
-/// `filter` with an index-eligible operator; `None` otherwise.
-fn index_can_accelerate(
-    filter: &Document,
-    index_keys: &Document,
-) -> Option<(String, IndexCondition)> {
-    let (first_field, _) = index_keys.iter().next()?;
-    extract_field_condition(filter, first_field.as_str()).map(|cond| (first_field.clone(), cond))
 }
 
 /// Try to extract an index-eligible condition for `field` from `filter`.
@@ -179,11 +173,11 @@ fn extract_operator_condition(ops: &Document) -> Option<IndexCondition> {
 
     // $exists: false — index contains only present values, so we cannot use
     // it to find documents where the field is absent.
-    match ops.get("$exists") {
-        Some(Bson::Boolean(false)) | Some(Bson::Int32(0)) | Some(Bson::Int64(0)) => {
-            return None;
-        }
-        _ => {}
+    if matches!(
+        ops.get("$exists"),
+        Some(Bson::Boolean(false)) | Some(Bson::Int32(0)) | Some(Bson::Int64(0))
+    ) {
+        return None;
     }
 
     // Point equality.

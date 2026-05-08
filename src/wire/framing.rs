@@ -1,14 +1,10 @@
-// ---------------------------------------------------------------------------
-// Async framing helpers (public; used by integration tests and benchmarks)
-// ---------------------------------------------------------------------------
-
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::protocol::{MsgHeader, OpMsg, MAX_MESSAGE_SIZE};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Default read timeout for `read_message`.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -24,26 +20,20 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// - `InvalidWireMessage` — header too short, opcode not supported, message
 ///   exceeds `MAX_MESSAGE_SIZE`, or checksum mismatch
 pub async fn read_message(stream: &mut TcpStream) -> Result<OpMsg> {
-    // Step 1: read the 16-byte header.
     let mut header_buf = [0u8; MsgHeader::SIZE];
     tokio::time::timeout(READ_TIMEOUT, stream.read_exact(&mut header_buf))
         .await
         .map_err(|_| {
-            crate::error::Error::Io(std::io::Error::new(
+            Error::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "read_message: timed out waiting for message header",
             ))
         })??;
 
-    // Peek at the declared message length without fully parsing the header yet.
-    let declared_len = i32::from_le_bytes(
-        header_buf[0..4]
-            .try_into()
-            .expect("header_buf is 16 bytes; slice [0..4] is exactly 4"),
-    ) as usize;
+    let declared_len = MsgHeader::parse(&header_buf)?.message_length as usize;
 
     if declared_len < MsgHeader::SIZE {
-        return Err(crate::error::Error::InvalidWireMessage {
+        return Err(Error::InvalidWireMessage {
             detail: format!(
                 "messageLength {} is smaller than header size {}",
                 declared_len,
@@ -52,7 +42,7 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<OpMsg> {
         });
     }
     if declared_len > MAX_MESSAGE_SIZE {
-        return Err(crate::error::Error::InvalidWireMessage {
+        return Err(Error::InvalidWireMessage {
             detail: format!(
                 "message size {} exceeds maximum {} bytes (48 MiB)",
                 declared_len, MAX_MESSAGE_SIZE
@@ -60,24 +50,21 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<OpMsg> {
         });
     }
 
-    // Step 2: allocate a buffer for the full message and copy the header in.
     let mut msg_buf = vec![0u8; declared_len];
     msg_buf[..MsgHeader::SIZE].copy_from_slice(&header_buf);
 
-    // Step 3: read the remainder of the message.
     tokio::time::timeout(
         READ_TIMEOUT,
         stream.read_exact(&mut msg_buf[MsgHeader::SIZE..]),
     )
     .await
     .map_err(|_| {
-        crate::error::Error::Io(std::io::Error::new(
+        Error::Io(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "read_message: timed out waiting for message body",
         ))
     })??;
 
-    // Step 4: parse and validate.
     OpMsg::parse(&msg_buf)
 }
 

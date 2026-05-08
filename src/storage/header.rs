@@ -6,9 +6,8 @@
 
 // All expect() calls in this module operate on fixed-size slice conversions
 // (e.g. `buf[0..4].try_into().expect("4 bytes")`). The slices are guaranteed
-// correct by construction — the buffer is always exactly PAGE_SIZE bytes.
-// These are safe in practice; they are allowed here. The slices are guaranteed
-// correct by construction — see the fixed-size buffer invariant above.
+// correct by construction because header buffers are always exactly
+// HEADER_PAGE_SIZE bytes.
 #![allow(clippy::expect_used)]
 //!
 //! ## On-disk layout (format version 1)
@@ -260,7 +259,29 @@ impl FileHeader {
     /// All reserved bytes (110–127) and padding (128–4095) are zero-filled.
     pub(crate) fn to_bytes(&self) -> [u8; HEADER_PAGE_SIZE] {
         let mut buf = [0u8; HEADER_PAGE_SIZE];
-        self.write_fields(&mut buf);
+        buf[0..4].copy_from_slice(&self.magic);
+        buf[4..8].copy_from_slice(&self.format_version.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.page_size_internal.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.page_size_leaf.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.created_at.to_le_bytes());
+        buf[24..36].copy_from_slice(&self.last_checkpoint_ts.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.catalog_root_page.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.free_list_head_4k.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.free_list_head_32k.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.total_page_count.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.free_page_count_4k.to_le_bytes());
+        buf[56..60].copy_from_slice(&self.free_page_count_32k.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.checksum_algo.to_le_bytes());
+        // offset 64..68: checksum, written after all covered fields.
+        buf[68..72].copy_from_slice(&self.wal_salt1.to_le_bytes());
+        buf[72..76].copy_from_slice(&self.wal_salt2.to_le_bytes());
+        buf[76..80].copy_from_slice(&self.catalog_root_backup.to_le_bytes());
+        buf[80] = self.catalog_root_level;
+        buf[81..89].copy_from_slice(&self.next_namespace_id.to_le_bytes());
+        buf[89..97].copy_from_slice(&self.next_index_id.to_le_bytes());
+        buf[97..101].copy_from_slice(&self.history_store_root_page.to_le_bytes());
+        buf[101] = self.history_store_root_level;
+        buf[102..110].copy_from_slice(&self.checkpoint_applied_lsn.to_le_bytes());
 
         let checksum = Self::compute_checksum(&buf);
         buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
@@ -371,7 +392,6 @@ impl FileHeader {
             wal_salt2: u32::from_le_bytes(buf[72..76].try_into().expect("4 bytes")),
             catalog_root_backup: u32::from_le_bytes(buf[76..80].try_into().expect("4 bytes")),
             catalog_root_level: buf[80],
-            // Phase 1 §10.7 — durable id counters + history-store root page.
             next_namespace_id: u64::from_le_bytes(buf[81..89].try_into().expect("8 bytes")),
             next_index_id: u64::from_le_bytes(buf[89..97].try_into().expect("8 bytes")),
             history_store_root_page: u32::from_le_bytes(buf[97..101].try_into().expect("4 bytes")),
@@ -407,43 +427,6 @@ impl FileHeader {
             });
         }
         Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Write all structured fields into `buf`.
-    ///
-    /// Does **not** write the checksum at offset 64 — that is the caller's
-    /// responsibility (done in `to_bytes`).
-    fn write_fields(&self, buf: &mut [u8; HEADER_PAGE_SIZE]) {
-        buf[0..4].copy_from_slice(&self.magic);
-        buf[4..8].copy_from_slice(&self.format_version.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.page_size_internal.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.page_size_leaf.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.created_at.to_le_bytes());
-        buf[24..36].copy_from_slice(&self.last_checkpoint_ts.to_le_bytes());
-        buf[36..40].copy_from_slice(&self.catalog_root_page.to_le_bytes());
-        buf[40..44].copy_from_slice(&self.free_list_head_4k.to_le_bytes());
-        buf[44..48].copy_from_slice(&self.free_list_head_32k.to_le_bytes());
-        buf[48..52].copy_from_slice(&self.total_page_count.to_le_bytes());
-        buf[52..56].copy_from_slice(&self.free_page_count_4k.to_le_bytes());
-        buf[56..60].copy_from_slice(&self.free_page_count_32k.to_le_bytes());
-        buf[60..64].copy_from_slice(&self.checksum_algo.to_le_bytes());
-        // offset 64–67: checksum — written by to_bytes after this call
-        buf[68..72].copy_from_slice(&self.wal_salt1.to_le_bytes());
-        buf[72..76].copy_from_slice(&self.wal_salt2.to_le_bytes());
-        buf[76..80].copy_from_slice(&self.catalog_root_backup.to_le_bytes());
-        buf[80] = self.catalog_root_level;
-        // Phase 1 §10.7 — durable id counters + history-store root page.
-        buf[81..89].copy_from_slice(&self.next_namespace_id.to_le_bytes());
-        buf[89..97].copy_from_slice(&self.next_index_id.to_le_bytes());
-        buf[97..101].copy_from_slice(&self.history_store_root_page.to_le_bytes());
-        buf[101] = self.history_store_root_level;
-        buf[102..110].copy_from_slice(&self.checkpoint_applied_lsn.to_le_bytes());
-        // offsets 110–127: reserved, already zero-filled by array init
-        // offsets 128–4095: padding, already zero-filled
     }
 }
 

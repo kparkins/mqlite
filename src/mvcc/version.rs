@@ -159,21 +159,12 @@ impl Drop for OverflowRef {
 ///
 /// Cloning a `VersionData::Overflow(_)` runs the `OverflowRef::Clone`
 /// incref path, preserving the refcount ↔ live-handle invariant.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VersionData {
     /// Inline payload that fits in a leaf cell.
     Inline(Vec<u8>),
     /// Payload stored in a refcounted overflow chain.
     Overflow(OverflowRef),
-}
-
-impl Clone for VersionData {
-    fn clone(&self) -> Self {
-        match self {
-            VersionData::Inline(v) => VersionData::Inline(v.clone()),
-            VersionData::Overflow(r) => VersionData::Overflow(r.clone()),
-        }
-    }
 }
 
 impl VersionData {

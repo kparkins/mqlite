@@ -55,13 +55,6 @@ impl PublishDirty {
     pub(crate) fn mark_header(&mut self) {
         self.catalog_header_dirty = true;
     }
-
-    /// Merge two dirty states with bitwise-OR semantics on both fields.
-    #[allow(dead_code)]
-    pub(crate) fn merge(&mut self, other: PublishDirty) {
-        self.published_catalog_dirty |= other.published_catalog_dirty;
-        self.catalog_header_dirty |= other.catalog_header_dirty;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +81,7 @@ pub(crate) fn build_published_catalog(
         for idx in indexes {
             index_owner_by_id.insert(idx.id, coll.id);
             idxs.push(PublishedIndex {
+                #[cfg(test)]
                 id: idx.id,
                 name: idx.name.clone(),
                 root_page: idx.root_page,
@@ -248,33 +242,6 @@ mod tests {
         let mut d = PublishDirty::default();
         d.mark_header();
         assert!(!d.published_catalog_dirty);
-        assert!(d.catalog_header_dirty);
-    }
-
-    #[test]
-    fn merge_is_bitwise_or() {
-        let mut d = PublishDirty {
-            published_catalog_dirty: false,
-            catalog_header_dirty: true,
-        };
-        let other = PublishDirty {
-            published_catalog_dirty: true,
-            catalog_header_dirty: false,
-        };
-        d.merge(other);
-        assert!(d.published_catalog_dirty);
-        assert!(d.catalog_header_dirty);
-    }
-
-    #[test]
-    fn merge_preserves_already_set_bits() {
-        let mut d = PublishDirty {
-            published_catalog_dirty: true,
-            catalog_header_dirty: true,
-        };
-        let other = PublishDirty::default();
-        d.merge(other);
-        assert!(d.published_catalog_dirty);
         assert!(d.catalog_header_dirty);
     }
 }

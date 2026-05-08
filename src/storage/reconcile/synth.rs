@@ -51,7 +51,7 @@ pub(crate) enum NotInstallable {
     FoldedLeafExceedsPageByteBudget,
 }
 
-/// Synthesize a folded leaf image using the Phase 4 full-timestamp rules.
+/// Synthesize a folded leaf image using the full-timestamp rules.
 ///
 /// # Errors
 ///
@@ -117,10 +117,11 @@ pub(crate) fn synthesize_page(
     }
 
     let folded_cells: Vec<FoldedLeafCell> = base_cells.into_values().collect();
-    if predict_encoded_leaf_size(&folded_cells, &RetainedChains::new()) > PAGE_SIZE_LEAF as usize {
+    let page_budget = PAGE_SIZE_LEAF as usize;
+    if predict_encoded_leaf_size(&folded_cells, &RetainedChains::new()) > page_budget {
         return Err(NotInstallable::VisibleWinnerExceedsPageBudget);
     }
-    if predict_encoded_leaf_size(&folded_cells, &retained_chains) > PAGE_SIZE_LEAF as usize {
+    if predict_encoded_leaf_size(&folded_cells, &retained_chains) > page_budget {
         return Err(NotInstallable::FoldedLeafExceedsPageByteBudget);
     }
 
@@ -146,6 +147,7 @@ pub(crate) fn visible_winners_fit_individual_leaf_pages(
     checkpoint_ts: Ts,
 ) -> Result<bool, NotInstallable> {
     let mut visible_winners = 0usize;
+    let page_budget = PAGE_SIZE_LEAF as usize;
     for (key, chain) in chains {
         let Some(index) = checkpoint_winner_index(chain, checkpoint_ts) else {
             return Ok(false);
@@ -159,7 +161,7 @@ pub(crate) fn visible_winners_fit_individual_leaf_pages(
         }
         visible_winners += 1;
         let cell = materialized_cell_for_budget(key, entry)?;
-        if predict_encoded_leaf_size(&[cell], &RetainedChains::new()) > PAGE_SIZE_LEAF as usize {
+        if predict_encoded_leaf_size(&[cell], &RetainedChains::new()) > page_budget {
             return Ok(false);
         }
     }

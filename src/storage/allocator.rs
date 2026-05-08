@@ -453,8 +453,8 @@ impl AllocatorHandle {
     // access pattern lets Clone / Drop on OverflowRef stay lock-free on the
     // hot path.
     //
-    // `drain_free_queue` is the single writer-path that transitions a page
-    // from refcount=0 → free list.
+    // Drains recheck refcounts before moving pages out of reader-visible
+    // overflow ownership.
 
     /// Look up or create the shared `AtomicU32` refcount for `first_page`.
     fn refcount_handle(&self, first_page: u32) -> Arc<AtomicU32> {
@@ -627,8 +627,7 @@ impl AllocatorHandle {
                 continue;
             }
             let page = entry.page();
-            let cnt = self.overflow_refcount(page);
-            if cnt == 0 {
+            if self.overflow_refcount(page) == 0 {
                 let mut alloc = PageAllocator::new(&mut state.header, io);
                 alloc.free_32k(page)?;
                 // Drop the refcount entry — the page is no longer live.
@@ -689,8 +688,7 @@ impl AllocatorHandle {
                 continue;
             }
             let page = entry.page();
-            let cnt = self.overflow_refcount(page);
-            if cnt == 0 {
+            if self.overflow_refcount(page) == 0 {
                 // Drop the refcount entry — the page is no longer live.
                 #[allow(clippy::unwrap_used)]
                 let mut table = self.inner.overflow_refcounts.lock().unwrap();

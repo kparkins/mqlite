@@ -1,6 +1,6 @@
-//! Writer-side visibility context for Phase 3 uniqueness plumbing.
+//! Writer-side MVCC visibility context and history probes.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::mvcc::read_view::ReadView;
@@ -22,7 +22,7 @@ pub(crate) struct WriteVisibility<'a> {
     pub(in crate::storage::paged_engine) ns_id: NamespaceId,
     pub(in crate::storage::paged_engine) primary_history:
         PrimaryHistoryProbe<'a, BufferPoolPageStore>,
-    history_store: &'a std::sync::Mutex<HistoryStore<BufferPoolPageStore>>,
+    history_store: &'a Mutex<HistoryStore<BufferPoolPageStore>>,
 }
 
 impl<'a> WriteVisibility<'a> {
@@ -86,41 +86,19 @@ impl<'a> WriteVisibility<'a> {
         &self,
         index_id: i64,
     ) -> SecondaryHistoryProbe<'a, BufferPoolPageStore> {
-        SecondaryHistoryProbe::new(self.history_store, self.ns_id, index_id)
-    }
-}
-
-/// Secondary-index history probe placeholder for Phase 4 spill support.
-pub(in crate::storage::paged_engine) struct SecondaryHistoryProbe<'a, S: BTreePageStore> {
-    store: &'a std::sync::Mutex<HistoryStore<S>>,
-    collection_id: i64,
-    index_id: i64,
-}
-
-impl<'a, S: BTreePageStore> SecondaryHistoryProbe<'a, S> {
-    /// Create a secondary history probe for one secondary-index kind tag.
-    ///
-    /// # Arguments
-    ///
-    /// * `store` - history-store mutex.
-    /// * `collection_id` - durable collection identifier.
-    /// * `index_id` - durable secondary index identifier.
-    ///
-    /// # Returns
-    ///
-    /// A history probe for one secondary index.
-    #[must_use]
-    pub(in crate::storage::paged_engine) fn new(
-        store: &'a std::sync::Mutex<HistoryStore<S>>,
-        collection_id: i64,
-        index_id: i64,
-    ) -> Self {
-        Self {
-            store,
-            collection_id,
+        SecondaryHistoryProbe {
+            store: self.history_store,
+            collection_id: self.ns_id,
             index_id,
         }
     }
+}
+
+/// Secondary-index history probe for one namespace/index pair.
+pub(in crate::storage::paged_engine) struct SecondaryHistoryProbe<'a, S: BTreePageStore> {
+    store: &'a Mutex<HistoryStore<S>>,
+    collection_id: i64,
+    index_id: i64,
 }
 
 impl<S: BTreePageStore> HistoryProbe for SecondaryHistoryProbe<'_, S> {

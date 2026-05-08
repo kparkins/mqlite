@@ -336,8 +336,7 @@ impl BufferPoolHandle {
     pub(crate) fn flush(&self) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
         crate::journal::append_sync_observations::record_handle_flush();
-        let durable_lsn = self.journal_durable_lsn()?;
-        let Some(durable_lsn) = durable_lsn else {
+        let Some(durable_lsn) = self.journal_durable_lsn()? else {
             return self.flush_journal_less_test_handle();
         };
         self.pool.set_main_file_flush_lsn(durable_lsn);
@@ -461,7 +460,6 @@ impl BufferPoolHandle {
     /// main-data frames and — combined with the outermost lock-order position —
     /// keeps reconciliation's installation of aged entries on a path that
     /// never re-enters the main pool's partition mutexes.
-    #[allow(dead_code)]
     pub(crate) fn history_pool(&self) -> &Arc<BufferPool> {
         &self.history_pool
     }
@@ -476,7 +474,6 @@ impl BufferPoolHandle {
     /// Used by writer-path code that needs a `PageSource` for
     /// [`AllocatorHandle::drain_free_queue`] without re-constructing one.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn page_source(&self) -> &BufferPoolPageSource {
         &self.pool_io
     }

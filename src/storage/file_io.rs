@@ -40,10 +40,6 @@ use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::lock::FileLock;
 use crate::storage::page::PAGE_SIZE_LEAF;
 
-// ---------------------------------------------------------------------------
-// FilePageSource
-// ---------------------------------------------------------------------------
-
 /// File-backed `PageSource` implementation.
 ///
 /// Wraps an `Arc<dyn FileLock>` so that I/O and advisory locking share the
@@ -67,7 +63,7 @@ impl FilePageSource {
     ///
     /// All pages occupy a uniform 32 KB slot regardless of their size class.
     #[inline]
-    pub(crate) fn file_offset(page_number: u32) -> u64 {
+    fn file_offset(page_number: u32) -> u64 {
         page_number as u64 * PAGE_SIZE_LEAF as u64
     }
 }
@@ -114,23 +110,12 @@ impl PageSource for FilePageSource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
     /// In-memory `FileLock` implementation for testing `FilePageSource`.
-    ///
-    /// Backed by a `HashMap<u64, Vec<u8>>` keyed by byte offset + length.
-    /// Supports positional reads and writes.
     struct MemFileLock {
         data: Mutex<Vec<u8>>,
     }
@@ -189,10 +174,6 @@ mod tests {
         (lock, io)
     }
 
-    // -----------------------------------------------------------------------
-    // file_offset
-    // -----------------------------------------------------------------------
-
     #[test]
     fn file_offset_page_0_is_zero() {
         assert_eq!(FilePageSource::file_offset(0), 0);
@@ -212,10 +193,6 @@ mod tests {
             );
         }
     }
-
-    // -----------------------------------------------------------------------
-    // write_page / read_page roundtrip
-    // -----------------------------------------------------------------------
 
     #[test]
     fn write_and_read_32k_page_roundtrip() {
@@ -296,10 +273,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // EOF handling — reading a page beyond file end returns zeroes
-    // -----------------------------------------------------------------------
-
     #[test]
     fn read_beyond_eof_returns_zeroes_32k() {
         let (_, io) = make_io(); // empty file
@@ -322,10 +295,6 @@ mod tests {
             "EOF read of page 0 must return zeroes"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Multiple writes to same page
-    // -----------------------------------------------------------------------
 
     #[test]
     fn second_write_overwrites_first() {

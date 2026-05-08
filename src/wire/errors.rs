@@ -31,7 +31,7 @@ pub(super) fn err_from_mqlite(e: crate::error::Error) -> Document {
 }
 
 /// Map a MongoDB error code to its canonical `codeName` string.
-pub(super) fn mqlite_code_name(code: i32) -> &'static str {
+fn mqlite_code_name(code: i32) -> &'static str {
     match code {
         crate::error::codes::DUPLICATE_KEY => "DuplicateKey",
         crate::error::codes::NAMESPACE_NOT_FOUND => "NamespaceNotFound",

@@ -19,8 +19,7 @@ impl<S: BTreePageStore> BTree<S> {
     /// merge with a sibling. Parent separator keys are updated accordingly.
     pub(crate) fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let mut path: Vec<(u32, usize)> = Vec::new();
-        let found = self.delete_subtree(self.root_page, self.root_level, key, &mut path)?;
-        Ok(found)
+        self.delete_subtree(self.root_page, self.root_level, key, &mut path)
     }
 
     /// Recursive delete.
@@ -44,9 +43,9 @@ impl<S: BTreePageStore> BTree<S> {
         let child_page = node.child_at(child_idx);
 
         path.push((page, child_idx));
-        let found = self.delete_subtree(child_page, level - 1, key, path)?;
+        let found = self.delete_subtree(child_page, level - 1, key, path);
         path.pop();
-        Ok(found)
+        found
     }
 
     /// Delete `key` from the leaf at `page`, then handle underflow.
@@ -107,7 +106,6 @@ impl<S: BTreePageStore> BTree<S> {
                 return self.merge_leaf_into_left(
                     parent_page,
                     child_idx,
-                    path,
                     left_page,
                     left_node,
                     page,
@@ -133,14 +131,7 @@ impl<S: BTreePageStore> BTree<S> {
             let right_node = LeafNode::parse(&right_buf[..])?;
 
             if Self::can_merge_leaves(&node, &right_node) {
-                return self.merge_leaf_into_right(
-                    parent_page,
-                    path,
-                    page,
-                    node,
-                    right_page,
-                    right_node,
-                );
+                return self.merge_leaf_into_right(parent_page, page, node, right_page, right_node);
             }
 
             return self.redistribute_leaf_pair(
@@ -263,12 +254,10 @@ impl<S: BTreePageStore> BTree<S> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn merge_leaf_into_left(
         &mut self,
         parent_page: u32,
         child_idx: usize,
-        path: &[(u32, usize)],
         left_page: u32,
         mut left_node: LeafNode,
         page: u32,
@@ -298,13 +287,12 @@ impl<S: BTreePageStore> BTree<S> {
         self.store.free_leaf(page)?;
 
         self.redirect_parent_child_pointer(parent_page, child_idx, left_page)?;
-        self.remove_from_parent(parent_page, child_idx - 1, path)
+        self.remove_from_parent(parent_page, child_idx - 1)
     }
 
     fn merge_leaf_into_right(
         &mut self,
         parent_page: u32,
-        path: &[(u32, usize)],
         page: u32,
         node: LeafNode,
         right_page: u32,
@@ -334,7 +322,7 @@ impl<S: BTreePageStore> BTree<S> {
             ));
         }
         self.store.free_leaf(page)?;
-        self.remove_from_parent(parent_page, 0, path)
+        self.remove_from_parent(parent_page, 0)
     }
 
     /// Redirect the child pointer at `child_idx` in the internal node at
@@ -368,38 +356,27 @@ impl<S: BTreePageStore> BTree<S> {
     /// root to its remaining child. Otherwise write the updated node back in
     /// place; internal-node underflow propagation is still intentionally
     /// deferred in this implementation.
-    fn remove_from_parent(
-        &mut self,
-        parent_page: u32,
-        separator_idx: usize,
-        _path: &[(u32, usize)],
-    ) -> Result<()> {
+    fn remove_from_parent(&mut self, parent_page: u32, separator_idx: usize) -> Result<()> {
         let buf = self.store.read_internal(parent_page)?;
         let mut parent = InternalNode::parse(&buf[..])?;
 
         parent.entries.remove(separator_idx);
 
-        if parent.entries.is_empty() {
+        if parent.entries.is_empty() && parent_page == self.root_page {
             // The root has no more separator keys.  If it's the actual tree root,
             // we make rightmost_child the new root.
-            if parent_page == self.root_page {
-                self.root_page = parent.rightmost_child;
-                if self.root_level > 0 {
-                    self.root_level -= 1;
-                }
-                self.store.free_internal(parent_page)?;
-                return Ok(());
+            self.root_page = parent.rightmost_child;
+            if self.root_level > 0 {
+                self.root_level -= 1;
             }
-            // Not the root: need to propagate underflow upward.
-            // We accept an underfull internal node (just write it back).
-            // A more complete implementation would merge internal nodes too.
-            let enc = parent.encode()?;
-            self.store.write_internal(parent_page, &enc)?;
-        } else {
-            let enc = parent.encode()?;
-            self.store.write_internal(parent_page, &enc)?;
+            self.store.free_internal(parent_page)?;
+            return Ok(());
         }
 
+        // Non-root internal underflow propagation is intentionally deferred:
+        // write the underfull internal node back in place.
+        let enc = parent.encode()?;
+        self.store.write_internal(parent_page, &enc)?;
         Ok(())
     }
 }

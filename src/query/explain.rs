@@ -55,25 +55,23 @@ impl ExplainResult {
     /// `docs_examined` must be supplied by the executor because the planner
     /// does not run the query — it only selects the access path.
     pub(crate) fn from_plan(plan: &ScanPlan, docs_examined: u64) -> Self {
-        match plan {
-            ScanPlan::CollScan => ExplainResult {
-                plan: "COLLSCAN".to_owned(),
-                index_used: None,
-                docs_examined,
-                full_scan: true,
-            },
-            ScanPlan::PrimaryKeyLookup { .. } => ExplainResult {
-                plan: "IDHACK".to_owned(),
-                index_used: Some("_id_".to_owned()),
-                docs_examined,
-                full_scan: false,
-            },
-            ScanPlan::IndexScan { index_name, .. } => ExplainResult {
-                plan: format!("IXSCAN {{ {index_name} }}"),
-                index_used: Some(index_name.clone()),
-                docs_examined,
-                full_scan: false,
-            },
+        let (plan, index_used, full_scan) = match plan {
+            ScanPlan::CollScan => ("COLLSCAN".to_owned(), None, true),
+            ScanPlan::PrimaryKeyLookup { .. } => {
+                ("IDHACK".to_owned(), Some("_id_".to_owned()), false)
+            }
+            ScanPlan::IndexScan { index_name, .. } => (
+                format!("IXSCAN {{ {index_name} }}"),
+                Some(index_name.clone()),
+                false,
+            ),
+        };
+
+        Self {
+            plan,
+            index_used,
+            docs_examined,
+            full_scan,
         }
     }
 }

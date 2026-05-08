@@ -99,7 +99,6 @@ pub(super) struct Frame {
     /// scoped to a single resident `Frame`: cache hits reuse it across
     /// pin/unpin cycles, while a cache miss installs a fresh latch with
     /// the new page (§10.18 rule 1 — `PageLatch` is bound to the Frame).
-    #[allow(dead_code)]
     pub(super) latch: PageLatch,
 }
 
@@ -199,7 +198,6 @@ fn has_live_committed_head(frame: &Frame) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(super) struct PartitionOccupancySnapshot {
     pub(super) resident_frames: usize,
     pub(super) pinned_frames: usize,
@@ -226,10 +224,7 @@ pub(super) struct Partition {
 impl Partition {
     pub(super) fn new(capacity: usize, page_size: usize) -> Self {
         let capacity = capacity.max(1);
-        let mut frames = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            frames.push(None);
-        }
+        let frames = std::iter::repeat_with(|| None).take(capacity).collect();
         Self {
             frames,
             page_map: HashMap::new(),
@@ -433,22 +428,14 @@ impl Partition {
             return 0;
         };
         let mut dropped = 0usize;
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(frame.deltas.len());
-        keys.extend(frame.deltas.keys().cloned());
-        for key in keys {
-            let Some(chain_arc) = frame.deltas.get_mut(&key) else {
-                continue;
-            };
+        frame.deltas.retain(|_, chain_arc| {
             let before = chain_arc.len();
             let chain_mut = Arc::make_mut(chain_arc);
             chain_mut.retain(|e| e.stop_ts == Ts::MAX || e.stop_ts > ort);
             let after = chain_arc.len();
             dropped += before - after;
-
-            if chain_arc.is_empty() {
-                frame.deltas.remove(&key);
-            }
-        }
+            !chain_arc.is_empty()
+        });
         dropped
     }
 
@@ -522,10 +509,6 @@ impl Partition {
     }
 
     /// Return copied snapshots of dirty resident frames in this partition.
-    #[allow(
-        dead_code,
-        reason = "US-005 lands checkpoint-owned frame snapshots before the full driver consumes them"
-    )]
     pub(super) fn dirty_frame_snapshots(&self, size: PageSize) -> Vec<(u32, PageSize, Vec<u8>)> {
         self.frames
             .iter()
@@ -569,7 +552,6 @@ impl Partition {
     }
 
     /// Return occupancy counts for resident frames in this partition.
-    #[allow(dead_code)]
     pub(super) fn occupancy_snapshot(&self) -> PartitionOccupancySnapshot {
         let mut snapshot = PartitionOccupancySnapshot::default();
         for frame in self.frames.iter().flatten() {

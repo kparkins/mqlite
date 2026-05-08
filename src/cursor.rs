@@ -1,3 +1,7 @@
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::marker::PhantomData;
+
 use bson::Document;
 use serde::de::DeserializeOwned;
 
@@ -35,16 +39,14 @@ use crate::query::explain::ExplainResult;
 /// This follows the same contract as the MongoDB Rust driver's `Cursor<T>`.
 pub struct Cursor<T> {
     /// Buffered documents not yet returned to the caller.
-    buffer: std::collections::VecDeque<Document>,
+    buffer: VecDeque<Document>,
     /// Phantom for the document type.
-    _phantom: std::marker::PhantomData<T>,
+    _phantom: PhantomData<T>,
     /// Makes `Cursor<T>` explicitly `!Sync`.
     ///
     /// `Cell<()>` is `Send + !Sync`.  Adding `PhantomData<Cell<()>>` causes
     /// the compiler to opt the struct out of `Sync` without affecting `Send`.
-    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
-    /// Whether the cursor has been exhausted.
-    done: bool,
+    _not_sync: PhantomData<Cell<()>>,
     /// Query plan metadata captured at cursor creation time.
     plan: ExplainResult,
 }
@@ -65,12 +67,25 @@ impl<T> Cursor<T> {
     /// returned verbatim by [`Cursor::explain`].
     pub(crate) fn new(docs: Vec<Document>, plan: ExplainResult) -> Self {
         Cursor {
-            buffer: std::collections::VecDeque::from(docs),
-            _phantom: std::marker::PhantomData,
-            _not_sync: std::marker::PhantomData,
-            done: false,
+            buffer: VecDeque::from(docs),
+            _phantom: PhantomData,
+            _not_sync: PhantomData,
             plan,
         }
+    }
+
+    /// Create an empty cursor for unit tests that only exercise cursor storage.
+    #[cfg(all(test, feature = "wire"))]
+    pub(crate) fn empty() -> Self {
+        Self::new(
+            Vec::new(),
+            ExplainResult {
+                plan: "COLLSCAN".to_owned(),
+                index_used: None,
+                docs_examined: 0,
+                full_scan: true,
+            },
+        )
     }
 
     /// Returns `true` if the cursor has no remaining documents to return.
@@ -81,7 +96,7 @@ impl<T> Cursor<T> {
     /// `cursor.id = 0` to the driver.
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
-        self.done || self.buffer.is_empty()
+        self.buffer.is_empty()
     }
 
     /// Explain the query plan that was used to produce this cursor.
@@ -119,14 +134,8 @@ impl<T: DeserializeOwned> Iterator for Cursor<T> {
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        let Some(doc) = self.buffer.pop_front() else {
-            self.done = true;
-            return None;
-        };
-        Some(bson::from_document(doc).map_err(Error::BsonDeserialization))
+        self.buffer
+            .pop_front()
+            .map(|doc| bson::from_document(doc).map_err(Error::BsonDeserialization))
     }
 }

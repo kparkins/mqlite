@@ -191,8 +191,7 @@ pub(super) fn update_documents(
                 maintain_secondary_on_update(
                     shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn,
                 )?;
-                let entry_opt = catalog_lock(md).get_collection(ns)?;
-                if let Some(entry) = entry_opt {
+                if let Some(entry) = catalog_lock(md).get_collection(ns)? {
                     txn.stage_primary_update(
                         entry.id,
                         ns_arc.clone(),
@@ -252,8 +251,7 @@ pub(super) fn delete_documents(
         for (key, doc, expected_head) in &pairs_to_delete {
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             maintain_secondary_on_delete(shared, md, ns, doc, &doc_id, txn)?;
-            let entry_opt = catalog_lock(md).get_collection(ns)?;
-            if let Some(entry) = entry_opt {
+            if let Some(entry) = catalog_lock(md).get_collection(ns)? {
                 txn.stage_primary_delete(entry.id, ns_arc.clone(), key.clone(), *expected_head);
             }
         }
@@ -341,8 +339,7 @@ pub(super) fn find_one_and_update(
     let ns_arc = Ns::from(ns);
     engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         maintain_secondary_on_update(shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn)?;
-        let entry_opt = catalog_lock(md).get_collection(ns)?;
-        if let Some(entry) = entry_opt {
+        if let Some(entry) = catalog_lock(md).get_collection(ns)? {
             txn.stage_primary_update(entry.id, ns_arc.clone(), key, new_bytes, expected_head);
         }
         Ok(())
@@ -392,8 +389,7 @@ pub(super) fn find_one_and_delete(
     let ns_arc = Ns::from(ns);
     engine.run_write_commit_envelope(ns, None, |shared, md, txn, _vis| {
         maintain_secondary_on_delete(shared, md, ns, &doc, &doc_id, txn)?;
-        let entry_opt = catalog_lock(md).get_collection(ns)?;
-        if let Some(entry) = entry_opt {
+        if let Some(entry) = catalog_lock(md).get_collection(ns)? {
             txn.stage_primary_delete(entry.id, ns_arc.clone(), key, expected_head);
         }
         Ok(())
@@ -452,23 +448,20 @@ pub(super) fn find_one_and_replace(
 
     let new_bytes = bson::to_vec(&new_doc).map_err(Error::BsonSerialization)?;
 
-    let old_doc_clone = old_doc.clone();
-    let new_doc_clone = new_doc.clone();
     let ns_arc = Ns::from(ns);
     engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         maintain_secondary_on_update(
             shared,
             md,
             ns,
-            &old_doc_clone,
-            &new_doc_clone,
+            &old_doc,
+            &new_doc,
             &original_id,
             &original_id,
             vis,
             txn,
         )?;
-        let entry_opt = catalog_lock(md).get_collection(ns)?;
-        if let Some(entry) = entry_opt {
+        if let Some(entry) = catalog_lock(md).get_collection(ns)? {
             txn.stage_primary_update(entry.id, ns_arc.clone(), old_key, new_bytes, expected_head);
         }
         Ok(())

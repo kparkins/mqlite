@@ -39,7 +39,7 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) use bson::oid::ObjectId;
+use bson::oid::ObjectId;
 
 // ---------------------------------------------------------------------------
 // Process-static state
@@ -77,9 +77,13 @@ impl ObjectIdGenerator {
     ///
     /// Safe to call concurrently from any number of threads.
     pub(crate) fn generate() -> ObjectId {
-        let timestamp = current_timestamp_secs();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
         let process_id = *PROCESS_RANDOM.get_or_init(init_process_random);
-        let counter = next_counter();
+        let [_, b1, b2, b3] = COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+        let counter = [b1, b2, b3];
 
         ObjectId::from_parts(timestamp, process_id, counter)
     }
@@ -88,28 +92,6 @@ impl ObjectIdGenerator {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
-
-/// Return the current Unix time in whole seconds, truncated to `u32`.
-///
-/// Overflows after Feb 2106 — acceptable for MongoDB's 4-byte ObjectId
-/// timestamp field.
-fn current_timestamp_secs() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32
-}
-
-/// Atomically increment the counter and return the next 3-byte value.
-///
-/// The counter wraps around naturally (u32 overflow), which is acceptable —
-/// a collision within a single second across 2^24 (~16M) inserts is
-/// astronomically unlikely in practice.
-fn next_counter() -> [u8; 3] {
-    // Extract the low 3 bytes in big-endian order.
-    let [_, b1, b2, b3] = COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes();
-    [b1, b2, b3]
-}
 
 /// Initialize the 5-byte per-process random component.
 ///

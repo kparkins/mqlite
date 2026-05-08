@@ -81,7 +81,7 @@ pub struct InsertMany<'a, T> {
     pub(super) options: InsertManyOptions,
 }
 
-impl<'a, T: Serialize + DeserializeOwned> InsertMany<'a, T> {
+impl<'a, T: Serialize> InsertMany<'a, T> {
     /// If `true` (default), stop at the first error.
     /// If `false`, attempt all documents and collect errors.
     #[must_use]

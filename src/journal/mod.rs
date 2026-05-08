@@ -99,15 +99,8 @@ impl BoundaryAppended {
     }
 
     /// Journal byte offset where the boundary starts.
-    #[allow(dead_code)]
     pub(crate) fn journal_offset(&self) -> JournalOffset {
         self.journal_offset
-    }
-
-    /// Checkpoint timestamp covered by the boundary.
-    #[allow(dead_code)]
-    pub(crate) fn checkpoint_ts(&self) -> Ts {
-        self.checkpoint_ts
     }
 }
 
@@ -730,14 +723,6 @@ impl LogManager {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CheckpointBatchId(u64);
 
-impl CheckpointBatchId {
-    /// Return the numeric batch identity.
-    #[allow(dead_code)]
-    pub(crate) fn get(self) -> u64 {
-        self.0
-    }
-}
-
 /// Pool that produced a checkpoint journal frame.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum CheckpointPoolKind {
@@ -763,15 +748,8 @@ impl CheckpointBatchCursor {
     }
 
     /// Offset where checkpoint-owned pending frames must begin.
-    #[allow(dead_code)]
     pub(crate) fn expected_pending_start(&self) -> JournalOffset {
         self.expected_pending_start
-    }
-
-    /// Clean journal cursor observed before the batch opened.
-    #[allow(dead_code)]
-    pub(crate) fn clean_start_offset(&self) -> JournalOffset {
-        self.clean_start_offset
     }
 }
 
@@ -1272,14 +1250,6 @@ impl JournalManager {
         let emergency = self.index.insert(page_number, offset);
 
         Ok(emergency)
-    }
-
-    /// Return true when the journal still owns committed legacy page frames
-    /// that the old page-frame checkpoint path can safely drain.
-    pub(crate) fn has_legacy_page_frames_to_checkpoint(&self) -> bool {
-        self.last_committed_db_page_count.is_some()
-            && self.legacy_pending_start_offset.is_none()
-            && self.index.occupied_count() > 0
     }
 
     /// Low-level frame append.  Returns the byte offset of the written frame.

@@ -236,18 +236,6 @@ impl ReadView {
         self.epoch.visible_ts
     }
 
-    /// Published catalog pinned by the view.
-    #[must_use]
-    pub(crate) fn catalog(&self) -> &PublishedCatalog {
-        &self.epoch.catalog
-    }
-
-    /// Published catalog generation pinned by the view.
-    #[must_use]
-    pub(crate) fn catalog_generation(&self) -> u64 {
-        self.epoch.catalog_generation
-    }
-
     /// Live sequencer frontier published by `PublishSequencer` (§10.19
     /// C-1, US-037). Loads `publish_sequencer.published_frontier` with
     /// `Acquire`; never reads a cached `PublishedEpoch` field.
@@ -559,7 +547,6 @@ pub struct ChainSnapshot {
     /// Back-reference to the owning reader's `ReadView`, used for the
     /// poison check during `new`. `None` for standalone callers (primarily
     /// tests that exercise snapshot visibility without a registry).
-    #[allow(dead_code)]
     view: Option<Arc<ReadView>>,
 }
 

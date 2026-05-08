@@ -72,7 +72,6 @@ fn _assert_parsed_logical_frames_send() {
 struct Phase8RecoveredRecord {
     record: LogRecord,
     logical_frame: Option<LogicalTxnFrame>,
-    checkpoint_applied_lsn: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -336,13 +335,11 @@ impl JournalManager {
                 Some(Phase8RecoveredRecord {
                     record,
                     logical_frame: Some(logical_frame),
-                    checkpoint_applied_lsn: None,
                 })
             }
             LogRecordPayload::CatalogCommit(_) => Some(Phase8RecoveredRecord {
                 record,
                 logical_frame: None,
-                checkpoint_applied_lsn: None,
             }),
             LogRecordPayload::CheckpointBoundary(payload) => {
                 let checkpoint = CheckpointBoundaryPayload::decode(payload).ok()?;
@@ -355,7 +352,6 @@ impl JournalManager {
                 Some(Phase8RecoveredRecord {
                     record,
                     logical_frame: None,
-                    checkpoint_applied_lsn: Some(checkpoint_applied_lsn),
                 })
             }
         }

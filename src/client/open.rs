@@ -12,7 +12,7 @@ use crate::{
     journal::{JournalLayeredSource, JournalManager},
     options::OpenOptions,
     storage::{
-        buffer_pool::BufferPool,
+        buffer_pool::{default_sizes, BufferPool, PageSource},
         engine::StorageEngine,
         file_io::FilePageSource,
         handle::BufferPoolHandle,
@@ -130,10 +130,11 @@ impl Client {
         // Header initialization / validation.
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-        if file_size == 0 {
+        let baseline_header = if file_size == 0 {
             if !opts.read_only {
                 write_initial_header(file_lock.as_ref())?;
             }
+            read_and_validate_header(file_lock.as_ref(), &path)?
         } else if (file_size as usize) < HEADER_PAGE_SIZE {
             return Err(Error::CorruptDatabase {
                 path,
@@ -145,8 +146,8 @@ impl Client {
                 recoverable: false,
             });
         } else {
-            read_and_validate_header(file_lock.as_ref(), &path)?;
-        }
+            read_and_validate_header(file_lock.as_ref(), &path)?
+        };
 
         // Construct the buffer pool handle wired to the database file and
         // create a B+ tree engine backed by it.
@@ -155,12 +156,6 @@ impl Client {
         // to avoid the POSIX advisory-lock footgun.  OpenOptions::buffer_pool_size
         // controls the total byte budget split between 4 KB and 32 KB partitions.
         //
-        // Read the baseline file header after initialization. Journal recovery
-        // may replace page 0 with a recovered image; final engine construction
-        // below re-reads and validates that post-replay header before any
-        // allocator, buffer-pool, history-store, or metadata state is created.
-        let baseline_header = read_and_validate_header(file_lock.as_ref(), &path)?;
-
         // Open a dedicated file handle for journal checkpoint I/O.  This fd is
         // never used for advisory locking — only for writing checkpointed
         // pages back to the main file.  Both fds live for the same duration
@@ -186,11 +181,10 @@ impl Client {
         let file_src = Arc::new(FilePageSource::new(
             Arc::clone(&file_lock) as Arc<dyn FileLock>
         ));
-        let layered_source: Box<dyn crate::storage::buffer_pool::PageSource> =
-            Box::new(JournalLayeredSource::new(
-                Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,
-                Arc::clone(&journal),
-            ));
+        let layered_source: Box<dyn PageSource> = Box::new(JournalLayeredSource::new(
+            Arc::clone(&file_src) as Arc<dyn PageSource>,
+            Arc::clone(&journal),
+        ));
         let pool = Arc::new(BufferPool::new_with_delta_bearing_frames_warn_threshold(
             opts.buffer_pool_size,
             layered_source,
@@ -199,15 +193,11 @@ impl Client {
         // Dedicated history-store buffer pool.
         // Sized conservatively; routes through the same journal-layered source so
         // recovered history pages are visible after checkpoint.
-        let history_source: Box<dyn crate::storage::buffer_pool::PageSource> =
-            Box::new(JournalLayeredSource::new(
-                Arc::clone(&file_src) as Arc<dyn crate::storage::buffer_pool::PageSource>,
-                Arc::clone(&journal),
-            ));
-        let history_pool = Arc::new(BufferPool::new(
-            crate::storage::buffer_pool::default_sizes::HISTORY,
-            history_source,
+        let history_source: Box<dyn PageSource> = Box::new(JournalLayeredSource::new(
+            Arc::clone(&file_src) as Arc<dyn PageSource>,
+            Arc::clone(&journal),
         ));
+        let history_pool = Arc::new(BufferPool::new(default_sizes::HISTORY, history_source));
         let journal_main_file = Arc::new(Mutex::new(journal_io_file));
         let buffer_pool = Arc::new(BufferPoolHandle::with_journal(
             pool,
@@ -227,7 +217,6 @@ impl Client {
             opts.durability.clone(),
         )?);
         let inner = Arc::new(ClientInner::new(Some(path.clone()), file_lock, engine));
-        let _ = file_size; // used above, suppress warning
         #[cfg(feature = "tracing")]
         tracing::info!(
             target: "mqlite",

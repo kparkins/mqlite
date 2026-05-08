@@ -199,7 +199,6 @@ pub(crate) fn build_checkpoint_reconcile_plan<M>(
         .map(|entry| {
             let mut pages = entry.keys().copied().collect::<Vec<_>>();
             pages.sort_unstable();
-            pages.dedup();
             (entry.key().clone(), pages)
         })
         .collect::<Vec<_>>();
@@ -402,13 +401,11 @@ fn reconcile_leaf(
         }
         Err(_) => return Ok(LeafReconcileOutcome::NotInstallable),
     };
-    let mut planned_pages = [page_id];
-    planned_pages.sort_unstable();
     let mut latched_pages = match engine
         .shared
         .handle
         .pool()
-        .pin_leaf_set_for_reconcile(ident, &planned_pages)
+        .pin_leaf_set_for_reconcile(ident, &[page_id])
     {
         Ok(pages) => pages,
         Err(err) => return map_replace_error(err),

@@ -65,7 +65,7 @@ pub const MAX_FIELD_NAME_LEN: usize = 1_024;
 pub fn validate_document(doc: &Document) -> Result<()> {
     // Step 1: structural walk — must run before bson::to_vec to catch null-byte
     // field names with the correct error type.
-    let mut field_count: usize = 0;
+    let mut field_count = 0;
     validate_doc_recursive(doc, 0, &mut field_count)?;
 
     // Step 2: size check using canonical BSON serialization.
@@ -95,11 +95,9 @@ fn validate_doc_recursive(doc: &Document, depth: u32, field_count: &mut usize) -
         });
     }
 
-    for (key, value) in doc.iter() {
-        // Field name validation
+    for (key, value) in doc {
         validate_field_name(key)?;
 
-        // Running field count
         *field_count += 1;
         if *field_count > MAX_FIELD_COUNT {
             return Err(Error::DocumentValidationFailure {
@@ -107,7 +105,6 @@ fn validate_doc_recursive(doc: &Document, depth: u32, field_count: &mut usize) -
             });
         }
 
-        // Recurse into nested structures
         validate_value_recursive(value, depth + 1, field_count)?;
     }
 
@@ -117,11 +114,9 @@ fn validate_doc_recursive(doc: &Document, depth: u32, field_count: &mut usize) -
 /// Recursively validate a [`Bson`] value, descending into nested documents and arrays.
 fn validate_value_recursive(value: &Bson, depth: u32, field_count: &mut usize) -> Result<()> {
     match value {
-        Bson::Document(nested) => {
-            validate_doc_recursive(nested, depth, field_count)?;
-        }
+        Bson::Document(nested) => validate_doc_recursive(nested, depth, field_count)?,
         Bson::Array(arr) => {
-            for elem in arr.iter() {
+            for elem in arr {
                 validate_value_recursive(elem, depth + 1, field_count)?;
             }
         }

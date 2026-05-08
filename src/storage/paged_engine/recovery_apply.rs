@@ -44,12 +44,10 @@ pub(crate) fn check_recovery_replay_pool_bound(
     catalog: &Catalog<BufferPoolPageStore>,
     parsed: &ParsedLogicalFrames,
 ) -> Result<()> {
-    let estimate = estimate_recovery_replay_pool_usage(handle, catalog, parsed)?;
+    let delta_bearing_frames_count = estimate_recovery_replay_pool_usage(handle, catalog, parsed)?;
     let max_pool_bytes = handle.pool().max_pool_bytes();
     let max_leaf_frames_by_bytes = max_pool_bytes / PageSize::Large32k.bytes();
-    if estimate.delta_bearing_frames_count > max_leaf_frames_by_bytes
-        || estimate.byte_budget > max_pool_bytes
-    {
+    if delta_bearing_frames_count > max_leaf_frames_by_bytes {
         return Err(Error::RecoveryPoolExhausted);
     }
     Ok(())
@@ -299,17 +297,11 @@ fn replay_chain_op(
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct RecoveryReplayPoolEstimate {
-    delta_bearing_frames_count: usize,
-    byte_budget: usize,
-}
-
 fn estimate_recovery_replay_pool_usage(
     handle: &Arc<BufferPoolHandle>,
     catalog: &Catalog<BufferPoolPageStore>,
     parsed: &ParsedLogicalFrames,
-) -> Result<RecoveryReplayPoolEstimate> {
+) -> Result<usize> {
     let mut leaf_pages = BTreeSet::new();
     for (_, frame) in &parsed.frames {
         for op in &frame.ops {
@@ -340,11 +332,7 @@ fn estimate_recovery_replay_pool_usage(
             }
         }
     }
-    let delta_bearing_frames_count = leaf_pages.len();
-    Ok(RecoveryReplayPoolEstimate {
-        delta_bearing_frames_count,
-        byte_budget: delta_bearing_frames_count * PageSize::Large32k.bytes(),
-    })
+    Ok(leaf_pages.len())
 }
 
 fn replay_leaf_page(

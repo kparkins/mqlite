@@ -11,7 +11,6 @@ pub mod timestamp;
 pub mod transaction;
 pub mod version;
 
-#[allow(unused_imports)]
 pub use metrics::{
     active_read_views_snapshot,
     // Phase 1 §10.10 counters (US-012)
@@ -145,13 +144,7 @@ pub use metrics::{
     set_version_chain_depth_p99,
     version_chain_depth_p99_snapshot,
 };
-#[allow(unused_imports)]
 pub use read_view::{ChainSnapshot, ReadView, ReadViewRegistry, TestFrontierHandle};
-#[allow(unused_imports)]
 pub use timestamp::{HlcState, TimestampOracle, Ts};
-#[allow(unused_imports)]
-pub(crate) use transaction::{
-    ExpectedHead, PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite, WriteTxn,
-};
-#[allow(unused_imports)]
+pub(crate) use transaction::{ExpectedHead, PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite};
 pub use version::{OverflowRef, VersionData, VersionEntry, VersionState};

@@ -53,14 +53,9 @@ pub(crate) fn parse_op_query_body(buf: &[u8]) -> Result<Document> {
             ),
         });
     }
-    let raw = bson::RawDocumentBuf::from_bytes(buf[doc_offset..doc_offset + doc_size].to_vec())
-        .map_err(|e| crate::error::Error::InvalidWireMessage {
-            detail: format!("OP_QUERY BSON parse error: {}", e),
-        })?;
-    bson::from_slice::<Document>(raw.as_bytes()).map_err(|e| {
-        crate::error::Error::InvalidWireMessage {
-            detail: format!("OP_QUERY BSON deserialise error: {}", e),
-        }
+    let doc_bytes = &buf[doc_offset..doc_offset + doc_size];
+    bson::from_slice::<Document>(doc_bytes).map_err(|e| crate::error::Error::InvalidWireMessage {
+        detail: format!("OP_QUERY BSON deserialise error: {}", e),
     })
 }
 
@@ -113,11 +108,7 @@ pub(crate) fn build_op_reply(
 /// Returns the part of `fullCollectionName` before the first `'.'` (the
 /// database name), or `None` if the buffer is too short or not valid UTF-8.
 pub(crate) fn parse_op_query_db_name(buf: &[u8]) -> Option<String> {
-    if buf.len() < 5 {
-        return None;
-    }
-    // Skip 4-byte flags field.
-    let after_flags = &buf[4..];
+    let after_flags = buf.get(4..)?;
     // Locate the null terminator of fullCollectionName.
     let null_pos = after_flags.iter().position(|&b| b == 0)?;
     let coll_name = std::str::from_utf8(&after_flags[..null_pos]).ok()?;

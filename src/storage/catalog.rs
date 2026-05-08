@@ -44,7 +44,7 @@ use bson::{doc, DateTime, Document};
 
 use crate::error::{Error, Result};
 use crate::index::IndexModel;
-use crate::storage::btree::{BTree, BTreePageStore, MemPageStore};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue, MemPageStore};
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::root_snapshot::{IndexId, NamespaceId};
 
@@ -612,8 +612,8 @@ impl<S: BTreePageStore> Catalog<S> {
                 break;
             }
             let bytes = match value {
-                crate::storage::btree::CellValue::Inline(b) => b,
-                crate::storage::btree::CellValue::Overflow {
+                CellValue::Inline(b) => b,
+                CellValue::Overflow {
                     first_page,
                     total_length,
                 } => self.tree.read_overflow(first_page, total_length)?,
@@ -694,7 +694,7 @@ impl<S: BTreePageStore> Catalog<S> {
     // -----------------------------------------------------------------------
 
     /// Find a collection by its durable id (Phase 1 §10.7). Linear scan
-    /// over the in-memory catalog. Acceptable because catalogs are small
+    /// over the catalog B+ tree. Acceptable because catalogs are small
     /// (tens to low hundreds of entries) and this helper runs off the
     /// hot path (Phase 2 post-open validation, diagnostics, Phase 4
     /// reconcile-time resolution). Phase 1 intentionally does NOT add a
@@ -703,7 +703,6 @@ impl<S: BTreePageStore> Catalog<S> {
     /// Returns `None` for any id that was never allocated (including the
     /// reserved id `0`). Callers handle `None` per Phase 2 §5
     /// (log-and-proceed) or Phase 4 (hard error).
-    #[allow(dead_code)]
     pub(crate) fn find_collection_by_id(&self, id: NamespaceId) -> Result<Option<CollectionEntry>> {
         if id <= 0 {
             return Ok(None);
@@ -720,7 +719,6 @@ impl<S: BTreePageStore> Catalog<S> {
     /// owning `CollectionEntry` alongside the `IndexEntry`. Same linear-
     /// scan discipline as `find_collection_by_id`; same `None` handling
     /// rule for callers (Phase 2 §5 / Phase 4).
-    #[allow(dead_code)]
     pub(crate) fn find_index_by_id(
         &self,
         id: IndexId,
@@ -791,8 +789,8 @@ impl<S: BTreePageStore> Catalog<S> {
                 break;
             }
             let bytes = match value {
-                crate::storage::btree::CellValue::Inline(b) => b,
-                crate::storage::btree::CellValue::Overflow {
+                CellValue::Inline(b) => b,
+                CellValue::Overflow {
                     first_page,
                     total_length,
                 } => self.tree.read_overflow(first_page, total_length)?,

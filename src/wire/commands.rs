@@ -57,26 +57,28 @@ impl Command {
     ///
     /// Returns `None` for unrecognised commands.
     pub fn parse_name(s: &str) -> Option<Command> {
+        use Command::*;
+
         match s.to_lowercase().as_str() {
-            "insert" => Some(Command::Insert),
-            "find" => Some(Command::Find),
-            "update" => Some(Command::Update),
-            "delete" => Some(Command::Delete),
-            "findandmodify" => Some(Command::FindAndModify),
-            "getmore" => Some(Command::GetMore),
-            "killcursors" => Some(Command::KillCursors),
-            "createindexes" => Some(Command::CreateIndexes),
-            "dropindexes" => Some(Command::DropIndexes),
-            "listindexes" => Some(Command::ListIndexes),
-            "listcollections" => Some(Command::ListCollections),
-            "create" => Some(Command::Create),
-            "drop" => Some(Command::Drop),
-            "listdatabases" => Some(Command::ListDatabases),
-            "ping" => Some(Command::Ping),
-            "hello" => Some(Command::Hello),
-            "ismaster" => Some(Command::IsMaster),
-            "buildinfo" => Some(Command::BuildInfo),
-            "serverstatus" => Some(Command::ServerStatus),
+            "insert" => Some(Insert),
+            "find" => Some(Find),
+            "update" => Some(Update),
+            "delete" => Some(Delete),
+            "findandmodify" => Some(FindAndModify),
+            "getmore" => Some(GetMore),
+            "killcursors" => Some(KillCursors),
+            "createindexes" => Some(CreateIndexes),
+            "dropindexes" => Some(DropIndexes),
+            "listindexes" => Some(ListIndexes),
+            "listcollections" => Some(ListCollections),
+            "create" => Some(Create),
+            "drop" => Some(Drop),
+            "listdatabases" => Some(ListDatabases),
+            "ping" => Some(Ping),
+            "hello" => Some(Hello),
+            "ismaster" => Some(IsMaster),
+            "buildinfo" => Some(BuildInfo),
+            "serverstatus" => Some(ServerStatus),
             _ => None,
         }
     }

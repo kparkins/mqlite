@@ -37,11 +37,9 @@ pub(crate) type IndexId = i64;
 /// stable key.
 #[derive(Clone)]
 pub(crate) struct NamespaceSnapshot {
-    // `id` / `name` are part of the §10.1 published contract surface
-    // (consumed by `id_for_name` + `get_by_id`); suppress dead_code so
-    // the Phase 5 sequencer work can pick them up without churn.
-    #[allow(dead_code)]
     pub id: NamespaceId,
+    // `name` is part of the §10.1 published contract surface and must
+    // remain available even when production read paths key by id/name maps.
     #[allow(dead_code)]
     pub name: String,
     pub data_root_page: u32,
@@ -49,13 +47,10 @@ pub(crate) struct NamespaceSnapshot {
     pub indexes: Vec<PublishedIndex>,
 }
 
-/// Stable fields of an `IndexEntry` as of the published catalog. The `id`
-/// field is the durable identity allocated by §10.7.
+/// Stable read-path fields of an `IndexEntry` as of the published catalog.
 #[derive(Clone)]
 pub(crate) struct PublishedIndex {
-    // `id` is part of the §10.1 published contract surface; suppress
-    // dead_code until Phase 5 consumers land.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub id: IndexId,
     pub name: String,
     pub root_page: u32,

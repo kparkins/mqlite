@@ -196,10 +196,6 @@ pub(crate) struct SharedState {
     /// Per-collection DDL/probe admission lanes keyed by durable
     /// `CollectionEntry.id`. Ordinary CRUD is fenced by `metadata.read()`
     /// and does not admit through this registry.
-    #[allow(
-        dead_code,
-        reason = "admission tickets are retained for DDL/probe paths and unit coverage"
-    )]
     pub(crate) ns_writers: Arc<NsWriterRegistry>,
     /// Engine-wide checkpoint admission gate. Checkpoint closes this
     /// before taking the freeze window; CRUD writers enter here before
@@ -516,14 +512,6 @@ pub(crate) struct MetadataState {
     /// uncontended while no CRUD writer holds `metadata.read()`.
     pub catalog: std::sync::Mutex<Catalog<BufferPoolPageStore>>,
 }
-
-/// Read guard over [`MetadataState`] retained for writer-visibility plumbing.
-#[allow(
-    dead_code,
-    reason = "writer visibility uses this shape across identity resolution"
-)]
-pub(in crate::storage::paged_engine) type MetadataReadGuard<'a> =
-    std::sync::RwLockReadGuard<'a, MetadataState>;
 
 /// Phase 2 §5.2 Pass 2 — validate `ParsedLogicalFrames` against the live
 /// catalog without mutating any durable state.

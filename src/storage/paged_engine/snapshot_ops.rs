@@ -91,9 +91,8 @@ pub(super) fn fetch_primary_pair(
     }
 }
 
-pub(super) fn execute_primary_key_lookup_from_snap(
+fn execute_primary_key_lookup_from_snap(
     shared: &SharedState,
-    _ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
@@ -174,14 +173,9 @@ pub(super) fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Ve
 }
 
 /// Index scan using a published `NamespaceSnapshot` instead of the catalog.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "snapshot index scans pass planner-selected context directly to avoid a one-use args wrapper"
-)]
-pub(super) fn execute_index_scan_from_snap(
+fn execute_index_scan_from_snap(
     shared: &SharedState,
-    _ns: &str,
-    ns_snap: &crate::storage::root_snapshot::NamespaceSnapshot,
+    ns_snap: &NamespaceSnapshot,
     ready_indexes: &[&PublishedIndex],
     filter: &Document,
     view: &ReadView,
@@ -261,9 +255,8 @@ pub(super) fn execute_index_scan_from_snap(
     Ok(docs)
 }
 
-pub(super) fn execute_collscan_from_snap(
+fn execute_collscan_from_snap(
     shared: &SharedState,
-    _ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
@@ -277,7 +270,7 @@ pub(super) fn execute_collscan_from_snap(
 
 pub(super) fn execute_snapshot_pairs_from_snap(
     shared: &SharedState,
-    ns: &str,
+    _ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
@@ -301,7 +294,7 @@ pub(super) fn execute_snapshot_pairs_from_snap(
         .collect();
 
     let plan = select_plan(filter, &index_metas);
-    let pairs = execute_plan_from_snap(&plan, shared, ns, ns_snap, &ready_indexes, filter, epoch)?;
+    let pairs = execute_plan_from_snap(&plan, shared, ns_snap, &ready_indexes, filter, epoch)?;
     Ok((plan, pairs))
 }
 
@@ -309,7 +302,7 @@ pub(super) fn execute_snapshot_pairs_from_snap(
 /// callers that don't need the [`ScanPlan`] back.
 pub(super) fn execute_snapshot_pairs_only(
     shared: &SharedState,
-    ns: &str,
+    _ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
@@ -317,7 +310,7 @@ pub(super) fn execute_snapshot_pairs_only(
 ) -> Result<SnapshotPairs> {
     let (_plan, pairs) = execute_snapshot_pairs_from_snap(
         shared,
-        ns,
+        _ns,
         ns_snap,
         filter,
         epoch,
@@ -329,7 +322,6 @@ pub(super) fn execute_snapshot_pairs_only(
 fn execute_plan_from_snap(
     plan: &ScanPlan,
     shared: &SharedState,
-    ns: &str,
     ns_snap: &NamespaceSnapshot,
     ready_indexes: &[&PublishedIndex],
     filter: &Document,
@@ -337,7 +329,7 @@ fn execute_plan_from_snap(
 ) -> Result<SnapshotPairs> {
     match plan {
         ScanPlan::PrimaryKeyLookup { condition } => {
-            execute_primary_key_lookup_from_snap(shared, ns, ns_snap, filter, epoch, condition)
+            execute_primary_key_lookup_from_snap(shared, ns_snap, filter, epoch, condition)
         }
         ScanPlan::IndexScan {
             index_name,
@@ -347,7 +339,6 @@ fn execute_plan_from_snap(
             let view = open_snapshot_read_view(shared, epoch);
             execute_index_scan_from_snap(
                 shared,
-                ns,
                 ns_snap,
                 ready_indexes,
                 filter,
@@ -357,7 +348,7 @@ fn execute_plan_from_snap(
                 condition,
             )
         }
-        ScanPlan::CollScan => execute_collscan_from_snap(shared, ns, ns_snap, filter, epoch),
+        ScanPlan::CollScan => execute_collscan_from_snap(shared, ns_snap, filter, epoch),
     }
 }
 

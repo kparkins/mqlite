@@ -18,8 +18,8 @@
 //! [`JournalIndex::insert`] returns `true` to signal that an emergency
 //! checkpoint should drain the journal before it grows further.
 //!
-//! Recovery, rollback, and checkpoint correctness depend on the index
-//! reflecting only durable, committed frames — see the call sites in
+//! Recovery, rollback, and checkpoint correctness depend on the index being
+//! rebuilt or cleared with the journal state — see the call sites in
 //! [`crate::journal::JournalManager`] for the maintenance contract.
 
 use std::collections::HashMap;
@@ -65,11 +65,6 @@ impl JournalIndex {
     pub(crate) fn insert(&mut self, page_number: u32, journal_offset: u64) -> bool {
         self.map.insert(page_number, journal_offset);
         self.map.len() >= JOURNAL_INDEX_HOT_THRESHOLD
-    }
-
-    /// Remove `page_number` from the index. No-op if absent.
-    pub(crate) fn remove(&mut self, page_number: u32) {
-        self.map.remove(&page_number);
     }
 
     /// Drop every entry. Called after a full checkpoint or before rebuilding
@@ -120,21 +115,6 @@ mod tests {
         idx.insert(5, 200);
         assert_eq!(idx.lookup(5), Some(200));
         assert_eq!(idx.occupied_count(), 1);
-    }
-
-    #[test]
-    fn remove_entry() {
-        let mut idx = JournalIndex::new();
-        idx.insert(7, 512);
-        idx.remove(7);
-        assert!(idx.lookup(7).is_none());
-        assert_eq!(idx.occupied_count(), 0);
-    }
-
-    #[test]
-    fn remove_nonexistent_is_noop() {
-        let mut idx = JournalIndex::new();
-        idx.remove(999);
     }
 
     #[test]

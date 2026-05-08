@@ -276,59 +276,7 @@ impl LeafNode {
             ));
         }
         let key = data[pos..pos + key_len].to_vec();
-        let value_type = data[pos + key_len];
-
-        let value_pos = pos + key_len + 1;
-        let value = match value_type {
-            VALUE_TYPE_INLINE => {
-                if value_pos + 4 > data.len() {
-                    return Err(Error::Internal(
-                        "leaf cell: inline bson_len out of bounds".into(),
-                    ));
-                }
-                let bson_len = u32::from_le_bytes([
-                    data[value_pos],
-                    data[value_pos + 1],
-                    data[value_pos + 2],
-                    data[value_pos + 3],
-                ]) as usize;
-                let data_start = value_pos + 4;
-                if data_start + bson_len > data.len() {
-                    return Err(Error::Internal(
-                        "leaf cell: inline bson data out of bounds".into(),
-                    ));
-                }
-                CellValue::Inline(data[data_start..data_start + bson_len].to_vec())
-            }
-            VALUE_TYPE_OVERFLOW => {
-                if value_pos + 8 > data.len() {
-                    return Err(Error::Internal(
-                        "leaf cell: overflow pointer out of bounds".into(),
-                    ));
-                }
-                let first_page = u32::from_le_bytes([
-                    data[value_pos],
-                    data[value_pos + 1],
-                    data[value_pos + 2],
-                    data[value_pos + 3],
-                ]);
-                let total_length = u32::from_le_bytes([
-                    data[value_pos + 4],
-                    data[value_pos + 5],
-                    data[value_pos + 6],
-                    data[value_pos + 7],
-                ]);
-                CellValue::Overflow {
-                    first_page,
-                    total_length,
-                }
-            }
-            other => {
-                return Err(Error::Internal(format!(
-                    "unknown cell value type 0x{other:02X}"
-                )));
-            }
-        };
+        let value = Self::cell_value_at(data, offset)?;
 
         Ok(LeafCell { key, value })
     }

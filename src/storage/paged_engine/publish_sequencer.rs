@@ -52,11 +52,6 @@ use super::publish::PublishDirty;
 /// the §10.19 dense-window contract (§10.13.9 loom-shim requirement).
 #[cfg(loom)]
 type SequencerMutex<T> = loom::sync::Mutex<T>;
-/// Mutex backing the `PublishSequencer` inner state. Production code uses
-/// `parking_lot::Mutex` for the unfair / fast path; loom permutation
-/// harnesses substitute `loom::sync::Mutex` so the scheduler can interleave
-/// the register / mark_ready / mark_aborted critical sections required by
-/// the §10.19 dense-window contract (§10.13.9 loom-shim requirement).
 #[cfg(not(loom))]
 type SequencerMutex<T> = parking_lot::Mutex<T>;
 
@@ -71,10 +66,6 @@ type SequencerMutexGuard<'a, T> = parking_lot::MutexGuard<'a, T>;
 /// production code stays linear.
 #[cfg(loom)]
 type SequencerCondvar = loom::sync::Condvar;
-/// Condvar paired with [`SequencerMutex`]. The loom variant returns a
-/// `LockResult` from `wait`; the parking_lot variant takes the guard by
-/// `&mut`. The [`wait_seq`] helper hides the API divergence so the
-/// production code stays linear.
 #[cfg(not(loom))]
 type SequencerCondvar = parking_lot::Condvar;
 
@@ -483,7 +474,7 @@ impl PublishSequencer {
                     g.pending.insert(next, slot);
                     break;
                 }
-                PublishSlotState::Ready { dirty: _, publish } => {
+                PublishSlotState::Ready { publish, .. } => {
                     // Run publish under the sequencer mutex. §10.19
                     // C-1: store the new epoch first (inside the
                     // closure), then store `published_frontier` with

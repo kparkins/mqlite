@@ -365,15 +365,13 @@ pub fn fuzz_logical_txn_recover(body: &[u8]) -> std::result::Result<(), ()> {
     // of likely-allocated B-tree pages — enough surface to surface
     // any frame-kind skip helper panic seeded from the fuzzed body.
     let db = client.database("fuzz_db");
-    for col in &["c0", "c1"] {
+    for col in ["c0", "c1"] {
         if let Ok(cursor) = db
             .collection::<bson::Document>(col)
             .find(bson::doc! {})
             .run()
         {
-            for d in cursor.take(4) {
-                let _ = d;
-            }
+            let _ = cursor.take(4).count();
         }
     }
     drop(client);

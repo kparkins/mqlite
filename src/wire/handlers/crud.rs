@@ -15,7 +15,7 @@ use crate::options::{
 
 /// Extract an integer value from a BSON document field, coercing `Int32`,
 /// `Int64`, and `Double` variants to `i64`.
-fn get_i64(doc: &Document, key: &str) -> Option<i64> {
+pub(super) fn get_i64(doc: &Document, key: &str) -> Option<i64> {
     match doc.get(key) {
         Some(bson::Bson::Int32(i)) => Some(*i as i64),
         Some(bson::Bson::Int64(i)) => Some(*i),
@@ -71,13 +71,11 @@ pub(super) fn handle_insert(body: &Document, state: &ServerState) -> Document {
         return doc! { "n": 0i32, "ok": 1.0_f64 };
     }
 
+    let ns = qualified_coll(body, &coll_name);
     let ordered = body.get_bool("ordered").unwrap_or(true);
     let opts = InsertManyOptions { ordered };
 
-    match state
-        .database
-        .insert_many(&qualified_coll(body, &coll_name), &docs, opts)
-    {
+    match state.database.insert_many(&ns, &docs, opts) {
         Ok(result) => {
             let n = result.inserted_ids.len() as i32;
             if result.errors.is_empty() {
@@ -149,14 +147,15 @@ pub(super) fn handle_find(
         .map(|n| if n <= 0 { 101usize } else { n as usize })
         .unwrap_or(101);
 
-    let cursor =
-        match state
-            .database
-            .find::<Document>(&qualified_coll(body, &coll_name), filter, opts)
-        {
-            Ok(c) => c,
-            Err(e) => return err_from_mqlite(e),
-        };
+    let ns = qualified_coll(body, &coll_name);
+    let cursor = match state.database.find::<Document>(&ns, filter, opts) {
+        Ok(c) => c,
+        Err(e) => return err_from_mqlite(e),
+    };
+    let plan = match cursor.explain() {
+        Ok(plan) => plan,
+        Err(e) => return err_from_mqlite(e),
+    };
 
     // Collect all matching documents (cursor is already fully buffered in
     // memory by the storage engine, so this is a cheap move operation).
@@ -170,23 +169,19 @@ pub(super) fn handle_find(
 
     let split_at = batch_size.min(all_docs.len());
     let remaining: Vec<Document> = all_docs.drain(split_at..).collect();
-    let mut first_batch: bson::Array = Vec::with_capacity(all_docs.len());
-    for d in all_docs {
-        first_batch.push(bson::Bson::Document(d));
-    }
+    let first_batch: bson::Array = all_docs.into_iter().map(bson::Bson::Document).collect();
 
     // Store a server-side cursor for the remaining documents if any.
     let cursor_id: i64 = if remaining.is_empty() {
         0
     } else {
-        let remaining_cursor = crate::Cursor::<Document>::new(remaining, 0);
+        let remaining_cursor = crate::Cursor::<Document>::new(remaining, plan);
         cursors
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .store(remaining_cursor)
     };
 
-    let ns = format!("{}.{}", extract_db_name(body), coll_name);
     doc! {
         "cursor": {
             "firstBatch": first_batch,
@@ -224,6 +219,7 @@ pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
     let mut total_modified: i64 = 0;
     let mut upserted: bson::Array = Vec::with_capacity(updates.len());
     let mut write_errors: bson::Array = Vec::with_capacity(updates.len());
+    let ns = qualified_coll(body, &coll_name);
 
     for (i, spec_bson) in updates.iter().enumerate() {
         let spec = match spec_bson.as_document() {
@@ -253,13 +249,9 @@ pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
         let opts = UpdateOptions { upsert };
 
         let result = if multi {
-            state
-                .database
-                .update_many(&qualified_coll(body, &coll_name), filter, update_doc, opts)
+            state.database.update_many(&ns, filter, update_doc, opts)
         } else {
-            state
-                .database
-                .update_one(&qualified_coll(body, &coll_name), filter, update_doc, opts)
+            state.database.update_one(&ns, filter, update_doc, opts)
         };
 
         match result {
@@ -324,6 +316,7 @@ pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
 
     let mut total_deleted: i64 = 0;
     let mut write_errors: bson::Array = Vec::with_capacity(deletes.len());
+    let ns = qualified_coll(body, &coll_name);
 
     for (i, spec_bson) in deletes.iter().enumerate() {
         let spec = match spec_bson.as_document() {
@@ -341,13 +334,9 @@ pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
         let limit = get_i64(spec, "limit").unwrap_or(1);
 
         let result = if limit == 0 {
-            state
-                .database
-                .delete_many(&qualified_coll(body, &coll_name), filter)
+            state.database.delete_many(&ns, filter)
         } else {
-            state
-                .database
-                .delete_one(&qualified_coll(body, &coll_name), filter)
+            state.database.delete_one(&ns, filter)
         };
 
         match result {
@@ -407,15 +396,15 @@ pub(super) fn handle_find_and_modify(body: &Document, state: &ServerState) -> Do
     let return_new = body.get_bool("new").unwrap_or(false);
     let upsert = body.get_bool("upsert").unwrap_or(false);
     let sort = body.get_document("sort").ok().cloned();
+    let ns = qualified_coll(body, &coll_name);
 
     if remove {
         // ---- findAndModify + remove ----
         let opts = FindOneAndDeleteOptions { sort };
-        match state.database.find_one_and_delete_with_options::<Document>(
-            &qualified_coll(body, &coll_name),
-            filter,
-            opts,
-        ) {
+        match state
+            .database
+            .find_one_and_delete_with_options::<Document>(&ns, filter, opts)
+        {
             Ok(Some(doc)) => doc! {
                 "value": bson::Bson::Document(doc),
                 "lastErrorObject": { "n": 1i32 },
@@ -448,24 +437,21 @@ pub(super) fn handle_find_and_modify(body: &Document, state: &ServerState) -> Do
             sort,
         };
 
-        match state.database.find_one_and_update_with_options::<Document>(
-            &qualified_coll(body, &coll_name),
-            filter,
-            update_doc,
-            opts,
-        ) {
+        match state
+            .database
+            .find_one_and_update_with_options::<Document>(&ns, filter, update_doc, opts)
+        {
             Ok(Some(doc)) => {
                 // A document was returned.
                 // With ReturnDocument::Before this is the original (updatedExisting=true).
                 // With ReturnDocument::After this is the post-update doc; we cannot
                 // distinguish update-of-existing vs upsert from the return value alone,
                 // so we conservatively report updatedExisting=true (the common path).
-                let updated_existing = true;
                 doc! {
                     "value": bson::Bson::Document(doc),
                     "lastErrorObject": {
                         "n": 1i32,
-                        "updatedExisting": updated_existing,
+                        "updatedExisting": true,
                     },
                     "ok": 1.0_f64,
                 }

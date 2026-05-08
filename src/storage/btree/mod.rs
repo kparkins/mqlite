@@ -481,13 +481,6 @@ impl BTreePageStore for MemPageStore {
         &mut self,
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        self.take_all_chains_on_page(page)
-    }
-
-    fn take_all_chains_on_page(
-        &mut self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
         Ok(self
             .leaf_chains
             .remove(&page)
@@ -568,14 +561,7 @@ impl<S: BTreePageStore> BTree<S> {
     /// Create a new empty B+ tree in `store`, allocating the first leaf page as root.
     pub(crate) fn create(mut store: S) -> Result<Self> {
         let root_page = store.alloc_leaf()?;
-        // Write an empty leaf page.
-        let node = LeafNode {
-            flags: 0,
-            next_leaf_page: 0,
-            prev_leaf_page: 0,
-            cells: Vec::new(),
-        };
-        let buf = node.encode()?;
+        let buf = empty_leaf_page_bytes()?;
         store.write_leaf_structural(root_page, &buf)?;
         Ok(BTree {
             store,
@@ -591,13 +577,7 @@ impl<S: BTreePageStore> BTree<S> {
     /// at `root_page` makes the tree ready for insertions without allocating
     /// an additional page.
     pub(crate) fn create_at(mut store: S, root_page: u32) -> Result<Self> {
-        let node = LeafNode {
-            flags: 0,
-            next_leaf_page: 0,
-            prev_leaf_page: 0,
-            cells: Vec::new(),
-        };
-        let buf = node.encode()?;
+        let buf = empty_leaf_page_bytes()?;
         store.write_leaf_structural(root_page, &buf)?;
         Ok(BTree {
             store,

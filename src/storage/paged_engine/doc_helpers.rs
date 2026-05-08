@@ -1,5 +1,5 @@
 //! Pure document helpers shared across `doc_ops`: id assignment, validation,
-//! projection, sorting, unique-constraint checks, and cell resolution.
+//! projection, sorting, and unique-constraint checks.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,7 +10,7 @@ use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
 use crate::mvcc::{PrimaryOp, PrimaryWrite};
 use crate::query::get_nested_field;
-use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
+use crate::storage::btree::{BTree, BTreePageStore, HistoryProbe};
 use crate::storage::oid::ObjectIdGenerator;
 
 /// Return current Unix milliseconds.
@@ -41,83 +41,11 @@ pub(in crate::storage::paged_engine) fn validate_index_keys(keys: &Document) -> 
          planned for a future release.";
 
     for (_field, value) in keys {
-        let type_name: Option<&str> = match value {
-            Bson::String(s) => match s.as_str() {
-                "text" => Some("text"),
-                "2d" => Some("2d"),
-                "2dsphere" => Some("2dsphere"),
-                "hashed" => Some("hashed"),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(t) = type_name {
-            return Err(Error::UnsupportedIndexOption {
-                option: t.to_owned(),
-                suggestion: SUGGESTION.to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Check unique index constraints before inserting `new_doc` into `tree`.
-///
-/// `unique_specs` is a list of `(index_name, fields, sparse)` for each unique index.
-/// If any existing document matches the new doc on all indexed fields, returns
-/// [`Error::DuplicateKey`].
-#[allow(dead_code)]
-pub(in crate::storage::paged_engine) fn check_unique_constraints_base_only<S: BTreePageStore>(
-    tree: &BTree<S>,
-    unique_specs: &[(String, Vec<String>, bool)],
-    new_doc: &Document,
-) -> Result<()> {
-    if unique_specs.is_empty() {
-        return Ok(());
-    }
-
-    let null_encoded = encode_key(&Bson::Null);
-
-    for (idx_name, fields, sparse) in unique_specs {
-        // Encode the candidate document's indexed fields.
-        let mut new_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
-        new_encoded.extend(
-            fields
-                .iter()
-                .map(|f| encode_key(new_doc.get(f.as_str()).unwrap_or(&Bson::Null))),
-        );
-
-        // Sparse: skip if all indexed fields are null/absent.
-        if *sparse && new_encoded.iter().all(|v| v == &null_encoded) {
-            continue;
-        }
-
-        // Scan all documents in the tree.
-        let pairs = tree.range_scan(None, None)?;
-        let mut existing_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
-        for (_, cv) in pairs {
-            let bson_bytes = resolve_cell(tree, cv)?;
-            let existing: Document =
-                bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
-
-            existing_encoded.clear();
-            existing_encoded.extend(
-                fields
-                    .iter()
-                    .map(|f| encode_key(existing.get(f.as_str()).unwrap_or(&Bson::Null))),
-            );
-
-            if new_encoded == existing_encoded {
-                return Err(Error::DuplicateKey {
-                    detail: format!(
-                        "E11000 duplicate key error — unique index '{}': dup key {{{}}}",
-                        idx_name,
-                        fields
-                            .iter()
-                            .map(|f| format!("{}: {:?}", f, new_doc.get(f.as_str())))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+        if let Bson::String(t) = value {
+            if matches!(t.as_str(), "text" | "2d" | "2dsphere" | "hashed") {
+                return Err(Error::UnsupportedIndexOption {
+                    option: t.to_owned(),
+                    suggestion: SUGGESTION.to_owned(),
                 });
             }
         }
@@ -218,21 +146,6 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints_mvcc<S: BTreePa
         }
     }
     Ok(())
-}
-
-/// Resolve a [`CellValue`] from a B+ tree to raw bytes.
-#[allow(dead_code)]
-pub(in crate::storage::paged_engine) fn resolve_cell<S: BTreePageStore>(
-    tree: &BTree<S>,
-    cv: CellValue,
-) -> Result<Vec<u8>> {
-    match cv {
-        CellValue::Inline(b) => Ok(b),
-        CellValue::Overflow {
-            first_page,
-            total_length,
-        } => tree.read_overflow(first_page, total_length),
-    }
 }
 
 // ---------------------------------------------------------------------------

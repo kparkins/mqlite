@@ -150,10 +150,7 @@ impl<S: BTreePageStore> BTree<S> {
             let node = LeafNode::parse(&buf[..])?;
 
             let start_idx = match start_key {
-                Some(k) => match node.binary_search(k) {
-                    Ok(i) => i,
-                    Err(i) => i,
-                },
+                Some(k) => node.binary_search(k).unwrap_or_else(|i| i),
                 None => 0,
             };
 
@@ -255,16 +252,16 @@ impl<S: BTreePageStore> BTree<S> {
                     .as_mut()
                     .and_then(|iter| iter.peek().map(|(key, _)| *key));
 
-                let Some(source) = merge_source(base_key, chain_key) else {
+                let Some((source, source_key)) = merge_source(base_key, chain_key) else {
                     break;
                 };
 
-                if end_excludes_key(end, source.key()) {
+                if end_excludes_key(end, source_key) {
                     return Ok(results);
                 }
 
                 match source {
-                    MergeSource::Base(_) => {
+                    MergeSource::Base => {
                         let Some(cell) = base_iter.next() else {
                             break;
                         };
@@ -288,7 +285,7 @@ impl<S: BTreePageStore> BTree<S> {
                         }
                         results.push((cell.key.clone(), resolve_cell(&cell.value)?));
                     }
-                    MergeSource::Chain(_) => {
+                    MergeSource::Chain => {
                         let next = chain_iter.as_mut().and_then(|iter| iter.next());
                         let Some((key, entry)) = next else {
                             break;
@@ -297,7 +294,7 @@ impl<S: BTreePageStore> BTree<S> {
                             results.push((key.to_vec(), resolve_entry(entry)?));
                         }
                     }
-                    MergeSource::Both(_) => {
+                    MergeSource::Both => {
                         let Some(cell) = base_iter.next() else {
                             break;
                         };
@@ -546,31 +543,24 @@ impl<S: BTreePageStore> BTree<S> {
 }
 
 #[derive(Clone, Copy)]
-enum MergeSource<'a> {
-    Base(&'a [u8]),
-    Chain(&'a [u8]),
-    Both(&'a [u8]),
+enum MergeSource {
+    Base,
+    Chain,
+    Both,
 }
 
-impl<'a> MergeSource<'a> {
-    fn key(self) -> &'a [u8] {
-        match self {
-            MergeSource::Base(key) => key,
-            MergeSource::Chain(key) => key,
-            MergeSource::Both(key) => key,
-        }
-    }
-}
-
-fn merge_source<'a>(base: Option<&'a [u8]>, chain: Option<&'a [u8]>) -> Option<MergeSource<'a>> {
+fn merge_source<'a>(
+    base: Option<&'a [u8]>,
+    chain: Option<&'a [u8]>,
+) -> Option<(MergeSource, &'a [u8])> {
     match (base, chain) {
         (None, None) => None,
-        (Some(base), None) => Some(MergeSource::Base(base)),
-        (None, Some(chain)) => Some(MergeSource::Chain(chain)),
+        (Some(base), None) => Some((MergeSource::Base, base)),
+        (None, Some(chain)) => Some((MergeSource::Chain, chain)),
         (Some(base), Some(chain)) => match base.cmp(chain) {
-            CmpOrdering::Less => Some(MergeSource::Base(base)),
-            CmpOrdering::Equal => Some(MergeSource::Both(base)),
-            CmpOrdering::Greater => Some(MergeSource::Chain(chain)),
+            CmpOrdering::Less => Some((MergeSource::Base, base)),
+            CmpOrdering::Equal => Some((MergeSource::Both, base)),
+            CmpOrdering::Greater => Some((MergeSource::Chain, chain)),
         },
     }
 }

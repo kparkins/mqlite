@@ -26,11 +26,9 @@ pub(super) fn catalog_lock(
 }
 
 /// Thin wrapper that takes the CRUD / DDL catalog lock, invokes
-/// `publish_commit` with the threaded `PublishDirty`, and (for now)
-/// records the Phase 0 rebuild counter when a fresh
-/// `Arc<PublishedCatalog>` was actually built. US-012 will split this
-/// into the four Phase 1 counters; for US-006 we only need to gate the
-/// existing rebuild tick on `dirty.published_catalog_dirty`.
+/// `publish_commit` with the threaded `PublishDirty`, and records the legacy
+/// published-snapshot rebuild counter when a fresh `Arc<PublishedCatalog>` was
+/// actually built. `publish_commit` owns the Phase 1 §10.10 counters.
 ///
 /// `reserved_catalog_gen` (Phase 5 §10.17.1, US-006):
 ///   - DDL callers pass `Some(reserved)` where `reserved` was returned
@@ -48,7 +46,7 @@ pub(super) fn rebuild_and_publish_locked(
     reserved_catalog_gen: Option<u64>,
 ) -> Result<()> {
     let cat = catalog_lock(md);
-    let _epoch = publish_commit(shared, &cat, publish_ts, dirty, reserved_catalog_gen)?;
+    publish_commit(shared, &cat, publish_ts, dirty, reserved_catalog_gen)?;
     if dirty.published_catalog_dirty {
         crate::mvcc::metrics::record_published_snapshot_rebuild();
     }

@@ -1,6 +1,8 @@
 // === Command handlers: admin / status ===
 
-use bson::{doc, DateTime, Document};
+use std::collections::BTreeSet;
+
+use bson::{doc, Bson, DateTime, Document};
 
 use super::super::server::ServerState;
 
@@ -31,7 +33,7 @@ pub(super) fn handle_hello(state: &ServerState, connection_id: i32) -> Document 
         // counter is always 0 (mqlite is not a replica set and never transitions state).
         "topologyVersion": {
             "processId": state.topology_process_id,
-            "counter": bson::Bson::Int64(0_i64),
+            "counter": Bson::Int64(0_i64),
         },
 
         // Capacity limits (match MongoDB 8.0 defaults).
@@ -107,10 +109,10 @@ pub(super) fn handle_server_status(state: &ServerState) -> Document {
         "host": "mqlite",
         "version": env!("CARGO_PKG_VERSION"),
         "process": "mqlite",
-        "pid": bson::Bson::Int64(std::process::id() as i64),
-        "uptime": bson::Bson::Int64(uptime_secs),
-        "uptimeMillis": bson::Bson::Int64(uptime_secs * 1_000),
-        "uptimeEstimate": bson::Bson::Int64(uptime_secs),
+        "pid": Bson::Int64(std::process::id() as i64),
+        "uptime": Bson::Int64(uptime_secs),
+        "uptimeMillis": Bson::Int64(uptime_secs * 1_000),
+        "uptimeEstimate": Bson::Int64(uptime_secs),
         "localTime": DateTime::now(),
         "connections": {
             "current": total_conns,
@@ -147,28 +149,30 @@ pub(super) fn handle_server_status(state: &ServerState) -> Document {
 pub(super) fn handle_list_databases(state: &ServerState) -> Document {
     // Collect unique database names from all "db.collection" collection names.
     let all_names = state.database.list_collection_names().unwrap_or_default();
-    let mut db_set: std::collections::BTreeSet<String> = all_names
+    let db_set: BTreeSet<String> = all_names
         .into_iter()
-        .filter_map(|n| n.split('.').next().map(|db| db.to_owned()))
+        .filter_map(|n| {
+            let db = n.split('.').next()?;
+            (db != "$").then(|| db.to_owned())
+        })
         .collect();
-    // Remove internal engine namespaces that are not user databases.
-    db_set.remove("$");
 
     let size_on_disk = state.journal_file_size() as i64;
-
-    let mut databases: bson::Array = Vec::with_capacity(db_set.len());
-    for name in &db_set {
-        databases.push(bson::Bson::Document(doc! {
-            "name": name,
-            "sizeOnDisk": size_on_disk,
-            "empty": false,
-        }));
-    }
+    let databases: bson::Array = db_set
+        .into_iter()
+        .map(|name| {
+            Bson::Document(doc! {
+                "name": name,
+                "sizeOnDisk": size_on_disk,
+                "empty": false,
+            })
+        })
+        .collect();
 
     doc! {
         "databases": databases,
         "totalSize": size_on_disk,
-        "totalSizeMb": bson::Bson::Int64(size_on_disk / (1024 * 1024)),
+        "totalSizeMb": Bson::Int64(size_on_disk / (1024 * 1024)),
         "ok": 1.0_f64,
     }
 }

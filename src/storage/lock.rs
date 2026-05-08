@@ -373,16 +373,12 @@ impl FileLock for PosixFileLock {
 /// operation returns an explicit error so Windows builds cannot silently run
 /// without lock-file I/O.
 #[cfg(windows)]
-pub(crate) struct WindowsFileLock {
-    _marker: std::marker::PhantomData<()>,
-}
+pub(crate) struct WindowsFileLock;
 
 #[cfg(windows)]
 impl WindowsFileLock {
     pub(crate) fn new() -> Self {
-        WindowsFileLock {
-            _marker: std::marker::PhantomData,
-        }
+        Self
     }
 }
 
@@ -424,10 +420,6 @@ impl FileLock for WindowsFileLock {
 // ---------------------------------------------------------------------------
 
 /// Closed-set enum wrapping all platform [`FileLock`] implementations.
-///
-/// Replaces `Box<dyn FileLock>` / `Arc<dyn FileLock>` with a concrete type
-/// that the compiler can monomorphize, eliminating vtable dispatch on every
-/// I/O and locking call.
 pub(crate) enum AnyFileLock {
     #[cfg(unix)]
     Posix(PosixFileLock),

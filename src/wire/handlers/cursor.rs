@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use bson::{doc, Document};
 
-use super::super::errors::{err_bad_value, err_from_mqlite};
+use super::super::errors::err_bad_value;
 use super::super::server::{ConnectionCursors, ServerState};
 
 /// Extract an integer value from a BSON document field, coercing `Int32`,
@@ -50,7 +50,7 @@ pub(super) fn handle_get_more(
     };
 
     let coll_name = match body.get_str("collection") {
-        Ok(s) => s.to_owned(),
+        Ok(s) => s,
         Err(_) => return err_bad_value("getMore requires a \"collection\" field"),
     };
 
@@ -60,7 +60,7 @@ pub(super) fn handle_get_more(
         .unwrap_or(101);
 
     // Drain up to `batch_size` documents from the cursor in a single critical section.
-    let (next_batch, exhausted) = {
+    let (next_batch, returned_id) = {
         let mut guard = cursors.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(cursor_id) {
             None => {
@@ -77,21 +77,15 @@ pub(super) fn handle_get_more(
                     .take(batch_size)
                     .filter_map(|r| r.ok().map(bson::Bson::Document))
                     .collect();
-                let done = cursor.is_exhausted();
-                (batch, done)
+                let returned_id = if cursor.is_exhausted() {
+                    guard.remove(cursor_id);
+                    0
+                } else {
+                    cursor_id
+                };
+                (batch, returned_id)
             }
         }
-    };
-
-    // Remove the cursor from the map once it is exhausted.
-    let returned_id: i64 = if exhausted {
-        cursors
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(cursor_id);
-        0
-    } else {
-        cursor_id
     };
 
     let ns = format!("{}.{}", extract_db_name(body), coll_name);
@@ -115,15 +109,8 @@ pub(super) fn handle_kill_cursors(
     body: &Document,
     cursors: &Arc<Mutex<ConnectionCursors>>,
 ) -> Document {
-    let cursor_ids: Vec<i64> = match body.get_array("cursors") {
-        Ok(arr) => arr
-            .iter()
-            .filter_map(|b| match b {
-                bson::Bson::Int64(id) => Some(*id),
-                bson::Bson::Int32(id) => Some(*id as i64),
-                _ => None,
-            })
-            .collect(),
+    let cursor_ids = match body.get_array("cursors") {
+        Ok(arr) => arr,
         Err(_) => return err_bad_value("killCursors requires a \"cursors\" array"),
     };
 
@@ -131,11 +118,15 @@ pub(super) fn handle_kill_cursors(
     let mut not_found: bson::Array = Vec::with_capacity(cursor_ids.len());
 
     let mut guard = cursors.lock().unwrap_or_else(|e| e.into_inner());
-    for id in &cursor_ids {
-        if guard.remove(*id).is_some() {
-            killed.push(bson::Bson::Int64(*id));
+    for id in cursor_ids.iter().filter_map(|b| match b {
+        bson::Bson::Int64(id) => Some(*id),
+        bson::Bson::Int32(id) => Some(*id as i64),
+        _ => None,
+    }) {
+        if guard.remove(id).is_some() {
+            killed.push(bson::Bson::Int64(id));
         } else {
-            not_found.push(bson::Bson::Int64(*id));
+            not_found.push(bson::Bson::Int64(id));
         }
     }
 
