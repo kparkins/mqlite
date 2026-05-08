@@ -481,22 +481,28 @@ pub(super) fn find_one_and_replace(
     }))
 }
 
+fn upsert_stage(
+    engine: &super::PagedEngine,
+    ns: &str,
+    doc: Document,
+) -> Result<(Bson, Document)> {
+    let snapshot = doc.clone();
+    let id = engine.run_write(ns, |shared, md, txn, vis| {
+        stage_insert_in_write_txn(shared, md, txn, vis, ns, doc)
+    })?;
+    Ok((id, snapshot))
+}
+
 pub(super) fn upsert_for_update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
     update_doc: &Document,
 ) -> Result<UpdateResult> {
-    let mut new_doc = upsert_base_from_filter(filter);
-    apply_update(&mut new_doc, update_doc, true)?;
-    let id = engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_in_write_txn(shared, md, txn, vis, ns, new_doc)
-    })?;
-    Ok(UpdateResult {
-        matched_count: 0,
-        modified_count: 0,
-        upserted_id: Some(id),
-    })
+    let mut doc = upsert_base_from_filter(filter);
+    apply_update(&mut doc, update_doc, true)?;
+    let (id, _) = upsert_stage(engine, ns, doc)?;
+    Ok(UpdateResult { matched_count: 0, modified_count: 0, upserted_id: Some(id) })
 }
 
 pub(super) fn upsert_for_find_one_and_update(
@@ -506,16 +512,13 @@ pub(super) fn upsert_for_find_one_and_update(
     update_doc: &Document,
     opts: &FindOneAndUpdateOptions,
 ) -> Result<Option<Document>> {
-    let mut new_doc = upsert_base_from_filter(filter);
-    apply_update(&mut new_doc, update_doc, true)?;
-    ensure_id(&mut new_doc);
-    let after_doc = new_doc.clone();
-    engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_in_write_txn(shared, md, txn, vis, ns, new_doc).map(|_| ())
-    })?;
+    let mut doc = upsert_base_from_filter(filter);
+    apply_update(&mut doc, update_doc, true)?;
+    ensure_id(&mut doc);
+    let (_, after) = upsert_stage(engine, ns, doc)?;
     Ok(match opts.return_document {
         ReturnDocument::Before => None,
-        ReturnDocument::After => Some(after_doc),
+        ReturnDocument::After => Some(after),
     })
 }
 
@@ -525,14 +528,11 @@ pub(super) fn upsert_for_find_one_and_replace(
     replacement: &Document,
     opts: &FindOneAndReplaceOptions,
 ) -> Result<Option<Document>> {
-    let mut new_doc = replacement.clone();
-    ensure_id(&mut new_doc);
-    let after_doc = new_doc.clone();
-    engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_in_write_txn(shared, md, txn, vis, ns, new_doc).map(|_| ())
-    })?;
+    let mut doc = replacement.clone();
+    ensure_id(&mut doc);
+    let (_, after) = upsert_stage(engine, ns, doc)?;
     Ok(match opts.return_document {
         ReturnDocument::Before => None,
-        ReturnDocument::After => Some(after_doc),
+        ReturnDocument::After => Some(after),
     })
 }

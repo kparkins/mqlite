@@ -211,7 +211,7 @@ fn test_index_scan_and_collscan_agree_on_delta_only_entry() {
         .catalog
         .get_by_name(NS)
         .expect("namespace snapshot exists");
-    let collscan_pairs = super::snapshot_ops::execute_snapshot_pairs_only(
+    let (_, collscan_pairs) = super::snapshot_ops::execute_snapshot_pairs_from_snap(
         &engine.shared,
         NS,
         ns_snap,

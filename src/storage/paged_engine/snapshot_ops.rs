@@ -298,26 +298,6 @@ pub(super) fn execute_snapshot_pairs_from_snap(
     Ok((plan, pairs))
 }
 
-/// Thin wrapper around [`execute_snapshot_pairs_from_snap`] for non-find
-/// callers that don't need the [`ScanPlan`] back.
-pub(super) fn execute_snapshot_pairs_only(
-    shared: &SharedState,
-    _ns: &str,
-    ns_snap: &NamespaceSnapshot,
-    filter: &Document,
-    epoch: Arc<PublishedEpoch>,
-    allow_secondary_indexes: bool,
-) -> Result<SnapshotPairs> {
-    let (_plan, pairs) = execute_snapshot_pairs_from_snap(
-        shared,
-        _ns,
-        ns_snap,
-        filter,
-        epoch,
-        allow_secondary_indexes,
-    )?;
-    Ok(pairs)
-}
 
 fn execute_plan_from_snap(
     plan: &ScanPlan,
@@ -615,9 +595,6 @@ fn poison_checkpoint_post_mutation(engine: &super::PagedEngine, err: Error) -> E
     Error::EngineFatal { reason }
 }
 
-pub(super) fn close(engine: &super::PagedEngine) -> crate::error::Result<()> {
-    checkpoint(engine)
-}
 
 #[allow(
     dead_code,

@@ -1548,7 +1548,7 @@ impl StorageEngine for PagedEngine {
 
     fn close(&self) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
-        snapshot_ops::close(self)
+        snapshot_ops::checkpoint(self)
     }
 
     fn journal_sync(&self) -> Result<()> {
