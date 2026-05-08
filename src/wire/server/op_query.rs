@@ -93,34 +93,3 @@ pub(crate) fn build_op_reply(
     out.extend_from_slice(&bson_bytes);
     Ok(out)
 }
-
-/// Extract the database name from an OP_QUERY body buffer.
-///
-/// OP_QUERY body layout (after the 16-byte `MsgHeader`):
-/// ```text
-/// flags             : int32
-/// fullCollectionName: cstring  (e.g. "admin.$cmd")
-/// numberToSkip      : int32
-/// numberToReturn    : int32
-/// query             : BSON document
-/// ```
-///
-/// Returns the part of `fullCollectionName` before the first `'.'` (the
-/// database name), or `None` if the buffer is too short or not valid UTF-8.
-pub(crate) fn parse_op_query_db_name(buf: &[u8]) -> Option<String> {
-    let after_flags = buf.get(4..)?;
-    // Locate the null terminator of fullCollectionName.
-    let null_pos = after_flags.iter().position(|&b| b == 0)?;
-    let coll_name = std::str::from_utf8(&after_flags[..null_pos]).ok()?;
-    // Database name is the component before the first '.'.
-    Some(coll_name.split('.').next().unwrap_or("").to_owned())
-}
-
-/// Validate the `$db` field in an OP_MSG command body.
-///
-/// Any non-empty `$db` value is accepted — the database is created on first
-/// write ("use mydb" semantics).  Always returns `None` (no error).
-#[allow(dead_code)]
-pub(crate) fn check_db_field(_body: &Document, _server_db_name: &str) -> Option<Document> {
-    None
-}

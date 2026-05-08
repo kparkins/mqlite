@@ -198,9 +198,9 @@ impl OpenOptions {
     /// Returns [`Error::InvalidConfig`] when an option is outside its supported
     /// range.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.delta_bearing_frames_warn_threshold <= DELTA_BEARING_FRAMES_WARN_THRESHOLD_MIN
-            || self.delta_bearing_frames_warn_threshold > DELTA_BEARING_FRAMES_WARN_THRESHOLD_MAX
-            || self.delta_bearing_frames_warn_threshold.is_nan()
+        if !(self.delta_bearing_frames_warn_threshold.is_finite()
+            && self.delta_bearing_frames_warn_threshold > DELTA_BEARING_FRAMES_WARN_THRESHOLD_MIN
+            && self.delta_bearing_frames_warn_threshold <= DELTA_BEARING_FRAMES_WARN_THRESHOLD_MAX)
         {
             return Err(Error::InvalidConfig {
                 field: "delta_bearing_frames_warn_threshold",
@@ -225,13 +225,6 @@ pub(crate) struct FindOptions {
     pub projection: Option<Document>,
     /// Number of documents to fetch per internal batch. Default: 101.
     pub batch_size: Option<u32>,
-}
-
-impl FindOptions {
-    #[must_use]
-    pub fn new() -> Self {
-        FindOptions::default()
-    }
 }
 
 /// Options for `update_one` and `update_many` operations.

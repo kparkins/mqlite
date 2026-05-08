@@ -77,6 +77,18 @@ fn eq_operator() {
 }
 
 #[test]
+fn eq_operator_matches_whole_array() {
+    assert!(matches(
+        doc! { "a": { "$eq": [1, 2] } },
+        doc! { "a": [1, 2] }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$eq": [1, 2] } },
+        doc! { "a": [2, 1] }
+    ));
+}
+
+#[test]
 fn eq_null_matches_missing_and_null() {
     assert!(matches(doc! { "a": { "$eq": Bson::Null } }, doc! {}));
     assert!(matches(
@@ -187,6 +199,18 @@ fn in_array_element_match() {
     assert!(matches(
         doc! { "tags": { "$in": ["rust"] } },
         doc! { "tags": ["go", "rust"] }
+    ));
+}
+
+#[test]
+fn in_operator_matches_whole_array_candidate() {
+    assert!(matches(
+        doc! { "a": { "$in": [[1, 2]] } },
+        doc! { "a": [1, 2] }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$in": [[1, 2]] } },
+        doc! { "a": [2, 1] }
     ));
 }
 
@@ -621,6 +645,14 @@ fn elem_match_document_mode_multi_field() {
 }
 
 #[test]
+fn elem_match_mixed_operator_document_errors() {
+    assert!(errors(
+        doc! { "scores": { "$elemMatch": { "$gt": 10, "ignored": 99 } } },
+        doc! { "scores": [5, 15] }
+    ));
+}
+
+#[test]
 fn elem_match_non_array_no_match() {
     // Scalar field — $elemMatch never matches.
     assert!(no_match(
@@ -662,6 +694,30 @@ fn all_single_value_matches_scalar() {
     // MongoDB treats scalar as single-element array for $all.
     assert!(matches(doc! { "a": { "$all": [42] } }, doc! { "a": 42 }));
     assert!(no_match(doc! { "a": { "$all": [42] } }, doc! { "a": 43 }));
+}
+
+#[test]
+fn all_scalar_matches_duplicate_requirements_only_when_all_equal() {
+    assert!(matches(
+        doc! { "a": { "$all": [42, 42] } },
+        doc! { "a": 42 }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$all": [42, 43] } },
+        doc! { "a": 42 }
+    ));
+}
+
+#[test]
+fn all_null_scalar_matches_null_requirement() {
+    assert!(matches(
+        doc! { "a": { "$all": [Bson::Null] } },
+        doc! { "a": Bson::Null }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$all": [Bson::Null, 1] } },
+        doc! { "a": Bson::Null }
+    ));
 }
 
 #[test]

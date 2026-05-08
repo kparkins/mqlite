@@ -75,43 +75,44 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints_mvcc<S: BTreePa
     let new_id = new_doc.get("_id").unwrap_or(&Bson::Null);
 
     for (idx_name, fields, sparse) in unique_specs {
-        let mut new_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
-        new_encoded.extend(
-            fields
-                .iter()
-                .map(|f| encode_key(new_doc.get(f.as_str()).unwrap_or(&Bson::Null))),
-        );
+        let encode_fields = |out: &mut Vec<Vec<u8>>, doc: &Document| {
+            out.clear();
+            out.extend(
+                fields
+                    .iter()
+                    .map(|f| encode_key(doc.get(f.as_str()).unwrap_or(&Bson::Null))),
+            );
+        };
+        let duplicate_key = || Error::DuplicateKey {
+            detail: format!(
+                "E11000 duplicate key error — unique index '{}': dup key {{{}}}",
+                idx_name,
+                fields
+                    .iter()
+                    .map(|f| format!("{}: {:?}", f, new_doc.get(f.as_str())))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+
+        let mut new_encoded = Vec::with_capacity(fields.len());
+        encode_fields(&mut new_encoded, new_doc);
 
         if *sparse && new_encoded.iter().all(|v| v == &null_encoded) {
             continue;
         }
 
         let pairs = tree.range_scan_mvcc(None, None, view, history)?;
-        let mut existing_encoded: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+        let mut existing_encoded = Vec::with_capacity(fields.len());
         for (_, bson_bytes) in pairs {
             let existing: Document =
                 bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
-            existing_encoded.clear();
-            existing_encoded.extend(
-                fields
-                    .iter()
-                    .map(|f| encode_key(existing.get(f.as_str()).unwrap_or(&Bson::Null))),
-            );
 
+            encode_fields(&mut existing_encoded, &existing);
             if new_encoded == existing_encoded
                 && existing.get("_id").unwrap_or(&Bson::Null) != new_id
             {
-                return Err(Error::DuplicateKey {
-                    detail: format!(
-                        "E11000 duplicate key error — unique index '{}': dup key {{{}}}",
-                        idx_name,
-                        fields
-                            .iter()
-                            .map(|f| format!("{}: {:?}", f, new_doc.get(f.as_str())))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                });
+                return Err(duplicate_key());
             }
         }
 
@@ -121,27 +122,12 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints_mvcc<S: BTreePa
                 PrimaryOp::Delete => continue,
             };
             let existing: Document = bson::from_slice(data).map_err(Error::BsonDeserialization)?;
-            existing_encoded.clear();
-            existing_encoded.extend(
-                fields
-                    .iter()
-                    .map(|f| encode_key(existing.get(f.as_str()).unwrap_or(&Bson::Null))),
-            );
 
+            encode_fields(&mut existing_encoded, &existing);
             if new_encoded == existing_encoded
                 && existing.get("_id").unwrap_or(&Bson::Null) != new_id
             {
-                return Err(Error::DuplicateKey {
-                    detail: format!(
-                        "E11000 duplicate key error — unique index '{}': dup key {{{}}}",
-                        idx_name,
-                        fields
-                            .iter()
-                            .map(|f| format!("{}: {:?}", f, new_doc.get(f.as_str())))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                });
+                return Err(duplicate_key());
             }
         }
     }
@@ -151,10 +137,6 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints_mvcc<S: BTreePa
 // ---------------------------------------------------------------------------
 // Sort / projection helpers (replicated from engine.rs for local use)
 // ---------------------------------------------------------------------------
-
-pub(in crate::storage::paged_engine) fn sort_docs(docs: &mut [Document], sort: &Document) {
-    docs.sort_by(|a, b| compare_docs(a, b, sort));
-}
 
 pub(in crate::storage::paged_engine) fn compare_docs(
     a: &Document,

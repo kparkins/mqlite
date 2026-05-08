@@ -247,10 +247,10 @@ pub(super) fn delete_documents(
     }
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_commit_envelope(ns, None, |shared, md, txn, _vis| {
+    engine.run_write_commit_envelope(ns, None, |_shared, md, txn, _vis| {
         for (key, doc, expected_head) in &pairs_to_delete {
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
-            maintain_secondary_on_delete(shared, md, ns, doc, &doc_id, txn)?;
+            maintain_secondary_on_delete(md, ns, doc, &doc_id, txn)?;
             if let Some(entry) = catalog_lock(md).get_collection(ns)? {
                 txn.stage_primary_delete(entry.id, ns_arc.clone(), key.clone(), *expected_head);
             }
@@ -387,8 +387,8 @@ pub(super) fn find_one_and_delete(
     let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_commit_envelope(ns, None, |shared, md, txn, _vis| {
-        maintain_secondary_on_delete(shared, md, ns, &doc, &doc_id, txn)?;
+    engine.run_write_commit_envelope(ns, None, |_shared, md, txn, _vis| {
+        maintain_secondary_on_delete(md, ns, &doc, &doc_id, txn)?;
         if let Some(entry) = catalog_lock(md).get_collection(ns)? {
             txn.stage_primary_delete(entry.id, ns_arc.clone(), key, expected_head);
         }

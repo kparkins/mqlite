@@ -28,7 +28,7 @@ use crate::storage::structural_page_batch::StructuralPageBatch;
 
 use super::btree_ops::btree_collscan;
 use super::catalog_ops::rebuild_and_publish_locked;
-use super::doc_helpers::{apply_projection_to_doc, sort_docs};
+use super::doc_helpers::{apply_projection_to_doc, compare_docs};
 use super::index_maint::{
     index_bounds_free, index_entry_id_free, materialize_primary_deltas_for_checkpoint,
     materialize_ready_secondary_deltas_for_checkpoint,
@@ -149,7 +149,7 @@ impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryPr
 /// Apply sort/skip/limit/projection to a list of matched documents.
 pub(super) fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Vec<Document> {
     if let Some(s) = &opts.sort {
-        sort_docs(&mut docs, s);
+        docs.sort_by(|a, b| compare_docs(a, b, s));
     }
     if let Some(skip) = opts.skip {
         let n = skip as usize;
@@ -373,7 +373,7 @@ pub(super) fn checkpoint(engine: &super::PagedEngine) -> crate::error::Result<()
         .read_view_registry()
         .oldest_required_ts();
 
-    let checkpoint_plan = build_checkpoint_reconcile_plan(engine, md, checkpoint_ts, ort)?;
+    let checkpoint_plan = build_checkpoint_reconcile_plan(engine, checkpoint_ts, ort)?;
 
     if let Err(err) =
         checkpoint_after_reconcile_plan(engine, md, checkpoint_ts, ort, checkpoint_plan)

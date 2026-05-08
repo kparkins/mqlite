@@ -4,39 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use bson::{doc, Document};
 
-use super::super::errors::{
-    err_bad_value, err_collation_unsupported, err_from_mqlite, write_err_from_mqlite,
-};
+use super::super::errors::{err_bad_value, err_collation_unsupported, err_from_mqlite};
 use super::super::server::{ConnectionCursors, ServerState};
+use super::{get_i64, qualified_coll};
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndUpdateOptions, FindOptions, InsertManyOptions,
     ReturnDocument, UpdateOptions,
 };
-
-/// Extract an integer value from a BSON document field, coercing `Int32`,
-/// `Int64`, and `Double` variants to `i64`.
-pub(super) fn get_i64(doc: &Document, key: &str) -> Option<i64> {
-    match doc.get(key) {
-        Some(bson::Bson::Int32(i)) => Some(*i as i64),
-        Some(bson::Bson::Int64(i)) => Some(*i),
-        Some(bson::Bson::Double(f)) => Some(*f as i64),
-        _ => None,
-    }
-}
-
-/// Extract the database name from a command body's `$db` field.
-fn extract_db_name(body: &Document) -> String {
-    body.get_str("$db")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("test")
-        .to_owned()
-}
-
-/// Fully-qualify a collection name as `<db_name>.<coll_name>`.
-fn qualified_coll(body: &Document, coll_name: &str) -> String {
-    format!("{}.{}", extract_db_name(body), coll_name)
-}
 
 /// `insert` — insert one or more documents.
 ///
@@ -128,7 +102,7 @@ pub(super) fn handle_find(
 
     let filter = body.get_document("filter").cloned().unwrap_or_default();
 
-    let mut opts = FindOptions::new();
+    let mut opts = FindOptions::default();
     if let Ok(sort) = body.get_document("sort") {
         opts.sort = Some(sort.clone());
     }
@@ -266,11 +240,11 @@ pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
                 }
             }
             Err(e) => {
-                let (code, msg) = write_err_from_mqlite(&e);
+                let code = e.code().unwrap_or(crate::error::codes::INTERNAL_ERROR);
                 write_errors.push(bson::Bson::Document(doc! {
                     "index": i as i32,
                     "code": code,
-                    "errmsg": msg,
+                    "errmsg": e.to_string(),
                 }));
             }
         }
@@ -342,11 +316,11 @@ pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
         match result {
             Ok(r) => total_deleted += r.deleted_count as i64,
             Err(e) => {
-                let (code, msg) = write_err_from_mqlite(&e);
+                let code = e.code().unwrap_or(crate::error::codes::INTERNAL_ERROR);
                 write_errors.push(bson::Bson::Document(doc! {
                     "index": i as i32,
                     "code": code,
-                    "errmsg": msg,
+                    "errmsg": e.to_string(),
                 }));
             }
         }

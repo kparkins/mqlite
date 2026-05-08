@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 
 use bson::{oid::ObjectId, Document};
 
-use super::protocol::{MsgHeader, OpMsg, Section, MAX_MESSAGE_SIZE};
+use super::protocol::{MsgHeader, OpMsg, Section, MAX_MESSAGE_SIZE, OP_MSG};
 use crate::{
     client::{Client, ClientInner},
     error::Result,
@@ -52,9 +52,9 @@ use super::handlers::{
     handle_list_indexes, handle_server_status, handle_update,
 };
 pub(crate) use cursors::{cursor_sweep_task, ConnectionCursors};
-use op_query::{build_op_reply, parse_op_query_body, parse_op_query_db_name};
 #[cfg(test)]
-use op_query::{check_db_field, OP_REPLY};
+use op_query::OP_REPLY;
+use op_query::{build_op_reply, parse_op_query_body};
 
 // ---------------------------------------------------------------------------
 // Legacy opcodes (not in protocol.rs — used only for handshake interop)
@@ -351,10 +351,13 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
             _ = state.cancel.cancelled() => break,
         }
 
-        let declared_len =
-            i32::from_le_bytes(header_buf[0..4].try_into().expect("slice is 4 bytes")) as usize;
-        let opcode = i32::from_le_bytes(header_buf[12..16].try_into().expect("slice is 4 bytes"));
-        let request_id = i32::from_le_bytes(header_buf[4..8].try_into().expect("slice is 4 bytes"));
+        let header = match MsgHeader::parse(&header_buf) {
+            Ok(header) => header,
+            Err(_) => break,
+        };
+        let declared_len = header.message_length as usize;
+        let opcode = header.op_code;
+        let request_id = header.request_id;
 
         // Guard against oversized messages.
         if declared_len < MsgHeader::SIZE || declared_len > MAX_MESSAGE_SIZE {
@@ -383,7 +386,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
                     Err(_) => break,
                 }
             }
-            _ if opcode == super::protocol::OP_MSG => {
+            OP_MSG => {
                 // OP_MSG — all commands after handshake.
                 let msg = match OpMsg::parse(&full) {
                     Ok(m) => m,
@@ -429,10 +432,6 @@ fn dispatch_op_query(
 ) -> Result<Vec<u8>> {
     // OP_QUERY body starts after the 16-byte header.
     let body_buf = &full_msg[MsgHeader::SIZE..];
-
-    // Any database is accepted; the fullCollectionName db prefix is used only
-    // to identify which database the OP_QUERY targets (legacy handshake only).
-    let _ = parse_op_query_db_name(body_buf); // keep fn reachable for tests
 
     let doc = parse_op_query_body(body_buf)?;
     let command_name =

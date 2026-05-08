@@ -5,7 +5,7 @@
 //! operator argument.  Operator semantics — including array-unwrap and missing-
 //! field handling — are documented at each function.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, slice};
 
 use bson::Bson;
 use regex::RegexBuilder;
@@ -47,12 +47,8 @@ pub(super) fn eval_eq(field_value: Option<&Bson>, target: &Bson) -> Result<bool>
             // Missing field: matches `null` (like MongoDB).
             Ok(matches!(target, Bson::Null))
         }
-        Some(Bson::Array(arr)) => {
-            // Match the whole array exactly, OR any element.
-            Ok(bson_eq(&Bson::Array(arr.clone()), target)
-                || arr.iter().any(|elem| bson_eq(elem, target)))
-        }
-        Some(val) => Ok(bson_eq(val, target)),
+        Some(val) => Ok(bson_eq(val, target)
+            || matches!(val, Bson::Array(arr) if arr.iter().any(|elem| bson_eq(elem, target)))),
     }
 }
 
@@ -73,18 +69,18 @@ pub(super) fn eval_cmp(
     direction: Ordering,
     allow_equal: bool,
 ) -> Result<bool> {
-    match field_value {
-        None => Ok(false),
-        Some(Bson::Array(arr)) => Ok(arr
-            .iter()
-            .any(|elem| cmp_satisfies(elem, comparand, direction, allow_equal))),
-        Some(val) => Ok(cmp_satisfies(val, comparand, direction, allow_equal)),
-    }
-}
-
-fn cmp_satisfies(val: &Bson, comparand: &Bson, direction: Ordering, allow_equal: bool) -> bool {
-    let ord = compare_bson(val, comparand);
-    ord == direction || (allow_equal && ord == Ordering::Equal)
+    let Some(val) = field_value else {
+        return Ok(false);
+    };
+    let elems = if let Bson::Array(arr) = val {
+        arr.as_slice()
+    } else {
+        slice::from_ref(val)
+    };
+    Ok(elems.iter().any(|elem| {
+        let ord = compare_bson(elem, comparand);
+        ord == direction || (allow_equal && ord == Ordering::Equal)
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -102,14 +98,10 @@ pub(super) fn eval_in(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
             // Missing field: matches null in $in list.
             Ok(list.iter().any(|item| matches!(item, Bson::Null)))
         }
-        Some(Bson::Array(arr)) => {
-            // Array field: match if the whole array OR any element is in the list.
-            let field_arr = Bson::Array(arr.clone());
-            Ok(list.iter().any(|target| {
-                bson_eq(&field_arr, target) || arr.iter().any(|elem| bson_eq(elem, target))
-            }))
-        }
-        Some(val) => Ok(list.iter().any(|target| bson_eq(val, target))),
+        Some(val) => Ok(list.iter().any(|target| {
+            bson_eq(val, target)
+                || matches!(val, Bson::Array(arr) if arr.iter().any(|elem| bson_eq(elem, target)))
+        })),
     }
 }
 
@@ -135,9 +127,7 @@ pub(super) fn eval_not(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 pub(super) fn eval_exists(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
-    let want_exists = bson_to_bool("$exists", arg)?;
-    let does_exist = field_value.is_some();
-    Ok(does_exist == want_exists)
+    Ok(field_value.is_some() == bson_to_bool("$exists", arg)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,22 +141,20 @@ pub(super) fn eval_exists(field_value: Option<&Bson>, arg: &Bson) -> Result<bool
 /// - A numeric BSON type ID (e.g., `2` for string, `16` for int32)
 /// - An array of either (matches if field type is in the list)
 pub(super) fn eval_type(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
-    let val = match field_value {
-        None => return Ok(false),
-        Some(v) => v,
+    let Some(val) = field_value else {
+        return Ok(false);
     };
-
-    match arg {
-        Bson::Array(type_list) => {
-            for t in type_list {
-                if type_matches(val, t)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+    let specs = if let Bson::Array(type_list) = arg {
+        type_list.as_slice()
+    } else {
+        slice::from_ref(arg)
+    };
+    for type_spec in specs {
+        if type_matches(val, type_spec)? {
+            return Ok(true);
         }
-        _ => type_matches(val, arg),
     }
+    Ok(false)
 }
 
 fn type_matches(val: &Bson, type_spec: &Bson) -> Result<bool> {
@@ -236,10 +224,7 @@ fn type_name_to_id(name: &str) -> Result<i64> {
         "decimal" => 19,
         "minKey" => -1,
         "maxKey" => 127,
-        // MongoDB also accepts "number" as an alias for any numeric type.
         "number" => {
-            // Handled specially — not a single ID.
-            // We use a sentinel; caller must check for it.
             return Err(bad_value(
                 "type alias 'number' is not supported in $type; use an array of type IDs instead",
             ));
@@ -257,7 +242,7 @@ fn type_name_to_id(name: &str) -> Result<i64> {
 ///
 /// Only array-typed fields can match; scalars and missing fields never match.
 ///
-/// If all top-level keys in `arg` start with `$`, the operators are applied
+/// If any top-level key in `arg` starts with `$`, the operators are applied
 /// directly to each element (e.g., `{$gt: 5, $lt: 10}` tests each number).
 /// Otherwise the element must be a sub-document matching `arg` as a filter.
 pub(super) fn eval_elem_match(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
@@ -294,7 +279,7 @@ pub(super) fn eval_elem_match(field_value: Option<&Bson>, arg: &Bson) -> Result<
 /// For a scalar field, the field is treated as a single-element array
 /// (matching MongoDB 8.0 behaviour for `{a: {$all: [v]}}` vs `{a: v}`).
 ///
-/// Returns `false` for an empty `$all` list or a missing/null field.
+/// Returns `false` for an empty `$all` list or a missing field.
 ///
 /// Each element in the `$all` list may itself be an `{$elemMatch: ...}` document;
 /// in that case the sub-condition is evaluated against the whole field array.
@@ -306,15 +291,15 @@ pub(super) fn eval_all(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
     }
     match field_value {
         None => Ok(false),
-        Some(Bson::Array(arr)) => {
+        Some(arr_bson @ Bson::Array(arr)) => {
             for req_val in required {
                 // Check for $all: [{$elemMatch: {...}}] syntax.
-                let found = if let Bson::Document(cond) = req_val {
-                    if let Some(em_arg) = cond.get("$elemMatch") {
-                        eval_elem_match(Some(&Bson::Array(arr.clone())), em_arg)?
-                    } else {
-                        arr.iter().any(|elem| bson_eq(elem, req_val))
-                    }
+                let elem_match_arg = match req_val {
+                    Bson::Document(cond) => cond.get("$elemMatch"),
+                    _ => None,
+                };
+                let found = if let Some(em_arg) = elem_match_arg {
+                    eval_elem_match(Some(arr_bson), em_arg)?
                 } else {
                     arr.iter().any(|elem| bson_eq(elem, req_val))
                 };
@@ -324,16 +309,7 @@ pub(super) fn eval_all(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
             }
             Ok(true)
         }
-        Some(scalar) => {
-            // Treat a scalar as a single-element array.
-            for req_val in required {
-                if !bson_eq(scalar, req_val) {
-                    return Ok(false);
-                }
-            }
-            // Only matches if $all contains exactly one value (equal to scalar).
-            Ok(true)
-        }
+        Some(scalar) => Ok(required.iter().all(|req_val| bson_eq(scalar, req_val))),
     }
 }
 

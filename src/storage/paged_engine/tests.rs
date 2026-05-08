@@ -23,7 +23,9 @@ fn insert_and_find_one() {
 #[test]
 fn insert_missing_namespace_returns_empty_find() {
     let e = engine();
-    let (found, _) = e.find("test.users", &doc! {}, &FindOptions::new()).unwrap();
+    let (found, _) = e
+        .find("test.users", &doc! {}, &FindOptions::default())
+        .unwrap();
     assert!(found.is_empty());
 }
 
@@ -83,12 +85,54 @@ fn update_one_modifies_field() {
 }
 
 #[test]
+fn add_to_set_duplicate_only_does_not_modify_document() {
+    let e = engine();
+    e.insert("test.c", doc! { "tags": ["a", "b"] }).unwrap();
+
+    let r = e
+        .update(
+            "test.c",
+            &doc! {},
+            &doc! { "$addToSet": { "tags": "b" } },
+            &UpdateOptions::default(),
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(r.matched_count, 1);
+    assert_eq!(r.modified_count, 0);
+    let found = e.find_one("test.c", &doc! {}).unwrap().unwrap();
+    assert_eq!(found.get_array("tags").unwrap().len(), 2);
+}
+
+#[test]
+fn add_to_set_empty_each_does_not_modify_document() {
+    let e = engine();
+    e.insert("test.c", doc! { "tags": ["a", "b"] }).unwrap();
+
+    let r = e
+        .update(
+            "test.c",
+            &doc! {},
+            &doc! { "$addToSet": { "tags": { "$each": [] } } },
+            &UpdateOptions::default(),
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(r.matched_count, 1);
+    assert_eq!(r.modified_count, 0);
+    let found = e.find_one("test.c", &doc! {}).unwrap().unwrap();
+    assert_eq!(found.get_array("tags").unwrap().len(), 2);
+}
+
+#[test]
 fn find_with_sort_and_limit() {
     let e = engine();
     for i in [3i32, 1, 2] {
         e.insert("test.c", doc! { "v": i }).unwrap();
     }
-    let mut opts = FindOptions::new();
+    let mut opts = FindOptions::default();
     opts.sort = Some(doc! { "v": 1 });
     opts.limit = Some(2);
     let (results, _) = e.find("test.c", &doc! {}, &opts).unwrap();
@@ -526,6 +570,35 @@ fn buffered_index_maintained_on_delete() {
     assert!(found.is_none(), "deleted doc must not be returned");
 }
 
+#[test]
+fn buffered_index_maintained_on_find_one_and_delete() {
+    let (e, _io) = buffered_engine();
+
+    let idx = IndexModel::builder().keys(doc! { "email": 1 }).build();
+    e.create_index("test.users", &idx).unwrap();
+
+    e.insert(
+        "test.users",
+        doc! { "email": "dana@test.com", "role": "admin" },
+    )
+    .unwrap();
+
+    let deleted = e
+        .find_one_and_delete(
+            "test.users",
+            &doc! { "email": "dana@test.com" },
+            &FindOneAndDeleteOptions::default(),
+        )
+        .unwrap()
+        .expect("indexed document should be deleted");
+    assert_eq!(deleted.get_str("role").unwrap(), "admin");
+
+    let found = e
+        .find_one("test.users", &doc! { "email": "dana@test.com" })
+        .unwrap();
+    assert!(found.is_none(), "deleted doc must not be returned");
+}
+
 /// Verify that updating a document replaces its old secondary index entry
 /// with a new one.
 #[test]
@@ -582,7 +655,7 @@ fn buffered_index_scan_range_gt() {
         .find(
             "test.players",
             &doc! { "score": { "$gt": 7i32 } },
-            &FindOptions::new(),
+            &FindOptions::default(),
         )
         .unwrap();
     assert_eq!(results.len(), 2, "scores 8 and 9 should match");
@@ -610,7 +683,7 @@ fn buffered_index_scan_in_query() {
         .find(
             "test.orders",
             &doc! { "status": { "$in": ["pending", "active"] } },
-            &FindOptions::new(),
+            &FindOptions::default(),
         )
         .unwrap();
     assert_eq!(results.len(), 2);
@@ -672,7 +745,7 @@ fn buffered_compound_index_lookup() {
         .find(
             "test.products",
             &doc! { "category": "books" },
-            &FindOptions::new(),
+            &FindOptions::default(),
         )
         .unwrap();
     assert_eq!(results.len(), 2, "two books should be found");
@@ -768,7 +841,7 @@ fn swmr_concurrent_readers_do_not_block() {
         .map(|_| {
             let e = Arc::clone(&e);
             thread::spawn(move || {
-                let opts = FindOptions::new();
+                let opts = FindOptions::default();
                 let (docs, _) = e.find("test.c", &doc! {}, &opts).unwrap();
                 assert_eq!(
                     docs.len(),
@@ -1020,7 +1093,7 @@ fn find_performs_one_epoch_load() {
         .find(
             "test.find_range",
             &bson::doc! {},
-            &crate::options::FindOptions::new(),
+            &crate::options::FindOptions::default(),
         )
         .unwrap();
 }
@@ -1050,7 +1123,7 @@ fn find_on_missing_namespace_performs_one_epoch_load() {
         .find(
             "test.absent",
             &bson::doc! {},
-            &crate::options::FindOptions::new(),
+            &crate::options::FindOptions::default(),
         )
         .unwrap();
 }

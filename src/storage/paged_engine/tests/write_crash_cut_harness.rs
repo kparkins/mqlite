@@ -23,7 +23,7 @@ use super::PagedEngine;
 impl PagedEngine {
     fn crash_cut_probe_visible(&self, ns: &str, inserted_id: &Bson) -> Result<bool> {
         let filter = bson::doc! { "_id": inserted_id.clone() };
-        let (docs, _explain) = doc_ops::find_documents(self, ns, &filter, &FindOptions::new())?;
+        let (docs, _explain) = doc_ops::find_documents(self, ns, &filter, &FindOptions::default())?;
         Ok(!docs.is_empty())
     }
 
@@ -98,8 +98,8 @@ impl PagedEngine {
             return Self::phase0_stop_before_recovery(report, txn);
         }
 
-        let dirty = txn.publish_dirty();
-        let root_changing = txn.structural_tree_change();
+        let dirty = txn.publish_dirty;
+        let root_changing = false;
         let logical_payload = match frame.encode() {
             Ok(bytes) => bytes,
             Err(e) => {

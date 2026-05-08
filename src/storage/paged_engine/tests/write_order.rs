@@ -224,8 +224,11 @@ fn test_durable_logical_frame_exists_before_resident_install_live_reader() -> Re
         VersionState::Pending { .. }
     ));
 
-    let (pre_publish_docs, _) =
-        engine.find(LIVE_READER_NS, &doc! { "_id": 42i32 }, &FindOptions::new())?;
+    let (pre_publish_docs, _) = engine.find(
+        LIVE_READER_NS,
+        &doc! { "_id": 42i32 },
+        &FindOptions::default(),
+    )?;
     assert!(
         pre_publish_docs.is_empty(),
         "pre-publish readers must not see the resident Pending head"
@@ -234,8 +237,11 @@ fn test_durable_logical_frame_exists_before_resident_install_live_reader() -> Re
     gate.wait();
     writer.join().expect("writer thread panicked");
 
-    let (post_publish_docs, _) =
-        engine.find(LIVE_READER_NS, &doc! { "_id": 42i32 }, &FindOptions::new())?;
+    let (post_publish_docs, _) = engine.find(
+        LIVE_READER_NS,
+        &doc! { "_id": 42i32 },
+        &FindOptions::default(),
+    )?;
     assert_eq!(post_publish_docs.len(), 1);
 
     let committed_chain = primary_chain_for_id(&engine, &coll, &id)?;

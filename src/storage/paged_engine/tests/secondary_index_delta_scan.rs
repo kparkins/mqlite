@@ -156,7 +156,7 @@ fn test_execute_index_scan_ready_sees_delta_only_secondary() {
         .find(
             NS,
             &doc! { "email": "delta@example.test" },
-            &FindOptions::new(),
+            &FindOptions::default(),
         )
         .unwrap();
 
@@ -189,7 +189,7 @@ fn test_execute_index_scan_ready_hides_delta_only_secondary_tombstone() {
         .find(
             NS,
             &doc! { "email": "deleted@example.test" },
-            &FindOptions::new(),
+            &FindOptions::default(),
         )
         .unwrap();
 
@@ -204,7 +204,7 @@ fn test_index_scan_and_collscan_agree_on_delta_only_entry() {
     install_delta_only_indexed_doc(&engine, "agree@example.test", 3);
 
     let filter = doc! { "email": "agree@example.test" };
-    let (index_docs, explain) = engine.find(NS, &filter, &FindOptions::new()).unwrap();
+    let (index_docs, explain) = engine.find(NS, &filter, &FindOptions::default()).unwrap();
 
     let epoch = engine.shared.load_published();
     let ns_snap = epoch

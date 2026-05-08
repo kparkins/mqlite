@@ -219,7 +219,7 @@ fn test_building_index_receives_delta_only_writes() -> Result<()> {
     let (docs, explain) = engine.find(
         BUILDING_NS,
         &doc! { "email": "building@example.test" },
-        &FindOptions::new(),
+        &FindOptions::default(),
     )?;
     assert!(explain.index_used.is_none());
     assert_eq!(docs.len(), 1);

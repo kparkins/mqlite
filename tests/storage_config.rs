@@ -14,6 +14,7 @@ use mqlite::{Client, OpenOptions};
 const VALID_THRESHOLD: f64 = 1.0;
 const ZERO_THRESHOLD: f64 = 0.0;
 const ABOVE_ONE_THRESHOLD: f64 = 1.1;
+const NON_FINITE_THRESHOLDS: [f64; 3] = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
 
 #[test]
 fn delta_bearing_frames_warn_threshold_rejects_invalid_values() {
@@ -37,6 +38,18 @@ fn delta_bearing_frames_warn_threshold_rejects_invalid_values() {
         .is_err(),
         "thresholds above one must be rejected"
     );
+
+    for (i, threshold) in NON_FINITE_THRESHOLDS.iter().enumerate() {
+        let path = dir.path().join(format!("non-finite-{i}.mqlite"));
+        assert!(
+            Client::open_with_options(
+                &path,
+                OpenOptions::new().delta_bearing_frames_warn_threshold(*threshold),
+            )
+            .is_err(),
+            "non-finite threshold {threshold:?} must be rejected"
+        );
+    }
 }
 
 #[test]

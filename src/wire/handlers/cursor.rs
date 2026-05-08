@@ -6,26 +6,7 @@ use bson::{doc, Document};
 
 use super::super::errors::err_bad_value;
 use super::super::server::{ConnectionCursors, ServerState};
-
-/// Extract an integer value from a BSON document field, coercing `Int32`,
-/// `Int64`, and `Double` variants to `i64`.
-fn get_i64(doc: &Document, key: &str) -> Option<i64> {
-    match doc.get(key) {
-        Some(bson::Bson::Int32(i)) => Some(*i as i64),
-        Some(bson::Bson::Int64(i)) => Some(*i),
-        Some(bson::Bson::Double(f)) => Some(*f as i64),
-        _ => None,
-    }
-}
-
-/// Extract the database name from a command body's `$db` field.
-fn extract_db_name(body: &Document) -> String {
-    body.get_str("$db")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("test")
-        .to_owned()
-}
+use super::{get_i64, qualified_coll};
 
 /// `getMore` — fetch the next batch of results from an open server-side cursor.
 ///
@@ -88,7 +69,7 @@ pub(super) fn handle_get_more(
         }
     };
 
-    let ns = format!("{}.{}", extract_db_name(body), coll_name);
+    let ns = qualified_coll(body, coll_name);
     doc! {
         "cursor": {
             "nextBatch": next_batch,

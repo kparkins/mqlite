@@ -211,11 +211,6 @@ pub(crate) struct StructuralPageWrites {
 }
 
 impl StructuralPageWrites {
-    /// Create a fresh, empty page-byte staging area.
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     fn page_images(&self) -> Vec<StructuralPageImage> {
         let mut images = Vec::with_capacity(self.touched_4k.len() + self.touched_32k.len());
         for page_number in &self.touched_4k {
@@ -295,7 +290,7 @@ impl StructuralPageBatch {
     /// Create a structural batch and reserve any deferred-free pages for it.
     pub(crate) fn new(handle: &BufferPoolHandle) -> Self {
         Self {
-            writes: StructuralPageWrites::new(),
+            writes: StructuralPageWrites::default(),
             lifetime: AllocatorLifetimeBatch::new(handle),
             header: HeaderCatalogRootBatch::default(),
         }
@@ -530,13 +525,6 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
     }
 
     fn take_all_chains(
-        &mut self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        self.take_all_chains_on_page(page)
-    }
-
-    fn take_all_chains_on_page(
         &mut self,
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {

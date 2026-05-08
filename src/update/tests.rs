@@ -82,6 +82,56 @@ fn mul_doubles_field() {
     assert_eq!(as_f64(v), Some(30.0));
 }
 
+// ---- $min / $max --------------------------------------------------------
+
+#[test]
+fn min_sets_missing_and_smaller_values() {
+    let mut doc = doc! { "score": 10i32 };
+    apply(&mut doc, &doc! { "$min": { "score": 7i32, "floor": 1i32 } }).unwrap();
+    assert_eq!(doc.get_i32("score").unwrap(), 7);
+    assert_eq!(doc.get_i32("floor").unwrap(), 1);
+}
+
+#[test]
+fn min_keeps_equal_or_greater_current_value() {
+    let mut doc = doc! { "score": 10i32, "same": 5i32 };
+    apply(&mut doc, &doc! { "$min": { "score": 11i32, "same": 5i32 } }).unwrap();
+    assert_eq!(doc.get_i32("score").unwrap(), 10);
+    assert_eq!(doc.get_i32("same").unwrap(), 5);
+}
+
+#[test]
+fn max_sets_missing_and_greater_values() {
+    let mut doc = doc! { "score": 10i32 };
+    apply(
+        &mut doc,
+        &doc! { "$max": { "score": 12i32, "ceiling": 20i32 } },
+    )
+    .unwrap();
+    assert_eq!(doc.get_i32("score").unwrap(), 12);
+    assert_eq!(doc.get_i32("ceiling").unwrap(), 20);
+}
+
+#[test]
+fn max_keeps_equal_or_smaller_current_value() {
+    let mut doc = doc! { "score": 10i32, "same": 5i32 };
+    apply(&mut doc, &doc! { "$max": { "score": 9i32, "same": 5i32 } }).unwrap();
+    assert_eq!(doc.get_i32("score").unwrap(), 10);
+    assert_eq!(doc.get_i32("same").unwrap(), 5);
+}
+
+#[test]
+fn min_max_use_bson_type_ordering() {
+    let mut doc = doc! { "min_field": "z", "max_field": 1i32 };
+    apply(
+        &mut doc,
+        &doc! { "$min": { "min_field": 1i32 }, "$max": { "max_field": "z" } },
+    )
+    .unwrap();
+    assert_eq!(doc.get_i32("min_field").unwrap(), 1);
+    assert_eq!(doc.get_str("max_field").unwrap(), "z");
+}
+
 // ---- $rename ------------------------------------------------------------
 
 #[test]

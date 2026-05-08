@@ -39,7 +39,7 @@
 //! existing entry with a different `_id` constitutes a violation and returns
 //! [`Error::DuplicateKey`] (code 11000).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Bound;
 
 use bson::{Bson, Document};
@@ -289,7 +289,7 @@ pub(crate) fn check_unique_constraint_mvcc<S: BTreePageStore>(
     };
 
     let mut pending_deletes: HashSet<Vec<u8>> = HashSet::new();
-    let mut pending_inserts: BTreeMap<Vec<u8>, Bson> = BTreeMap::new();
+    let mut pending_inserts: HashSet<Vec<u8>> = HashSet::new();
     for write in pending
         .iter()
         .filter(|write| write.index_root_page == index_root_page)
@@ -298,9 +298,9 @@ pub(crate) fn check_unique_constraint_mvcc<S: BTreePageStore>(
             continue;
         }
         match &write.op {
-            SecIndexOp::Insert { id_bytes } => {
+            SecIndexOp::Insert { .. } => {
                 pending_deletes.remove(&write.key);
-                pending_inserts.insert(write.key.clone(), index_payload_id(id_bytes)?);
+                pending_inserts.insert(write.key.clone());
             }
             SecIndexOp::Delete => {
                 pending_inserts.remove(&write.key);
@@ -322,7 +322,7 @@ pub(crate) fn check_unique_constraint_mvcc<S: BTreePageStore>(
         }
     }
 
-    for pending_key in pending_inserts.keys() {
+    for pending_key in &pending_inserts {
         if pending_key != &my_key {
             return Err(Error::DuplicateKey {
                 detail: format!(
@@ -333,11 +333,6 @@ pub(crate) fn check_unique_constraint_mvcc<S: BTreePageStore>(
     }
 
     Ok(())
-}
-
-fn index_payload_id(id_bytes: &[u8]) -> Result<Bson> {
-    let doc: Document = bson::from_slice(id_bytes).map_err(Error::BsonDeserialization)?;
-    Ok(doc.get("_id").cloned().unwrap_or(Bson::Null))
 }
 
 // ---------------------------------------------------------------------------

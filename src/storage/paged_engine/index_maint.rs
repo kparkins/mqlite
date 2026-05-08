@@ -145,7 +145,6 @@ pub(super) fn maintain_secondary_on_insert(
 
 /// Maintain all secondary indexes after a document delete.
 pub(super) fn maintain_secondary_on_delete(
-    _shared: &SharedState,
     md: &MetadataState,
     ns: &str,
     doc: &Document,
@@ -228,9 +227,9 @@ fn sync_index_entry_metadata(
     }
     catalog_lock(md).update_index(&updated)?;
 
-    txn.mark_header();
+    txn.publish_dirty.mark_header();
     if root_changed && matches!(orig.state, IndexState::Ready) {
-        txn.mark_published();
+        txn.publish_dirty.mark_published();
     }
 
     Ok(())
@@ -250,27 +249,8 @@ fn live_head(chain: &VecDeque<crate::mvcc::VersionEntry>) -> Option<&crate::mvcc
         .find(|entry| entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted))
 }
 
-fn same_txn_pending(entry: &crate::mvcc::VersionEntry, txn_id: u64) -> bool {
-    matches!(entry.state, crate::mvcc::VersionState::Pending { txn_id: id } if id == txn_id)
-}
-
-fn head_identity(entry: &crate::mvcc::VersionEntry) -> crate::mvcc::ExpectedHead {
-    crate::mvcc::ExpectedHead {
-        commit_ts: entry.start_ts,
-        txn_id: entry.txn_id,
-    }
-}
-
 fn key_preview(key: &[u8]) -> Vec<u8> {
     key.iter().copied().take(KEY_PREVIEW_BYTES).collect()
-}
-
-fn index_field_directions(entry: &IndexEntry) -> Vec<bool> {
-    entry
-        .key_pattern
-        .iter()
-        .map(|(_, dir)| !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1)))
-        .collect()
 }
 
 fn unique_prefix_preview(prefix_start: &[u8]) -> Vec<u8> {
@@ -291,12 +271,19 @@ fn classify_delta_install(
         return Ok(false);
     };
 
-    if same_txn_pending(head, txn_id) {
+    if matches!(head.state, crate::mvcc::VersionState::Pending { txn_id: id } if id == txn_id) {
         return Ok(true);
     }
 
     match expected_head {
-        Some(expected) if head_identity(head) == expected => Ok(false),
+        Some(expected)
+            if (crate::mvcc::ExpectedHead {
+                commit_ts: head.start_ts,
+                txn_id: head.txn_id,
+            }) == expected =>
+        {
+            Ok(false)
+        }
         Some(_) => Err(Error::WriteConflict {
             reason: WriteConflictReason::StaleSnapshot,
         }),
@@ -340,6 +327,12 @@ fn check_unique_prefix_install(
         pages
     };
 
+    let unique_conflict = || Error::WriteConflict {
+        reason: WriteConflictReason::UniqueConflict {
+            key_prefix_preview: unique_prefix_preview(start),
+        },
+    };
+
     for page_id in scan_pages {
         let page = smo_latches
             .page_mut(page_id)
@@ -347,20 +340,12 @@ fn check_unique_prefix_install(
                 reason: WriteConflictReason::StructuralContention,
             })?;
         if page.has_live_delta_key_in_range(start, end, key)? {
-            return Err(Error::WriteConflict {
-                reason: WriteConflictReason::UniqueConflict {
-                    key_prefix_preview: unique_prefix_preview(start),
-                },
-            });
+            return Err(unique_conflict());
         }
         let snapshot = page.data_snapshot();
         if crate::storage::btree::leaf_contains_key_in_range(snapshot.as_slice(), start, end, key)?
         {
-            return Err(Error::WriteConflict {
-                reason: WriteConflictReason::UniqueConflict {
-                    key_prefix_preview: unique_prefix_preview(start),
-                },
-            });
+            return Err(unique_conflict());
         }
     }
     Ok(())
@@ -403,7 +388,11 @@ pub(super) fn install_pending_sec_index(
         })?;
         let unique_prefix_range =
             if entry.unique && matches!(write.op, crate::mvcc::SecIndexOp::Insert { .. }) {
-                let directions = index_field_directions(entry);
+                let directions = entry
+                    .key_pattern
+                    .iter()
+                    .map(|(_, dir)| !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1)))
+                    .collect::<Vec<_>>();
                 Some(compound_prefix_range_excluding_trailing_id(
                     &write.key,
                     &directions,
@@ -483,12 +472,17 @@ pub(super) fn install_pending_sec_index(
 
 fn secondary_tree_ident(shared: &SharedState, index_id: i64) -> Result<TreeIdent> {
     let epoch = shared.published.load_full();
-    let collection_id = epoch.catalog.index_owner_by_id(index_id).ok_or_else(|| {
-        Error::Internal(format!(
-            "published catalog missing owner for secondary index_id {}",
-            index_id
-        ))
-    })?;
+    let collection_id = epoch
+        .catalog
+        .index_owner_by_id
+        .get(&index_id)
+        .copied()
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "published catalog missing owner for secondary index_id {}",
+                index_id
+            ))
+        })?;
     Ok(TreeIdent {
         collection_id,
         kind: TreeKind::Secondary { index_id },

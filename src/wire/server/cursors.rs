@@ -7,14 +7,6 @@ use std::time::{Duration, Instant};
 /// Cursors not accessed for longer than this duration are evicted.
 pub(crate) const CURSOR_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// A buffered cursor stored in the per-connection cursor map.
-struct StoredCursor {
-    /// The buffered cursor data.
-    cursor: crate::Cursor<bson::Document>,
-    /// When this cursor was last accessed (used for idle eviction).
-    last_accessed: Instant,
-}
-
 /// Per-connection cursor state.
 ///
 /// Tracks all open server-side cursors for one TCP connection.  When
@@ -22,8 +14,7 @@ struct StoredCursor {
 /// every stored cursor is released automatically — satisfying the
 /// acceptance criterion "connection close releases all associated cursors".
 pub(crate) struct ConnectionCursors {
-    /// Cursor ID → stored cursor.
-    cursors: HashMap<i64, StoredCursor>,
+    cursors: HashMap<i64, (crate::Cursor<bson::Document>, Instant)>,
     /// Monotonically increasing cursor ID counter.  Starts at 1; cursor ID 0
     /// is reserved in the MongoDB wire protocol to mean "no cursor".
     next_cursor_id: i64,
@@ -42,27 +33,21 @@ impl ConnectionCursors {
         let id = self.next_cursor_id;
         // Cursor ID 0 is reserved; skip it on overflow.
         self.next_cursor_id = self.next_cursor_id.wrapping_add(1).max(1);
-        self.cursors.insert(
-            id,
-            StoredCursor {
-                cursor,
-                last_accessed: Instant::now(),
-            },
-        );
+        self.cursors.insert(id, (cursor, Instant::now()));
         id
     }
 
     /// Remove and return the cursor identified by `id`, if present.
     pub(crate) fn remove(&mut self, id: i64) -> Option<crate::Cursor<bson::Document>> {
-        self.cursors.remove(&id).map(|e| e.cursor)
+        self.cursors.remove(&id).map(|(cursor, _)| cursor)
     }
 
     /// Return a mutable reference to the cursor for `id`, refreshing its
     /// last-accessed timestamp.  Returns `None` if the cursor is not found.
     pub(crate) fn get_mut(&mut self, id: i64) -> Option<&mut crate::Cursor<bson::Document>> {
-        self.cursors.get_mut(&id).map(|e| {
-            e.last_accessed = Instant::now();
-            &mut e.cursor
+        self.cursors.get_mut(&id).map(|(cursor, last_accessed)| {
+            *last_accessed = Instant::now();
+            cursor
         })
     }
 
@@ -72,7 +57,7 @@ impl ConnectionCursors {
     pub(super) fn evict_idle(&mut self, timeout: Duration) -> usize {
         let before = self.cursors.len();
         self.cursors
-            .retain(|_, entry| entry.last_accessed.elapsed() < timeout);
+            .retain(|_, (_, last_accessed)| last_accessed.elapsed() < timeout);
         before - self.cursors.len()
     }
 

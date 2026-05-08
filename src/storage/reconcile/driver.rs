@@ -186,9 +186,8 @@ pub(crate) fn checkpoint_incomplete_error(
 /// Returns [`Error::CheckpointIncomplete`] when a checkpoint-visible dirty
 /// leaf cannot be included in the checkpoint batch before any reconcile,
 /// history-store, allocator, or journal mutation is attempted.
-pub(crate) fn build_checkpoint_reconcile_plan<M>(
+pub(crate) fn build_checkpoint_reconcile_plan(
     engine: &PagedEngine,
-    _md: &M,
     checkpoint_ts: crate::mvcc::Ts,
     oldest_required_ts: crate::mvcc::Ts,
 ) -> Result<CheckpointReconcilePlan> {
@@ -240,29 +239,28 @@ fn plan_leaf(
     checkpoint_ts: crate::mvcc::Ts,
     oldest_required_ts: crate::mvcc::Ts,
 ) -> Result<LeafPlanOutcome> {
-    let snapshot_result = engine
+    let snapshot = engine
         .shared
         .handle
         .pool()
-        .snapshot_leaf_for_reconcile(page_id);
-    let snapshot = match snapshot_result {
-        Err(Error::PoolExhausted { reason }) => {
-            let reason =
-                checkpoint_reason_for_plan_blocker(CheckpointPlanBlocker::PoolExhausted(reason));
-            return Err(checkpoint_incomplete_error(page_id, reason));
-        }
-        Err(err) => return Err(err),
-        Ok(snapshot) => snapshot,
-    };
-    let snapshot = match snapshot {
-        Some(snapshot) => snapshot,
+        .snapshot_leaf_for_reconcile(page_id)
+        .map_err(|err| match err {
+            Error::PoolExhausted { reason } => checkpoint_incomplete_error(
+                page_id,
+                checkpoint_reason_for_plan_blocker(CheckpointPlanBlocker::PoolExhausted(reason)),
+            ),
+            other => other,
+        })?;
+    let Some(snapshot) = snapshot else {
         // A stale dirty-map page with no resident frame has no resident chain
         // to reconcile; the durable page image has already left the pool.
-        None => return Ok(LeafPlanOutcome::ExcludedFutureDirty),
+        return Ok(LeafPlanOutcome::ExcludedFutureDirty);
     };
     if !has_checkpoint_visible_committed_delta(&snapshot.chains, checkpoint_ts) {
         return Ok(LeafPlanOutcome::ExcludedFutureDirty);
     }
+    let blocker_err =
+        |blocker| checkpoint_incomplete_error(page_id, checkpoint_reason_for_plan_blocker(blocker));
     match synthesize_page(
         &snapshot.base_image,
         &snapshot.chains,
@@ -274,23 +272,13 @@ fn plan_leaf(
         Err(NotInstallable::VisibleWinnerExceedsPageBudget) => {
             match visible_winners_fit_individual_leaf_pages(&snapshot.chains, checkpoint_ts) {
                 Ok(true) => Ok(LeafPlanOutcome::MutationReady),
-                Ok(false) => {
-                    let reason = checkpoint_reason_for_plan_blocker(
-                        CheckpointPlanBlocker::VisibleWinnerExceedsPageBudget,
-                    );
-                    Err(checkpoint_incomplete_error(page_id, reason))
-                }
-                Err(reason) => {
-                    let reason =
-                        checkpoint_reason_for_plan_blocker(checkpoint_blocker_for_synth(reason));
-                    Err(checkpoint_incomplete_error(page_id, reason))
-                }
+                Ok(false) => Err(blocker_err(
+                    CheckpointPlanBlocker::VisibleWinnerExceedsPageBudget,
+                )),
+                Err(reason) => Err(blocker_err(checkpoint_blocker_for_synth(reason))),
             }
         }
-        Err(reason) => {
-            let reason = checkpoint_reason_for_plan_blocker(checkpoint_blocker_for_synth(reason));
-            Err(checkpoint_incomplete_error(page_id, reason))
-        }
+        Err(reason) => Err(blocker_err(checkpoint_blocker_for_synth(reason))),
     }
 }
 

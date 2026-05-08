@@ -18,6 +18,8 @@ use crate::storage::page::PAGE_SIZE_LEAF;
 
 use super::plan::TreeIdent;
 
+const LEAF_PAGE_BUDGET: usize = PAGE_SIZE_LEAF as usize;
+
 /// Result of synthesizing one replacement folded leaf image.
 #[derive(Debug)]
 pub(crate) struct PageSynthesisResult {
@@ -117,11 +119,10 @@ pub(crate) fn synthesize_page(
     }
 
     let folded_cells: Vec<FoldedLeafCell> = base_cells.into_values().collect();
-    let page_budget = PAGE_SIZE_LEAF as usize;
-    if predict_encoded_leaf_size(&folded_cells, &RetainedChains::new()) > page_budget {
+    if predict_encoded_leaf_size(&folded_cells, &RetainedChains::new()) > LEAF_PAGE_BUDGET {
         return Err(NotInstallable::VisibleWinnerExceedsPageBudget);
     }
-    if predict_encoded_leaf_size(&folded_cells, &retained_chains) > page_budget {
+    if predict_encoded_leaf_size(&folded_cells, &retained_chains) > LEAF_PAGE_BUDGET {
         return Err(NotInstallable::FoldedLeafExceedsPageByteBudget);
     }
 
@@ -147,7 +148,6 @@ pub(crate) fn visible_winners_fit_individual_leaf_pages(
     checkpoint_ts: Ts,
 ) -> Result<bool, NotInstallable> {
     let mut visible_winners = 0usize;
-    let page_budget = PAGE_SIZE_LEAF as usize;
     for (key, chain) in chains {
         let Some(index) = checkpoint_winner_index(chain, checkpoint_ts) else {
             return Ok(false);
@@ -160,8 +160,15 @@ pub(crate) fn visible_winners_fit_individual_leaf_pages(
             continue;
         }
         visible_winners += 1;
-        let cell = materialized_cell_for_budget(key, entry)?;
-        if predict_encoded_leaf_size(&[cell], &RetainedChains::new()) > page_budget {
+        let cell = match &entry.data {
+            VersionData::Inline(bytes) if bytes.len() > OVERFLOW_THRESHOLD => {
+                let total_length = u32::try_from(bytes.len())
+                    .map_err(|_| NotInstallable::FoldedLeafExceedsPageByteBudget)?;
+                FoldedLeafCell::overflow(key.to_vec(), 0, total_length)
+            }
+            _ => folded_cell_from_entry(key, entry)?,
+        };
+        if predict_encoded_leaf_size(&[cell], &RetainedChains::new()) > LEAF_PAGE_BUDGET {
             return Ok(false);
         }
     }
@@ -209,19 +216,5 @@ fn folded_cell_from_entry(
                 total_length,
             ))
         }
-    }
-}
-
-fn materialized_cell_for_budget(
-    key: &[u8],
-    entry: &VersionEntry,
-) -> Result<FoldedLeafCell, NotInstallable> {
-    match &entry.data {
-        VersionData::Inline(bytes) if bytes.len() > OVERFLOW_THRESHOLD => {
-            let total_length = u32::try_from(bytes.len())
-                .map_err(|_| NotInstallable::FoldedLeafExceedsPageByteBudget)?;
-            Ok(FoldedLeafCell::overflow(key.to_vec(), 0, total_length))
-        }
-        _ => folded_cell_from_entry(key, entry),
     }
 }

@@ -103,11 +103,6 @@ impl PublishedCatalog {
     pub(crate) fn id_for_name(&self, name: &str) -> Option<NamespaceId> {
         self.namespace_id_by_name.get(name).copied()
     }
-
-    /// Resolve a secondary index id to its owning collection id.
-    pub(crate) fn index_owner_by_id(&self, index_id: IndexId) -> Option<NamespaceId> {
-        self.index_owner_by_id.get(&index_id).copied()
-    }
 }
 
 /// Atomically published read epoch. The outer object is what `ArcSwap`

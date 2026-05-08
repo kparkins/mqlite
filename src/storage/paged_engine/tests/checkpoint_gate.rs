@@ -181,7 +181,7 @@ fn test_checkpoint_gate_does_not_block_readers() -> Result<()> {
     let reader_engine = Arc::clone(&engine);
     let (reader_tx, reader_rx) = mpsc::channel();
     let reader = thread::spawn(move || {
-        let result = reader_engine.find(NS_A, &doc! { "_id": 30i32 }, &FindOptions::new());
+        let result = reader_engine.find(NS_A, &doc! { "_id": 30i32 }, &FindOptions::default());
         reader_tx.send(result).expect("send reader result");
     });
 

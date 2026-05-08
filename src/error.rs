@@ -14,8 +14,6 @@ pub mod codes {
     pub const CURSOR_NOT_FOUND: i32 = 43;
     /// The referenced collection or database does not exist.
     pub const NAMESPACE_NOT_FOUND: i32 = 26;
-    /// The database file format is not supported.
-    pub const UNSUPPORTED_FORMAT: i32 = 115;
     /// An MQL operator is not supported by mqlite.
     /// Matches MongoDB error code 9 (FailedToParse / unknown operator).
     pub const UNSUPPORTED_OPERATOR: i32 = 9;

@@ -150,7 +150,7 @@ fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
         Arc::clone(&engine.shared.publish_sequencer),
     ));
     let observed = wait_for_pending_snapshot(&engine, leaf, &key, Arc::clone(&foreign_view));
-    let pre_publish_find = engine.find(NS, &doc! { "_id": TARGET_ID }, &FindOptions::new());
+    let pre_publish_find = engine.find(NS, &doc! { "_id": TARGET_ID }, &FindOptions::default());
 
     if writer.is_finished() {
         writer.join().expect("writer thread panicked");
@@ -233,7 +233,7 @@ fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
         "S12 publish must advance the live sequencer frontier past the Pending start_ts"
     );
     let (post_publish_docs, _) =
-        engine.find(NS, &doc! { "_id": TARGET_ID }, &FindOptions::new())?;
+        engine.find(NS, &doc! { "_id": TARGET_ID }, &FindOptions::default())?;
     assert_eq!(post_publish_docs.len(), 1);
 
     Ok(())

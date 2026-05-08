@@ -11,7 +11,7 @@
 //!    into one self-contained log record and transfers ownership of the
 //!    pending `OverflowRef`s into installed version chains. Durability sync is
 //!    owned by the caller's LSN group-commit boundary.
-//! 4. On `rollback` / `Drop`: pending `OverflowRef`s decref via RAII.
+//! 4. On `Drop`: pending `OverflowRef`s decref via RAII.
 //!
 //! ## Lock ownership
 //!
@@ -63,7 +63,7 @@ pub struct ExpectedHead {
 ///
 /// Implements `PartialEq<&str>` and `PartialEq<str>` for ergonomic test
 /// assertions (`assert_eq!(pw.ns, "db.coll")`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Ns(Arc<str>);
 
 impl Ns {
@@ -85,12 +85,6 @@ impl From<String> for Ns {
     }
 }
 
-impl From<Arc<str>> for Ns {
-    fn from(a: Arc<str>) -> Self {
-        Ns(a)
-    }
-}
-
 impl PartialEq<str> for Ns {
     fn eq(&self, other: &str) -> bool {
         self.0.as_ref() == other
@@ -100,12 +94,6 @@ impl PartialEq<str> for Ns {
 impl PartialEq<&str> for Ns {
     fn eq(&self, other: &&str) -> bool {
         self.0.as_ref() == *other
-    }
-}
-
-impl PartialEq<Ns> for Ns {
-    fn eq(&self, other: &Ns) -> bool {
-        self.0 == other.0
     }
 }
 
@@ -122,7 +110,7 @@ impl std::ops::Deref for Ns {
 
 /// One pending secondary-index mutation staged by a `WriteTxn`.
 ///
-/// Entries are staged via `stage_sec_index_{insert,delete,update}` and
+/// Entries are staged via `stage_sec_index_{insert,delete}` and
 /// consumed by the commit loop that installs them into the per-key version
 /// chains under a shared `commit_ts`. On abort, the buffer is discarded by
 /// `WriteTxn::Drop` (no external refcount state to release — `id_bytes` is
@@ -240,8 +228,8 @@ pub(crate) struct WriteTxn {
     /// chains dropped at commit.
     pub(crate) refcount_deltas: SmallVec<[(u32, i32); 2]>,
     /// Pending secondary-index mutations staged by this transaction.
-    /// Populated via `stage_sec_index_{insert,delete,update}` and drained
-    /// at commit, installing each entry into the per-key version chain
+    /// Populated via `stage_sec_index_{insert,delete}` and drained at
+    /// commit, installing each entry into the per-key version chain
     /// under the shared `commit_ts`. On abort, the buffer is dropped with
     /// `self` — `SecIndexWrite` owns no external refcount state, so no
     /// RAII cleanup is required beyond vec drop.
@@ -258,9 +246,6 @@ pub(crate) struct WriteTxn {
     /// the staged state on abort (§10.9 "Failed commit path"). See
     /// `src/storage/paged_engine/publish.rs`.
     pub(crate) publish_dirty: PublishDirty,
-    /// True when this CRUD body had to perform structural primary B-tree
-    /// work even if the published catalog root stayed stable.
-    structural_tree_change: bool,
 }
 
 impl WriteTxn {
@@ -279,37 +264,7 @@ impl WriteTxn {
             pending_sec_index: SmallVec::new(),
             pending_primary: SmallVec::new(),
             publish_dirty: PublishDirty::default(),
-            structural_tree_change: false,
         }
-    }
-
-    /// Read the current `PublishDirty` (§10.2 Q-M1 accessor).
-    #[must_use]
-    pub(crate) fn publish_dirty(&self) -> PublishDirty {
-        self.publish_dirty
-    }
-
-    /// Mark reader-visible published metadata dirty (§10.2 Q-M1 accessor).
-    /// Forces a fresh `Arc<PublishedCatalog>` at publish time.
-    pub(crate) fn mark_published(&mut self) {
-        self.publish_dirty.mark_published();
-    }
-
-    /// Mark the on-disk catalog header dirty (§10.2 Q-M1 accessor).
-    /// Triggers the catalog-root header owner independently of publish.
-    pub(crate) fn mark_header(&mut self) {
-        self.publish_dirty.mark_header();
-    }
-
-    /// Mark that the writer crossed a primary-tree structural boundary.
-    pub(crate) fn mark_structural_tree_change(&mut self) {
-        self.structural_tree_change = true;
-    }
-
-    /// Return whether this writer crossed a primary-tree structural boundary.
-    #[must_use]
-    pub(crate) fn structural_tree_change(&self) -> bool {
-        self.structural_tree_change
     }
 
     /// Begin a new write transaction.
@@ -340,16 +295,6 @@ impl WriteTxn {
     /// (phase 6) moves each ref into the durable chain.
     pub(crate) fn attach_overflow(&mut self, r: OverflowRef) {
         self.pending.push(r);
-    }
-
-    /// Record a page-write for the ChainCommit frame.
-    pub(crate) fn push_page_write(&mut self, pw: ChainPageWrite) {
-        self.page_writes.push(pw);
-    }
-
-    /// Record a refcount delta for the ChainCommit frame.
-    pub(crate) fn push_refcount_delta(&mut self, first_page: u32, delta: i32) {
-        self.refcount_deltas.push((first_page, delta));
     }
 
     /// Stage a secondary-index insert for commit-time installation.
@@ -391,23 +336,6 @@ impl WriteTxn {
             expected_head: None,
             op: SecIndexOp::Delete,
         });
-    }
-
-    /// Stage a secondary-index update (delete old-key, insert new-key).
-    ///
-    /// Thin wrapper over `stage_sec_index_delete` + `stage_sec_index_insert`.
-    /// If `old_key == new_key`, both entries still stage — the install loop
-    /// runs them in order so the net effect is an overwrite.
-    pub(crate) fn stage_sec_index_update(
-        &mut self,
-        index_id: i64,
-        index_root_page: u32,
-        old_key: Vec<u8>,
-        new_key: Vec<u8>,
-        new_id_bytes: Vec<u8>,
-    ) {
-        self.stage_sec_index_delete(index_id, index_root_page, old_key);
-        self.stage_sec_index_insert(index_id, index_root_page, new_key, new_id_bytes);
     }
 
     /// Stage a primary-tree insert for commit-time chain installation.
@@ -656,13 +584,6 @@ impl WriteTxn {
             payload,
         })
     }
-
-    /// Explicit abort — equivalent to dropping the transaction.
-    ///
-    /// `Drop` runs on return, decrementing every `pending` refcount.
-    pub(crate) fn rollback(self) {
-        // Drop glue handles the decrefs.
-    }
 }
 
 /// Build a [`LogicalTxnFrame`] from staged `sec_writes` + `primary_writes`
@@ -796,19 +717,19 @@ mod tests {
     }
 
     #[test]
-    fn mark_published_sets_publish_dirty_published_bit() {
+    fn publish_dirty_marks_published_bit() {
         let mut t = WriteTxn::new(1);
-        t.mark_published();
-        assert!(t.publish_dirty().published_catalog_dirty);
-        assert!(!t.publish_dirty().catalog_header_dirty);
+        t.publish_dirty.mark_published();
+        assert!(t.publish_dirty.published_catalog_dirty);
+        assert!(!t.publish_dirty.catalog_header_dirty);
     }
 
     #[test]
-    fn mark_header_sets_publish_dirty_header_bit() {
+    fn publish_dirty_marks_header_bit() {
         let mut t = WriteTxn::new(1);
-        t.mark_header();
-        assert!(!t.publish_dirty().published_catalog_dirty);
-        assert!(t.publish_dirty().catalog_header_dirty);
+        t.publish_dirty.mark_header();
+        assert!(!t.publish_dirty.published_catalog_dirty);
+        assert!(t.publish_dirty.catalog_header_dirty);
     }
 
     #[test]
@@ -841,7 +762,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // begin / commit / rollback
+    // begin / commit / drop
     // -----------------------------------------------------------------------
 
     #[test]
@@ -912,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_drops_pending_and_decrefs() {
+    fn drop_drops_pending_and_decrefs() {
         let handle = fresh_handle();
         let alloc = handle.allocator().clone();
 
@@ -922,7 +843,7 @@ mod tests {
         t.attach_overflow(r);
         assert_eq!(alloc.overflow_refcount(88), 1);
 
-        t.rollback();
+        drop(t);
         assert_eq!(alloc.overflow_refcount(88), 0);
         assert_eq!(alloc.page_lifetime_queue().depth(), 1);
     }
@@ -981,9 +902,10 @@ mod tests {
     }
 
     #[test]
-    fn stage_sec_index_update_produces_delete_then_insert() {
+    fn staged_sec_index_delete_then_insert_preserves_order() {
         let mut t = WriteTxn::new(1);
-        t.stage_sec_index_update(300, 11, b"old".to_vec(), b"new".to_vec(), b"id".to_vec());
+        t.stage_sec_index_delete(300, 11, b"old".to_vec());
+        t.stage_sec_index_insert(300, 11, b"new".to_vec(), b"id".to_vec());
 
         assert_eq!(t.pending_sec_index.len(), 2);
         assert_eq!(t.pending_sec_index[0].index_id, 300);
@@ -1018,9 +940,9 @@ mod tests {
     }
 
     #[test]
-    fn rollback_discards_pending_sec_index() {
+    fn drop_discards_pending_sec_index() {
         // Abort path: staged sec-index writes must NOT reach any durable
-        // state. Drop of the txn (rollback) drops the buffer trivially —
+        // state. Drop of the txn drops the buffer trivially —
         // `SecIndexWrite` owns no external refcount, so no assertion beyond
         // "no panic, txn drops cleanly."
         let handle = fresh_handle();
@@ -1031,7 +953,7 @@ mod tests {
         t.stage_sec_index_insert(50, 9, b"k".to_vec(), b"id".to_vec());
         assert_eq!(t.pending_sec_index.len(), 1);
 
-        t.rollback();
+        drop(t);
         // No side-effects to observe — the buffer drop is infallible.
     }
 

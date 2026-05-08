@@ -24,6 +24,7 @@
 //! and is **not** handled here; use the engine's replace path instead.
 
 use bson::{Bson, DateTime, Document, Timestamp};
+use std::cmp::Ordering;
 
 use crate::error::{Error, Result};
 use crate::query::get_nested_field;
@@ -75,11 +76,15 @@ pub(crate) fn apply_update(doc: &mut Document, update: &Document, is_insert: boo
         match op.as_str() {
             "$set" => apply_set(doc, args_doc),
             "$unset" => apply_unset(doc, args_doc),
-            "$inc" => apply_inc(doc, args_doc)?,
-            "$mul" => apply_mul(doc, args_doc)?,
+            "$inc" => apply_arithmetic_update(doc, args_doc, "$inc", |current, operand| {
+                current + operand
+            })?,
+            "$mul" => apply_arithmetic_update(doc, args_doc, "$mul", |current, operand| {
+                current * operand
+            })?,
             "$rename" => apply_rename(doc, args_doc)?,
-            "$min" => apply_min(doc, args_doc),
-            "$max" => apply_max(doc, args_doc),
+            "$min" => apply_min_max(doc, args_doc, Ordering::Less),
+            "$max" => apply_min_max(doc, args_doc, Ordering::Greater),
             "$push" => apply_push(doc, args_doc)?,
             "$pull" => apply_pull(doc, args_doc),
             "$pullAll" => apply_pull_all(doc, args_doc)?,
@@ -93,7 +98,7 @@ pub(crate) fn apply_update(doc: &mut Document, update: &Document, is_insert: boo
             }
             _ => {
                 return Err(Error::UnsupportedOperator {
-                    operator: op.to_string(),
+                    operator: op.to_owned(),
                 })
             }
         }
@@ -220,36 +225,23 @@ fn apply_unset(doc: &mut Document, args: &Document) {
 }
 
 // ---------------------------------------------------------------------------
-// $inc
+// $inc / $mul
 // ---------------------------------------------------------------------------
 
-fn apply_inc(doc: &mut Document, args: &Document) -> Result<()> {
-    for (path, delta) in args {
-        let d = as_f64(delta).ok_or_else(|| {
-            Error::Internal(format!("$inc: value must be a number, got {delta:?}"))
+fn apply_arithmetic_update(
+    doc: &mut Document,
+    args: &Document,
+    op: &str,
+    combine: fn(f64, f64) -> f64,
+) -> Result<()> {
+    for (path, operand) in args {
+        let operand_n = as_f64(operand).ok_or_else(|| {
+            Error::Internal(format!("{op}: value must be a number, got {operand:?}"))
         })?;
 
         let current = get_nested_field(doc, path).cloned();
         let current_n = current.as_ref().and_then(as_f64).unwrap_or(0.0);
-        let result = numeric_result(current.as_ref(), current_n + d);
-        set_nested(doc, path, result);
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// $mul
-// ---------------------------------------------------------------------------
-
-fn apply_mul(doc: &mut Document, args: &Document) -> Result<()> {
-    for (path, factor) in args {
-        let f = as_f64(factor).ok_or_else(|| {
-            Error::Internal(format!("$mul: value must be a number, got {factor:?}"))
-        })?;
-
-        let current = get_nested_field(doc, path).cloned();
-        let current_n = current.as_ref().and_then(as_f64).unwrap_or(0.0);
-        let result = numeric_result(current.as_ref(), current_n * f);
+        let result = numeric_result(current.as_ref(), combine(current_n, operand_n));
         set_nested(doc, path, result);
     }
     Ok(())
@@ -284,28 +276,16 @@ fn apply_rename(doc: &mut Document, args: &Document) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Compare two BSON values using MongoDB's type ordering for `$min`/`$max`.
-fn bson_cmp(a: &Bson, b: &Bson) -> std::cmp::Ordering {
+fn bson_cmp(a: &Bson, b: &Bson) -> Ordering {
     use crate::keys::encode_key;
     encode_key(a).cmp(&encode_key(b))
 }
 
-fn apply_min(doc: &mut Document, args: &Document) {
+fn apply_min_max(doc: &mut Document, args: &Document, target: Ordering) {
     for (path, new_val) in args {
         let should_set = match get_nested_field(doc, path) {
             None => true,
-            Some(cur) => bson_cmp(new_val, cur) == std::cmp::Ordering::Less,
-        };
-        if should_set {
-            set_nested(doc, path, new_val.clone());
-        }
-    }
-}
-
-fn apply_max(doc: &mut Document, args: &Document) {
-    for (path, new_val) in args {
-        let should_set = match get_nested_field(doc, path) {
-            None => true,
-            Some(cur) => bson_cmp(new_val, cur) == std::cmp::Ordering::Greater,
+            Some(cur) => bson_cmp(new_val, cur) == target,
         };
         if should_set {
             set_nested(doc, path, new_val.clone());
@@ -535,7 +515,6 @@ fn apply_add_to_set(doc: &mut Document, args: &Document) -> Result<()> {
         };
 
         let field = get_nested_field(doc, path).cloned();
-        let field_missing = field.is_none();
         let mut arr = match field {
             None => vec![],
             Some(Bson::Array(a)) => a,
@@ -546,19 +525,13 @@ fn apply_add_to_set(doc: &mut Document, args: &Document) -> Result<()> {
             }
         };
 
-        let mut any_added = false;
         for elem in elements {
             if !arr.contains(&elem) {
                 arr.push(elem);
-                any_added = true;
             }
         }
 
-        // Write back whenever we added elements OR when the field didn't exist
-        // (so the field is created even if $each was empty).
-        if any_added || field_missing {
-            set_nested(doc, path, Bson::Array(arr));
-        }
+        set_nested(doc, path, Bson::Array(arr));
     }
     Ok(())
 }

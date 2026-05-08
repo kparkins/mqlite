@@ -91,6 +91,14 @@ fn assert_duplicate(result: Result<()>) {
     assert!(matches!(result, Err(Error::DuplicateKey { .. })));
 }
 
+fn assert_duplicate_detail(result: Result<()>) {
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "duplicate key error: E11000 duplicate key error — unique index 'email_unique': \
+         dup key {email: Some(String(\"a@example.com\"))}"
+    );
+}
+
 #[test]
 fn test_primary_unique_detects_delta_only_conflict() -> Result<()> {
     let ns = "test.us009.delta";
@@ -107,7 +115,7 @@ fn test_primary_unique_detects_delta_only_conflict() -> Result<()> {
         ns,
     );
 
-    assert_duplicate(result);
+    assert_duplicate_detail(result);
     Ok(())
 }
 
@@ -127,7 +135,7 @@ fn test_primary_unique_detects_same_txn_staged_conflict() -> Result<()> {
         ns,
     );
 
-    assert_duplicate(result);
+    assert_duplicate_detail(result);
     Ok(())
 }
 

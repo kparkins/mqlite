@@ -649,7 +649,7 @@ impl PagedEngine {
                 // still captures catalog-root movement; logical-chain installs
                 // can also make primary B-tree structural progress without
                 // forcing a fresh catalog header.
-                let mut root_changing = txn.structural_tree_change();
+                let mut root_changing = false;
 
                 // Refresh the logical-txn append-duration percentiles after
                 // the Phase 8 log append envelope completes.
@@ -705,7 +705,7 @@ impl PagedEngine {
                 );
                 drop(prev_published);
 
-                let dirty = txn.publish_dirty();
+                let dirty = txn.publish_dirty;
 
                 let frame =
                     txn.build_logical_txn_frame(&self.shared.handle, &primary_writes, &sec_writes);
@@ -980,7 +980,7 @@ impl StorageEngine for PagedEngine {
 
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
-        let opts = FindOptions::new();
+        let opts = FindOptions::default();
         let (results, _explain) = doc_ops::find_documents(self, ns, filter, &opts)?;
         Ok(results.into_iter().next())
     }

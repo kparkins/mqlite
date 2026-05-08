@@ -516,7 +516,6 @@ Drivers that inspect the `code` field of the error response will receive these v
 | 43 | `CURSOR_NOT_FOUND` | `Error::CursorNotFound` |
 | 48 | `ILLEGAL_OP` | `Error::InvalidWireMessage` |
 | 67 | `CANNOT_CREATE_INDEX` | `Error::UnsupportedIndexOption` |
-| 115 | `UNSUPPORTED_FORMAT` | *(internal: bad database file format)* |
 | 121 | `DOCUMENT_VALIDATION_FAILURE` | `Error::DocumentValidationFailure` |
 | 10334 | `DOCUMENT_TOO_LARGE` | `Error::DocumentTooLarge` |
 | 11000 | `DUPLICATE_KEY` | `Error::DuplicateKey` |

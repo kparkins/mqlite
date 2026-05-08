@@ -52,7 +52,9 @@ fn secondary_ident(engine: &PagedEngine) -> TreeIdent {
         .expect("ready email index");
     let owner = epoch
         .catalog
-        .index_owner_by_id(index.id)
+        .index_owner_by_id
+        .get(&index.id)
+        .copied()
         .expect("published index owner sidecar");
     assert_eq!(owner, ns_snap.id);
     TreeIdent {
@@ -95,8 +97,18 @@ fn published_catalog_rebuild_adds_index_owner_sidecar() {
     let ns_snap = epoch.catalog.get_by_name(NS).expect("namespace snapshot");
     let index = ns_snap.indexes.first().expect("ready index");
 
-    assert_eq!(epoch.catalog.index_owner_by_id(index.id), Some(ns_snap.id));
-    assert_eq!(epoch.catalog.index_owner_by_id(index.id + 1), None);
+    assert_eq!(
+        epoch.catalog.index_owner_by_id.get(&index.id).copied(),
+        Some(ns_snap.id)
+    );
+    assert_eq!(
+        epoch
+            .catalog
+            .index_owner_by_id
+            .get(&(index.id + 1))
+            .copied(),
+        None
+    );
 }
 
 #[test]

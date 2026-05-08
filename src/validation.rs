@@ -19,10 +19,6 @@ use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Maximum allowed BSON-serialized document size in bytes (16MB, matching MongoDB).
 pub const MAX_DOCUMENT_SIZE: usize = 16_777_216;
 
@@ -37,10 +33,6 @@ pub const MAX_FIELD_COUNT: usize = 10_000;
 /// Maximum byte length of any single BSON field name.
 /// mqlite enforces a stricter 1,024-byte limit (MongoDB technically allows up to document size).
 pub const MAX_FIELD_NAME_LEN: usize = 1_024;
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Validate a BSON document before inserting it into a collection.
 ///
@@ -63,12 +55,9 @@ pub const MAX_FIELD_NAME_LEN: usize = 1_024;
 /// - [`Error::DocumentTooLarge`] (code 10334) if the BSON-serialized size exceeds 16MB
 /// - [`Error::BsonSerialization`] if BSON serialization itself fails for another reason
 pub fn validate_document(doc: &Document) -> Result<()> {
-    // Step 1: structural walk — must run before bson::to_vec to catch null-byte
-    // field names with the correct error type.
     let mut field_count = 0;
     validate_doc_recursive(doc, 0, &mut field_count)?;
 
-    // Step 2: size check using canonical BSON serialization.
     let bytes = bson::to_vec(doc).map_err(Error::BsonSerialization)?;
     if bytes.len() > MAX_DOCUMENT_SIZE {
         return Err(Error::DocumentTooLarge {
@@ -79,10 +68,6 @@ pub fn validate_document(doc: &Document) -> Result<()> {
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
 
 /// Recursively validate a [`Document`] node.
 ///
@@ -96,7 +81,11 @@ fn validate_doc_recursive(doc: &Document, depth: u32, field_count: &mut usize) -
     }
 
     for (key, value) in doc {
-        validate_field_name(key)?;
+        if key.len() > MAX_FIELD_NAME_LEN || key.contains('\0') {
+            return Err(Error::DocumentValidationFailure {
+                detail: "field name too long or contains null byte".into(),
+            });
+        }
 
         *field_count += 1;
         if *field_count > MAX_FIELD_COUNT {
@@ -125,25 +114,6 @@ fn validate_value_recursive(value: &Bson, depth: u32, field_count: &mut usize) -
     }
     Ok(())
 }
-
-/// Validate a single BSON field name.
-///
-/// Rules:
-/// - Length must not exceed [`MAX_FIELD_NAME_LEN`] bytes.
-/// - Must not contain null bytes (`\0`), which are forbidden by the BSON spec
-///   and can corrupt index keys.
-fn validate_field_name(name: &str) -> Result<()> {
-    if name.len() > MAX_FIELD_NAME_LEN || name.contains('\0') {
-        return Err(Error::DocumentValidationFailure {
-            detail: "field name too long or contains null byte".into(),
-        });
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

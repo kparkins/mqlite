@@ -99,7 +99,27 @@ pub(super) fn handle_list_indexes(body: &Document, state: &ServerState) -> Docum
     index::handle_list_indexes(body, state)
 }
 
-#[cfg(test)]
+/// Extract an integer value from a BSON document field, coercing `Int32`,
+/// `Int64`, and `Double` variants to `i64`.
 pub(super) fn get_i64(doc: &Document, key: &str) -> Option<i64> {
-    crud::get_i64(doc, key)
+    match doc.get(key) {
+        Some(bson::Bson::Int32(i)) => Some(*i as i64),
+        Some(bson::Bson::Int64(i)) => Some(*i),
+        Some(bson::Bson::Double(f)) => Some(*f as i64),
+        _ => None,
+    }
+}
+
+/// Extract the database name from a command body's `$db` field.
+pub(super) fn extract_db_name(body: &Document) -> String {
+    body.get_str("$db")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("test")
+        .to_owned()
+}
+
+/// Fully-qualify a collection name as `<db_name>.<coll_name>`.
+pub(super) fn qualified_coll(body: &Document, coll_name: &str) -> String {
+    format!("{}.{}", extract_db_name(body), coll_name)
 }

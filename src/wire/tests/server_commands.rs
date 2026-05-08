@@ -280,18 +280,6 @@ fn dispatch_op_msg_unknown_command() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn check_db_field_always_returns_none() {
-    // Multi-database: any $db value is accepted — check_db_field is a no-op.
-    assert!(check_db_field(&doc! { "ping": 1 }, "myapp").is_none());
-    assert!(check_db_field(&doc! { "ping": 1, "$db": "admin" }, "myapp").is_none());
-    assert!(check_db_field(&doc! { "ping": 1, "$db": "myapp" }, "myapp").is_none());
-    assert!(
-        check_db_field(&doc! { "ping": 1, "$db": "wrongdb" }, "myapp").is_none(),
-        "any $db must be accepted in multi-database mode"
-    );
-}
-
-#[test]
 fn dispatch_op_msg_any_db_is_allowed() {
     // Arbitrary $db values must succeed (no Unauthorized for unknown db).
     let state = ServerState::default();
@@ -353,31 +341,6 @@ fn dispatch_op_msg_db_routes_to_correct_namespace() {
         batch_bar.is_empty(),
         "find in different db must return no documents"
     );
-}
-
-// -----------------------------------------------------------------------
-// parse_op_query_db_name
-// -----------------------------------------------------------------------
-
-#[test]
-fn parse_op_query_db_name_admin_cmd() {
-    // Simulate OP_QUERY body with fullCollectionName = "admin.$cmd"
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(&0i32.to_le_bytes()); // flags
-    buf.extend_from_slice(b"admin.$cmd\x00"); // fullCollectionName + NUL
-    buf.extend_from_slice(&0i32.to_le_bytes()); // numberToSkip
-    buf.extend_from_slice(&(-1i32).to_le_bytes()); // numberToReturn
-    assert_eq!(parse_op_query_db_name(&buf).as_deref(), Some("admin"));
-}
-
-#[test]
-fn parse_op_query_db_name_custom_collection() {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(&0i32.to_le_bytes());
-    buf.extend_from_slice(b"myapp.users\x00");
-    buf.extend_from_slice(&0i32.to_le_bytes());
-    buf.extend_from_slice(&(-1i32).to_le_bytes());
-    assert_eq!(parse_op_query_db_name(&buf).as_deref(), Some("myapp"));
 }
 
 #[test]

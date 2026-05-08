@@ -4,20 +4,7 @@ use bson::{doc, Document};
 
 use super::super::errors::{err_bad_value, err_from_mqlite};
 use super::super::server::ServerState;
-
-/// Extract the database name from a command body's `$db` field.
-fn extract_db_name(body: &Document) -> String {
-    body.get_str("$db")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("test")
-        .to_owned()
-}
-
-/// Fully-qualify a collection name as `<db_name>.<coll_name>`.
-fn qualified_coll(body: &Document, coll_name: &str) -> String {
-    format!("{}.{}", extract_db_name(body), coll_name)
-}
+use super::{extract_db_name, qualified_coll};
 
 /// `create` — explicitly create a collection.
 ///
