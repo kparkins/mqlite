@@ -786,7 +786,7 @@ impl<'a> Drop for PublishPauseGuard<'a> {
     }
 }
 
-/// Called by `run_write_existing` between `commit_txn` and
+/// Called by `run_write_commit_envelope` between `commit_txn` and
 /// `publish_commit`. Test-only — compiles to a true no-op in release
 /// builds.
 #[cfg(test)]
@@ -1073,8 +1073,8 @@ impl PagedEngine {
         right: bson::Document,
     ) -> Result<()> {
         self.run_write(ns, |shared, md, txn, vis| {
-            super::doc_ops::stage_insert_body(shared, md, txn, vis, ns, left)?;
-            super::doc_ops::stage_insert_body(shared, md, txn, vis, ns, right)?;
+            super::doc_ops::stage_insert_in_write_txn(shared, md, txn, vis, ns, left)?;
+            super::doc_ops::stage_insert_in_write_txn(shared, md, txn, vis, ns, right)?;
             Ok(())
         })
     }

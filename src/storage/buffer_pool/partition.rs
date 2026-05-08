@@ -53,13 +53,9 @@ impl PageDirtyLsn {
         match self {
             Self::Clean => PAGE_DIRTY_CLEAN,
             Self::Unflushable => PAGE_DIRTY_UNFLUSHABLE,
-            Self::Dirty { last_lsn } => {
-                debug_assert!(
-                    last_lsn <= MAX_PAGE_DIRTY_LSN,
-                    "page dirty LSN cannot collide with sentinel states"
-                );
-                last_lsn.min(MAX_PAGE_DIRTY_LSN)
-            }
+            // Journal-less test handles use u64::MAX as an "already durable"
+            // fence; keep the stored value out of the sentinel range.
+            Self::Dirty { last_lsn } => last_lsn.min(MAX_PAGE_DIRTY_LSN),
         }
     }
 

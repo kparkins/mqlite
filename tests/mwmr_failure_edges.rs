@@ -501,7 +501,7 @@ fn test_primary_install_failure_flips_secondary_pending_to_aborted() {
     coll.create_index(IndexModel::builder().keys(doc! { "email": 1 }).build())
         .expect("create email index");
 
-    client.__us019_set_primary_install_failures(2);
+    client.__us019_set_primary_install_failures(1);
     let doc = test_doc(1, "abort-secondary@example.com");
     let result = coll.insert_one(&doc);
     assert!(matches!(result, Err(Error::Internal(_))));

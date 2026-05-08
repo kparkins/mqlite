@@ -842,6 +842,34 @@ mod compat_tests {
     }
 
     #[test]
+    fn find_one_and_replace_return_document_after() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("docs");
+        col.insert_one(&doc! { "_id": 1i32, "sku": "A", "old": true })
+            .unwrap();
+
+        let replacement = doc! { "sku": "A", "qty": 2i32 };
+        let returned: Option<Document> = col
+            .find_one_and_replace(doc! { "sku": "A" }, &replacement)
+            .return_document(ReturnDocument::After)
+            .run()
+            .unwrap();
+
+        let returned_doc = returned.expect("must return the post-replace document");
+        assert_eq!(returned_doc.get_i32("_id").unwrap(), 1);
+        assert_eq!(returned_doc.get_i32("qty").unwrap(), 2);
+        assert!(!returned_doc.contains_key("old"));
+        let stored_doc = col
+            .find_one(doc! { "_id": 1i32 })
+            .unwrap()
+            .expect("replaced document must remain findable");
+        assert_eq!(stored_doc.get_i32("qty").unwrap(), 2);
+        assert!(!stored_doc.contains_key("old"));
+    }
+
+    #[test]
     fn upsert_behavioral_contract() {
         let _tempdir = TempDir::new().expect("tempdir");
         let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");

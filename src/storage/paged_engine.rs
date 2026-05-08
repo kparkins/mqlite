@@ -557,7 +557,8 @@ impl PagedEngine {
         F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
     {
         self.shared.check_engine_not_poisoned()?;
-        // Take read guard; if namespace absent, bootstrap then retry.
+        // Take a read guard to decide whether this write must bootstrap the
+        // namespace before entering the ordinary commit envelope.
         let md_read = self
             .metadata
             .read()
@@ -568,28 +569,13 @@ impl PagedEngine {
         if ns_missing {
             drop(md_read);
             let ns_id = self.bootstrap_namespace(ns)?;
-            return self.run_write_bootstrapped(ns, ns_id, f);
+            return self.run_write_commit_envelope(ns, Some(ns_id), f);
         }
         drop(md_read);
-        self.run_write_existing(ns, f)
+        self.run_write_commit_envelope(ns, None, f)
     }
 
-    fn run_write_existing<F, R>(&self, ns: &str, f: F) -> Result<R>
-    where
-        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
-    {
-        self.run_write_inner(ns, None, f)
-    }
-
-    fn run_write_bootstrapped<F, R>(&self, ns: &str, ns_id: i64, f: F) -> Result<R>
-    where
-        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
-    {
-        self.run_write_inner(ns, Some(ns_id), f)
-    }
-
-    /// Internal form of `run_write` that assumes the namespace already exists
-    /// (or the write path tolerates its absence — `update`/`delete` do).
+    /// Ordinary CRUD commit envelope after namespace bootstrap has been settled.
     ///
     /// Metadata-guard protocol: there is exactly one `metadata.read()`
     /// acquisition in this function. It is held across ordinary CRUD's full
@@ -607,7 +593,12 @@ impl PagedEngine {
     /// writer returns `WriteConflict { CatalogGenerationChanged }` while
     /// rollback is still purely in-memory. Catalog DDL on unrelated
     /// namespaces does not invalidate the writer's captured identity.
-    fn run_write_inner<F, R>(&self, ns: &str, bootstrapped_ns_id: Option<i64>, f: F) -> Result<R>
+    fn run_write_commit_envelope<F, R>(
+        &self,
+        ns: &str,
+        bootstrapped_ns_id: Option<i64>,
+        f: F,
+    ) -> Result<R>
     where
         F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
     {
@@ -749,9 +740,10 @@ impl PagedEngine {
                     prepared.payload,
                 );
 
-                let sec_pages = match self.install_pending_sec_index_with_retry(
+                let sec_pages = match install_pending_sec_index(
+                    &self.shared,
                     &self.metadata_state,
-                    &sec_writes,
+                    sec_writes.to_vec(),
                     &vis,
                     commit_ts,
                     txn_id,
@@ -764,9 +756,16 @@ impl PagedEngine {
                     }
                 };
 
-                let primary_install = self.install_pending_primary_with_retry(
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Err(e) =
+                    self::hidden_accessors::us019_maybe_fail_primary_install(&self.shared)
+                {
+                    return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+                }
+                let primary_install = install_pending_primary(
+                    &self.shared,
                     &self.metadata_state,
-                    &primary_writes,
+                    primary_writes.to_vec(),
                     &vis,
                     commit_ts,
                     txn_id,
@@ -957,68 +956,6 @@ impl PagedEngine {
             }
         }
     }
-
-    fn install_pending_sec_index_with_retry(
-        &self,
-        md: &MetadataState,
-        writes: &[crate::mvcc::SecIndexWrite],
-        vis: &WriteVisibility<'_>,
-        commit_ts: crate::mvcc::Ts,
-        txn_id: u64,
-    ) -> Result<Vec<u32>> {
-        if writes.is_empty() {
-            return Ok(Vec::new());
-        }
-        match install_pending_sec_index(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id) {
-            Ok(pages) => return Ok(pages),
-            Err(e @ Error::WriteConflict { .. }) => return Err(e),
-            Err(_) => {}
-        }
-        match install_pending_sec_index(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id) {
-            Ok(pages) => Ok(pages),
-            Err(e @ Error::WriteConflict { .. }) => Err(e),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn install_pending_primary_with_retry(
-        &self,
-        md: &MetadataState,
-        writes: &[crate::mvcc::PrimaryWrite],
-        vis: &WriteVisibility<'_>,
-        commit_ts: crate::mvcc::Ts,
-        txn_id: u64,
-    ) -> Result<(Vec<u32>, bool)> {
-        if writes.is_empty() {
-            return Ok((Vec::new(), false));
-        }
-        #[cfg(any(test, feature = "test-hooks"))]
-        let first_attempt = self::hidden_accessors::us019_maybe_fail_primary_install(&self.shared)
-            .and_then(|()| {
-                install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id)
-            });
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let first_attempt =
-            install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id);
-        match first_attempt {
-            Ok(pages) => return Ok(pages),
-            Err(e @ Error::WriteConflict { .. }) => return Err(e),
-            Err(_) => {}
-        }
-        #[cfg(any(test, feature = "test-hooks"))]
-        let second_attempt = self::hidden_accessors::us019_maybe_fail_primary_install(&self.shared)
-            .and_then(|()| {
-                install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id)
-            });
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let second_attempt =
-            install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id);
-        match second_attempt {
-            Ok(pages) => Ok(pages),
-            Err(e @ Error::WriteConflict { .. }) => Err(e),
-            Err(e) => Err(e),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,7 +965,9 @@ impl PagedEngine {
 impl StorageEngine for PagedEngine {
     fn insert(&self, ns: &str, doc: Document) -> Result<Bson> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::insert(self, ns, doc)
+        self.run_write(ns, |shared, md, txn, vis| {
+            doc_ops::stage_insert_in_write_txn(shared, md, txn, vis, ns, doc)
+        })
     }
 
     fn find(
@@ -1038,12 +977,14 @@ impl StorageEngine for PagedEngine {
         opts: &FindOptions,
     ) -> Result<(Vec<Document>, crate::query::explain::ExplainResult)> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::find(self, ns, filter, opts)
+        doc_ops::find_documents(self, ns, filter, opts)
     }
 
     fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::find_one(self, ns, filter)
+        let opts = FindOptions::new();
+        let (mut results, _explain) = doc_ops::find_documents(self, ns, filter, &opts)?;
+        Ok((!results.is_empty()).then(|| results.remove(0)))
     }
 
     fn update(
@@ -1055,17 +996,17 @@ impl StorageEngine for PagedEngine {
         many: bool,
     ) -> Result<UpdateResult> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::update(self, ns, filter, update, opts, many)
+        doc_ops::update_documents(self, ns, filter, update, opts, many)
     }
 
     fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::delete(self, ns, filter, many)
+        doc_ops::delete_documents(self, ns, filter, many)
     }
 
     fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::count(self, ns, filter)
+        doc_ops::count_documents(self, ns, filter)
     }
 
     fn find_one_and_update(
@@ -1076,7 +1017,7 @@ impl StorageEngine for PagedEngine {
         opts: &FindOneAndUpdateOptions,
     ) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::find_one_and_update_doc(self, ns, filter, update, opts)
+        doc_ops::find_one_and_update(self, ns, filter, update, opts)
     }
 
     fn find_one_and_delete(
@@ -1086,7 +1027,7 @@ impl StorageEngine for PagedEngine {
         opts: &FindOneAndDeleteOptions,
     ) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::find_one_and_delete_doc(self, ns, filter, opts)
+        doc_ops::find_one_and_delete(self, ns, filter, opts)
     }
 
     fn find_one_and_replace(
@@ -1097,7 +1038,7 @@ impl StorageEngine for PagedEngine {
         opts: &FindOneAndReplaceOptions,
     ) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::find_one_and_replace_doc(self, ns, filter, replacement, opts)
+        doc_ops::find_one_and_replace(self, ns, filter, replacement, opts)
     }
 
     fn create_index(&self, ns: &str, model: &IndexModel) -> Result<String> {

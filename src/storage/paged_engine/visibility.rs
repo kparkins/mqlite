@@ -12,7 +12,7 @@ use crate::storage::root_snapshot::NamespaceId;
 use super::snapshot_ops::{primary_history_probe, PrimaryHistoryProbe};
 use super::state::SharedState;
 
-/// Writer-side visibility context built once per `run_write_existing` call.
+/// Writer-side visibility context built once per `run_write_commit_envelope` call.
 ///
 /// The context pins one published epoch for the full Phase 3 write lifetime.
 /// Downstream uniqueness and install helpers receive shared references to this

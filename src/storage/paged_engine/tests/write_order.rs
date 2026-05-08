@@ -26,13 +26,13 @@ fn paged_engine_source() -> String {
     std::fs::read_to_string(path).expect("read paged_engine.rs")
 }
 
-fn run_write_inner_source(source: &str) -> &str {
+fn run_write_commit_envelope_source(source: &str) -> &str {
     let start = source
-        .find("fn run_write_inner")
-        .expect("run_write_inner exists");
+        .find("fn run_write_commit_envelope")
+        .expect("run_write_commit_envelope exists");
     let end = source[start..]
         .find("\n    fn register_ordinary_crud_slot")
-        .expect("register_ordinary_crud_slot follows run_write_inner");
+        .expect("register_ordinary_crud_slot follows run_write_commit_envelope");
     &source[start..start + end]
 }
 
@@ -96,17 +96,17 @@ fn primary_chain_for_id(
 }
 
 #[test]
-fn test_run_write_existing_uses_authoritative_us012_sequence() {
+fn test_run_write_commit_envelope_uses_authoritative_us012_sequence() {
     let source = paged_engine_source();
-    let run_write_inner = run_write_inner_source(&source);
+    let run_write_commit_envelope = run_write_commit_envelope_source(&source);
 
     assert_ordered(
-        run_write_inner,
+        run_write_commit_envelope,
         &[
             "let slot = match self.register_ordinary_crud_slot()",
             "LogRecordDraft::crud(",
-            "self.install_pending_sec_index_with_retry",
-            "self.install_pending_primary_with_retry",
+            "install_pending_sec_index(",
+            "install_pending_primary(",
             "self.shared.handle.reserve_log_record(draft)",
             "stamp_dirty_pages_lsn(&pending_pages, commit_end_lsn)",
             "reserved.write_and_mark()",
@@ -123,9 +123,9 @@ fn test_run_write_existing_uses_authoritative_us012_sequence() {
 }
 
 #[test]
-fn test_run_write_existing_has_no_ordinary_crud_legacy_authority() {
+fn test_run_write_commit_envelope_has_no_ordinary_crud_legacy_authority() {
     let source = paged_engine_source();
-    let run_write_inner = run_write_inner_source(&source);
+    let run_write_commit_envelope = run_write_commit_envelope_source(&source);
     let retired_field = concat!("commit", "_seq");
 
     assert!(
@@ -152,7 +152,7 @@ fn test_run_write_existing_has_no_ordinary_crud_legacy_authority() {
         "ns_writers.admit",
     ] {
         assert!(
-            !run_write_inner.contains(forbidden),
+            !run_write_commit_envelope.contains(forbidden),
             "US-003 ordinary CRUD must not contain legacy authority marker: {forbidden}"
         );
     }

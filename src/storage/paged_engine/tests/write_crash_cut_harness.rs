@@ -9,6 +9,7 @@ use bson::{Bson, Document};
 use crate::error::{EngineFatalReason, Error, Result};
 use crate::journal::log_file::LogRecordDraft;
 use crate::mvcc::transaction::WriteTxn;
+use crate::options::FindOptions;
 use crate::storage::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
 
 use super::catalog_ops::{catalog_lock, rebuild_and_publish_locked};
@@ -22,7 +23,8 @@ use super::PagedEngine;
 impl PagedEngine {
     fn crash_cut_probe_visible(&self, ns: &str, inserted_id: &Bson) -> Result<bool> {
         let filter = bson::doc! { "_id": inserted_id.clone() };
-        Ok(doc_ops::find_one(self, ns, &filter)?.is_some())
+        let (docs, _explain) = doc_ops::find_documents(self, ns, &filter, &FindOptions::new())?;
+        Ok(!docs.is_empty())
     }
 
     fn phase0_stop_before_recovery(
@@ -56,7 +58,7 @@ impl PagedEngine {
         let vis = WriteVisibility::new(&self.shared, ns)?;
         let txn_id = vis.read_view.txn_id;
         let mut txn = WriteTxn::new(txn_id);
-        let inserted_id = doc_ops::stage_insert_body(
+        let inserted_id = doc_ops::stage_insert_in_write_txn(
             &self.shared,
             &self.metadata_state,
             &mut txn,

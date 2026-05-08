@@ -2,7 +2,7 @@
 //!
 //! Locks down the metadata-guard protocol:
 //!
-//!  * `run_write_existing` holds exactly one `metadata.read()` acquisition,
+//!  * `run_write_commit_envelope` holds exactly one `metadata.read()` acquisition,
 //!    bracketing only the id-capture + `NsWriterRegistry::admit` scope, and
 //!    the guard is dropped before the body call (AC #2, AC #5 source gate).
 //!  * Ordinary CRUD never advances `PublishedEpoch.catalog_generation`; only
@@ -58,7 +58,7 @@ fn open_with_collection_a() -> (tempfile::TempDir, Client) {
     let client = Client::open(&path).unwrap();
     client.database(DB).create_collection(COLL_A).unwrap();
     // Seed a doc so the published epoch advances past the bootstrap and
-    // subsequent CRUD takes the `run_write_existing` path (not the
+    // subsequent CRUD takes the `run_write_commit_envelope` path (not the
     // bootstrap-and-retry path inside `run_write`).
     client
         .database(DB)
@@ -95,10 +95,10 @@ fn flag_set_within(flag: &AtomicBool, timeout: Duration) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// AC #5 source gate: exactly one `metadata.read()` in `run_write_existing`.
+// AC #5 source gate: exactly one `metadata.read()` in `run_write_commit_envelope`.
 // ---------------------------------------------------------------------------
 
-/// AC #5 / §10.17 step 3 — `run_write_existing` holds exactly one
+/// AC #5 / §10.17 step 3 — `run_write_commit_envelope` holds exactly one
 /// `metadata.read()` acquisition and drops it before the body call.
 ///
 /// Repository-wide single-line greps cannot prove this property because
@@ -109,14 +109,14 @@ fn flag_set_within(flag: &AtomicBool, timeout: Duration) -> bool {
 /// — fails the gate. §10.21 CV-5 forbids the publish closure from
 /// reacquiring the read guard.
 #[test]
-fn test_run_write_existing_holds_exactly_one_metadata_read() {
+fn test_run_write_commit_envelope_holds_exactly_one_metadata_read() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let path = project_root.join("src/storage/paged_engine.rs");
     let body = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
 
-    let function_body =
-        extract_function_body(&body, "run_write_inner").expect("run_write_inner locatable");
+    let function_body = extract_function_body(&body, "run_write_commit_envelope")
+        .expect("run_write_commit_envelope locatable");
 
     // Strip line comments so doc references like
     // "the single `self.metadata.read()` call" do not count.
@@ -128,24 +128,24 @@ fn test_run_write_existing_holds_exactly_one_metadata_read() {
     let read_count = count_metadata_read_calls(&code_only);
     assert_eq!(
         read_count, 1,
-        "run_write_existing must hold exactly one self.metadata.read() acquisition (§10.17 step 3, US-006 AC #5); found {read_count}",
+        "run_write_commit_envelope must hold exactly one self.metadata.read() acquisition (§10.17 step 3, US-006 AC #5); found {read_count}",
     );
 
-    // Forbid `metadata.write()` inside `run_write_existing` outright —
+    // Forbid `metadata.write()` inside `run_write_commit_envelope` outright —
     // DDL escalation is owned by `run_ddl`.
     let write_count = count_metadata_write_calls(&code_only);
     assert_eq!(
         write_count, 0,
-        "run_write_existing must not acquire self.metadata.write() ({write_count} found); only run_ddl may take metadata.write",
+        "run_write_commit_envelope must not acquire self.metadata.write() ({write_count} found); only run_ddl may take metadata.write",
     );
 }
 
-/// Find the top-level `fn run_write_existing<F, R>(&self, ...)` body and
+/// Find the top-level `fn run_write_commit_envelope<F, R>(&self, ...)` body and
 /// return everything between the opening brace of the function and the
 /// matching close. Returns `None` if the function is not present.
 fn extract_function_body(source: &str, function_name: &str) -> Option<String> {
     // Match the function signature start. The signature spans multiple
-    // lines so we search for the first `fn run_write_existing` token.
+    // lines so we search for the first `fn run_write_commit_envelope` token.
     let sig_start = source.find(&format!("fn {function_name}"))?;
     // Find the opening `{` after the signature. Skip the where-clause.
     let mut depth: i32 = 0;
@@ -698,7 +698,7 @@ fn count_metadata_method_calls(code: &str, method: &'static str) -> usize {
         // Skip whitespace (including newlines) between `.metadata`
         // and the `.<method>()` token. The receiver before `.metadata`
         // is overwhelmingly `self` here; we don't enforce that because
-        // `run_write_existing` body has only one valid receiver.
+        // `run_write_commit_envelope` body has only one valid receiver.
         let rest = &code[after..];
         let ws_len = rest
             .char_indices()

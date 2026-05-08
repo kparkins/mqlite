@@ -528,9 +528,9 @@ impl WriteTxn {
     ///
     /// This is the S5-only half of [`emit_logical_txn_frame`]: it consumes
     /// the pre-allocated `commit_ts` Cell and returns the frame without doing
-    /// journal I/O. `run_write_existing` appends the returned frame inside the
-    /// journal envelope so rollback handling can distinguish frame construction
-    /// from durability.
+    /// journal I/O. `run_write_commit_envelope` appends the returned frame
+    /// inside the journal envelope so rollback handling can distinguish frame
+    /// construction from durability.
     pub(crate) fn build_logical_txn_frame(
         &self,
         journal: &BufferPoolHandle,
@@ -1178,7 +1178,7 @@ mod tests {
     /// public rename API) cannot invalidate the recorded id because the
     /// stage-time snapshot lives in the staged struct rather than being
     /// re-resolved from the catalog at emit time. The test exercises the
-    /// production commit path: `run_write_existing` drains `pending_primary`
+    /// production commit path: `run_write_commit_envelope` drains `pending_primary`
     /// via `std::mem::take` before `txn.commit(...)` runs, and
     /// `txn.commit(...)` then drains `pending_sec_index` and emits the
     /// `ChainCommit` frame. We replicate that sequence here and assert
@@ -1250,7 +1250,7 @@ mod tests {
         assert_ne!(mutated_index.id, orig_index.id);
 
         // Replicate the production commit envelope:
-        //   1. run_write_existing drains `pending_primary` via mem::take
+        //   1. run_write_commit_envelope drains `pending_primary` via mem::take
         //      and hands it to install_pending_primary.
         //   2. txn.commit(...) drains `pending_sec_index` internally and
         //      emits the ChainCommit journal frame.
@@ -1302,7 +1302,7 @@ mod tests {
         // model a rename / re-bind that would only affect an
         // emit-time-re-resolver implementation. The production
         // engine reads `entry.id` at stage time
-        // (`stage_insert_body` etc.), captures it into the
+        // (`stage_insert_in_write_txn` etc.), captures it into the
         // PrimaryWrite struct, and never re-resolves at emit time.
         let mut live_collection = CollectionEntry {
             id: STAGE_TIME_NS_ID,
@@ -1377,7 +1377,7 @@ mod tests {
 
         let oracle = TimestampOracle::new();
         // Stage using the LIVE catalog entry's id at this moment.
-        // This mirrors `stage_insert_body` / `secondary_index::stage`
+        // This mirrors `stage_insert_in_write_txn` / `secondary_index::stage`
         // in production, which read `entry.id` from the live entry
         // and pass it into `stage_primary_insert` / `stage_sec_index_insert`.
         let mut t = WriteTxn::new(11);

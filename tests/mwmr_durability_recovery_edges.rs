@@ -709,8 +709,8 @@ fn tc11_assert_phase6_logical_tail_checkpoint_contract() {
 
     let engine_source = std::fs::read_to_string(&engine_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", engine_path.display()));
-    let run_write = tc11_extract_function_body(&engine_source, "run_write_inner")
-        .expect("run_write_inner locatable");
+    let run_write = tc11_extract_function_body(&engine_source, "run_write_commit_envelope")
+        .expect("run_write_commit_envelope locatable");
     let run_write = tc11_strip_line_comments(&run_write);
     for token in [
         "StructuralPageBatch::new",

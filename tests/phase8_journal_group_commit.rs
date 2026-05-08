@@ -325,17 +325,17 @@ fn phase8_checkpoint_fsyncs_main_file_before_boundary_record() {
 #[test]
 fn phase8_commit_stamps_dirty_pages_with_commit_end_lsn_before_waiting() {
     let engine = include_str!("../src/storage/paged_engine.rs");
-    let run_write_inner = source_between(
+    let run_write_commit_envelope = source_between(
         engine,
-        "fn run_write_inner",
+        "fn run_write_commit_envelope",
         "fn register_ordinary_crud_slot",
     );
     let stamp = "stamp_dirty_pages_lsn(&pending_pages, commit_end_lsn)";
     let wait = "self.wait_for_commit_durability(commit_end_lsn)?";
-    let stamp_pos = run_write_inner
+    let stamp_pos = run_write_commit_envelope
         .find(stamp)
         .expect("commit stamps touched pages");
-    let wait_pos = run_write_inner
+    let wait_pos = run_write_commit_envelope
         .find(wait)
         .expect("commit waits for durability after stamping");
 
@@ -343,24 +343,24 @@ fn phase8_commit_stamps_dirty_pages_with_commit_end_lsn_before_waiting() {
         stamp_pos < wait_pos,
         "dirty page LSN stamping must precede durability waiting"
     );
-    assert!(run_write_inner.contains("LogRecordDraft::crud("));
-    assert!(run_write_inner.contains("self.shared.handle.reserve_log_record(draft)"));
-    assert!(run_write_inner.contains("reserved.write_and_mark()"));
+    assert!(run_write_commit_envelope.contains("LogRecordDraft::crud("));
+    assert!(run_write_commit_envelope.contains("self.shared.handle.reserve_log_record(draft)"));
+    assert!(run_write_commit_envelope.contains("reserved.write_and_mark()"));
     assert!(
-        !run_write_inner.contains("journal_ready_lsn()"),
+        !run_write_commit_envelope.contains("journal_ready_lsn()"),
         "ordinary commits must stamp pages with their own ChainCommit end LSN"
     );
     assert!(
-        !run_write_inner.contains("self.lock_journal_mutex()"),
+        !run_write_commit_envelope.contains("self.lock_journal_mutex()"),
         "ordinary CRUD must not enter the production journal mutex"
     );
     assert!(
-        !run_write_inner.contains("self.shared.handle.flush()"),
+        !run_write_commit_envelope.contains("self.shared.handle.flush()"),
         "ordinary CRUD must not use commit-time handle.flush"
     );
     assert!(
-        run_write_inner.contains("§4.6 deviation: US-006 installs Pending pages as")
-            && run_write_inner.contains("Unflushable before reservation"),
+        run_write_commit_envelope.contains("§4.6 deviation: US-006 installs Pending pages as")
+            && run_write_commit_envelope.contains("Unflushable before reservation"),
         "the live install/reserve/stamp ordering deviation must be documented"
     );
 }

@@ -47,7 +47,7 @@ fn buffered_engine() -> PagedEngine {
 }
 
 #[test]
-fn test_run_write_existing_constructs_single_write_visibility() {
+fn test_run_write_commit_envelope_constructs_single_write_visibility() {
     let engine = buffered_engine();
     engine.create_namespace("test.us008.single").unwrap();
 

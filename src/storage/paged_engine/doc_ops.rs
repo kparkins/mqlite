@@ -1,5 +1,5 @@
-//! Engine-level CRUD free functions: insert, find, update, delete, and the
-//! `findOneAnd*` family. Pure helpers (id, validation, projection, sort,
+//! Engine-level CRUD helpers for find, update, delete, the `findOneAnd*`
+//! family, and insert staging. Pure helpers (id, validation, projection, sort,
 //! unique-constraint checks, cell resolution) live in [`super::doc_helpers`].
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use crate::storage::btree::BTree;
 use crate::update::{apply_update, is_operator_update, upsert_base_from_filter};
 use crate::validation::validate_document;
 
-use super::btree_ops::stage_insert_doc;
+use super::btree_ops::prepare_insert_document;
 use super::catalog_ops::{catalog_lock, new_store};
 use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
@@ -60,7 +60,7 @@ fn attach_expected_heads(
         .collect()
 }
 
-pub(super) fn stage_insert_body(
+pub(super) fn stage_insert_in_write_txn(
     shared: &SharedState,
     md: &MetadataState,
     txn: &mut crate::mvcc::transaction::WriteTxn,
@@ -77,7 +77,7 @@ pub(super) fn stage_insert_body(
         entry.data_root_page,
         entry.data_root_level,
     );
-    let (id, key, bson_bytes) = stage_insert_doc(
+    let (id, key, bson_bytes) = prepare_insert_document(
         &tree,
         &mut doc,
         &[],
@@ -91,13 +91,7 @@ pub(super) fn stage_insert_body(
     Ok(id)
 }
 
-pub(super) fn insert(engine: &super::PagedEngine, ns: &str, doc: Document) -> Result<Bson> {
-    engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_body(shared, md, txn, vis, ns, doc)
-    })
-}
-
-pub(super) fn find(
+pub(super) fn find_documents(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -129,17 +123,7 @@ pub(super) fn find(
     Ok((apply_find_opts(matched, opts), explain))
 }
 
-pub(super) fn find_one(
-    engine: &super::PagedEngine,
-    ns: &str,
-    filter: &Document,
-) -> Result<Option<Document>> {
-    let opts = FindOptions::new();
-    let (mut results, _explain) = find(engine, ns, filter, &opts)?;
-    Ok((!results.is_empty()).then(|| results.remove(0)))
-}
-
-pub(super) fn update(
+pub(super) fn update_documents(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -159,7 +143,7 @@ pub(super) fn update(
     let matched_pairs: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = match ns_snap_opt {
         None => {
             if opts.upsert {
-                return do_upsert_update(engine, ns, filter, update_doc);
+                return upsert_for_update(engine, ns, filter, update_doc);
             }
             return Ok(UpdateResult {
                 matched_count: 0,
@@ -182,7 +166,7 @@ pub(super) fn update(
     };
 
     if matched_pairs.is_empty() && opts.upsert {
-        return do_upsert_update(engine, ns, filter, update_doc);
+        return upsert_for_update(engine, ns, filter, update_doc);
     }
 
     let pairs_to_process: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = if many {
@@ -192,7 +176,7 @@ pub(super) fn update(
     };
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, txn, vis| {
+    engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         let mut matched_count = 0u64;
         let mut modified_count = 0u64;
         for (key, mut doc, expected_head) in pairs_to_process {
@@ -227,7 +211,7 @@ pub(super) fn update(
     })
 }
 
-pub(super) fn delete(
+pub(super) fn delete_documents(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -264,7 +248,7 @@ pub(super) fn delete(
     }
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, txn, _vis| {
+    engine.run_write_commit_envelope(ns, None, |shared, md, txn, _vis| {
         for (key, doc, expected_head) in &pairs_to_delete {
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             maintain_secondary_on_delete(shared, md, ns, doc, &doc_id, txn)?;
@@ -279,7 +263,11 @@ pub(super) fn delete(
     Ok(DeleteResult { deleted_count })
 }
 
-pub(super) fn count(engine: &super::PagedEngine, ns: &str, filter: &Document) -> Result<u64> {
+pub(super) fn count_documents(
+    engine: &super::PagedEngine,
+    ns: &str,
+    filter: &Document,
+) -> Result<u64> {
     let snap = engine.shared.load_published();
     let ns_snap = match snap.catalog.get_by_name(ns) {
         None => return Ok(0),
@@ -296,7 +284,7 @@ pub(super) fn count(engine: &super::PagedEngine, ns: &str, filter: &Document) ->
     .len() as u64)
 }
 
-pub(super) fn find_one_and_update_doc(
+pub(super) fn find_one_and_update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -314,7 +302,7 @@ pub(super) fn find_one_and_update_doc(
         match snap.catalog.get_by_name(ns) {
             None => {
                 if opts.upsert {
-                    return fam_upsert_update(engine, ns, filter, update_doc, opts);
+                    return upsert_for_find_one_and_update(engine, ns, filter, update_doc, opts);
                 }
                 return Ok(None);
             }
@@ -334,7 +322,7 @@ pub(super) fn find_one_and_update_doc(
 
     if matched.is_empty() {
         if opts.upsert {
-            return fam_upsert_update(engine, ns, filter, update_doc, opts);
+            return upsert_for_find_one_and_update(engine, ns, filter, update_doc, opts);
         }
         return Ok(None);
     }
@@ -351,7 +339,7 @@ pub(super) fn find_one_and_update_doc(
     let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, txn, vis| {
+    engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         maintain_secondary_on_update(shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn)?;
         let entry_opt = catalog_lock(md).get_collection(ns)?;
         if let Some(entry) = entry_opt {
@@ -366,7 +354,7 @@ pub(super) fn find_one_and_update_doc(
     }))
 }
 
-pub(super) fn find_one_and_delete_doc(
+pub(super) fn find_one_and_delete(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -402,7 +390,7 @@ pub(super) fn find_one_and_delete_doc(
     let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
 
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, txn, _vis| {
+    engine.run_write_commit_envelope(ns, None, |shared, md, txn, _vis| {
         maintain_secondary_on_delete(shared, md, ns, &doc, &doc_id, txn)?;
         let entry_opt = catalog_lock(md).get_collection(ns)?;
         if let Some(entry) = entry_opt {
@@ -414,7 +402,7 @@ pub(super) fn find_one_and_delete_doc(
     Ok(Some(doc))
 }
 
-pub(super) fn find_one_and_replace_doc(
+pub(super) fn find_one_and_replace(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -426,7 +414,7 @@ pub(super) fn find_one_and_replace_doc(
         match snap.catalog.get_by_name(ns) {
             None => {
                 if opts.upsert {
-                    return fam_upsert_replace(engine, ns, replacement, opts);
+                    return upsert_for_find_one_and_replace(engine, ns, replacement, opts);
                 }
                 return Ok(None);
             }
@@ -446,7 +434,7 @@ pub(super) fn find_one_and_replace_doc(
 
     if matched.is_empty() {
         if opts.upsert {
-            return fam_upsert_replace(engine, ns, replacement, opts);
+            return upsert_for_find_one_and_replace(engine, ns, replacement, opts);
         }
         return Ok(None);
     }
@@ -467,7 +455,7 @@ pub(super) fn find_one_and_replace_doc(
     let old_doc_clone = old_doc.clone();
     let new_doc_clone = new_doc.clone();
     let ns_arc = Ns::from(ns);
-    engine.run_write_existing(ns, |shared, md, txn, vis| {
+    engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         maintain_secondary_on_update(
             shared,
             md,
@@ -492,7 +480,7 @@ pub(super) fn find_one_and_replace_doc(
     }))
 }
 
-pub(super) fn do_upsert_update(
+pub(super) fn upsert_for_update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -501,7 +489,7 @@ pub(super) fn do_upsert_update(
     let mut new_doc = upsert_base_from_filter(filter);
     apply_update(&mut new_doc, update_doc, true)?;
     let id = engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_body(shared, md, txn, vis, ns, new_doc)
+        stage_insert_in_write_txn(shared, md, txn, vis, ns, new_doc)
     })?;
     Ok(UpdateResult {
         matched_count: 0,
@@ -510,7 +498,7 @@ pub(super) fn do_upsert_update(
     })
 }
 
-pub(super) fn fam_upsert_update(
+pub(super) fn upsert_for_find_one_and_update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -522,7 +510,7 @@ pub(super) fn fam_upsert_update(
     ensure_id(&mut new_doc);
     let after_doc = new_doc.clone();
     engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_body(shared, md, txn, vis, ns, new_doc).map(|_| ())
+        stage_insert_in_write_txn(shared, md, txn, vis, ns, new_doc).map(|_| ())
     })?;
     Ok(match opts.return_document {
         ReturnDocument::Before => None,
@@ -530,7 +518,7 @@ pub(super) fn fam_upsert_update(
     })
 }
 
-pub(super) fn fam_upsert_replace(
+pub(super) fn upsert_for_find_one_and_replace(
     engine: &super::PagedEngine,
     ns: &str,
     replacement: &Document,
@@ -540,7 +528,7 @@ pub(super) fn fam_upsert_replace(
     ensure_id(&mut new_doc);
     let after_doc = new_doc.clone();
     engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_body(shared, md, txn, vis, ns, new_doc).map(|_| ())
+        stage_insert_in_write_txn(shared, md, txn, vis, ns, new_doc).map(|_| ())
     })?;
     Ok(match opts.return_document {
         ReturnDocument::Before => None,

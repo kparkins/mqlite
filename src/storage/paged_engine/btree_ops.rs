@@ -13,7 +13,7 @@ use crate::validation::validate_document;
 use super::doc_helpers::{check_unique_constraints_mvcc, ensure_id};
 use super::visibility::WriteVisibility;
 
-/// Validate and stage `doc` for a logical primary insert.
+/// Validate and prepare `doc` for a logical primary insert.
 ///
 /// `unique_specs` are `(name, fields, sparse)` tuples for unique secondary
 /// indexes; violated constraints return [`Error::DuplicateKey`] before the
@@ -22,7 +22,7 @@ use super::visibility::WriteVisibility;
 /// Returns `(id_bson, encoded_key, bson_bytes)` so callers can stage the MVCC
 /// primary-chain entry without writing row bytes through a structural B-tree
 /// batch.
-pub(super) fn stage_insert_doc<S: BTreePageStore>(
+pub(super) fn prepare_insert_document<S: BTreePageStore>(
     tree: &BTree<S>,
     doc: &mut Document,
     unique_specs: &[(String, Vec<String>, bool)],

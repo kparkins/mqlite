@@ -27,7 +27,7 @@ fn assert_internal<T>(result: mqlite::Result<T>) {
 }
 
 #[test]
-fn test_repeated_primary_install_failure_aborts_pre_durable_without_poison() {
+fn test_primary_install_failure_aborts_pre_durable_without_poison() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("us019-fatal.mqlite");
 
@@ -36,34 +36,28 @@ fn test_repeated_primary_install_failure_aborts_pre_durable_without_poison() {
     db.create_collection("c").expect("create collection");
     client.checkpoint().expect("checkpoint baseline catalog");
 
-    client.__us019_set_primary_install_failures(1);
     db.collection::<Document>("c")
-        .insert_one(&doc! { "_id": 1i32, "phase": "retry" })
-        .expect("single injected S9 failure should retry and commit");
-    assert_eq!(
-        client.__us019_primary_install_attempts(),
-        2,
-        "S9 failure must be retried exactly once"
-    );
+        .insert_one(&doc! { "_id": 1i32, "phase": "baseline" })
+        .expect("baseline insert");
 
-    let journal_len_before_repeated_failure = std::fs::metadata(crash_harness::journal_path(&path))
+    let journal_len_before_failure = std::fs::metadata(crash_harness::journal_path(&path))
         .expect("journal metadata before repeated failure")
         .len();
-    client.__us019_set_primary_install_failures(2);
+    client.__us019_set_primary_install_failures(1);
     assert_internal(
         db.collection::<Document>("c")
             .insert_one(&doc! { "_id": 2i32, "phase": "aborted" }),
     );
     assert_eq!(
         client.__us019_primary_install_attempts(),
-        2,
-        "S9 repeated failure must stop after the retry"
+        1,
+        "S9 failure must not be retried inside the same commit envelope"
     );
-    let journal_len_after_repeated_failure = std::fs::metadata(crash_harness::journal_path(&path))
+    let journal_len_after_failure = std::fs::metadata(crash_harness::journal_path(&path))
         .expect("journal metadata after repeated failure")
         .len();
     assert_eq!(
-        journal_len_after_repeated_failure, journal_len_before_repeated_failure,
+        journal_len_after_failure, journal_len_before_failure,
         "pre-durable install failure must not append durable state"
     );
     assert!(db
@@ -81,7 +75,7 @@ fn test_repeated_primary_install_failure_aborts_pre_durable_without_poison() {
         .expect("engine must remain writable after pre-durable abort");
     assert_eq!(
         client.__us019_primary_install_attempts(),
-        3,
+        2,
         "successful follow-up write should use one normal primary install attempt"
     );
 
