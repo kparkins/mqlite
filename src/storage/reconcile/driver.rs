@@ -436,7 +436,7 @@ fn reconcile_leaf(
         .shared
         .handle
         .pool()
-        .pin_leaf_set_for_reconcile(ident, &[page_id])
+        .pin_leaves_for_reconcile(ident, &[page_id])
     {
         Ok(pages) => pages,
         Err(err) => return replace_err(err),

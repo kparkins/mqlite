@@ -1072,8 +1072,8 @@ impl PagedEngine {
         right: bson::Document,
     ) -> Result<()> {
         self.run_write(ns, |shared, md, txn, vis| {
-            super::doc_ops::stage_insert_in_write_txn(shared, md, txn, vis, ns, left)?;
-            super::doc_ops::stage_insert_in_write_txn(shared, md, txn, vis, ns, right)?;
+            super::doc_ops::stage_insert(shared, md, txn, vis, ns, left)?;
+            super::doc_ops::stage_insert(shared, md, txn, vis, ns, right)?;
             Ok(())
         })
     }
@@ -1091,7 +1091,7 @@ impl PagedEngine {
             .shared
             .handle
             .pool()
-            .pin_leaf_set_for_reconcile(ident, &[leaf])
+            .pin_leaves_for_reconcile(ident, &[leaf])
             .map_err(|err| Error::Internal(format!("US-028 reconcile latch failed: {err:?}")))?;
         ready
             .send(())

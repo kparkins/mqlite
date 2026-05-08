@@ -781,22 +781,17 @@ impl BufferPool {
             .delta_bearing_frames_warn_above_threshold
             .swap(above_threshold, Ordering::Relaxed);
         if above_threshold && !was_above {
-            Self::emit_delta_bearing_frames_warn(snapshot);
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                target: "mqlite",
+                delta_bearing_frames_count = snapshot.delta_bearing_frames_count,
+                total_pool_frames = snapshot.total_pool_frames as u64,
+                delta_bearing_frames_ratio = snapshot.delta_bearing_frames_ratio,
+                "mqlite::delta_bearing_frames_threshold_crossed"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = snapshot;
         }
-    }
-
-    #[allow(dead_code)]
-    fn emit_delta_bearing_frames_warn(snapshot: &BufferPoolOccupancySnapshot) {
-        #[cfg(feature = "tracing")]
-        tracing::warn!(
-            target: "mqlite",
-            delta_bearing_frames_count = snapshot.delta_bearing_frames_count,
-            total_pool_frames = snapshot.total_pool_frames as u64,
-            delta_bearing_frames_ratio = snapshot.delta_bearing_frames_ratio,
-            "mqlite::delta_bearing_frames_threshold_crossed"
-        );
-        #[cfg(not(feature = "tracing"))]
-        let _ = snapshot;
     }
 
     /// Pin `page_number` in the appropriate partition and return a
@@ -851,7 +846,7 @@ impl BufferPool {
         ident: TreeIdent,
         page_number: u32,
     ) -> std::result::Result<LatchedPinnedPage<'_>, ReplaceLeafError> {
-        let mut pages = self.pin_leaf_set_for_reconcile(ident, &[page_number])?;
+        let mut pages = self.pin_leaves_for_reconcile(ident, &[page_number])?;
         pages.pop().ok_or(ReplaceLeafError::NotResident)
     }
 
@@ -863,7 +858,7 @@ impl BufferPool {
     /// ascending `page_id` order. If any planned page is unavailable, no
     /// partial acquisition is returned and any prior pins are released before
     /// the recoverable error is surfaced.
-    pub(crate) fn pin_leaf_set_for_reconcile(
+    pub(crate) fn pin_leaves_for_reconcile(
         &self,
         _ident: TreeIdent,
         planned_pages: &[u32],

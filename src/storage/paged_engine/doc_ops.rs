@@ -22,7 +22,7 @@ use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
     maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
 };
-use super::snapshot_ops::{apply_find_opts, execute_snapshot_pairs_from_snap};
+use super::snapshot_ops::{apply_find_opts, execute_pairs};
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -57,7 +57,7 @@ fn attach_expected_heads(
         .collect()
 }
 
-pub(super) fn stage_insert_in_write_txn(
+pub(super) fn stage_insert(
     shared: &SharedState,
     md: &MetadataState,
     txn: &mut crate::mvcc::transaction::WriteTxn,
@@ -88,7 +88,7 @@ pub(super) fn stage_insert_in_write_txn(
     Ok(id)
 }
 
-pub(super) fn find_documents(
+pub(super) fn find(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -106,7 +106,7 @@ pub(super) fn find_documents(
         }
         Some(n) => n,
     };
-    let (plan, pairs) = execute_snapshot_pairs_from_snap(
+    let (plan, pairs) = execute_pairs(
         &engine.shared,
         ns,
         ns_snap,
@@ -120,7 +120,7 @@ pub(super) fn find_documents(
     Ok((apply_find_opts(matched, opts), explain))
 }
 
-pub(super) fn update_documents(
+pub(super) fn update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -151,7 +151,7 @@ pub(super) fn update_documents(
         Some(ns_snap) => attach_expected_heads(
             &engine.shared,
             ns_snap,
-            execute_snapshot_pairs_from_snap(
+            execute_pairs(
                 &engine.shared,
                 ns,
                 ns_snap,
@@ -208,7 +208,7 @@ pub(super) fn update_documents(
     })
 }
 
-pub(super) fn delete_documents(
+pub(super) fn delete(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -222,7 +222,7 @@ pub(super) fn delete_documents(
                 let pairs = attach_expected_heads(
                     &engine.shared,
                     ns_snap,
-                    execute_snapshot_pairs_from_snap(
+                    execute_pairs(
                         &engine.shared,
                         ns,
                         ns_snap,
@@ -260,7 +260,7 @@ pub(super) fn delete_documents(
     Ok(DeleteResult { deleted_count })
 }
 
-pub(super) fn count_documents(
+pub(super) fn count(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
@@ -270,7 +270,7 @@ pub(super) fn count_documents(
         None => return Ok(0),
         Some(n) => n,
     };
-    Ok(execute_snapshot_pairs_from_snap(
+    Ok(execute_pairs(
         &engine.shared,
         ns,
         ns_snap,
@@ -307,7 +307,7 @@ pub(super) fn find_one_and_update(
             Some(ns_snap) => attach_expected_heads(
                 &engine.shared,
                 ns_snap,
-                execute_snapshot_pairs_from_snap(
+                execute_pairs(
                     &engine.shared,
                     ns,
                     ns_snap,
@@ -366,7 +366,7 @@ pub(super) fn find_one_and_delete(
                 &engine.shared,
                 ns_snap,
                 {
-                    let (_, pairs) = execute_snapshot_pairs_from_snap(
+                    let (_, pairs) = execute_pairs(
                         &engine.shared,
                         ns,
                         ns_snap,
@@ -422,7 +422,7 @@ pub(super) fn find_one_and_replace(
                 &engine.shared,
                 ns_snap,
                 {
-                    let (_, pairs) = execute_snapshot_pairs_from_snap(
+                    let (_, pairs) = execute_pairs(
                         &engine.shared,
                         ns,
                         ns_snap,
@@ -487,7 +487,7 @@ fn upsert_stage(
 ) -> Result<(Bson, Document)> {
     let snapshot = doc.clone();
     let id = engine.run_write(ns, |shared, md, txn, vis| {
-        stage_insert_in_write_txn(shared, md, txn, vis, ns, doc)
+        stage_insert(shared, md, txn, vis, ns, doc)
     })?;
     Ok((id, snapshot))
 }

@@ -23,7 +23,7 @@ use super::PagedEngine;
 impl PagedEngine {
     fn crash_cut_probe_visible(&self, ns: &str, inserted_id: &Bson) -> Result<bool> {
         let filter = bson::doc! { "_id": inserted_id.clone() };
-        let (docs, _explain) = doc_ops::find_documents(self, ns, &filter, &FindOptions::default())?;
+        let (docs, _explain) = doc_ops::find(self, ns, &filter, &FindOptions::default())?;
         Ok(!docs.is_empty())
     }
 
@@ -58,7 +58,7 @@ impl PagedEngine {
         let vis = WriteVisibility::new(&self.shared, ns)?;
         let txn_id = vis.read_view.txn_id;
         let mut txn = WriteTxn::new(txn_id);
-        let inserted_id = doc_ops::stage_insert_in_write_txn(
+        let inserted_id = doc_ops::stage_insert(
             &self.shared,
             &self.metadata_state,
             &mut txn,

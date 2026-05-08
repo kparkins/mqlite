@@ -58,7 +58,7 @@ impl<S: BTreePageStore> BTree<S> {
     /// (the caller must call [`BTree::read_overflow`] explicitly).  Use
     /// [`BTree::get`] for a fully resolved lookup.
     pub(crate) fn search(&self, key: &[u8]) -> Result<Option<CellValue>> {
-        let (_, (buf, _)) = self.read_leaf_for_point_key_latch_coupled(key)?;
+        let (_, (buf, _)) = self.read_leaf_for_point_key(key)?;
         LeafNode::cell_value(&buf[..], key)
     }
 
@@ -96,7 +96,7 @@ impl<S: BTreePageStore> BTree<S> {
         view: &ReadView,
         history: Option<&dyn HistoryProbe>,
     ) -> Result<Option<Vec<u8>>> {
-        let (_, (buf, snap)) = self.read_leaf_for_point_key_latch_coupled(key)?;
+        let (_, (buf, snap)) = self.read_leaf_for_point_key(key)?;
         if let Some(snap) = snap.as_ref() {
             if let Some(entry) = snap.visible_at(key, view) {
                 if entry.is_tombstone {
@@ -169,7 +169,7 @@ impl<S: BTreePageStore> BTree<S> {
 
         // Find the first leaf that might contain start_key.
         let (_, mut leaf_read) = match start_key {
-            Some(k) => self.read_leaf_for_key_latch_coupled(k)?,
+            Some(k) => self.read_leaf_for_key(k)?,
             None => self.read_leftmost_leaf_latch_coupled()?,
         };
 
@@ -241,7 +241,7 @@ impl<S: BTreePageStore> BTree<S> {
         let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
         let (_, mut leaf_read) = match start {
-            Bound::Included(k) | Bound::Excluded(k) => self.read_leaf_for_key_latch_coupled(k)?,
+            Bound::Included(k) | Bound::Excluded(k) => self.read_leaf_for_key(k)?,
             Bound::Unbounded => self.read_leftmost_leaf_latch_coupled()?,
         };
 
@@ -392,7 +392,7 @@ impl<S: BTreePageStore> BTree<S> {
 
     /// Traverse root-to-leaf with reader latch coupling and read the leaf
     /// while the leaf shared latch is still held.
-    fn read_leaf_for_key_latch_coupled(&self, key: &[u8]) -> Result<(u32, LeafRead)> {
+    fn read_leaf_for_key(&self, key: &[u8]) -> Result<(u32, LeafRead)> {
         let mut page = self.root_page;
         let mut level = self.root_level;
         let mut guard = self
@@ -424,7 +424,7 @@ impl<S: BTreePageStore> BTree<S> {
 
     /// Traverse root-to-leaf for a point read and snapshot only `key`'s
     /// resident delta chain while the leaf shared latch is still held.
-    fn read_leaf_for_point_key_latch_coupled(&self, key: &[u8]) -> Result<(u32, LeafRead)> {
+    fn read_leaf_for_point_key(&self, key: &[u8]) -> Result<(u32, LeafRead)> {
         let mut page = self.root_page;
         let mut level = self.root_level;
         let mut guard = self

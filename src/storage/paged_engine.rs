@@ -957,7 +957,7 @@ impl PagedEngine {
     pub(crate) fn insert(&self, ns: &str, doc: Document) -> Result<Bson> {
         self.shared.check_engine_not_poisoned()?;
         self.run_write(ns, |shared, md, txn, vis| {
-            doc_ops::stage_insert_in_write_txn(shared, md, txn, vis, ns, doc)
+            doc_ops::stage_insert(shared, md, txn, vis, ns, doc)
         })
     }
 
@@ -968,13 +968,13 @@ impl PagedEngine {
         opts: &FindOptions,
     ) -> Result<(Vec<Document>, crate::query::explain::ExplainResult)> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::find_documents(self, ns, filter, opts)
+        doc_ops::find(self, ns, filter, opts)
     }
 
     pub(crate) fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
         let opts = FindOptions::default();
-        let (results, _explain) = doc_ops::find_documents(self, ns, filter, &opts)?;
+        let (results, _explain) = doc_ops::find(self, ns, filter, &opts)?;
         Ok(results.into_iter().next())
     }
 
@@ -987,17 +987,17 @@ impl PagedEngine {
         many: bool,
     ) -> Result<UpdateResult> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::update_documents(self, ns, filter, update, opts, many)
+        doc_ops::update(self, ns, filter, update, opts, many)
     }
 
     pub(crate) fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::delete_documents(self, ns, filter, many)
+        doc_ops::delete(self, ns, filter, many)
     }
 
     pub(crate) fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::count_documents(self, ns, filter)
+        doc_ops::count(self, ns, filter)
     }
 
     pub(crate) fn find_one_and_update(

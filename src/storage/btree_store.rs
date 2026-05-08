@@ -327,13 +327,6 @@ impl BTreePageStore for BufferPoolPageStore {
         &mut self,
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        self.take_all_chains_on_page(page)
-    }
-
-    fn take_all_chains_on_page(
-        &mut self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
         if self.is_history {
             return Ok(Vec::new());
         }

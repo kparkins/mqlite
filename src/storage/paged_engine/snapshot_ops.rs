@@ -268,7 +268,7 @@ fn execute_collscan_from_snap(
     btree_collscan(&tree, filter, &view, Some(&probe))
 }
 
-pub(super) fn execute_snapshot_pairs_from_snap(
+pub(super) fn execute_pairs(
     shared: &SharedState,
     _ns: &str,
     ns_snap: &NamespaceSnapshot,

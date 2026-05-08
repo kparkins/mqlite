@@ -531,7 +531,7 @@ fn production_emitter_carries_stage_time_ids_under_mutation() {
     // model a rename / re-bind that would only affect an
     // emit-time-re-resolver implementation. The production
     // engine reads `entry.id` at stage time
-    // (`stage_insert_in_write_txn` etc.), captures it into the
+    // (`stage_insert` etc.), captures it into the
     // PrimaryWrite struct, and never re-resolves at emit time.
     let mut live_collection = CollectionEntry {
         id: STAGE_TIME_NS_ID,
@@ -606,7 +606,7 @@ fn production_emitter_carries_stage_time_ids_under_mutation() {
 
     let oracle = TimestampOracle::new();
     // Stage using the LIVE catalog entry's id at this moment.
-    // This mirrors `stage_insert_in_write_txn` / `secondary_index::stage`
+    // This mirrors `stage_insert` / `secondary_index::stage`
     // in production, which read `entry.id` from the live entry
     // and pass it into `stage_primary_insert` / `stage_sec_index_insert`.
     let mut t = WriteTxn::new(11);
