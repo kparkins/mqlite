@@ -16,7 +16,6 @@ use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::catalog::{IndexEntry, IndexState};
-use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
 use crate::storage::history_store::{HistorySpillTxn, HistoryStore};

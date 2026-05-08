@@ -11,7 +11,6 @@ use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
-use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
@@ -174,7 +173,7 @@ fn test_checkpoint_incomplete_after_reconcile_mutation_poisons_engine() -> Resul
     engine.create_namespace(NS)?;
     engine.insert(NS, doc! { "_id": 10, "value": "installable" })?;
 
-    engine.test_us026_arm_post_register_failpoint(Us026PostRegisterFailpoint::Flush);
+    engine.us026_arm_post_register_failpoint(Us026PostRegisterFailpoint::Flush);
 
     let err = engine
         .checkpoint()

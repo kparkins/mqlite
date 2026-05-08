@@ -877,7 +877,7 @@ fn us009_state_names(entries: Vec<VersionEntry>) -> Vec<String> {
 impl PagedEngine {
     /// Test-only: sample the timestamp oracle's current
     /// `(physical_ms, logical)`. See §10.6 + Contract 3.4.
-    pub(super) fn test_oracle_now(&self) -> (u64, u32) {
+    pub(crate) fn oracle_now(&self) -> (u64, u32) {
         let ts = self.shared.oracle.now();
         (ts.physical_ms, ts.logical)
     }
@@ -885,7 +885,7 @@ impl PagedEngine {
     /// Test-only: sample the current published
     /// `PublishedEpoch.visible_ts`. Used by §10.6 / US-010 reopen
     /// bootstrap checks.
-    pub(super) fn test_published_visible_ts(&self) -> (u64, u32) {
+    pub(crate) fn published_visible_ts(&self) -> (u64, u32) {
         let snap = self.shared.load_published();
         let ts = snap.visible_ts;
         (ts.physical_ms, ts.logical)
@@ -893,7 +893,7 @@ impl PagedEngine {
 
     /// Test-only: published-catalog rebuild generation. Advances on
     /// rebuild publishes and holds steady on catalog-Arc reuse.
-    pub(super) fn test_published_catalog_gen(&self) -> u64 {
+    pub(crate) fn published_catalog_gen(&self) -> u64 {
         self.shared.load_published().catalog_generation
     }
 
@@ -901,7 +901,7 @@ impl PagedEngine {
     /// (§10.19 C-1). Phase 5 makes the sequencer the single source of
     /// truth for the published frontier; the accessor name is preserved
     /// for callers that pre-date US-005.
-    pub(super) fn test_published_sequencer_frontier(&self) -> (u64, u32) {
+    pub(crate) fn published_sequencer_frontier(&self) -> (u64, u32) {
         let ts = self
             .shared
             .publish_sequencer
@@ -913,7 +913,7 @@ impl PagedEngine {
     /// Test-only: number of recovery post-open epoch stores performed by
     /// this engine instance.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_recovery_open_published_store_count(&self) -> u64 {
+    pub(crate) fn recovery_open_published_store_count(&self) -> u64 {
         self.shared
             .recovery_open_published_store_count
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -921,7 +921,7 @@ impl PagedEngine {
 
     /// Test-only: highest `ChainCommit.commit_ts` observed during the
     /// most recent journal recovery. See US-002 crash harness.
-    pub(super) fn test_recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
+    pub(crate) fn recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
         self.shared
             .handle
             .recovered_max_commit_ts()
@@ -931,7 +931,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us019_set_primary_install_failures(&self, failures: u8) {
+    pub(crate) fn us019_set_primary_install_failures(&self, failures: u8) {
         self.shared
             .us019_primary_install_attempts
             .store(0, Ordering::Release);
@@ -941,14 +941,14 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us019_primary_install_attempts(&self) -> u64 {
+    pub(crate) fn us019_primary_install_attempts(&self) -> u64 {
         self.shared
             .us019_primary_install_attempts
             .load(Ordering::Acquire)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us009_primary_chain_states(
+    pub(crate) fn us009_primary_chain_states(
         &self,
         ns: &str,
         id: &bson::Bson,
@@ -971,7 +971,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us009_inject_primary_committed_head(
+    pub(crate) fn us009_inject_primary_committed_head(
         &self,
         ns: &str,
         doc: &bson::Document,
@@ -1013,7 +1013,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us009_secondary_chain_states(
+    pub(crate) fn us009_secondary_chain_states(
         &self,
         ns: &str,
         index_name: &str,
@@ -1059,13 +1059,13 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us028_primary_leaf_for_id(&self, ns: &str, id: &bson::Bson) -> Result<u32> {
+    pub(crate) fn us028_primary_leaf_for_id(&self, ns: &str, id: &bson::Bson) -> Result<u32> {
         self.test_us028_primary_leaf_ident(ns, id)
             .map(|(_, leaf)| leaf)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us022_insert_two_docs_one_txn(
+    pub(crate) fn us022_insert_two_docs_one_txn(
         &self,
         ns: &str,
         left: bson::Document,
@@ -1079,7 +1079,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us028_hold_primary_leaf_reconcile_latch(
+    pub(crate) fn us028_hold_primary_leaf_reconcile_latch(
         &self,
         ns: &str,
         id: &bson::Bson,
@@ -1102,14 +1102,14 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us028_hold_primary_leaf_writer_latch(
+    pub(crate) fn us028_hold_primary_leaf_writer_latch(
         &self,
         ns: &str,
         id: &bson::Bson,
         ready: Sender<()>,
         release: Receiver<()>,
     ) -> Result<()> {
-        let leaf = self.test_us028_primary_leaf_for_id(ns, id)?;
+        let leaf = self.us028_primary_leaf_for_id(ns, id)?;
         let _page = self.shared.handle.pool().pin_for_write(leaf)?;
         ready
             .send(())
@@ -1120,14 +1120,14 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us025_hold_primary_leaf_reader_latch(
+    pub(crate) fn us025_hold_primary_leaf_reader_latch(
         &self,
         ns: &str,
         id: &bson::Bson,
         ready: Sender<()>,
         release: Receiver<()>,
     ) -> Result<()> {
-        let leaf = self.test_us028_primary_leaf_for_id(ns, id)?;
+        let leaf = self.us028_primary_leaf_for_id(ns, id)?;
         let _page = self.shared.handle.pool().pin_for_read(leaf)?;
         ready
             .send(())
@@ -1138,7 +1138,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us009_reset_flip_publish_order(&self) {
+    pub(crate) fn us009_reset_flip_publish_order(&self) {
         self.shared
             .us009_event_order_counter
             .store(0, Ordering::Release);
@@ -1154,7 +1154,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us009_flip_publish_order(&self) -> (u64, u64) {
+    pub(crate) fn us009_flip_publish_order(&self) -> (u64, u64) {
         (
             self.shared
                 .us009_committed_flip_order
@@ -1166,14 +1166,14 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us009_fail_after_committed_flip_once(&self) {
+    pub(crate) fn us009_fail_after_committed_flip_once(&self) {
         self.shared
             .us009_fail_after_committed_flip
             .store(1, Ordering::Release);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us026_arm_post_register_failpoint(
+    pub(crate) fn us026_arm_post_register_failpoint(
         &self,
         failpoint: Us026PostRegisterFailpoint,
     ) {
@@ -1181,34 +1181,34 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_phase8_journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
+    pub(crate) fn phase8_journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
         self.shared.handle.journal_lsn_snapshot()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_phase8_fail_next_dirty_lsn_stamp(&self) {
+    pub(crate) fn phase8_fail_next_dirty_lsn_stamp(&self) {
         phase8_arm_dirty_lsn_stamp_failure(&self.shared);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_phase8_fail_next_after_dirty_lsn_stamp(&self) {
+    pub(crate) fn phase8_fail_next_after_dirty_lsn_stamp(&self) {
         phase8_arm_after_dirty_lsn_stamp_failure(&self.shared);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_phase8_fail_next_after_durable_before_flip(&self) {
+    pub(crate) fn phase8_fail_next_after_durable_before_flip(&self) {
         phase8_arm_after_durable_before_flip_failure(&self.shared);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_install_phase8_before_reservation_hook(
+    pub(crate) fn install_phase8_before_reservation_hook(
         &self,
     ) -> Phase8BeforeReservationHookGuard {
         install_phase8_before_reservation_hook(&self.shared)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_install_write_body_entry_hook(
+    pub(crate) fn install_write_body_entry_hook(
         &self,
         ns: &str,
         observe_flag: Option<Arc<AtomicBool>>,
@@ -1217,7 +1217,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_install_create_index_build_hook(
+    pub(crate) fn install_create_index_build_hook(
         &self,
         ns: &str,
         index_name: &str,
@@ -1226,7 +1226,7 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_install_create_index_build_failure_hook(
+    pub(crate) fn install_create_index_build_failure_hook(
         &self,
         ns: &str,
         index_name: &str,
@@ -1235,18 +1235,18 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us008_reset_structural_page_observations(&self) {
+    pub(crate) fn us008_reset_structural_page_observations(&self) {
         crate::storage::structural_batch_observations::reset_committed_structural_leaf_bytes();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_us008_committed_structural_leaf_bytes(&self) -> u64 {
+    pub(crate) fn us008_committed_structural_leaf_bytes(&self) -> u64 {
         crate::storage::structural_batch_observations::committed_structural_leaf_bytes()
     }
 
     /// Test-only US-011 probe: install one pending unique email index entry
     /// directly through the production `install_pending_sec_index` path.
-    pub(super) fn test_us011_install_pending_unique_email(
+    pub(crate) fn us011_install_pending_unique_email(
         &self,
         ns: &str,
         index_name: &str,
@@ -1297,7 +1297,7 @@ impl PagedEngine {
 
     /// Test-only US-011 probe: return sibling pages selected when a unique
     /// prefix range crosses both leaf boundaries.
-    pub(super) fn test_us011_unique_prefix_sibling_pages(&self) -> Result<Vec<u32>> {
+    pub(crate) fn us011_unique_prefix_sibling_pages(&self) -> Result<Vec<u32>> {
         let email = bson::Bson::String("sibling@example.test".to_owned());
         let lower_id = bson::Bson::Int32(1);
         let probe_id = bson::Bson::Int32(2);

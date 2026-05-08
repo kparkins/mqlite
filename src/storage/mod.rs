@@ -8,7 +8,6 @@ pub(crate) mod btree;
 pub(crate) mod btree_store;
 pub(crate) mod buffer_pool;
 pub(crate) mod catalog;
-pub(crate) mod engine;
 pub(crate) mod file_io;
 pub(crate) mod handle;
 pub(crate) mod header;

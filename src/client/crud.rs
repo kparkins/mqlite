@@ -1,7 +1,7 @@
 //! `ClientInner` CRUD methods + checkpoint/backup.
 //!
 //! Extracted from [`super`] to keep `client.rs` under the length budget. All
-//! storage operations are routed through `self.engine` (a `Box<dyn StorageEngine>`).
+//! storage operations are routed through `self.engine` (an `Arc<PagedEngine>`).
 
 use std::path::Path;
 

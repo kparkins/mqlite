@@ -13,7 +13,6 @@ use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::catalog::CollectionEntry;
-use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::test_support::{ArcIo, MockIo};

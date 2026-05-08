@@ -9,7 +9,6 @@ use bson::doc;
 use crate::error::{EngineFatalReason, Error, Result};
 use crate::options::FindOptions;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
-use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::test_support::{ArcIo, MockIo};
@@ -47,8 +46,8 @@ fn test_checkpoint_gate_blocks_new_writers_and_drains_all_namespaces() -> Result
     let engine = Arc::new(buffered_engine()?);
     create_namespaces(&engine, &[NS_A, NS_B, NS_C])?;
 
-    let mut hook_a = engine.test_install_write_body_entry_hook(NS_A, None);
-    let mut hook_b = engine.test_install_write_body_entry_hook(NS_B, None);
+    let mut hook_a = engine.install_write_body_entry_hook(NS_A, None);
+    let mut hook_b = engine.install_write_body_entry_hook(NS_B, None);
     let writer_a_engine = Arc::clone(&engine);
     let writer_b_engine = Arc::clone(&engine);
     let writer_a = thread::spawn(move || {
@@ -90,7 +89,7 @@ fn test_checkpoint_gate_blocks_new_writers_and_drains_all_namespaces() -> Result
         .expect("checkpoint admission guard");
     drainer.join().expect("drainer joined");
 
-    let mut hook_c = engine.test_install_write_body_entry_hook(NS_C, None);
+    let mut hook_c = engine.install_write_body_entry_hook(NS_C, None);
     let writer_c_engine = Arc::clone(&engine);
     let writer_c = thread::spawn(move || {
         writer_c_engine
@@ -122,7 +121,7 @@ fn test_checkpoint_gate_released_on_planning_error() -> Result<()> {
         .close_and_drain_all(GATE_TIMEOUT)?;
     drop(guard);
 
-    let mut hook = engine.test_install_write_body_entry_hook(NS_A, None);
+    let mut hook = engine.install_write_body_entry_hook(NS_A, None);
     let writer_engine = Arc::clone(&engine);
     let writer = thread::spawn(move || {
         writer_engine

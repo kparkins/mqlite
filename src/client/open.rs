@@ -13,7 +13,6 @@ use crate::{
     options::OpenOptions,
     storage::{
         buffer_pool::{default_sizes, BufferPool, PageSource},
-        engine::StorageEngine,
         file_io::FilePageSource,
         handle::BufferPoolHandle,
         header::HEADER_PAGE_SIZE,
@@ -207,7 +206,7 @@ impl Client {
             journal_main_file,
         ));
 
-        let engine: Box<dyn StorageEngine> = Box::new(PagedEngine::new_buffered_with_busy(
+        let engine = Arc::new(PagedEngine::new_buffered_with_busy(
             buffer_pool,
             catalog_root_page,
             catalog_root_level,

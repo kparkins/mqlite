@@ -35,7 +35,7 @@ impl PagedEngine {
         Ok(report)
     }
 
-    pub(super) fn crash_cut_probe_insert_impl(
+    pub(crate) fn crash_cut_probe_insert(
         &self,
         ns: &str,
         doc: Document,

@@ -599,7 +599,7 @@ fn poison_checkpoint_post_mutation(engine: &super::PagedEngine, err: Error) -> E
 #[allow(
     dead_code,
     reason = "FullSync CRUD now syncs through group commit before publish; \
-              this helper backs the explicit StorageEngine journal_sync surface"
+              this helper backs the explicit journal_sync inherent method"
 )]
 pub(super) fn journal_sync(engine: &super::PagedEngine) -> crate::error::Result<()> {
     engine

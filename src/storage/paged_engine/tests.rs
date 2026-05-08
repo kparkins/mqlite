@@ -1285,7 +1285,7 @@ fn list_namespaces_performs_one_epoch_load() {
     e.create_namespace("test.ln_b").unwrap();
 
     let _scope = ReadOpScope::new(1);
-    let names = <PagedEngine as StorageEngine>::list_namespaces(&e).unwrap();
+    let names = e.list_namespaces().unwrap();
     assert!(names.len() >= 2);
 }
 

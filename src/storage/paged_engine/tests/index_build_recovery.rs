@@ -9,7 +9,6 @@ use crate::index::IndexModel;
 use crate::options::FindOptions;
 use crate::storage::buffer_pool::{default_sizes, BufferPool};
 use crate::storage::catalog::{IndexEntry, IndexState};
-use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::paged_engine::hidden_accessors::Us026PostRegisterFailpoint;
@@ -173,7 +172,7 @@ fn build_flush_failure_after_structural_commit_poisons_engine() {
         super::index_maint::ReserveOutcome::Reserved(_)
     ));
 
-    engine.test_us026_arm_post_register_failpoint(Us026PostRegisterFailpoint::Flush);
+    engine.us026_arm_post_register_failpoint(Us026PostRegisterFailpoint::Flush);
     let err = engine
         .create_index_build(NS, TAG_INDEX)
         .expect_err("post-structural-commit flush failure must poison the engine");

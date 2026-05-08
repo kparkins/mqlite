@@ -3,7 +3,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::storage::{engine::StorageEngine, lock::AnyFileLock};
+use crate::storage::{lock::AnyFileLock, paged_engine::PagedEngine};
 
 /// Internal shared state for a [`super::Client`].
 ///
@@ -18,12 +18,6 @@ use crate::storage::{engine::StorageEngine, lock::AnyFileLock};
 /// lanes: two writers on different namespaces overlap; same-namespace writers
 /// serialize on an engine-owned lane mutex. Busy-timeout + busy-handler
 /// configuration is plumbed into `PagedEngine::new_buffered_with_busy`.
-///
-/// ## Storage engine
-///
-/// `engine` is a `Box<dyn StorageEngine>` — the concrete type is always
-/// [`crate::storage::paged_engine::PagedEngine`], but `ClientInner` never
-/// knows this.
 pub(crate) struct ClientInner {
     /// Path to the database file.
     pub path: Option<PathBuf>,
@@ -32,15 +26,15 @@ pub(crate) struct ClientInner {
     /// Stored as `Arc` so the same fd can be shared with the `FilePageSource`
     /// backing the buffer pool.
     pub(super) file_lock: Arc<AnyFileLock>,
-    /// Storage engine.  All CRUD operations are dispatched through this trait.
-    pub(crate) engine: Box<dyn StorageEngine>,
+    /// Storage engine.  All CRUD operations are dispatched through this handle.
+    pub(crate) engine: Arc<PagedEngine>,
 }
 
 impl ClientInner {
     pub(super) fn new(
         path: Option<PathBuf>,
         file_lock: Arc<AnyFileLock>,
-        engine: Box<dyn StorageEngine>,
+        engine: Arc<PagedEngine>,
     ) -> Self {
         Self {
             path,

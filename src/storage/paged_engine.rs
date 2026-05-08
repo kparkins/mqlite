@@ -1,4 +1,4 @@
-//! `PagedEngine` — `StorageEngine` backed by B+ trees.
+//! `PagedEngine` — storage engine backed by B+ trees.
 //!
 //! ## Design
 //!
@@ -138,9 +138,6 @@ use crate::options::BusyHandler;
 
 use bson::{Bson, Document};
 
-use super::engine::StorageEngine;
-#[cfg(any(test, feature = "test-hooks"))]
-use super::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
 use crate::error::{Error, Result, WriteConflictReason};
 use crate::index::{IndexInfo, IndexModel};
 use crate::journal::log_file::{
@@ -953,18 +950,18 @@ impl PagedEngine {
 }
 
 // ---------------------------------------------------------------------------
-// StorageEngine implementation
+// Storage operations (inherent impl — was StorageEngine trait impl)
 // ---------------------------------------------------------------------------
 
-impl StorageEngine for PagedEngine {
-    fn insert(&self, ns: &str, doc: Document) -> Result<Bson> {
+impl PagedEngine {
+    pub(crate) fn insert(&self, ns: &str, doc: Document) -> Result<Bson> {
         self.shared.check_engine_not_poisoned()?;
         self.run_write(ns, |shared, md, txn, vis| {
             doc_ops::stage_insert_in_write_txn(shared, md, txn, vis, ns, doc)
         })
     }
 
-    fn find(
+    pub(crate) fn find(
         &self,
         ns: &str,
         filter: &Document,
@@ -974,14 +971,14 @@ impl StorageEngine for PagedEngine {
         doc_ops::find_documents(self, ns, filter, opts)
     }
 
-    fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
+    pub(crate) fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
         let opts = FindOptions::default();
         let (results, _explain) = doc_ops::find_documents(self, ns, filter, &opts)?;
         Ok(results.into_iter().next())
     }
 
-    fn update(
+    pub(crate) fn update(
         &self,
         ns: &str,
         filter: &Document,
@@ -993,17 +990,17 @@ impl StorageEngine for PagedEngine {
         doc_ops::update_documents(self, ns, filter, update, opts, many)
     }
 
-    fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
+    pub(crate) fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
         self.shared.check_engine_not_poisoned()?;
         doc_ops::delete_documents(self, ns, filter, many)
     }
 
-    fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
+    pub(crate) fn count(&self, ns: &str, filter: &Document) -> Result<u64> {
         self.shared.check_engine_not_poisoned()?;
         doc_ops::count_documents(self, ns, filter)
     }
 
-    fn find_one_and_update(
+    pub(crate) fn find_one_and_update(
         &self,
         ns: &str,
         filter: &Document,
@@ -1014,7 +1011,7 @@ impl StorageEngine for PagedEngine {
         doc_ops::find_one_and_update(self, ns, filter, update, opts)
     }
 
-    fn find_one_and_delete(
+    pub(crate) fn find_one_and_delete(
         &self,
         ns: &str,
         filter: &Document,
@@ -1024,7 +1021,7 @@ impl StorageEngine for PagedEngine {
         doc_ops::find_one_and_delete(self, ns, filter, opts)
     }
 
-    fn find_one_and_replace(
+    pub(crate) fn find_one_and_replace(
         &self,
         ns: &str,
         filter: &Document,
@@ -1035,17 +1032,17 @@ impl StorageEngine for PagedEngine {
         doc_ops::find_one_and_replace(self, ns, filter, replacement, opts)
     }
 
-    fn create_index(&self, ns: &str, model: &IndexModel) -> Result<String> {
+    pub(crate) fn create_index(&self, ns: &str, model: &IndexModel) -> Result<String> {
         self.shared.check_engine_not_poisoned()?;
         index_maint::create_index(self, ns, model)
     }
 
-    fn drop_index(&self, ns: &str, name: &str) -> Result<()> {
+    pub(crate) fn drop_index(&self, ns: &str, name: &str) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
         index_maint::drop_index(self, ns, name)
     }
 
-    fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
+    pub(crate) fn list_indexes(&self, ns: &str) -> Result<Vec<IndexInfo>> {
         self.shared.check_engine_not_poisoned()?;
         index_maint::list_indexes(self, ns)
     }
@@ -1054,7 +1051,7 @@ impl StorageEngine for PagedEngine {
     // create_namespace
     // -----------------------------------------------------------------------
 
-    fn create_namespace(&self, ns: &str) -> Result<()> {
+    pub(crate) fn create_namespace(&self, ns: &str) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
         let result = self.run_namespace_create_ddl(|shared, md, batch| {
             let data_root = {
@@ -1082,7 +1079,7 @@ impl StorageEngine for PagedEngine {
     // drop_namespace
     // -----------------------------------------------------------------------
 
-    fn drop_namespace(&self, ns: &str) -> Result<()> {
+    pub(crate) fn drop_namespace(&self, ns: &str) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
         let stale_target = || Error::WriteConflict {
             reason: WriteConflictReason::CatalogGenerationChanged,
@@ -1226,7 +1223,7 @@ impl StorageEngine for PagedEngine {
     // list_namespaces
     // -----------------------------------------------------------------------
 
-    fn list_namespaces(&self) -> Result<Vec<String>> {
+    pub(crate) fn list_namespaces(&self) -> Result<Vec<String>> {
         self.shared.check_engine_not_poisoned()?;
         let snap = self.shared.load_published();
         let keys = snap.catalog.namespace_id_by_name.keys();
@@ -1235,324 +1232,75 @@ impl StorageEngine for PagedEngine {
         Ok(out)
     }
 
-    fn checkpoint(&self) -> Result<()> {
+    pub(crate) fn checkpoint(&self) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
         snapshot_ops::checkpoint(self)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
+    pub(crate) fn read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
         Some(Arc::clone(self.shared.handle.read_view_registry()))
     }
 
-    // Test-only trait methods — implementations live in
-    // `src/storage/paged_engine/tests/hidden_accessors.rs` so the production
-    // impl stays free of test-scaffolding logic.
     #[cfg(any(test, feature = "test-hooks"))]
-    fn oracle_now(&self) -> (u64, u32) {
-        self.test_oracle_now()
+    pub(crate) fn us039_reset_append_sync_observations(&self) {
+        crate::journal::append_sync_observations::reset();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn published_visible_ts(&self) -> (u64, u32) {
-        self.test_published_visible_ts()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn published_catalog_gen(&self) -> u64 {
-        self.test_published_catalog_gen()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn published_sequencer_frontier(&self) -> (u64, u32) {
-        self.test_published_sequencer_frontier()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn recovery_open_published_store_count(&self) -> u64 {
-        self.test_recovery_open_published_store_count()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn recovered_max_commit_ts(&self) -> Option<(u64, u32)> {
-        self.test_recovered_max_commit_ts()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us019_set_primary_install_failures(&self, failures: u8) {
-        self.test_us019_set_primary_install_failures(failures);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us019_primary_install_attempts(&self) -> u64 {
-        self.test_us019_primary_install_attempts()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us009_primary_chain_states(&self, ns: &str, id: &Bson) -> Result<Vec<String>> {
-        self.test_us009_primary_chain_states(ns, id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us009_inject_primary_committed_head(
+    pub(crate) fn us039_append_sync_observations(
         &self,
-        ns: &str,
-        doc: &Document,
-        commit_ts: crate::mvcc::Ts,
-        txn_id: u64,
-    ) -> Result<()> {
-        self.test_us009_inject_primary_committed_head(ns, doc, commit_ts, txn_id)
+    ) -> crate::journal::append_sync_observations::Us039AppendSyncObservations {
+        crate::journal::append_sync_observations::snapshot()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us009_secondary_chain_states(
-        &self,
-        ns: &str,
-        index_name: &str,
-        doc: &Document,
-        id: &Bson,
-    ) -> Result<Vec<String>> {
-        self.test_us009_secondary_chain_states(ns, index_name, doc, id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us009_reset_flip_publish_order(&self) {
-        self.test_us009_reset_flip_publish_order();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us009_flip_publish_order(&self) -> (u64, u64) {
-        self.test_us009_flip_publish_order()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us009_fail_after_committed_flip_once(&self) {
-        self.test_us009_fail_after_committed_flip_once();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us028_primary_leaf_for_id(&self, ns: &str, id: &Bson) -> Result<u32> {
-        self.test_us028_primary_leaf_for_id(ns, id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us022_insert_two_docs_one_txn(
-        &self,
-        ns: &str,
-        left: Document,
-        right: Document,
-    ) -> Result<()> {
-        self.test_us022_insert_two_docs_one_txn(ns, left, right)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us028_hold_primary_leaf_reconcile_latch(
-        &self,
-        ns: &str,
-        id: &Bson,
-        ready: std::sync::mpsc::Sender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    ) -> Result<()> {
-        self.test_us028_hold_primary_leaf_reconcile_latch(ns, id, ready, release)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us028_hold_primary_leaf_writer_latch(
-        &self,
-        ns: &str,
-        id: &Bson,
-        ready: std::sync::mpsc::Sender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    ) -> Result<()> {
-        self.test_us028_hold_primary_leaf_writer_latch(ns, id, ready, release)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us025_hold_primary_leaf_reader_latch(
-        &self,
-        ns: &str,
-        id: &Bson,
-        ready: std::sync::mpsc::Sender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    ) -> Result<()> {
-        self.test_us025_hold_primary_leaf_reader_latch(ns, id, ready, release)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us026_arm_post_register_failpoint(
-        &self,
-        failpoint: self::hidden_accessors::Us026PostRegisterFailpoint,
-    ) {
-        self.test_us026_arm_post_register_failpoint(failpoint);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn phase8_journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
-        self.test_phase8_journal_lsn_snapshot()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn phase8_fail_next_dirty_lsn_stamp(&self) {
-        self.test_phase8_fail_next_dirty_lsn_stamp();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn phase8_fail_next_after_dirty_lsn_stamp(&self) {
-        self.test_phase8_fail_next_after_dirty_lsn_stamp();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn phase8_fail_next_after_durable_before_flip(&self) {
-        self.test_phase8_fail_next_after_durable_before_flip();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn install_phase8_before_reservation_hook(
-        &self,
-    ) -> self::hidden_accessors::Phase8BeforeReservationHookGuard {
-        self.test_install_phase8_before_reservation_hook()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn install_write_body_entry_hook(
-        &self,
-        ns: &str,
-        observe_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-    ) -> self::hidden_accessors::WriteBodyEntryHookGuard {
-        self.test_install_write_body_entry_hook(ns, observe_flag)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn install_create_index_build_hook(
-        &self,
-        ns: &str,
-        index_name: &str,
-    ) -> self::hidden_accessors::CreateIndexBuildHookGuard {
-        self.test_install_create_index_build_hook(ns, index_name)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn install_create_index_build_failure_hook(
-        &self,
-        ns: &str,
-        index_name: &str,
-    ) -> self::hidden_accessors::CreateIndexBuildHookGuard {
-        self.test_install_create_index_build_failure_hook(ns, index_name)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us017_reset_group_commit_probe(&self) {
+    pub(crate) fn us017_reset_group_commit_probe(&self) {
         self::group_commit_observations::reset();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us017_expect_group_commit_cohort_size(&self, expected: u64) {
+    pub(crate) fn us017_expect_group_commit_cohort_size(&self, expected: u64) {
         self::group_commit_observations::set_expected_cohort_size(expected);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us017_fail_next_group_commit_fsync(&self) {
+    pub(crate) fn us017_fail_next_group_commit_fsync(&self) {
         self::group_commit_observations::fail_next_fsync();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us017_pause_next_group_commit_after_close(
+    pub(crate) fn us017_pause_next_group_commit_after_close(
         &self,
     ) -> self::group_commit_observations::Us017GroupCommitPauseGuard {
         self::group_commit_observations::install_pause_after_close()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn us017_group_commit_observations(
+    pub(crate) fn us017_group_commit_observations(
         &self,
     ) -> self::group_commit_observations::Us017GroupCommitObservations {
         self::group_commit_observations::observations()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us008_reset_structural_page_observations(&self) {
-        self.test_us008_reset_structural_page_observations();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us008_committed_structural_leaf_bytes(&self) -> u64 {
-        self.test_us008_committed_structural_leaf_bytes()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us011_install_pending_unique_email(
-        &self,
-        ns: &str,
-        index_name: &str,
-        id: Bson,
-        email: &str,
-        txn_id: u64,
-    ) -> Result<()> {
-        self.test_us011_install_pending_unique_email(ns, index_name, id, email, txn_id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us011_unique_prefix_sibling_pages(&self) -> Result<Vec<u32>> {
-        self.test_us011_unique_prefix_sibling_pages()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn crash_cut_probe_insert(
-        &self,
-        ns: &str,
-        doc: Document,
-        cut: Phase0ProbeCut,
-    ) -> Result<Phase0ProbeReport> {
-        self.crash_cut_probe_insert_impl(ns, doc, cut)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us036_test_poison_engine(&self, reason: crate::error::EngineFatalReason) {
-        self.us036_test_poison_engine(reason);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us036_test_poisoned_reason(&self) -> Option<crate::error::EngineFatalReason> {
-        self.us036_test_poisoned_reason()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us036_test_register_publish_slot(
-        &self,
-    ) -> Result<self::engine_fatal_harness::Us036PublishSlot> {
-        self.us036_test_register_publish_slot()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us036_test_admit_writer(
-        &self,
-        ns_id: i64,
-        timeout_ms: u64,
-    ) -> Result<self::engine_fatal_harness::Us036WriterTicket> {
-        self.us036_test_admit_writer(ns_id, timeout_ms)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us036_test_close_and_drain(&self, ns_id: i64, timeout_ms: u64) -> Result<()> {
-        self.us036_test_close_and_drain(ns_id, timeout_ms)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn us036_test_namespace_id(&self, ns: &str) -> Result<Option<i64>> {
-        self.us036_test_namespace_id(ns)
-    }
-
-    fn close(&self) -> Result<()> {
+    #[allow(dead_code)]
+    pub(crate) fn close(&self) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
         snapshot_ops::checkpoint(self)
     }
 
-    fn journal_sync(&self) -> Result<()> {
+    #[allow(
+        dead_code,
+        reason = "FullSync CRUD now syncs inside the engine group-commit path; \
+                  the method remains for explicit admin/test sync callers"
+    )]
+    pub(crate) fn journal_sync(&self) -> Result<()> {
         self.shared.check_engine_not_poisoned()?;
         snapshot_ops::journal_sync(self)
     }
 
-    fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
         self.shared.check_engine_not_poisoned()?;
         snapshot_ops::snapshot_bytes(self)
     }
