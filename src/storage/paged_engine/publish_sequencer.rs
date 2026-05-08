@@ -593,5 +593,5 @@ impl PublishSequencer {
 }
 
 #[cfg(test)]
-#[path = "tests/publish_sequencer_tests.rs"]
-mod publish_sequencer_tests;
+#[path = "tests/publish_sequencer.rs"]
+mod publish_sequencer;

@@ -22,9 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::latched_pinned_page_drop_test_probe::{
-    drain_events, EVENT_LATCH_RELEASE, EVENT_PIN_RELEASE,
-};
+use super::latched_pinned_page_drop_order::{drain_events, EVENT_LATCH_RELEASE, EVENT_PIN_RELEASE};
 use super::page_latch::LatchMode;
 use super::{default_sizes, BufferPool, LatchedPinnedPage, PageSize};
 use crate::storage::test_support::{ArcIo, MockIo};

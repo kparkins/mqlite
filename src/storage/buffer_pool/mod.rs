@@ -48,9 +48,11 @@ mod chains;
 #[allow(dead_code)]
 mod page_latch;
 #[cfg(any(test, feature = "test-hooks"))]
-pub mod page_latch_fairness_test_probe;
+#[path = "tests/page_latch_fairness_harness.rs"]
+pub mod page_latch_fairness_harness;
 #[cfg(any(test, feature = "test-hooks"))]
-pub mod page_latch_upgrade_test_probe;
+#[path = "tests/page_latch_upgrade_race.rs"]
+pub mod page_latch_upgrade_race;
 mod partition;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -274,8 +276,8 @@ impl Drop for LatchHoldRecorder<'_> {
         // Step 2 — record the latch-release event AFTER the unlock has
         // actually happened. In production the line is a no-op.
         #[cfg(test)]
-        latched_pinned_page_drop_test_probe::record_drop_event(
-            latched_pinned_page_drop_test_probe::EVENT_LATCH_RELEASE,
+        latched_pinned_page_drop_order::record_drop_event(
+            latched_pinned_page_drop_order::EVENT_LATCH_RELEASE,
         );
     }
 }
@@ -607,8 +609,8 @@ impl Drop for LatchedPinnedPage<'_> {
         // Pin-release event fires AFTER `unpin_internal` returns, so
         // the recorded order matches the actual side-effect order.
         #[cfg(test)]
-        latched_pinned_page_drop_test_probe::record_drop_event(
-            latched_pinned_page_drop_test_probe::EVENT_PIN_RELEASE,
+        latched_pinned_page_drop_order::record_drop_event(
+            latched_pinned_page_drop_order::EVENT_PIN_RELEASE,
         );
     }
 }
@@ -1579,28 +1581,31 @@ pub(crate) mod default_sizes {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "tests/delta_eviction_policy_tests.rs"]
-mod delta_eviction_policy_tests;
+#[path = "tests/delta_eviction_policy.rs"]
+mod delta_eviction_policy;
 #[cfg(test)]
-#[path = "tests/delta_occupancy_metrics_tests.rs"]
-mod delta_occupancy_metrics_tests;
+#[path = "tests/delta_occupancy_metrics.rs"]
+mod delta_occupancy_metrics;
 #[cfg(test)]
-mod delta_order_tests;
+#[path = "tests/delta_order.rs"]
+mod delta_order;
 #[cfg(test)]
-#[path = "tests/dirty_frame_snapshot_tests.rs"]
-mod dirty_frame_snapshot_tests;
+#[path = "tests/dirty_frame_snapshot.rs"]
+mod dirty_frame_snapshot;
 #[cfg(test)]
-#[path = "tests/latched_dirty_frame_tests.rs"]
-mod latched_dirty_frame_tests;
+#[path = "tests/latched_dirty_frame.rs"]
+mod latched_dirty_frame;
 #[cfg(test)]
-mod latched_pinned_page_drop_test_probe;
+#[path = "tests/latched_pinned_page.rs"]
+mod latched_pinned_page;
 #[cfg(test)]
-#[path = "tests/latched_pinned_page_tests.rs"]
-mod latched_pinned_page_tests;
+#[path = "tests/latched_pinned_page_drop_order.rs"]
+mod latched_pinned_page_drop_order;
 #[cfg(test)]
-#[path = "tests/reconcile_delta_preservation_tests.rs"]
-mod reconcile_delta_preservation_tests;
+#[path = "tests/reconcile_delta_preservation.rs"]
+mod reconcile_delta_preservation;
 #[cfg(any(test, feature = "test-hooks"))]
-mod resident_chain_test_probe;
+#[path = "tests/resident_chain_snapshot.rs"]
+mod resident_chain_snapshot;
 #[cfg(test)]
 mod tests;

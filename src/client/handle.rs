@@ -131,7 +131,7 @@ impl Client {
     /// not part of the stable application API.
     #[doc(hidden)]
     pub fn __phase8_bench_reset_sync_observations(&self) {
-        crate::journal::append_sync_test_probe::reset();
+        crate::journal::append_sync_observations::reset();
     }
 
     /// Return successful journal fsync boundaries observed since reset.
@@ -141,14 +141,14 @@ impl Client {
     #[doc(hidden)]
     #[must_use]
     pub fn __phase8_bench_journal_sync_os_boundaries(&self) -> u64 {
-        crate::journal::append_sync_test_probe::snapshot().journal_sync_os_boundaries
+        crate::journal::append_sync_observations::snapshot().journal_sync_os_boundaries
     }
 
     // Test-only accessors (`__oracle_now`, `__published_visible_ts`,
     // `__published_catalog_gen`, `__published_sequencer_frontier`,
     // `__recovery_open_published_store_count`, `__recovered_max_commit_ts`,
     // `__read_view_registry`) live in a dedicated module:
-    // `src/client/test_accessors.rs`. Keeping them out of this file
+    // `src/client/tests/hidden_accessors.rs`. Keeping them out of this file
     // makes the boundary between production API and test scaffolding
     // unambiguous.
 }

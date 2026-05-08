@@ -33,11 +33,13 @@
 // boundary so denylist-mode CI does not trip on the pre-existing pattern.
 #![allow(clippy::expect_used)]
 
-pub(crate) mod append_sync_test_probe;
+#[path = "tests/append_sync_observations.rs"]
+pub(crate) mod append_sync_observations;
 #[allow(dead_code)]
 pub(crate) mod log_file;
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) mod logical_replay_test_probe;
+#[path = "tests/logical_replay_fixtures.rs"]
+pub(crate) mod logical_replay_fixtures;
 mod recovery;
 #[allow(dead_code)]
 pub(crate) mod shm;
@@ -58,7 +60,7 @@ use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 use crate::storage::page::PAGE_SIZE_LEAF;
 #[cfg(any(test, feature = "test-hooks"))]
-use crate::storage::paged_engine::group_commit_test_probe;
+use crate::storage::paged_engine::group_commit_observations;
 
 use self::shm::JournalIndex;
 
@@ -288,7 +290,7 @@ impl LogManager {
             sync_in_progress: AtomicBool::new(false),
             file,
             #[cfg(any(test, feature = "test-hooks"))]
-            probe_id: group_commit_test_probe::next_probe_id(),
+            probe_id: group_commit_observations::next_probe_id(),
         }
     }
 
@@ -481,7 +483,7 @@ impl LogManager {
                 .is_ok()
             {
                 #[cfg(any(test, feature = "test-hooks"))]
-                let leader_guard = group_commit_test_probe::leader_entered();
+                let leader_guard = group_commit_observations::leader_entered();
 
                 let sync_target = match self.close_sync_target_after_wait() {
                     Ok(target) => target,
@@ -494,7 +496,7 @@ impl LogManager {
                     }
                 };
                 #[cfg(any(test, feature = "test-hooks"))]
-                let result = if group_commit_test_probe::take_fail_next_fsync() {
+                let result = if group_commit_observations::take_fail_next_fsync() {
                     Err(Error::Internal(
                         "US-017 injected group-commit fsync failure".into(),
                     ))
@@ -507,10 +509,10 @@ impl LogManager {
                     Ok(()) => {
                         let durable_target = sync_target.min(self.ready_lsn());
                         self.durable_lsn.store(durable_target, Ordering::Release);
-                        self::append_sync_test_probe::record_handle_journal_sync();
-                        self::append_sync_test_probe::record_journal_sync_os_boundary();
+                        self::append_sync_observations::record_handle_journal_sync();
+                        self::append_sync_observations::record_journal_sync_os_boundary();
                         #[cfg(any(test, feature = "test-hooks"))]
-                        group_commit_test_probe::record_fsync_success(durable_target);
+                        group_commit_observations::record_fsync_success(durable_target);
                         self.sync_in_progress.store(false, Ordering::Release);
                         #[cfg(any(test, feature = "test-hooks"))]
                         drop(leader_guard);
@@ -519,7 +521,7 @@ impl LogManager {
                     Err(error) => {
                         #[cfg(any(test, feature = "test-hooks"))]
                         {
-                            group_commit_test_probe::record_fsync_failure(sync_target);
+                            group_commit_observations::record_fsync_failure(sync_target);
                             drop(leader_guard);
                         }
                         return Err(self.poison(
@@ -552,9 +554,9 @@ impl LogManager {
             Self::check_poisoned_locked(&state)?;
 
             #[cfg(any(test, feature = "test-hooks"))]
-            if let Some(expected) = group_commit_test_probe::expected_cohort_size() {
-                if group_commit_test_probe::active_waiters() >= expected {
-                    group_commit_test_probe::clear_expected_cohort_size();
+            if let Some(expected) = group_commit_observations::expected_cohort_size() {
+                if group_commit_observations::active_waiters() >= expected {
+                    group_commit_observations::clear_expected_cohort_size();
                     break;
                 }
                 if Instant::now() < test_deadline {
@@ -578,7 +580,7 @@ impl LogManager {
         let sync_target = self.ready_lsn();
         drop(state);
         #[cfg(any(test, feature = "test-hooks"))]
-        group_commit_test_probe::pause_after_close_if_installed(self.probe_id, sync_target);
+        group_commit_observations::pause_after_close_if_installed(self.probe_id, sync_target);
         Ok(sync_target)
     }
 
@@ -595,7 +597,7 @@ impl LogManager {
     /// manager.
     pub(crate) fn wait_durable(&self, end_lsn: u64) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
-        let _waiter_guard = group_commit_test_probe::waiter_entered();
+        let _waiter_guard = group_commit_observations::waiter_entered();
         self.ensure_sync(end_lsn)
     }
 
@@ -2024,13 +2026,13 @@ pub(crate) fn write_page_to_main(
 }
 
 #[cfg(test)]
-#[path = "mod_tests.rs"]
+#[path = "tests/journal_manager.rs"]
 mod tests_extracted;
 
 #[cfg(test)]
-#[path = "tests/header_format_tests.rs"]
-mod header_format_tests;
+#[path = "tests/header_format.rs"]
+mod header_format;
 
 #[cfg(test)]
-#[path = "tests/checkpoint_boundary_recovery_tests.rs"]
-mod checkpoint_boundary_recovery_tests;
+#[path = "tests/checkpoint_boundary_recovery.rs"]
+mod checkpoint_boundary_recovery;

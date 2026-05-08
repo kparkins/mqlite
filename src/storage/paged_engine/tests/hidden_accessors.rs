@@ -5,7 +5,7 @@
 //! engine state that is deliberately kept out of the public
 //! `StorageEngine` trait's production surface. They are reached from
 //! integration tests through `#[doc(hidden)]` `Client::__*` accessors
-//! in `src/client/test_accessors.rs`. None of these methods should
+//! in `src/client/tests/hidden_accessors.rs`. None of these methods should
 //! ever be invoked by application code.
 //!
 //! Isolated into its own file so the boundary between production
@@ -1237,12 +1237,12 @@ impl PagedEngine {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn test_us008_reset_structural_page_observations(&self) {
-        crate::storage::structural_page_batch_test_probe::reset_committed_structural_leaf_bytes();
+        crate::storage::structural_batch_observations::reset_committed_structural_leaf_bytes();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn test_us008_committed_structural_leaf_bytes(&self) -> u64 {
-        crate::storage::structural_page_batch_test_probe::committed_structural_leaf_bytes()
+        crate::storage::structural_batch_observations::committed_structural_leaf_bytes()
     }
 
     /// Test-only US-011 probe: install one pending unique email index entry

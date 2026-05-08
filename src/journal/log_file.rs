@@ -2991,5 +2991,5 @@ pub(crate) fn try_skip_logical_txn<R: Read + Seek>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "log_file_tests.rs"]
+#[path = "tests/log_file_codec.rs"]
 mod tests;

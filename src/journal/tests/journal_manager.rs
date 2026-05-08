@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn phase8_journal_log_manager_durable_lsn_stays_at_closed_sync_target() {
-        crate::storage::paged_engine::group_commit_test_probe::reset();
+        crate::storage::paged_engine::group_commit_observations::reset();
         let io = TestPositionedLogIo::new(usize::MAX, None);
         let manager = log_manager_from_io(io.clone(), 0);
         let first = manager.reserve(3).unwrap();
@@ -475,7 +475,7 @@ mod tests {
         manager.write_reserved(&second, b"def").unwrap();
 
         let mut pause =
-            crate::storage::paged_engine::group_commit_test_probe::install_pause_after_close_for(
+            crate::storage::paged_engine::group_commit_observations::install_pause_after_close_for(
                 manager.probe_id(),
             );
         let sync_manager = Arc::clone(&manager);
@@ -499,7 +499,7 @@ mod tests {
         );
         assert!(manager.durable_lsn() <= manager.ready_lsn());
         assert_eq!(io.sync_calls(), 1);
-        crate::storage::paged_engine::group_commit_test_probe::reset();
+        crate::storage::paged_engine::group_commit_observations::reset();
     }
 
     #[test]
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn phase8_journal_commit_append_uses_log_manager_not_seek_write_all() {
-        let source = include_str!("mod.rs");
+        let source = include_str!("../mod.rs");
         let chain_body = source
             .split("fn append_chain_commit_record")
             .nth(1)

@@ -190,7 +190,7 @@ fn test_mark_ready_closure_is_publish_only() {
 
 #[test]
 fn test_durable_logical_frame_exists_before_resident_install_live_reader() -> Result<()> {
-    use super::test_accessors::install_publish_pause;
+    use super::hidden_accessors::install_publish_pause;
 
     let engine = Arc::new(buffered_engine()?);
     engine.create_namespace(LIVE_READER_NS)?;

@@ -267,20 +267,20 @@ pub(crate) struct SharedState {
     pub write_body_entry_hooks: std::sync::Mutex<
         std::collections::HashMap<
             String,
-            std::collections::VecDeque<super::test_accessors::WriteBodyEntryHook>,
+            std::collections::VecDeque<super::hidden_accessors::WriteBodyEntryHook>,
         >,
     >,
     /// Test-only one-shot pause after Pending install and before log
     /// reservation.
     #[cfg(any(test, feature = "test-hooks"))]
     pub phase8_before_reservation_hook:
-        std::sync::Mutex<Option<super::test_accessors::Phase8BeforeReservationHook>>,
+        std::sync::Mutex<Option<super::hidden_accessors::Phase8BeforeReservationHook>>,
     /// Test-only create-index build-scan rendezvous hooks.
     #[cfg(any(test, feature = "test-hooks"))]
     pub create_index_build_hooks: std::sync::Mutex<
         std::collections::HashMap<
             (String, String),
-            std::collections::VecDeque<super::test_accessors::CreateIndexBuildHook>,
+            std::collections::VecDeque<super::hidden_accessors::CreateIndexBuildHook>,
         >,
     >,
     /// Monotonic ids for test-only write-body entry hooks.
@@ -836,13 +836,13 @@ impl MetadataState {
 }
 
 #[cfg(test)]
-#[path = "state_tests.rs"]
-mod state_tests;
+#[path = "tests/state_recovery.rs"]
+mod state_recovery;
 
 #[cfg(test)]
-#[path = "tests/dirty_leaf_state_tests.rs"]
-mod dirty_leaf_state_tests;
+#[path = "tests/dirty_leaf_state.rs"]
+mod dirty_leaf_state;
 
 #[cfg(test)]
-#[path = "tests/dirty_leaf_marking_tests.rs"]
-mod dirty_leaf_marking_tests;
+#[path = "tests/dirty_leaf_marking.rs"]
+mod dirty_leaf_marking;

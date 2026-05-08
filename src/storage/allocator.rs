@@ -871,5 +871,5 @@ impl AllocatorHandle {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "allocator_tests.rs"]
+#[path = "tests/allocator.rs"]
 mod tests;

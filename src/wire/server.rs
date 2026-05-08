@@ -629,5 +629,5 @@ fn merge_doc_sequences_into_body(body: &Document, sections: &[Section]) -> Docum
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "server_tests.rs"]
+#[path = "tests/server_commands.rs"]
 mod tests;

@@ -9,7 +9,7 @@ use bson::{Bson, Document};
 use crate::error::{EngineFatalReason, Error, Result};
 use crate::journal::log_file::LogRecordDraft;
 use crate::mvcc::transaction::WriteTxn;
-use crate::storage::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
+use crate::storage::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
 
 use super::catalog_ops::{catalog_lock, rebuild_and_publish_locked};
 use super::doc_ops;

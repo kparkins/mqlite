@@ -49,7 +49,7 @@ impl<'a> WriteVisibility<'a> {
     /// current published catalog.
     pub(crate) fn new(shared: &'a SharedState, ns: &str) -> Result<Self> {
         #[cfg(test)]
-        super::write_visibility_epoch_tests::record_write_visibility_new();
+        super::write_visibility_epoch::record_write_visibility_new();
 
         // §10.19 C-1 / US-037: load the (epoch, sequencer-frontier) pair
         // coherently so foreign-Pending visibility evaluated through this

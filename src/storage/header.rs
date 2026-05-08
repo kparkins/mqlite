@@ -840,5 +840,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "tests/header_history_root_tests.rs"]
-mod header_history_root_tests;
+#[path = "tests/header_history_root.rs"]
+mod header_history_root;

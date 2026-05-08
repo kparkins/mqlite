@@ -894,5 +894,5 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "catalog_tests.rs"]
+#[path = "tests/catalog.rs"]
 mod tests;

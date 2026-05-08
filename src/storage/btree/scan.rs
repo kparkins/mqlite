@@ -604,7 +604,7 @@ fn page_size_for_level(level: u8) -> PageSize {
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn record_reader_shared_acquire(page_id: u32, level: u8) {
-    super::reader_crabbing_test_probe::record_shared_acquire(page_id, level);
+    super::reader_crabbing_observations::record_shared_acquire(page_id, level);
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
@@ -612,7 +612,7 @@ fn record_reader_shared_acquire(_page_id: u32, _level: u8) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn record_reader_parent_release_after_child(parent_page: u32, child_page: u32) {
-    super::reader_crabbing_test_probe::record_parent_release_after_child(parent_page, child_page);
+    super::reader_crabbing_observations::record_parent_release_after_child(parent_page, child_page);
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
@@ -620,7 +620,7 @@ fn record_reader_parent_release_after_child(_parent_page: u32, _child_page: u32)
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn pause_before_iteration() -> Result<()> {
-    super::reader_latch_scope_test_probe::pause_before_iteration()
+    super::range_scan_latch_scope::pause_before_iteration()
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]

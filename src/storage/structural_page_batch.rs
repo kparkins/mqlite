@@ -279,7 +279,7 @@ impl StructuralPageWrites {
         for page in touched_32k {
             if let Some(buf) = self.staged_32k.remove(&page) {
                 #[cfg(any(test, feature = "test-hooks"))]
-                crate::storage::structural_page_batch_test_probe::record_committed_structural_leaf_bytes(
+                crate::storage::structural_batch_observations::record_committed_structural_leaf_bytes(
                     buf.len(),
                 );
                 base.write_leaf_structural(page, &buf)?;
@@ -566,9 +566,9 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
 }
 
 #[cfg(test)]
-#[path = "structural_page_batch_tests.rs"]
+#[path = "tests/structural_page_batch.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "structural_page_batch_store_tests.rs"]
-mod store_tests;
+#[path = "tests/structural_page_batch_store.rs"]
+mod structural_page_batch_store;

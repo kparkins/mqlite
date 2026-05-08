@@ -12,7 +12,7 @@ use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::engine::StorageEngine;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
-use crate::storage::paged_engine::test_accessors::Us026PostRegisterFailpoint;
+use crate::storage::paged_engine::hidden_accessors::Us026PostRegisterFailpoint;
 use crate::storage::test_support::{ArcIo, MockIo};
 
 const NS: &str = "test.us018c.docs";

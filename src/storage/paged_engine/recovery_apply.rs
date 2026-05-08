@@ -362,5 +362,5 @@ fn replay_leaf_page(
 }
 
 #[cfg(test)]
-#[path = "recovery_apply_tests.rs"]
-mod recovery_apply_tests;
+#[path = "tests/recovery_apply.rs"]
+mod recovery_apply;

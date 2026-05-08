@@ -620,5 +620,5 @@ impl Partition {
 }
 
 #[cfg(test)]
-#[path = "tests/partition_latch_eviction_tests.rs"]
-mod partition_latch_eviction_tests;
+#[path = "tests/partition_latch_eviction.rs"]
+mod partition_latch_eviction;

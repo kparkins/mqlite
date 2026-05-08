@@ -123,7 +123,7 @@ fn assert_inline_doc(entry: &VersionEntry, expected_id: i32) {
 
 #[test]
 fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
-    use super::test_accessors::install_publish_pause;
+    use super::hidden_accessors::install_publish_pause;
 
     let engine = Arc::new(buffered_engine()?);
     engine.create_namespace(NS)?;

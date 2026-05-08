@@ -335,7 +335,7 @@ impl BufferPoolHandle {
     /// 4. Flush the pool again to write the freshly dirtied header page.
     pub(crate) fn flush(&self) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
-        crate::journal::append_sync_test_probe::record_handle_flush();
+        crate::journal::append_sync_observations::record_handle_flush();
         let durable_lsn = self.journal_durable_lsn()?;
         let Some(durable_lsn) = durable_lsn else {
             return self.flush_journal_less_test_handle();
@@ -388,7 +388,7 @@ impl BufferPoolHandle {
             .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
         file_guard.sync_data().map_err(Error::Io)?;
         #[cfg(any(test, feature = "test-hooks"))]
-        crate::journal::append_sync_test_probe::record_main_file_sync();
+        crate::journal::append_sync_observations::record_main_file_sync();
         Ok(())
     }
 

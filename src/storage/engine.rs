@@ -26,18 +26,18 @@
 use bson::{Bson, Document};
 
 #[cfg(any(test, feature = "test-hooks"))]
-use super::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
-#[cfg(any(test, feature = "test-hooks"))]
-use super::paged_engine::group_commit_test_probe::{
+use super::paged_engine::group_commit_observations::{
     Us017GroupCommitObservations, Us017GroupCommitPauseGuard,
 };
 #[cfg(any(test, feature = "test-hooks"))]
-use super::paged_engine::test_accessors::{
+use super::paged_engine::hidden_accessors::{
     CreateIndexBuildHookGuard, Phase8BeforeReservationHookGuard, Us026PostRegisterFailpoint,
     WriteBodyEntryHookGuard,
 };
 #[cfg(any(test, feature = "test-hooks"))]
-use crate::journal::append_sync_test_probe::Us039AppendSyncObservations;
+use super::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::journal::append_sync_observations::Us039AppendSyncObservations;
 use crate::{
     error::Result,
     index::{IndexInfo, IndexModel},
@@ -507,14 +507,14 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     fn us039_reset_append_sync_observations(&self) {
-        crate::journal::append_sync_test_probe::reset();
+        crate::journal::append_sync_observations::reset();
     }
 
     /// Hidden US-039 test hook: snapshot append/sync ownership counters.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     fn us039_append_sync_observations(&self) -> Us039AppendSyncObservations {
-        crate::journal::append_sync_test_probe::snapshot()
+        crate::journal::append_sync_observations::snapshot()
     }
 
     /// Hidden US-017 test hook: reset group-commit probe state.
@@ -628,7 +628,7 @@ pub trait StorageEngine: Send + Sync {
     #[doc(hidden)]
     fn us036_test_register_publish_slot(
         &self,
-    ) -> Result<crate::storage::paged_engine::engine_fatal_test_probe::Us036PublishSlot> {
+    ) -> Result<crate::storage::paged_engine::engine_fatal_harness::Us036PublishSlot> {
         Err(crate::error::Error::Internal(
             "us036 publish-slot probe is unsupported by this engine".into(),
         ))
@@ -641,7 +641,7 @@ pub trait StorageEngine: Send + Sync {
         &self,
         _ns_id: i64,
         _timeout_ms: u64,
-    ) -> Result<crate::storage::paged_engine::engine_fatal_test_probe::Us036WriterTicket> {
+    ) -> Result<crate::storage::paged_engine::engine_fatal_harness::Us036WriterTicket> {
         Err(crate::error::Error::Internal(
             "us036 writer-admit probe is unsupported by this engine".into(),
         ))

@@ -313,5 +313,5 @@ fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bo
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "filter_tests.rs"]
+#[path = "tests/filter_matching.rs"]
 mod tests_extracted;

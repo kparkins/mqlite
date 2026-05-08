@@ -8,8 +8,6 @@ pub(crate) mod btree;
 pub(crate) mod btree_store;
 pub(crate) mod buffer_pool;
 pub(crate) mod catalog;
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) mod crash_cut_test_probe;
 pub(crate) mod engine;
 pub(crate) mod file_io;
 pub(crate) mod handle;
@@ -22,8 +20,12 @@ pub(crate) mod paged_engine;
 pub(crate) mod reconcile;
 pub(crate) mod root_snapshot;
 pub(crate) mod secondary_index;
-pub(crate) mod structural_page_batch;
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) mod structural_page_batch_test_probe;
+#[path = "tests/structural_batch_observations.rs"]
+pub(crate) mod structural_batch_observations;
+pub(crate) mod structural_page_batch;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "tests/write_crash_cut_contract.rs"]
+pub(crate) mod write_crash_cut_contract;

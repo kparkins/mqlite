@@ -564,9 +564,9 @@ fn checkpoint_after_reconcile_plan(
         checkpoint_applied_lsn = Some(candidate_lsn);
     }
     #[cfg(any(test, feature = "test-hooks"))]
-    super::test_accessors::us026_fail_if_armed(
+    super::hidden_accessors::us026_fail_if_armed(
         &engine.shared,
-        super::test_accessors::Us026PostRegisterFailpoint::Flush,
+        super::hidden_accessors::Us026PostRegisterFailpoint::Flush,
     )?;
     engine.shared.handle.flush()?;
     if engine.shared.handle.has_dirty_pages()? {
@@ -581,8 +581,8 @@ fn checkpoint_after_reconcile_plan(
         return Ok(());
     }
     #[cfg(any(test, feature = "test-hooks"))]
-    super::test_accessors::phase8_checkpoint_abort_if_armed(
-        super::test_accessors::Phase8CheckpointFailpoint::AfterMaterializationFlushBeforeBoundary,
+    super::hidden_accessors::phase8_checkpoint_abort_if_armed(
+        super::hidden_accessors::Phase8CheckpointFailpoint::AfterMaterializationFlushBeforeBoundary,
     );
     let checkpoint_applied_lsn = checkpoint_applied_lsn.ok_or_else(|| {
         Error::Internal("checkpoint boundary requested without an applied LSN".into())

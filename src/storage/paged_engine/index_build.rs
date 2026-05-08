@@ -289,7 +289,7 @@ impl PagedEngine {
         };
 
         #[cfg(any(test, feature = "test-hooks"))]
-        super::test_accessors::create_index_build_if_installed(&self.shared, ns, name)?;
+        super::hidden_accessors::create_index_build_if_installed(&self.shared, ns, name)?;
 
         {
             let _md_read = self

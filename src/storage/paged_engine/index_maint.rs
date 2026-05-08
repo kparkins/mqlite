@@ -527,7 +527,7 @@ pub(super) fn install_pending_primary(
     txn_id: u64,
 ) -> Result<(Vec<u32>, bool)> {
     #[cfg(test)]
-    super::unique_constraint_delta_tests::record_install_pending_primary_call();
+    super::unique_constraint_delta::record_install_pending_primary_call();
 
     if writes.is_empty() {
         return Ok((Vec::new(), false));

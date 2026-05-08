@@ -29,103 +29,109 @@
 
 mod btree_ops;
 mod catalog_ops;
-#[cfg(any(test, feature = "test-hooks"))]
-mod crash_cut_test_probe;
 mod doc_helpers;
 mod doc_ops;
 /// Test-only engine-fatal probe — engine-fatal poison + sequencer + writer
 /// admission handles. Kept in a separate module so intrusive test plumbing
 /// stays out of production paths.
 #[cfg(any(test, feature = "test-hooks"))]
-pub mod engine_fatal_test_probe;
+#[path = "paged_engine/tests/engine_fatal_harness.rs"]
+pub mod engine_fatal_harness;
 #[cfg(any(test, feature = "test-hooks"))]
-pub mod group_commit_test_probe;
-mod index_build;
-mod index_maint;
-pub(crate) mod publish;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod publish_registry_test_probe;
-pub(crate) mod publish_sequencer;
-mod recovery_apply;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod smo_classification_test_probe;
-mod smo_latch;
-mod snapshot_ops;
-mod state;
+#[path = "paged_engine/tests/group_commit_observations.rs"]
+pub mod group_commit_observations;
 /// Test-only `impl PagedEngine` accessors — isolated from the
 /// production code path in a separate file so the boundary is
 /// visible at a glance.
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) mod test_accessors;
+#[path = "paged_engine/tests/hidden_accessors.rs"]
+pub(crate) mod hidden_accessors;
+mod index_build;
+mod index_maint;
+pub(crate) mod publish;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "paged_engine/tests/publish_registry_harness.rs"]
+pub mod publish_registry_harness;
+pub(crate) mod publish_sequencer;
+mod recovery_apply;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "paged_engine/tests/smo_classification_observations.rs"]
+pub mod smo_classification_observations;
+mod smo_latch;
+mod snapshot_ops;
+mod state;
 mod visibility;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "paged_engine/tests/write_crash_cut_harness.rs"]
+mod write_crash_cut_harness;
 pub(crate) mod writer_registry;
 
 #[cfg(test)]
-#[path = "paged_engine/tests/allocator_freeze_boundary_tests.rs"]
-mod allocator_freeze_boundary_tests;
+#[path = "paged_engine/tests/allocator_freeze_boundary.rs"]
+mod allocator_freeze_boundary;
 #[cfg(test)]
-#[path = "paged_engine/tests/checkpoint_boundary_replay_tests.rs"]
-mod checkpoint_boundary_replay_tests;
+#[path = "paged_engine/tests/checkpoint_boundary_replay.rs"]
+mod checkpoint_boundary_replay;
 #[cfg(test)]
-#[path = "paged_engine/tests/checkpoint_dirty_leaf_reconcile_tests.rs"]
-mod checkpoint_dirty_leaf_reconcile_tests;
+#[path = "paged_engine/tests/checkpoint_dirty_leaf_reconcile.rs"]
+mod checkpoint_dirty_leaf_reconcile;
 #[cfg(test)]
-#[path = "paged_engine/tests/checkpoint_flush_set_tests.rs"]
-mod checkpoint_flush_set_tests;
+#[path = "paged_engine/tests/checkpoint_flush_set.rs"]
+mod checkpoint_flush_set;
 #[cfg(test)]
-#[path = "paged_engine/tests/checkpoint_gate_tests.rs"]
-mod checkpoint_gate_tests;
+#[path = "paged_engine/tests/checkpoint_gate.rs"]
+mod checkpoint_gate;
 #[cfg(test)]
-#[path = "paged_engine/tests/checkpoint_incomplete_metrics_tests.rs"]
-mod checkpoint_incomplete_metrics_tests;
+#[path = "paged_engine/tests/checkpoint_incomplete_metrics.rs"]
+mod checkpoint_incomplete_metrics;
 #[cfg(test)]
-#[path = "paged_engine/tests/checkpoint_reconcile_plan_tests.rs"]
-mod checkpoint_reconcile_plan_tests;
+#[path = "paged_engine/tests/checkpoint_reconcile_plan.rs"]
+mod checkpoint_reconcile_plan;
 #[cfg(test)]
-#[path = "paged_engine/tests/dirty_leaf_integration_tests.rs"]
-mod dirty_leaf_integration_tests;
+#[path = "paged_engine/tests/dirty_leaf_integration.rs"]
+mod dirty_leaf_integration;
 #[cfg(test)]
-#[path = "paged_engine/tests/index_build_recovery_tests.rs"]
-mod index_build_recovery_tests;
+#[path = "paged_engine/tests/index_build_recovery.rs"]
+mod index_build_recovery;
 #[cfg(test)]
-#[path = "paged_engine/tests/logical_replay_frontier_tests.rs"]
-mod logical_replay_frontier_tests;
+#[path = "paged_engine/tests/logical_replay_frontier.rs"]
+mod logical_replay_frontier;
 #[cfg(test)]
-#[path = "paged_engine/tests/orphan_chain_commit_recovery_tests.rs"]
-mod orphan_chain_commit_recovery_tests;
+#[path = "paged_engine/tests/orphan_chain_commit_recovery.rs"]
+mod orphan_chain_commit_recovery;
 #[cfg(test)]
-#[path = "paged_engine/tests/pending_write_visibility_tests.rs"]
-mod pending_write_visibility_tests;
+#[path = "paged_engine/tests/pending_write_visibility.rs"]
+mod pending_write_visibility;
 #[cfg(test)]
-#[path = "paged_engine/tests/published_epoch_coherence_tests.rs"]
-mod published_epoch_coherence_tests;
+#[path = "paged_engine/tests/published_epoch_coherence.rs"]
+mod published_epoch_coherence;
 #[cfg(test)]
-#[path = "paged_engine/tests/retired_sequence_source_audit_tests.rs"]
-mod retired_sequence_source_audit_tests;
+#[path = "paged_engine/tests/retired_sequence_source_audit.rs"]
+mod retired_sequence_source_audit;
 #[cfg(test)]
-#[path = "paged_engine/tests/secondary_index_delta_scan_tests.rs"]
-mod secondary_index_delta_scan_tests;
+#[path = "paged_engine/tests/secondary_index_delta_scan.rs"]
+mod secondary_index_delta_scan;
 #[cfg(test)]
-#[path = "paged_engine/tests/secondary_index_pending_write_tests.rs"]
-mod secondary_index_pending_write_tests;
+#[path = "paged_engine/tests/secondary_index_pending_write.rs"]
+mod secondary_index_pending_write;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-#[path = "paged_engine/tests/unique_constraint_delta_tests.rs"]
-mod unique_constraint_delta_tests;
+#[path = "paged_engine/tests/unique_constraint_delta.rs"]
+mod unique_constraint_delta;
 #[cfg(test)]
-#[path = "paged_engine/tests/write_order_tests.rs"]
-mod write_order_tests;
+#[path = "paged_engine/tests/write_order.rs"]
+mod write_order;
 #[cfg(test)]
-#[path = "paged_engine/tests/write_visibility_epoch_tests.rs"]
-mod write_visibility_epoch_tests;
+#[path = "paged_engine/tests/write_visibility_epoch.rs"]
+mod write_visibility_epoch;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 #[cfg(any(test, feature = "test-hooks"))]
-use self::test_accessors::{Phase3CommitFailpoint, Us026PostRegisterFailpoint};
+use self::hidden_accessors::{Phase3CommitFailpoint, Us026PostRegisterFailpoint};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -133,9 +139,9 @@ use crate::options::BusyHandler;
 
 use bson::{Bson, Document};
 
-#[cfg(any(test, feature = "test-hooks"))]
-use super::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
 use super::engine::StorageEngine;
+#[cfg(any(test, feature = "test-hooks"))]
+use super::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
 use crate::error::{Error, Result, WriteConflictReason};
 use crate::index::{IndexInfo, IndexModel};
 use crate::journal::log_file::{
@@ -371,7 +377,7 @@ impl PagedEngine {
         debug_assert_eq!(written_end_lsn, commit_end_lsn);
         self.wait_for_commit_durability(commit_end_lsn)?;
         #[cfg(any(test, feature = "test-hooks"))]
-        if self::test_accessors::us026_fail_if_armed(
+        if self::hidden_accessors::us026_fail_if_armed(
             &self.shared,
             Us026PostRegisterFailpoint::Flush,
         )
@@ -643,7 +649,7 @@ impl PagedEngine {
         // catalog itself is behind `Mutex<Catalog>`, while page latches and
         // expected-head checks serialize resident chain mutation.
         #[cfg(any(test, feature = "test-hooks"))]
-        self::test_accessors::write_body_entry_if_installed(&self.shared, ns);
+        self::hidden_accessors::write_body_entry_if_installed(&self.shared, ns);
         let body_result = f(&self.shared, &self.metadata_state, &mut txn, &vis);
 
         match body_result {
@@ -778,14 +784,14 @@ impl PagedEngine {
                 pending_pages.extend(primary_pages);
 
                 #[cfg(any(test, feature = "test-hooks"))]
-                if let Err(e) = self::test_accessors::us026_fail_if_armed(
+                if let Err(e) = self::hidden_accessors::us026_fail_if_armed(
                     &self.shared,
                     Us026PostRegisterFailpoint::BeforeLogReservation,
                 ) {
                     return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
                 }
                 #[cfg(any(test, feature = "test-hooks"))]
-                self::test_accessors::phase8_before_reservation_if_installed(&self.shared);
+                self::hidden_accessors::phase8_before_reservation_if_installed(&self.shared);
 
                 let reserved = match self.shared.handle.reserve_log_record(draft) {
                     Ok(reserved) => reserved,
@@ -802,7 +808,7 @@ impl PagedEngine {
                 // is the first point where those pages become flushable by LSN.
                 #[cfg(any(test, feature = "test-hooks"))]
                 if let Err(e) =
-                    self::test_accessors::phase8_fail_dirty_lsn_stamp_if_armed(&self.shared)
+                    self::hidden_accessors::phase8_fail_dirty_lsn_stamp_if_armed(&self.shared)
                 {
                     return Err(self.poison_after_reserved_log_failure(&reserved, e));
                 }
@@ -815,7 +821,7 @@ impl PagedEngine {
                 }
                 #[cfg(any(test, feature = "test-hooks"))]
                 if let Err(e) =
-                    self::test_accessors::phase8_fail_after_dirty_lsn_stamp_if_armed(&self.shared)
+                    self::hidden_accessors::phase8_fail_after_dirty_lsn_stamp_if_armed(&self.shared)
                 {
                     return Err(self.poison_after_reserved_log_failure(&reserved, e));
                 }
@@ -828,7 +834,7 @@ impl PagedEngine {
                 crate::mvcc::metrics::record_journal_chain_commit_frame();
                 self.wait_for_commit_durability(commit_end_lsn)?;
                 #[cfg(any(test, feature = "test-hooks"))]
-                if self::test_accessors::phase8_fail_after_durable_before_flip_if_armed(
+                if self::hidden_accessors::phase8_fail_after_durable_before_flip_if_armed(
                     &self.shared,
                 )
                 .is_err()
@@ -839,7 +845,7 @@ impl PagedEngine {
                 }
 
                 #[cfg(test)]
-                self::test_accessors::publish_pause_if_installed(&self.shared);
+                self::hidden_accessors::publish_pause_if_installed(&self.shared);
 
                 // S9: the log record is ready/durable before the
                 // Pending-to-Committed flip. The flip runs before publish so
@@ -852,9 +858,11 @@ impl PagedEngine {
                     })?;
                 #[cfg(any(test, feature = "test-hooks"))]
                 {
-                    self::test_accessors::us009_record_committed_flip(&self.shared);
-                    if self::test_accessors::us009_fail_after_committed_flip_if_armed(&self.shared)
-                        .is_err()
+                    self::hidden_accessors::us009_record_committed_flip(&self.shared);
+                    if self::hidden_accessors::us009_fail_after_committed_flip_if_armed(
+                        &self.shared,
+                    )
+                    .is_err()
                     {
                         return Err(self.engine_fatal(
                             crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
@@ -863,7 +871,7 @@ impl PagedEngine {
                 }
 
                 #[cfg(any(test, feature = "test-hooks"))]
-                self::test_accessors::phase3_abort_if_armed(
+                self::hidden_accessors::phase3_abort_if_armed(
                     Phase3CommitFailpoint::AfterLegacyCommitBeforePublish,
                 );
 
@@ -874,7 +882,7 @@ impl PagedEngine {
                         .publish_sequencer
                         .mark_ready(slot, move |publish_ts| {
                             #[cfg(any(test, feature = "test-hooks"))]
-                            self::test_accessors::us009_record_publish_ready(&shared);
+                            self::hidden_accessors::us009_record_publish_ready(&shared);
                             rebuild_and_publish_locked(
                                 &shared,
                                 &metadata_state,
@@ -985,7 +993,7 @@ impl PagedEngine {
             return Ok((Vec::new(), false));
         }
         #[cfg(any(test, feature = "test-hooks"))]
-        let first_attempt = self::test_accessors::us019_maybe_fail_primary_install(&self.shared)
+        let first_attempt = self::hidden_accessors::us019_maybe_fail_primary_install(&self.shared)
             .and_then(|()| {
                 install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id)
             });
@@ -998,7 +1006,7 @@ impl PagedEngine {
             Err(_) => {}
         }
         #[cfg(any(test, feature = "test-hooks"))]
-        let second_attempt = self::test_accessors::us019_maybe_fail_primary_install(&self.shared)
+        let second_attempt = self::hidden_accessors::us019_maybe_fail_primary_install(&self.shared)
             .and_then(|()| {
                 install_pending_primary(&self.shared, md, writes.to_vec(), vis, commit_ts, txn_id)
             });
@@ -1303,7 +1311,7 @@ impl StorageEngine for PagedEngine {
     }
 
     // Test-only trait methods — implementations live in
-    // `src/storage/paged_engine/test_accessors.rs` so the production
+    // `src/storage/paged_engine/tests/hidden_accessors.rs` so the production
     // impl stays free of test-scaffolding logic.
     #[cfg(any(test, feature = "test-hooks"))]
     fn oracle_now(&self) -> (u64, u32) {
@@ -1438,7 +1446,7 @@ impl StorageEngine for PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     fn us026_arm_post_register_failpoint(
         &self,
-        failpoint: self::test_accessors::Us026PostRegisterFailpoint,
+        failpoint: self::hidden_accessors::Us026PostRegisterFailpoint,
     ) {
         self.test_us026_arm_post_register_failpoint(failpoint);
     }
@@ -1466,7 +1474,7 @@ impl StorageEngine for PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     fn install_phase8_before_reservation_hook(
         &self,
-    ) -> self::test_accessors::Phase8BeforeReservationHookGuard {
+    ) -> self::hidden_accessors::Phase8BeforeReservationHookGuard {
         self.test_install_phase8_before_reservation_hook()
     }
 
@@ -1475,7 +1483,7 @@ impl StorageEngine for PagedEngine {
         &self,
         ns: &str,
         observe_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-    ) -> self::test_accessors::WriteBodyEntryHookGuard {
+    ) -> self::hidden_accessors::WriteBodyEntryHookGuard {
         self.test_install_write_body_entry_hook(ns, observe_flag)
     }
 
@@ -1484,7 +1492,7 @@ impl StorageEngine for PagedEngine {
         &self,
         ns: &str,
         index_name: &str,
-    ) -> self::test_accessors::CreateIndexBuildHookGuard {
+    ) -> self::hidden_accessors::CreateIndexBuildHookGuard {
         self.test_install_create_index_build_hook(ns, index_name)
     }
 
@@ -1493,37 +1501,37 @@ impl StorageEngine for PagedEngine {
         &self,
         ns: &str,
         index_name: &str,
-    ) -> self::test_accessors::CreateIndexBuildHookGuard {
+    ) -> self::hidden_accessors::CreateIndexBuildHookGuard {
         self.test_install_create_index_build_failure_hook(ns, index_name)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_reset_group_commit_probe(&self) {
-        self::group_commit_test_probe::reset();
+        self::group_commit_observations::reset();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_expect_group_commit_cohort_size(&self, expected: u64) {
-        self::group_commit_test_probe::set_expected_cohort_size(expected);
+        self::group_commit_observations::set_expected_cohort_size(expected);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_fail_next_group_commit_fsync(&self) {
-        self::group_commit_test_probe::fail_next_fsync();
+        self::group_commit_observations::fail_next_fsync();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_pause_next_group_commit_after_close(
         &self,
-    ) -> self::group_commit_test_probe::Us017GroupCommitPauseGuard {
-        self::group_commit_test_probe::install_pause_after_close()
+    ) -> self::group_commit_observations::Us017GroupCommitPauseGuard {
+        self::group_commit_observations::install_pause_after_close()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn us017_group_commit_observations(
         &self,
-    ) -> self::group_commit_test_probe::Us017GroupCommitObservations {
-        self::group_commit_test_probe::observations()
+    ) -> self::group_commit_observations::Us017GroupCommitObservations {
+        self::group_commit_observations::observations()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1576,7 +1584,7 @@ impl StorageEngine for PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     fn us036_test_register_publish_slot(
         &self,
-    ) -> Result<self::engine_fatal_test_probe::Us036PublishSlot> {
+    ) -> Result<self::engine_fatal_harness::Us036PublishSlot> {
         self.us036_test_register_publish_slot()
     }
 
@@ -1585,7 +1593,7 @@ impl StorageEngine for PagedEngine {
         &self,
         ns_id: i64,
         timeout_ms: u64,
-    ) -> Result<self::engine_fatal_test_probe::Us036WriterTicket> {
+    ) -> Result<self::engine_fatal_harness::Us036WriterTicket> {
         self.us036_test_admit_writer(ns_id, timeout_ms)
     }
 

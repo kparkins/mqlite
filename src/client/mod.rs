@@ -32,18 +32,20 @@ pub mod collection;
 /// Lightweight database-namespace handle (returned by `Client::database`).
 pub mod database;
 
-#[cfg(any(test, feature = "test-hooks"))]
-mod crash_cut_test_probe;
 mod crud;
 mod handle;
-mod inner;
-mod open;
-mod path;
 /// Test-only `impl Client` accessors — `__`-prefixed, `#[doc(hidden)]`,
 /// and strictly NOT part of the public API. Isolated here so the
 /// boundary between production code and test scaffolding is obvious.
 #[cfg(any(test, feature = "test-hooks"))]
-mod test_accessors;
+#[path = "tests/hidden_accessors.rs"]
+mod hidden_accessors;
+mod inner;
+mod open;
+mod path;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "tests/write_crash_cut_hook.rs"]
+mod write_crash_cut_hook;
 
 #[cfg(test)]
 mod tests;
@@ -53,7 +55,7 @@ pub use collection::{
 };
 pub use database::Database;
 pub use handle::Client;
-pub(crate) use inner::ClientInner;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use test_accessors::{Phase8CatalogCommitKind, Phase8LogRecordKind, Phase8LogRecordSummary};
+pub use hidden_accessors::{Phase8CatalogCommitKind, Phase8LogRecordKind, Phase8LogRecordSummary};
+pub(crate) use inner::ClientInner;

@@ -140,9 +140,11 @@ pub(crate) struct BTreePathStep {
 mod chain;
 mod node;
 #[cfg(any(test, feature = "test-hooks"))]
-pub mod reader_crabbing_test_probe;
+#[path = "tests/range_scan_latch_scope.rs"]
+pub mod range_scan_latch_scope;
 #[cfg(any(test, feature = "test-hooks"))]
-pub mod reader_latch_scope_test_probe;
+#[path = "tests/reader_crabbing_observations.rs"]
+pub mod reader_crabbing_observations;
 pub(crate) mod reconcile;
 
 use chain::*;
@@ -673,37 +675,37 @@ mod scan;
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "../btree_tests.rs"]
+#[path = "tests/structural_operations.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "tests/history_probe_scan_tests.rs"]
-mod history_probe_scan_tests;
+#[path = "tests/history_probe_scan.rs"]
+mod history_probe_scan;
 
 #[cfg(test)]
-#[path = "tests/delta_point_lookup_tests.rs"]
-mod delta_point_lookup_tests;
+#[path = "tests/delta_point_lookup.rs"]
+mod delta_point_lookup;
 
 #[cfg(test)]
-#[path = "tests/merged_range_scan_tests.rs"]
-mod merged_range_scan_tests;
+#[path = "tests/merged_range_scan.rs"]
+mod merged_range_scan;
 
 #[cfg(test)]
-#[path = "tests/folded_leaf_encoding_tests.rs"]
-mod folded_leaf_encoding_tests;
+#[path = "tests/folded_leaf_encoding.rs"]
+mod folded_leaf_encoding;
 
 #[cfg(test)]
-#[path = "tests/history_fallthrough_tests.rs"]
-mod history_fallthrough_tests;
+#[path = "tests/history_fallthrough.rs"]
+mod history_fallthrough;
 
 #[cfg(test)]
-#[path = "tests/split_delta_routing_tests.rs"]
-mod split_delta_routing_tests;
+#[path = "tests/split_delta_routing.rs"]
+mod split_delta_routing;
 
 #[cfg(test)]
-#[path = "tests/split_atomicity_tests.rs"]
-mod split_atomicity_tests;
+#[path = "tests/split_atomicity.rs"]
+mod split_atomicity;
 
 #[cfg(test)]
-#[path = "tests/leaf_cell_decode_tests.rs"]
-mod leaf_cell_decode_tests;
+#[path = "tests/leaf_cell_decode.rs"]
+mod leaf_cell_decode;

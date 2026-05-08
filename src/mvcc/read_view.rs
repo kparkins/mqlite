@@ -1189,10 +1189,10 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(not(loom))]
-#[path = "tests/read_view_pending_visibility_tests.rs"]
-mod read_view_pending_visibility_tests;
+#[path = "tests/read_view_pending_visibility.rs"]
+mod read_view_pending_visibility;
 
 #[cfg(test)]
 #[cfg(not(loom))]
-#[path = "tests/chain_snapshot_range_tests.rs"]
-mod chain_snapshot_range_tests;
+#[path = "tests/chain_snapshot_range.rs"]
+mod chain_snapshot_range;

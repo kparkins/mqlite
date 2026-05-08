@@ -2,8 +2,8 @@
 //!
 //! Phase 5 PRD guardrail: "Intrusive test code must live in a separate
 //! file from the production code it exercises." This module is `mod
-//! publish_sequencer_tests` reached from `publish_sequencer.rs` via
-//! `#[cfg(test)] #[path = "tests/publish_sequencer_tests.rs"]`.
+//! publish_sequencer` reached from `publish_sequencer.rs` via
+//! `#[cfg(test)] #[path = "tests/publish_sequencer.rs"]`.
 
 #![allow(
     clippy::unwrap_used,

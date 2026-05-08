@@ -170,7 +170,7 @@ pub use error::{Error, Result};
 pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::crash_cut_test_probe::{Phase0ProbeCut, Phase0ProbeReport};
+pub use storage::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
@@ -178,7 +178,7 @@ pub use storage::header::{read_durable_header_counters, DurableHeaderCounters};
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::paged_engine::test_accessors::{
+pub use storage::paged_engine::hidden_accessors::{
     arm_phase3_commit_failpoint, arm_phase8_checkpoint_failpoint, CreateIndexBuildHookGuard,
     Phase3CommitFailpoint, Phase3CommitFailpointGuard, Phase8BeforeReservationHookGuard,
     Phase8CheckpointFailpoint, Phase8CheckpointFailpointGuard, Us026PostRegisterFailpoint,
@@ -187,27 +187,27 @@ pub use storage::paged_engine::test_accessors::{
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::buffer_pool::page_latch_upgrade_test_probe::page_latch_upgrade_race_counts as __us019_page_latch_upgrade_race_counts;
+pub use storage::buffer_pool::page_latch_upgrade_race::page_latch_upgrade_race_counts as __us019_page_latch_upgrade_race_counts;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use journal::logical_replay_test_probe::{
+pub use journal::logical_replay_fixtures::{
     append_logical_replay_frames as __us018_append_logical_replay_frames, Us018LogicalReplayFrame,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use journal::append_sync_test_probe::Us039AppendSyncObservations;
+pub use journal::append_sync_observations::Us039AppendSyncObservations;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::paged_engine::group_commit_test_probe::{
+pub use storage::paged_engine::group_commit_observations::{
     Us017GroupCommitObservations, Us017GroupCommitPauseGuard,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::paged_engine::smo_classification_test_probe::{
+pub use storage::paged_engine::smo_classification_observations::{
     drain_events as __us010_drain_events,
     force_revalidation_failures as __us010_force_revalidation_failures,
     push_classification_override_names as __us010_push_classification_override_names,
@@ -216,13 +216,13 @@ pub use storage::paged_engine::smo_classification_test_probe::{
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::btree::reader_crabbing_test_probe::{
+pub use storage::btree::reader_crabbing_observations::{
     drain_events as __us025_drain_events, reset as __us025_reset_probe, Us025CrabbingEvent,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::btree::reader_latch_scope_test_probe::{
+pub use storage::btree::range_scan_latch_scope::{
     drain_latch_samples as __us016_drain_latch_samples,
     install_range_scan_iteration_pause as __us016_install_range_scan_iteration_pause,
     reset as __us016_reset_probe, Us016RangeScanPauseGuard, Us016ReadLatchSample,
@@ -230,14 +230,14 @@ pub use storage::btree::reader_latch_scope_test_probe::{
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::buffer_pool::page_latch_fairness_test_probe::{
+pub use storage::buffer_pool::page_latch_fairness_harness::{
     us020_upgrade_loser_backoff_progress, us020_writer_preference_bounds_reader_starvation,
     Us020UpgradeRaceProgress,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::paged_engine::publish_registry_test_probe::{
+pub use storage::paged_engine::publish_registry_harness::{
     Us020PublishSequencer, Us020PublishSlot, Us020WriterRegistry, Us020WriterTicket,
 };
 

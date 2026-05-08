@@ -140,9 +140,9 @@ pub(crate) fn classify_write(
     };
     let shape = classify_leaf_bytes(data.as_slice(), false, &[], &target)?;
     #[cfg(any(test, feature = "test-hooks"))]
-    super::smo_classification_test_probe::record_classification("shared", &shape);
+    super::smo_classification_observations::record_classification("shared", &shape);
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(shape) = super::smo_classification_test_probe::override_classification("shared") {
+    if let Some(shape) = super::smo_classification_observations::override_classification("shared") {
         return Ok(shape);
     }
     Ok(shape)
@@ -168,7 +168,7 @@ pub(crate) fn acquire_smo_latches<'pool>(
             return structural_contention();
         }
         #[cfg(any(test, feature = "test-hooks"))]
-        if super::smo_classification_test_probe::force_revalidation_failure_once() {
+        if super::smo_classification_observations::force_revalidation_failure_once() {
             return structural_contention();
         }
 
@@ -187,7 +187,7 @@ pub(crate) fn acquire_smo_latches<'pool>(
         drop(pages);
         reclassifications = reclassifications.saturating_add(1);
         #[cfg(any(test, feature = "test-hooks"))]
-        super::smo_classification_test_probe::record_reclassification(reclassifications);
+        super::smo_classification_observations::record_reclassification(reclassifications);
         if reclassifications >= shared.smo_classification_retry_cap {
             return structural_contention();
         }
@@ -242,9 +242,9 @@ fn classify_write_from_leaf(
     let shape = classify_leaf_bytes(data, is_root_leaf, path, target)?;
     #[cfg(any(test, feature = "test-hooks"))]
     {
-        super::smo_classification_test_probe::record_classification(phase, &shape);
+        super::smo_classification_observations::record_classification(phase, &shape);
         if let Some(override_shape) =
-            super::smo_classification_test_probe::override_classification(phase)
+            super::smo_classification_observations::override_classification(phase)
         {
             return Ok(override_shape);
         }
@@ -328,7 +328,7 @@ fn acquire_pages<'pool>(
     let mut pages = Vec::with_capacity(required_pages.len());
     for page_id in required_pages {
         #[cfg(any(test, feature = "test-hooks"))]
-        super::smo_classification_test_probe::record_exclusive_acquire(*page_id);
+        super::smo_classification_observations::record_exclusive_acquire(*page_id);
         pages.push(shared.handle.pool().pin_for_write(*page_id)?);
     }
     Ok(pages)
@@ -375,9 +375,9 @@ fn reclassify_exclusive(
             classify_leaf_bytes(data, plan.target.root_level == 0, &plan.path, &plan.target)?;
         #[cfg(any(test, feature = "test-hooks"))]
         {
-            super::smo_classification_test_probe::record_classification("exclusive", &shape);
+            super::smo_classification_observations::record_classification("exclusive", &shape);
             if let Some(override_shape) =
-                super::smo_classification_test_probe::override_classification("exclusive")
+                super::smo_classification_observations::override_classification("exclusive")
             {
                 shapes.push(override_shape);
                 continue;

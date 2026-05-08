@@ -617,5 +617,5 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "secondary_index_tests.rs"]
+#[path = "tests/secondary_index.rs"]
 mod tests;

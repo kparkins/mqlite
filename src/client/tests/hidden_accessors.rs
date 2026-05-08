@@ -688,7 +688,7 @@ impl Client {
     }
 
     // §10.8 #19 publish-pause hook is `#[cfg(test)]`-gated inside
-    // `src/storage/paged_engine/test_accessors.rs` (no `Arc<Barrier>`
+    // `src/storage/paged_engine/tests/hidden_accessors.rs` (no `Arc<Barrier>`
     // or atomic pointer in production builds). Its paired rendezvous
     // test therefore lives as a unit test, not an integration test —
     // see `src/storage/paged_engine/tests.rs::publish_happens_strictly_after_commit_txn`.
@@ -716,7 +716,7 @@ impl Client {
     #[doc(hidden)]
     pub fn __us036_register_publish_slot(
         &self,
-    ) -> crate::error::Result<crate::storage::paged_engine::engine_fatal_test_probe::Us036PublishSlot>
+    ) -> crate::error::Result<crate::storage::paged_engine::engine_fatal_harness::Us036PublishSlot>
     {
         self.inner.engine.us036_test_register_publish_slot()
     }
@@ -730,9 +730,8 @@ impl Client {
         &self,
         ns_id: i64,
         timeout_ms: u64,
-    ) -> crate::error::Result<
-        crate::storage::paged_engine::engine_fatal_test_probe::Us036WriterTicket,
-    > {
+    ) -> crate::error::Result<crate::storage::paged_engine::engine_fatal_harness::Us036WriterTicket>
+    {
         self.inner.engine.us036_test_admit_writer(ns_id, timeout_ms)
     }
 

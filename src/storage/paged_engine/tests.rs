@@ -1086,7 +1086,7 @@ fn consecutive_reads_each_within_scope() {
 /// barrier, then releases it and observes the new epoch.
 #[test]
 fn publish_happens_strictly_after_commit_txn() {
-    use super::test_accessors::install_publish_pause;
+    use super::hidden_accessors::install_publish_pause;
     use std::sync::Barrier;
 
     let (engine_raw, _io) = buffered_engine();
