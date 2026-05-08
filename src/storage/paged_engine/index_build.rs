@@ -20,13 +20,9 @@ use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
 use crate::storage::secondary_index::build_index_mvcc;
 use crate::storage::structural_page_batch::StructuralPageBatch;
 
-use super::catalog_ops::{
-    catalog_lock, new_store, new_structural_store, rebuild_and_publish_locked,
-    sync_catalog_root_structural,
-};
 use super::doc_helpers::now_millis;
 use super::index_maint::{CreateIndexReservation, ReserveOutcome};
-use super::publish::PublishDirty;
+use super::publish::{rebuild_and_publish, sync_catalog_root_structural, PublishDirty};
 use super::snapshot_ops::{open_snapshot_read_view, primary_history_probe};
 use super::PagedEngine;
 
@@ -64,7 +60,7 @@ impl PagedEngine {
         else {
             return;
         };
-        let mut cat = catalog_lock(&self.metadata_state);
+        let mut cat = self.metadata_state.catalog_lock();
         let Ok(Some(current)) = cat.get_index(ns, name) else {
             return;
         };
@@ -96,7 +92,7 @@ impl PagedEngine {
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
 
         {
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             if cat.get_collection(ns)?.is_some() {
                 if let Some(existing) = cat.get_index(ns, name)? {
                     if existing.state == IndexState::Ready {
@@ -112,7 +108,7 @@ impl PagedEngine {
         let mut reservation = None;
 
         let ns_id_to_drain = {
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             cat.get_collection(ns)?.map(|collection| collection.id)
         };
         let ddl_guard = if let Some(ns_id) = ns_id_to_drain {
@@ -139,16 +135,16 @@ impl PagedEngine {
         let mut batch = StructuralPageBatch::new(&self.shared.handle);
 
         let body = (|| {
-            let mut cat = catalog_lock(&self.metadata_state);
+            let mut cat = self.metadata_state.catalog_lock();
             if cat.get_collection(ns)?.is_none() {
                 // Allocate a durable namespace id.
                 let ns_id = cat.allocate_namespace_id();
                 let data_root = cat.create_collection(ns, ns_id, bson::doc! {}, now_millis())?;
                 drop(cat);
                 sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
-                let data_store = new_structural_store(&self.shared, &mut batch);
+                let data_store = self.shared.new_structural_store(&mut batch);
                 BTree::create_at(data_store, data_root)?;
-                cat = catalog_lock(&self.metadata_state);
+                cat = self.metadata_state.catalog_lock();
                 cat.get_collection(ns)?.ok_or_else(|| {
                     Error::Internal(format!("collection '{}' missing after index bootstrap", ns))
                 })?;
@@ -185,7 +181,7 @@ impl PagedEngine {
 
             // Initialize the freshly-allocated leaf page so the index
             // tree is valid to open for writes during the build step.
-            let idx_store = new_structural_store(&self.shared, &mut batch);
+            let idx_store = self.shared.new_structural_store(&mut batch);
             BTree::create_at(idx_store, idx_root)?;
             Ok(())
         })();
@@ -219,7 +215,7 @@ impl PagedEngine {
             .shared
             .publish_sequencer
             .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish_locked(
+                rebuild_and_publish(
                     &shared,
                     &metadata_state,
                     publish_ts,
@@ -269,7 +265,7 @@ impl PagedEngine {
                 .metadata
                 .read()
                 .map_err(|_| Error::Internal("metadata lock poisoned".into()))?;
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             let idx_entry = cat.get_index(ns, name)?.ok_or_else(|| {
                 Error::Internal(format!(
                     "index '{}' on '{}' disappeared before build phase",
@@ -296,7 +292,7 @@ impl PagedEngine {
                 .metadata
                 .read()
                 .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             let collection = cat.get_collection(ns)?.ok_or_else(stale_target)?;
             if collection.id != data_entry.id {
                 return Err(stale_target());
@@ -317,7 +313,7 @@ impl PagedEngine {
             // The data tree is read-only during index build — we use a
             // plain BufferPoolPageStore (no structural batch) so the
             // idx_store can hold the sole mutable batch borrow simultaneously.
-            let data_store = new_store(&self.shared);
+            let data_store = self.shared.new_btree_store();
             let data_tree = BTree::open(
                 data_store,
                 data_entry.data_root_page,
@@ -327,7 +323,7 @@ impl PagedEngine {
             let read_view = open_snapshot_read_view(&self.shared, epoch);
             let primary_history = primary_history_probe(&self.shared, data_entry.id);
             let (root_page, root_level, any_multikey) = {
-                let idx_store = new_structural_store(&self.shared, &mut batch);
+                let idx_store = self.shared.new_structural_store(&mut batch);
                 let mut idx_tree = if rebuild_derived_pages {
                     BTree::create(idx_store)?
                 } else {
@@ -343,7 +339,7 @@ impl PagedEngine {
                 (idx_tree.root_page, idx_tree.root_level, any_multikey)
             };
             if rebuild_derived_pages {
-                let old_store = new_structural_store(&self.shared, &mut batch);
+                let old_store = self.shared.new_structural_store(&mut batch);
                 BTree::open(old_store, idx_entry.root_page, idx_entry.root_level)
                     .free_all_pages()?;
             }
@@ -369,7 +365,7 @@ impl PagedEngine {
                     .metadata
                     .read()
                     .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-                let mut cat = catalog_lock(&self.metadata_state);
+                let mut cat = self.metadata_state.catalog_lock();
                 let collection = cat.get_collection(ns)?.ok_or_else(stale_target)?;
                 if collection.id != data_entry.id {
                     return Err(stale_target());
@@ -460,7 +456,7 @@ impl PagedEngine {
             .write()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
         {
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             let collection = cat
                 .get_collection(ns)?
                 .ok_or_else(|| Error::CollectionNotFound {
@@ -481,7 +477,7 @@ impl PagedEngine {
             .close_and_drain_guard(target.ns_id, self.busy_timeout)?;
 
         {
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             let collection = cat
                 .get_collection(ns)?
                 .ok_or_else(|| Error::CollectionNotFound {
@@ -511,7 +507,7 @@ impl PagedEngine {
 
         let body = (|| -> Result<()> {
             {
-                let mut cat = catalog_lock(&self.metadata_state);
+                let mut cat = self.metadata_state.catalog_lock();
                 let collection =
                     cat.get_collection(ns)?
                         .ok_or_else(|| Error::CollectionNotFound {
@@ -562,7 +558,7 @@ impl PagedEngine {
             .shared
             .publish_sequencer
             .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish_locked(
+                rebuild_and_publish(
                     &shared,
                     &metadata_state,
                     publish_ts,
@@ -596,7 +592,7 @@ impl PagedEngine {
                 .metadata
                 .read()
                 .map_err(|_| Error::Internal("metadata lock poisoned".into()))?;
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             let mut builds = Vec::new();
             for coll in cat.list_collections()? {
                 for idx in cat.list_indexes(&coll.name)? {
@@ -630,7 +626,7 @@ impl PagedEngine {
         index: &IndexEntry,
     ) -> Result<()> {
         let mut tree = BTree::open(
-            new_structural_store(&self.shared, batch),
+            self.shared.new_structural_store(batch),
             index.root_page,
             index.root_level,
         );
@@ -645,7 +641,7 @@ impl PagedEngine {
                     .pin_for_write_sized(*page_id, *size)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut store = new_structural_store(&self.shared, batch);
+        let mut store = self.shared.new_structural_store(batch);
         for (page_id, size) in pages {
             match size {
                 PageSize::Small4k => store.free_internal(page_id)?,
@@ -681,7 +677,7 @@ impl PagedEngine {
             .write()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
         {
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             let Some(collection) = cat.get_collection(ns)? else {
                 return Err(Error::CollectionNotFound {
                     name: ns.to_owned(),
@@ -710,7 +706,7 @@ impl PagedEngine {
             .close_and_drain_guard(target.ns_id, self.busy_timeout)?;
 
         let target_index = {
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             let Some(collection) = cat.get_collection(ns)? else {
                 return Err(Error::CollectionNotFound {
                     name: ns.to_owned(),
@@ -750,7 +746,7 @@ impl PagedEngine {
         let body = (|| -> Result<()> {
             self.free_index_pages_exclusive(&mut batch, &target_index)?;
             {
-                let mut cat = catalog_lock(&self.metadata_state);
+                let mut cat = self.metadata_state.catalog_lock();
                 let removed = cat.drop_index(ns, name)?;
                 if !removed {
                     return Ok(());
@@ -795,7 +791,7 @@ impl PagedEngine {
             .shared
             .publish_sequencer
             .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish_locked(
+                rebuild_and_publish(
                     &shared,
                     &metadata_state,
                     publish_ts,

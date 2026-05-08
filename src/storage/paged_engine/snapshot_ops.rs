@@ -27,7 +27,7 @@ use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedEpoch, Published
 use crate::storage::structural_page_batch::StructuralPageBatch;
 
 use super::btree_ops::btree_collscan;
-use super::catalog_ops::rebuild_and_publish_locked;
+use super::publish::rebuild_and_publish;
 use super::doc_helpers::{apply_projection_to_doc, compare_docs};
 use super::index_maint::{
     index_bounds_free, index_entry_id_free, materialize_primary_deltas_for_checkpoint,
@@ -408,7 +408,7 @@ fn checkpoint_after_reconcile_plan(
                 return Err(err);
             }
         };
-    let mut base_store = super::catalog_ops::new_store(&engine.shared);
+    let mut base_store = engine.shared.new_btree_store();
     batch.commit_lsn_fenced(
         &mut base_store,
         &engine.shared.handle,
@@ -447,11 +447,11 @@ fn checkpoint_after_reconcile_plan(
             .next_catalog_gen
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             + 1;
-        rebuild_and_publish_locked(&engine.shared, md, publish_ts, dirty, Some(reserved_gen))?;
+        rebuild_and_publish(&engine.shared, md, publish_ts, dirty, Some(reserved_gen))?;
     }
 
     let (root_page, root_level) = {
-        let cat = super::catalog_ops::catalog_lock(md);
+        let cat = md.catalog_lock();
         (cat.root_page(), cat.root_level())
     };
     engine.shared.handle.allocator().update_header(|h| {

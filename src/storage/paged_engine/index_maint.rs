@@ -20,11 +20,7 @@ use crate::storage::secondary_index::{
 };
 use crate::storage::structural_page_batch::StructuralPageBatch;
 
-use super::catalog_ops::{
-    catalog_lock, new_store, new_structural_store, rebuild_and_publish_locked,
-    sync_catalog_root_structural,
-};
-use super::publish::PublishDirty;
+use super::publish::{rebuild_and_publish, sync_catalog_root_structural, PublishDirty};
 use super::smo_latch::{acquire_smo_latches, SmoWriteOp, SmoWriteTarget};
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
@@ -116,9 +112,9 @@ pub(super) fn maintain_secondary_on_insert(
     vis: &WriteVisibility<'_>,
     txn: &mut WriteTxn,
 ) -> Result<()> {
-    let entries = catalog_lock(md).list_indexes(ns)?;
+    let entries = md.catalog_lock().list_indexes(ns)?;
     for entry in entries {
-        let store = new_store(shared);
+        let store = shared.new_btree_store();
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
         let history_probe = vis.secondary_history_probe(entry.id);
         let history = Some(&history_probe as &dyn HistoryProbe);
@@ -151,7 +147,7 @@ pub(super) fn maintain_secondary_on_delete(
     doc_id: &Bson,
     txn: &mut WriteTxn,
 ) -> Result<()> {
-    let entries = catalog_lock(md).list_indexes(ns)?;
+    let entries = md.catalog_lock().list_indexes(ns)?;
     for entry in entries {
         update_index_on_delete(doc, doc_id, &entry, txn)?;
     }
@@ -174,9 +170,9 @@ pub(super) fn maintain_secondary_on_update(
     vis: &WriteVisibility<'_>,
     txn: &mut WriteTxn,
 ) -> Result<()> {
-    let entries = catalog_lock(md).list_indexes(ns)?;
+    let entries = md.catalog_lock().list_indexes(ns)?;
     for entry in entries {
-        let store = new_store(shared);
+        let store = shared.new_btree_store();
         let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
         let history_probe = vis.secondary_history_probe(entry.id);
         let history = Some(&history_probe as &dyn HistoryProbe);
@@ -225,7 +221,7 @@ fn sync_index_entry_metadata(
     if multikey_changed {
         updated.multikey = true;
     }
-    catalog_lock(md).update_index(&updated)?;
+    md.catalog_lock().update_index(&updated)?;
 
     txn.publish_dirty.mark_header();
     if root_changed && matches!(orig.state, IndexState::Ready) {
@@ -369,7 +365,7 @@ pub(super) fn install_pending_sec_index(
 
     let mut entry_by_id: StdHashMap<i64, IndexEntry> = StdHashMap::new();
     {
-        let cat = catalog_lock(md);
+        let cat = md.catalog_lock();
         let collections = cat.list_collections()?;
         for coll in &collections {
             for entry in cat.list_indexes(&coll.name)? {
@@ -509,7 +505,7 @@ pub(super) fn install_pending_primary(
 
     let mut targets = Vec::with_capacity(writes.len());
     for write in &writes {
-        let coll = match catalog_lock(md).get_collection(&write.ns)? {
+        let coll = match md.catalog_lock().get_collection(&write.ns)? {
             Some(c) => c,
             None => continue,
         };
@@ -527,7 +523,7 @@ pub(super) fn install_pending_primary(
 
     let mut target_idx = 0usize;
     for write in writes {
-        let coll = match catalog_lock(md).get_collection(&write.ns)? {
+        let coll = match md.catalog_lock().get_collection(&write.ns)? {
             Some(c) => c,
             None => continue,
         };
@@ -626,7 +622,7 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
     batch: &mut StructuralPageBatch,
 ) -> Result<(bool, HashSet<TreeIdent>, bool)> {
     let entries = {
-        let cat = catalog_lock(md);
+        let cat = md.catalog_lock();
         let collections = cat.list_collections()?;
         let mut entries = Vec::new();
         for coll in &collections {
@@ -660,7 +656,7 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
             collection_id,
             kind: TreeKind::Secondary { index_id: entry.id },
         };
-        let read_tree = BTree::open(new_store(shared), entry.root_page, entry.root_level);
+        let read_tree = BTree::open(shared.new_btree_store(), entry.root_page, entry.root_level);
         let deltas = read_tree.visible_delta_entries(&view)?;
         if deltas.is_empty() {
             if shared.dirty_leaves.contains_key(&ident) {
@@ -671,7 +667,7 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
         materialized_trees.insert(ident);
 
         let mut tree = BTree::open(
-            new_structural_store(shared, batch),
+            shared.new_structural_store(batch),
             entry.root_page,
             entry.root_level,
         );
@@ -686,7 +682,7 @@ pub(super) fn materialize_ready_secondary_deltas_for_checkpoint(
             let mut updated = entry;
             updated.root_page = new_root;
             updated.root_level = new_level;
-            if !catalog_lock(md).update_index(&updated)? {
+            if !md.catalog_lock().update_index(&updated)? {
                 return Err(Error::Internal(
                     "checkpoint secondary materialization lost index metadata".into(),
                 ));
@@ -718,7 +714,7 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
     batch: &mut StructuralPageBatch,
 ) -> Result<(bool, HashSet<TreeIdent>, bool)> {
     let collections = {
-        let cat = catalog_lock(md);
+        let cat = md.catalog_lock();
         cat.list_collections()?
     };
     if collections.is_empty() {
@@ -744,7 +740,7 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
             continue;
         }
 
-        let read_tree = BTree::open(new_store(shared), coll.data_root_page, coll.data_root_level);
+        let read_tree = BTree::open(shared.new_btree_store(), coll.data_root_page, coll.data_root_level);
         let deltas = read_tree.visible_delta_entries(&view)?;
         if deltas.is_empty() {
             requires_logical_tail = true;
@@ -753,7 +749,7 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
         materialized_trees.insert(ident);
 
         let mut tree = BTree::open(
-            new_structural_store(shared, batch),
+            shared.new_structural_store(batch),
             coll.data_root_page,
             coll.data_root_level,
         );
@@ -768,7 +764,7 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
             let mut updated = coll;
             updated.data_root_page = new_root;
             updated.data_root_level = new_level;
-            if !catalog_lock(md).update_collection(&updated)? {
+            if !md.catalog_lock().update_collection(&updated)? {
                 return Err(Error::Internal(
                     "checkpoint primary materialization lost collection metadata".into(),
                 ));
@@ -911,7 +907,7 @@ pub(super) fn drop_index(
         .write()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
     let (ns_id, target_index) = {
-        let cat = catalog_lock(&engine.metadata_state);
+        let cat = engine.metadata_state.catalog_lock();
         let collection = cat
             .get_collection(ns)?
             .ok_or_else(|| Error::CollectionNotFound {
@@ -943,7 +939,7 @@ pub(super) fn drop_index(
     let body = (|| -> Result<()> {
         engine.free_index_pages_exclusive(&mut batch, &target_index)?;
         {
-            let mut cat = catalog_lock(&engine.metadata_state);
+            let mut cat = engine.metadata_state.catalog_lock();
             let collection = cat
                 .get_collection(ns)?
                 .ok_or_else(|| Error::CollectionNotFound {
@@ -1008,7 +1004,7 @@ pub(super) fn drop_index(
         .shared
         .publish_sequencer
         .mark_ready(slot, move |publish_ts| {
-            rebuild_and_publish_locked(
+            rebuild_and_publish(
                 &shared,
                 &metadata_state,
                 publish_ts,

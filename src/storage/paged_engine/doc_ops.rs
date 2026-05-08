@@ -18,7 +18,6 @@ use crate::update::{apply_update, is_operator_update, upsert_base_from_filter};
 use crate::validation::validate_document;
 
 use super::btree_ops::prepare_insert_document;
-use super::catalog_ops::{catalog_lock, new_store};
 use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
     maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
@@ -67,11 +66,11 @@ pub(super) fn stage_insert_in_write_txn(
     mut doc: Document,
 ) -> Result<Bson> {
     let ns_arc = Ns::from(ns);
-    let entry = catalog_lock(md)
+    let entry = md.catalog_lock()
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-write", ns)))?;
     let tree = BTree::open(
-        new_store(shared),
+        shared.new_btree_store(),
         entry.data_root_page,
         entry.data_root_level,
     );
@@ -190,7 +189,7 @@ pub(super) fn update_documents(
                 maintain_secondary_on_update(
                     shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn,
                 )?;
-                if let Some(entry) = catalog_lock(md).get_collection(ns)? {
+                if let Some(entry) = md.catalog_lock().get_collection(ns)? {
                     txn.stage_primary_update(
                         entry.id,
                         ns_arc.clone(),
@@ -251,7 +250,7 @@ pub(super) fn delete_documents(
         for (key, doc, expected_head) in &pairs_to_delete {
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             maintain_secondary_on_delete(md, ns, doc, &doc_id, txn)?;
-            if let Some(entry) = catalog_lock(md).get_collection(ns)? {
+            if let Some(entry) = md.catalog_lock().get_collection(ns)? {
                 txn.stage_primary_delete(entry.id, ns_arc.clone(), key.clone(), *expected_head);
             }
         }
@@ -341,7 +340,7 @@ pub(super) fn find_one_and_update(
     let ns_arc = Ns::from(ns);
     engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         maintain_secondary_on_update(shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn)?;
-        if let Some(entry) = catalog_lock(md).get_collection(ns)? {
+        if let Some(entry) = md.catalog_lock().get_collection(ns)? {
             txn.stage_primary_update(entry.id, ns_arc.clone(), key, new_bytes, expected_head);
         }
         Ok(())
@@ -394,7 +393,7 @@ pub(super) fn find_one_and_delete(
     let ns_arc = Ns::from(ns);
     engine.run_write_commit_envelope(ns, None, |_shared, md, txn, _vis| {
         maintain_secondary_on_delete(md, ns, &doc, &doc_id, txn)?;
-        if let Some(entry) = catalog_lock(md).get_collection(ns)? {
+        if let Some(entry) = md.catalog_lock().get_collection(ns)? {
             txn.stage_primary_delete(entry.id, ns_arc.clone(), key, expected_head);
         }
         Ok(())
@@ -469,7 +468,7 @@ pub(super) fn find_one_and_replace(
             vis,
             txn,
         )?;
-        if let Some(entry) = catalog_lock(md).get_collection(ns)? {
+        if let Some(entry) = md.catalog_lock().get_collection(ns)? {
             txn.stage_primary_update(entry.id, ns_arc.clone(), old_key, new_bytes, expected_head);
         }
         Ok(())

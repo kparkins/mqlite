@@ -18,8 +18,9 @@ use crate::storage::catalog::Catalog;
 use crate::storage::root_snapshot::{
     NamespaceSnapshot, PublishedCatalog, PublishedEpoch, PublishedIndex,
 };
+use crate::storage::structural_page_batch::StructuralPageBatch;
 
-use super::state::SharedState;
+use super::state::{MetadataState, SharedState};
 
 // ---------------------------------------------------------------------------
 // PublishDirty
@@ -212,6 +213,61 @@ pub(crate) fn publish_commit(
         crate::mvcc::metrics::record_root_neutral_commit();
     }
     Ok(new_epoch)
+}
+
+// ---------------------------------------------------------------------------
+// Thin wrappers used by mutation sites
+// ---------------------------------------------------------------------------
+
+/// Take the CRUD / DDL catalog lock, invoke `publish_commit` with the
+/// threaded `PublishDirty`, and record the legacy published-snapshot rebuild
+/// counter when a fresh `Arc<PublishedCatalog>` was actually built.
+///
+/// `reserved_catalog_gen` (Phase 5 §10.17.1, US-006):
+///   - DDL callers pass `Some(reserved)` where `reserved` was returned
+///     by `SharedState.next_catalog_gen.fetch_add(1, AcqRel) + 1` under
+///     `metadata.write()` BEFORE this publish. The published epoch's
+///     `catalog_generation` is stamped with that exact reservation.
+///   - CRUD callers pass `None`. The published epoch's
+///     `catalog_generation` inherits the prior published value, never
+///     advancing through a CRUD publish (§10.21 CV-5).
+pub(super) fn rebuild_and_publish(
+    shared: &SharedState,
+    md: &MetadataState,
+    publish_ts: crate::mvcc::timestamp::Ts,
+    dirty: PublishDirty,
+    reserved_catalog_gen: Option<u64>,
+) -> Result<()> {
+    let cat = md.catalog_lock();
+    publish_commit(shared, &cat, publish_ts, dirty, reserved_catalog_gen)?;
+    if dirty.published_catalog_dirty {
+        crate::mvcc::metrics::record_published_snapshot_rebuild();
+    }
+    Ok(())
+}
+
+/// Update catalog-root header fields through the structural header owner.
+pub(super) fn sync_catalog_root_structural(
+    shared: &SharedState,
+    md: &MetadataState,
+    batch: &mut StructuralPageBatch,
+) -> Result<()> {
+    let (root_page, root_level, next_namespace_id, next_index_id) = {
+        let cat = md.catalog_lock();
+        (
+            cat.root_page(),
+            cat.root_level(),
+            cat.next_namespace_id() as u64,
+            cat.next_index_id() as u64,
+        )
+    };
+    batch.update_header(&shared.handle, |header| {
+        header.catalog_root_page = root_page;
+        header.catalog_root_level = root_level;
+        header.catalog_root_backup = root_page;
+        header.next_namespace_id = next_namespace_id;
+        header.next_index_id = next_index_id;
+    })
 }
 
 // ---------------------------------------------------------------------------

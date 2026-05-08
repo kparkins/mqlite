@@ -12,7 +12,7 @@ use crate::mvcc::transaction::WriteTxn;
 use crate::options::FindOptions;
 use crate::storage::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
 
-use super::catalog_ops::{catalog_lock, rebuild_and_publish_locked};
+use super::publish::rebuild_and_publish;
 use super::doc_ops;
 use super::index_maint::{
     flip_pending_to_committed_for, install_pending_primary, install_pending_sec_index,
@@ -46,7 +46,7 @@ impl PagedEngine {
             .metadata
             .read()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        if catalog_lock(&self.metadata_state)
+        if self.metadata_state.catalog_lock()
             .get_collection(ns)?
             .is_none()
         {
@@ -191,7 +191,7 @@ impl PagedEngine {
         self.shared
             .publish_sequencer
             .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish_locked(&shared, &metadata_state, publish_ts, dirty, None)
+                rebuild_and_publish(&shared, &metadata_state, publish_ts, dirty, None)
             })?;
         report.publish_ts = Some((commit_ts.physical_ms, commit_ts.logical));
         report.post_publish_visible = Some(self.crash_cut_probe_visible(ns, &inserted_id)?);

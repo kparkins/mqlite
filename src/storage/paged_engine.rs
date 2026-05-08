@@ -28,7 +28,6 @@
 //! [`select_plan`]: crate::query::planner::select_plan
 
 mod btree_ops;
-mod catalog_ops;
 mod doc_helpers;
 mod doc_ops;
 /// Test-only engine-fatal probe — engine-fatal poison + sequencer + writer
@@ -159,10 +158,7 @@ use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::structural_page_batch::StructuralPageBatch;
 
-use self::catalog_ops::{
-    catalog_lock, new_store, new_structural_store, rebuild_and_publish_locked,
-    sync_catalog_root_structural,
-};
+use self::publish::{rebuild_and_publish, sync_catalog_root_structural};
 use self::doc_helpers::now_millis;
 use self::index_maint::{
     flip_pending_to_aborted_for, flip_pending_to_committed_for, install_pending_primary,
@@ -358,7 +354,7 @@ impl PagedEngine {
         let reserved = self.shared.handle.reserve_log_record(draft)?;
         let commit_end_lsn = reserved.end_lsn();
 
-        let mut base_store = new_store(&self.shared);
+        let mut base_store = self.shared.new_btree_store();
         if let Err(error) =
             batch.commit_lsn_fenced(&mut base_store, &self.shared.handle, commit_end_lsn)
         {
@@ -399,7 +395,7 @@ impl PagedEngine {
     ) -> Result<(Vec<u8>, Vec<u32>)> {
         let header = self.shared.handle.allocator().with_header(Clone::clone)?;
         let mut catalog_page_ids: BTreeSet<PageId> = {
-            let mut cat = catalog_lock(&self.metadata_state);
+            let mut cat = self.metadata_state.catalog_lock();
             cat.collect_pages_by_size()?
                 .into_iter()
                 .map(|(page, _size)| PageId(page))
@@ -493,7 +489,7 @@ impl PagedEngine {
         md: &MetadataState,
         ns: &str,
     ) -> Result<Option<NamespaceCatalogIdentity>> {
-        let cat = catalog_lock(md);
+        let cat = md.catalog_lock();
         let Some(collection) = cat.get_collection(ns)? else {
             return Ok(None);
         };
@@ -530,7 +526,7 @@ impl PagedEngine {
         // name receives a fresh `CollectionEntry.id`.
         self.run_namespace_create_ddl(|shared, md, batch| {
             let data_root = {
-                let mut cat = catalog_lock(md);
+                let mut cat = md.catalog_lock();
                 if let Some(entry) = cat.get_collection(ns)? {
                     return Ok(entry.id);
                 }
@@ -541,7 +537,7 @@ impl PagedEngine {
                 (id, data_root)
             };
             sync_catalog_root_structural(shared, md, batch)?;
-            let _ = BTree::create_at(new_structural_store(shared, batch), data_root.1)?;
+            let _ = BTree::create_at(shared.new_structural_store(batch), data_root.1)?;
             Ok(data_root.0)
         })
     }
@@ -563,7 +559,7 @@ impl PagedEngine {
             .metadata
             .read()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        let ns_missing = catalog_lock(&self.metadata_state)
+        let ns_missing = self.metadata_state.catalog_lock()
             .get_collection(ns)?
             .is_none();
         if ns_missing {
@@ -880,7 +876,7 @@ impl PagedEngine {
                         .mark_ready(slot, move |publish_ts| {
                             #[cfg(any(test, feature = "test-hooks"))]
                             self::hidden_accessors::us009_record_publish_ready(&shared);
-                            rebuild_and_publish_locked(
+                            rebuild_and_publish(
                                 &shared,
                                 &metadata_state,
                                 publish_ts,
@@ -1062,7 +1058,7 @@ impl StorageEngine for PagedEngine {
         self.shared.check_engine_not_poisoned()?;
         let result = self.run_namespace_create_ddl(|shared, md, batch| {
             let data_root = {
-                let mut cat = catalog_lock(md);
+                let mut cat = md.catalog_lock();
                 if cat.get_collection(ns)?.is_some() {
                     return Err(Error::DuplicateKey {
                         detail: format!("collection '{ns}' already exists"),
@@ -1074,7 +1070,7 @@ impl StorageEngine for PagedEngine {
                 cat.create_collection(ns, id, bson::doc! {}, now_millis())?
             };
             sync_catalog_root_structural(shared, md, batch)?;
-            let store = new_structural_store(shared, batch);
+            let store = shared.new_structural_store(batch);
             BTree::create_at(store, data_root)?;
             Ok(())
         });
@@ -1097,7 +1093,7 @@ impl StorageEngine for PagedEngine {
             .write()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
         let Some(target_collection) = ({
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             cat.get_collection(ns)?
         }) else {
             return Ok(());
@@ -1106,7 +1102,7 @@ impl StorageEngine for PagedEngine {
         let data_root = target_collection.data_root_page;
         let data_level = target_collection.data_root_level;
         let index_roots: Vec<(u32, u8)> = {
-            let cat = catalog_lock(&self.metadata_state);
+            let cat = self.metadata_state.catalog_lock();
             cat.list_indexes(ns)?
                 .into_iter()
                 .map(|entry| (entry.root_page, entry.root_level))
@@ -1135,7 +1131,7 @@ impl StorageEngine for PagedEngine {
 
         let body = (|| -> Result<()> {
             {
-                let cat = catalog_lock(&self.metadata_state);
+                let cat = self.metadata_state.catalog_lock();
                 let collection =
                     cat.get_collection(ns)?
                         .ok_or_else(|| Error::CollectionNotFound {
@@ -1152,7 +1148,7 @@ impl StorageEngine for PagedEngine {
             }
 
             {
-                let mut cat = catalog_lock(&self.metadata_state);
+                let mut cat = self.metadata_state.catalog_lock();
                 let collection =
                     cat.get_collection(ns)?
                         .ok_or_else(|| Error::CollectionNotFound {
@@ -1202,7 +1198,7 @@ impl StorageEngine for PagedEngine {
             .shared
             .publish_sequencer
             .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish_locked(
+                rebuild_and_publish(
                     &shared,
                     &metadata_state,
                     publish_ts,
@@ -1626,7 +1622,7 @@ impl PagedEngine {
             .shared
             .publish_sequencer
             .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish_locked(
+                rebuild_and_publish(
                     &shared,
                     &metadata_state,
                     publish_ts,
@@ -1654,7 +1650,7 @@ impl PagedEngine {
         root_level: u8,
     ) -> Result<()> {
         let mut tree = BTree::open(
-            new_structural_store(&self.shared, batch),
+            self.shared.new_structural_store(batch),
             root_page,
             root_level,
         );
@@ -1669,7 +1665,7 @@ impl PagedEngine {
                     .pin_for_write_sized(*page_id, *size)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut store = new_structural_store(&self.shared, batch);
+        let mut store = self.shared.new_structural_store(batch);
         for (page_id, size) in pages {
             match size {
                 PageSize::Small4k => store.free_internal(page_id)?,

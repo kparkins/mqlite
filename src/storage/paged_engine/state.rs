@@ -24,8 +24,8 @@ use crate::storage::handle::BufferPoolHandle;
 use crate::storage::history_store::HistoryStore;
 use crate::storage::reconcile::driver::{DirtyReason, LeafState, TreeIdent};
 use crate::storage::root_snapshot::PublishedEpoch;
+use crate::storage::structural_page_batch::{StructuralBatchStore, StructuralPageBatch};
 
-use super::catalog_ops::catalog_lock;
 use super::publish::build_published_catalog;
 use super::publish_sequencer::PublishSequencer;
 use super::recovery_apply::{
@@ -394,6 +394,19 @@ impl SharedState {
         Ok(())
     }
 
+    /// Create a new [`BufferPoolPageStore`] backed by `self.handle`.
+    pub(super) fn new_btree_store(&self) -> BufferPoolPageStore {
+        BufferPoolPageStore::new(Arc::clone(&self.handle))
+    }
+
+    /// Create a structural writer-side page store borrowing the given batch.
+    pub(super) fn new_structural_store<'a>(
+        &self,
+        batch: &'a mut StructuralPageBatch,
+    ) -> StructuralBatchStore<'a> {
+        batch.store(self.new_btree_store())
+    }
+
     /// Poison the live engine after a post-durable unrecoverable
     /// failure. Preserves the first reason if called more than once;
     /// later attempts notify the sequencer but do not overwrite the
@@ -622,6 +635,14 @@ fn validate_frame_ordinals_dense(frame: &LogicalTxnFrame) -> Result<()> {
 }
 
 impl MetadataState {
+    #[allow(
+        clippy::expect_used,
+        reason = "catalog poisoning is an invariant breach; existing behavior is to panic"
+    )]
+    pub(super) fn catalog_lock(&self) -> std::sync::MutexGuard<'_, Catalog<BufferPoolPageStore>> {
+        self.catalog.lock().expect("catalog poisoned")
+    }
+
     /// Create the initial MetadataState + SharedState from an existing
     /// (or fresh) buffer pool handle.
     pub(super) fn new(
@@ -802,7 +823,7 @@ impl MetadataState {
         // already match; we still persist the history-store root if it
         // was zero and just freshly created.
         if catalog_root_page == 0 || history_root_page == 0 {
-            let cat = catalog_lock(&md);
+            let cat = md.catalog_lock();
             let root_page = cat.root_page();
             let root_level = cat.root_level();
             drop(cat);

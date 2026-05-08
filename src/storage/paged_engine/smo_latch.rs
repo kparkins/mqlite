@@ -10,7 +10,6 @@ use crate::storage::btree::{
 };
 use crate::storage::buffer_pool::LatchedPinnedPage;
 
-use super::catalog_ops::new_store;
 use super::state::SharedState;
 
 /// Shape of a staged write for Phase 5 SMO gating (§10.24).
@@ -197,7 +196,7 @@ fn plan_targets(shared: &SharedState, targets: &[SmoWriteTarget]) -> Result<Vec<
     let mut planned = Vec::with_capacity(targets.len());
     for target in targets {
         let path = {
-            let tree = BTree::open(new_store(shared), target.root_page, target.root_level);
+            let tree = BTree::open(shared.new_btree_store(), target.root_page, target.root_level);
             tree.path_to_leaf(&target.key)?
         };
         let leaf = path
@@ -321,7 +320,7 @@ fn acquire_pages<'pool>(
 fn paths_still_valid(shared: &SharedState, planned: &[PlannedWrite]) -> Result<bool> {
     for plan in planned {
         let tree = BTree::open(
-            new_store(shared),
+            shared.new_btree_store(),
             plan.target.root_page,
             plan.target.root_level,
         );

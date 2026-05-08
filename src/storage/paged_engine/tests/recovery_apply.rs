@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bson::Bson;
 
-use super::super::{catalog_ops, PagedEngine};
+use super::super::PagedEngine;
 use super::apply_parsed_logical_frames;
 use crate::client::Client;
 use crate::journal::log_file::{
@@ -56,7 +56,7 @@ fn buffered_engine() -> PagedEngine {
 
 fn collection(engine: &PagedEngine) -> CollectionEntry {
     let _md = engine.metadata.read().expect("metadata read");
-    catalog_ops::catalog_lock(&engine.metadata_state)
+    engine.metadata_state.catalog_lock()
         .get_collection(NS)
         .expect("read catalog")
         .expect("collection exists")

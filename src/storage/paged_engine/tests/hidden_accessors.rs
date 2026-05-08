@@ -26,7 +26,6 @@ use std::sync::{
 use super::state::SharedState;
 use super::PagedEngine;
 #[cfg(any(test, feature = "test-hooks"))]
-use super::{catalog_ops::catalog_lock, catalog_ops::new_store};
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{index_maint::install_pending_sec_index, visibility::WriteVisibility};
 use crate::error::{Error, Result};
@@ -954,12 +953,12 @@ impl PagedEngine {
         ns: &str,
         id: &bson::Bson,
     ) -> Result<Vec<String>> {
-        let coll = catalog_lock(&self.metadata_state)
+        let coll = self.metadata_state.catalog_lock()
             .get_collection(ns)?
             .ok_or_else(|| Error::Internal(format!("namespace '{ns}' not found")))?;
         let key = encode_key(id);
         let tree = BTree::open(
-            new_store(&self.shared),
+            self.shared.new_btree_store(),
             coll.data_root_page,
             coll.data_root_level,
         );
@@ -979,13 +978,13 @@ impl PagedEngine {
         commit_ts: Ts,
         txn_id: u64,
     ) -> Result<()> {
-        let coll = catalog_lock(&self.metadata_state)
+        let coll = self.metadata_state.catalog_lock()
             .get_collection(ns)?
             .ok_or_else(|| Error::Internal(format!("namespace '{ns}' not found")))?;
         let id = doc.get("_id").cloned().unwrap_or(bson::Bson::Null);
         let key = encode_key(&id);
         let tree = BTree::open(
-            new_store(&self.shared),
+            self.shared.new_btree_store(),
             coll.data_root_page,
             coll.data_root_level,
         );
@@ -1021,7 +1020,7 @@ impl PagedEngine {
         doc: &bson::Document,
         id: &bson::Bson,
     ) -> Result<Vec<String>> {
-        let index = catalog_lock(&self.metadata_state)
+        let index = self.metadata_state.catalog_lock()
             .get_index(ns, index_name)?
             .ok_or_else(|| Error::Internal(format!("index '{index_name}' not found")))?;
         let (keys, _) = build_index_keys(doc, &index.key_pattern, id, index.sparse)?;
@@ -1029,7 +1028,7 @@ impl PagedEngine {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Internal("US-009 secondary probe got no index key".into()))?;
-        let tree = BTree::open(new_store(&self.shared), index.root_page, index.root_level);
+        let tree = BTree::open(self.shared.new_btree_store(), index.root_page, index.root_level);
         let leaf = tree.find_leaf(&key)?;
         self.shared
             .handle
@@ -1040,12 +1039,12 @@ impl PagedEngine {
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn test_us028_primary_leaf_ident(&self, ns: &str, id: &bson::Bson) -> Result<(TreeIdent, u32)> {
-        let coll = catalog_lock(&self.metadata_state)
+        let coll = self.metadata_state.catalog_lock()
             .get_collection(ns)?
             .ok_or_else(|| Error::Internal(format!("namespace '{ns}' not found")))?;
         let key = encode_key(id);
         let tree = BTree::open(
-            new_store(&self.shared),
+            self.shared.new_btree_store(),
             coll.data_root_page,
             coll.data_root_level,
         );
@@ -1255,7 +1254,7 @@ impl PagedEngine {
         email: &str,
         txn_id: u64,
     ) -> Result<()> {
-        let index = catalog_lock(&self.metadata_state)
+        let index = self.metadata_state.catalog_lock()
             .get_index(ns, index_name)?
             .ok_or_else(|| Error::Internal(format!("index '{index_name}' not found")))?;
         if !index.unique {

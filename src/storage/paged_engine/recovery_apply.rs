@@ -20,7 +20,6 @@ use crate::storage::handle::BufferPoolHandle;
 use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 use crate::storage::root_snapshot::PublishedEpoch;
 
-use super::catalog_ops::catalog_lock;
 use super::publish::build_published_catalog;
 use super::state::{MetadataState, SharedState};
 
@@ -33,7 +32,7 @@ pub(crate) fn apply_parsed_logical_frames(
     md: &MetadataState,
     parsed: &ParsedLogicalFrames,
 ) -> Result<()> {
-    let catalog = catalog_lock(md);
+    let catalog = md.catalog_lock();
     apply_parsed_logical_frames_locked(shared, &catalog, parsed)
 }
 
@@ -60,7 +59,7 @@ pub(crate) fn install_recovered_published_epoch(
     recovered_max_commit_ts: Option<Ts>,
 ) -> Result<()> {
     let visible_ts = recovered_max_commit_ts.unwrap_or_default();
-    let catalog = catalog_lock(md);
+    let catalog = md.catalog_lock();
     let epoch = Arc::new(PublishedEpoch {
         visible_ts,
         catalog: Arc::new(build_published_catalog(&catalog)?),

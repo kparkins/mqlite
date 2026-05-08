@@ -83,7 +83,7 @@ fn index_entry(engine: &PagedEngine, ns: &str) -> Result<IndexEntry> {
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    let entry = super::catalog_ops::catalog_lock(&engine.metadata_state)
+    let entry = engine.metadata_state.catalog_lock()
         .get_index(ns, EMAIL_INDEX)?
         .ok_or_else(|| Error::Internal("email index missing".into()))?;
     Ok(entry)
@@ -97,7 +97,7 @@ fn collection_entry(
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    let entry = super::catalog_ops::catalog_lock(&engine.metadata_state)
+    let entry = engine.metadata_state.catalog_lock()
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal("collection missing".into()))?;
     Ok(entry)
