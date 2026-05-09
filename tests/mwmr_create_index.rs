@@ -18,144 +18,214 @@
 )]
 
 use bson::doc;
+#[cfg(feature = "test-hooks")]
+use bson::Bson;
 use bson::Document;
 use mqlite::{Client, IndexModel};
+#[cfg(feature = "test-hooks")]
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
+#[cfg(feature = "test-hooks")]
+use std::time::Duration;
 use std::time::Instant;
+
+#[cfg(feature = "test-hooks")]
+const TEST_DB: &str = "d";
+#[cfg(feature = "test-hooks")]
+const BIG_COLL: &str = "big";
+#[cfg(feature = "test-hooks")]
+const BIG_NS: &str = "d.big";
+#[cfg(feature = "test-hooks")]
+const DOCS_COLL: &str = "docs";
+#[cfg(feature = "test-hooks")]
+const DOCS_NS: &str = "d.docs";
+#[cfg(feature = "test-hooks")]
+const OTHER_COLL: &str = "other_concurrent";
+#[cfg(feature = "test-hooks")]
+const CATEGORY_INDEX: &str = "category_1";
+#[cfg(feature = "test-hooks")]
+const TAG_INDEX: &str = "tag_1";
+#[cfg(feature = "test-hooks")]
+const SETTLE_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(feature = "test-hooks")]
+const CATEGORY_SEED_DOCS: i32 = 2000;
+#[cfg(feature = "test-hooks")]
+const OTHER_WRITES: i32 = 200;
+#[cfg(feature = "test-hooks")]
+const INITIAL_DOCS: i32 = 500;
+#[cfg(feature = "test-hooks")]
+const FINAL_DOCS: i32 = 1000;
 
 /// Other-namespace writers must NOT be serialized behind `create_index`.
 ///
-/// Strategy: seed namespace A with enough docs that the index build takes
-/// measurable wall-clock time, then time N inserts on namespace B both
-/// serially (baseline) and concurrently with a `create_index` on A.
-/// If lanes work, the concurrent time is close to the baseline —
-/// definitely less than 2.5x.
+/// Strategy: pause namespace A's build scan after the Building publish, then
+/// prove namespace B writes finish before the build is released.
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+#[ignore = "requires test-hooks for deterministic create-index concurrency gate"]
+fn create_index_on_other_ns_does_not_block_writers() {}
+
+#[cfg(feature = "test-hooks")]
 #[test]
 fn create_index_on_other_ns_does_not_block_writers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ci.mqlite");
     let client = Client::open(&path).unwrap();
 
-    // Seed namespace A with a large-ish collection so the build takes
-    // measurable time.
-    let col_a = client.database("d").collection::<Document>("big");
-    for i in 0..2000i32 {
+    // Seed namespace A and bootstrap namespace B before the build starts.
+    let col_a = client.database(TEST_DB).collection::<Document>(BIG_COLL);
+    for i in 0..CATEGORY_SEED_DOCS {
         col_a
             .insert_one(&doc! { "_id": i, "name": format!("doc-{i}"), "category": i % 10 })
             .unwrap();
     }
+    client
+        .database(TEST_DB)
+        .collection::<Document>(OTHER_COLL)
+        .insert_one(&doc! { "_id": -1i32, "v": "seed" })
+        .unwrap();
 
-    // Note: no pre-create needed. Post-fix, Phase 2 of create_index
-    // holds only the target namespace's lane during the long scan —
-    // it does NOT hold metadata.read(). `bootstrap_namespace` (DDL)
-    // for a new namespace takes metadata.write() and is free to run
-    // concurrently with an in-flight create_index build on another
-    // namespace.
-
-    // Baseline: insert 200 docs into namespace B serially (no concurrent
-    // build), measure duration.
-    let col_b_baseline = client
-        .database("d")
-        .collection::<Document>("other_baseline");
-    let t0 = Instant::now();
-    for i in 0..200i32 {
-        col_b_baseline
-            .insert_one(&doc! { "_id": i, "v": format!("baseline-{i}") })
-            .unwrap();
-    }
-    let baseline = t0.elapsed();
-
-    // Concurrent: spawn create_index on A, while inserting 200 docs into
-    // a distinct namespace B.
-    let barrier = Arc::new(Barrier::new(2));
-    let client_b = client.clone();
-    let bb = Arc::clone(&barrier);
-    let h_b = thread::spawn(move || {
-        bb.wait();
-        let col = client_b
-            .database("d")
-            .collection::<Document>("other_concurrent");
-        let t = Instant::now();
-        for i in 0..200i32 {
-            col.insert_one(&doc! { "_id": i, "v": format!("concurrent-{i}") })
-                .unwrap();
-        }
-        t.elapsed()
-    });
-
+    let mut build_hook = client.__install_create_index_build_hook(BIG_NS, CATEGORY_INDEX);
     let client_a = client.clone();
-    let ba = Arc::clone(&barrier);
     let h_a = thread::spawn(move || {
-        ba.wait();
-        let coll_a = client_a.database("d").collection::<Document>("big");
+        let coll_a = client_a.database(TEST_DB).collection::<Document>(BIG_COLL);
         coll_a
             .create_index(IndexModel::builder().keys(doc! { "category": 1 }).build())
             .unwrap();
     });
 
-    let elapsed_b = h_b.join().unwrap();
-    h_a.join().unwrap();
+    build_hook
+        .wait_until_entered()
+        .expect("create_index reached the build scan hook");
 
-    assert!(
-        elapsed_b.as_micros() < (baseline.as_micros() as f64 * 2.5) as u128,
-        "writer on namespace B was blocked by create_index on A: \
-         baseline={:?} concurrent_b={:?}",
-        baseline,
-        elapsed_b,
+    let (done_tx, done_rx) = mpsc::channel();
+    let client_b = client.clone();
+    let h_b = thread::spawn(move || {
+        let result = (|| -> mqlite::Result<()> {
+            let col = client_b
+                .database(TEST_DB)
+                .collection::<Document>(OTHER_COLL);
+            for i in 0..OTHER_WRITES {
+                col.insert_one(&doc! { "_id": i, "v": format!("concurrent-{i}") })?;
+            }
+            Ok(())
+        })();
+        let _ = done_tx.send(result);
+    });
+
+    match done_rx.recv_timeout(SETTLE_DEADLINE) {
+        Ok(result) => result.expect("writer on namespace B succeeds while build scan is paused"),
+        Err(err) => {
+            build_hook
+                .release()
+                .expect("build was waiting on release channel");
+            h_a.join().expect("create_index thread joined");
+            h_b.join().expect("writer thread joined");
+            panic!(
+                "writer on namespace B did not finish while create_index build on A was paused: {err}"
+            );
+        }
+    }
+    h_b.join().expect("writer thread joined");
+
+    build_hook
+        .release()
+        .expect("build was waiting on release channel");
+    h_a.join().expect("create_index thread joined");
+
+    let other_count = client
+        .database(TEST_DB)
+        .collection::<Document>(OTHER_COLL)
+        .count_documents(doc! {})
+        .unwrap();
+    assert_eq!(
+        other_count,
+        u64::try_from(OTHER_WRITES + 1).unwrap(),
+        "all namespace B writes should commit while namespace A build is paused"
     );
 
     // Sanity: the index was actually built and contains all docs on A.
     let count = client
-        .database("d")
-        .collection::<Document>("big")
+        .database(TEST_DB)
+        .collection::<Document>(BIG_COLL)
         .count_documents(doc! { "category": 5 })
         .unwrap();
-    assert_eq!(count, 200, "index should match all docs with category=5");
+    assert_eq!(
+        count,
+        u64::try_from(CATEGORY_SEED_DOCS / 10).unwrap(),
+        "index should match all docs with category=5"
+    );
 }
 
-/// Docs inserted DURING the build must still appear in the finished
-/// index — dual-writes from concurrent writers on the same ns must hit
-/// the Building index.
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+#[ignore = "requires test-hooks for deterministic create-index concurrency gate"]
+fn create_index_includes_concurrent_inserts() {}
+
+#[cfg(feature = "test-hooks")]
 #[test]
 fn create_index_includes_concurrent_inserts() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ci_dual.mqlite");
     let client = Client::open(&path).unwrap();
 
-    // Seed with 500 docs.
-    let col = client.database("d").collection::<Document>("docs");
-    for i in 0..500i32 {
+    let col = client.database(TEST_DB).collection::<Document>(DOCS_COLL);
+    for i in 0..INITIAL_DOCS {
         col.insert_one(&doc! { "_id": i, "tag": format!("t-{}", i % 5) })
             .unwrap();
     }
 
-    // Concurrent writer: inserts 500 more docs on the SAME namespace.
+    let mut build_hook = client.__install_create_index_build_hook(DOCS_NS, TAG_INDEX);
+    let build_client = client.clone();
+    let build = thread::spawn(move || {
+        build_client
+            .database(TEST_DB)
+            .collection::<Document>(DOCS_COLL)
+            .create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
+            .unwrap();
+    });
+
+    build_hook
+        .wait_until_entered()
+        .expect("create_index reached the build scan hook");
+
     let writer_client = client.clone();
     let writer = thread::spawn(move || {
-        let col = writer_client.database("d").collection::<Document>("docs");
-        for i in 500..1000i32 {
+        let col = writer_client
+            .database(TEST_DB)
+            .collection::<Document>(DOCS_COLL);
+        for i in INITIAL_DOCS..FINAL_DOCS {
             col.insert_one(&doc! { "_id": i, "tag": format!("t-{}", i % 5) })
                 .unwrap();
         }
     });
-
-    // Build the index. The build's namespace-lane phase serializes with
-    // the concurrent writer (same ns), so the writer waits for Phase 2
-    // to finish. Inserts that happen between Phase 1 (reserve) and
-    // Phase 2 (build), and between Phase 2 and Phase 3 (commit), must
-    // also be in the index — `maintain_secondary_on_insert` dual-writes
-    // to the Building entry.
-    let coll = client.database("d").collection::<Document>("docs");
-    coll.create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
-        .unwrap();
-
     writer.join().unwrap();
 
-    // All 1000 docs must be observable via the index.
-    let count = coll.count_documents(doc! { "tag": "t-0" }).unwrap();
+    let states = client
+        .__us009_secondary_chain_states(
+            DOCS_NS,
+            TAG_INDEX,
+            &doc! { "_id": INITIAL_DOCS, "tag": "t-0" },
+            &Bson::Int32(INITIAL_DOCS),
+        )
+        .expect("Building index secondary chain can be inspected");
+    let has_committed_building_entry = states.iter().any(|state| state == "Committed");
+
+    build_hook
+        .release()
+        .expect("build was waiting on release channel");
+    build.join().unwrap();
+
+    assert!(
+        has_committed_building_entry,
+        "writer must dual-write a committed entry into the Building index; states={states:?}"
+    );
+
+    let count = col.count_documents(doc! { "tag": "t-0" }).unwrap();
     assert_eq!(
-        count, 200,
+        count,
+        u64::try_from(FINAL_DOCS / 5).unwrap(),
         "all docs (including post-build inserts) must be indexed"
     );
 }

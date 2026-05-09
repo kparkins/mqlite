@@ -315,11 +315,12 @@ fn assert_us016_source_contract() {
     let read_leaf = std::fs::read_to_string(manifest_dir.join("src/storage/btree_store.rs"))
         .expect("read btree_store.rs");
     assert!(
-        read_leaf.contains("pin_for_read(page)")
-            && read_leaf.contains("latched.data_snapshot()")
-            && read_leaf.contains("latched.snapshot_chains(None)?")
-            && read_leaf.contains("drop(latched);")
-            && read_leaf.contains("LeafPageImage::shared(page_data)?"),
+        read_leaf.contains("fn snapshot_leaf")
+            && read_leaf.contains("p.data_snapshot()")
+            && read_leaf.contains("snap_chains(p)?")
+            && read_leaf.contains("LeafPageImage::shared(data)?")
+            && read_leaf.contains("pin_shared_for_read(page, PageSize::Large32k)?")
+            && read_leaf.contains("self.snapshot_leaf(&guard, |p| p.snapshot_chains(None))"),
         "BufferPoolPageStore::read_leaf must copy bytes, clone chain snapshots, then drop the shared latch"
     );
 

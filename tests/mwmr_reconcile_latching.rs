@@ -489,11 +489,13 @@ fn test_writer_latch_held_reconcile_waits() {
 fn test_reconcile_chain_mutation_requires_exclusive_latch() {
     let driver = source_file("src/storage/reconcile/driver.rs");
     assert!(
-        driver.contains("planned_pages.sort_unstable();"),
-        "reconcile_leaf must sort the planned page set before latching"
+        driver.contains("pages.sort_unstable();")
+            && driver
+                .contains("LeafPlanOutcome::MutationReady => mutation_ready_pages.push(page_id)",),
+        "checkpoint reconcile planning must sort mutation-ready page sets before latching"
     );
     assert!(
-        driver.contains("pin_leaf_set_for_reconcile"),
+        driver.contains("pin_leaves_for_reconcile(ident, &[page_id])"),
         "reconcile_leaf must acquire its planned page set through the \
          reconcile latch helper"
     );

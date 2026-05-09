@@ -524,13 +524,12 @@ fn test_us004_structural_callers_use_page_batch_owner() {
 fn test_us005_header_catalog_root_owner_replaces_retired_helpers() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let owner_path = project_root.join("src/storage/structural_page_batch.rs");
-    let catalog_ops_path = project_root.join("src/storage/paged_engine/catalog_ops.rs");
     let production_paths: Vec<PathBuf> = vec![
         owner_path.clone(),
-        catalog_ops_path.clone(),
         project_root.join("src/storage/paged_engine.rs"),
         project_root.join("src/storage/paged_engine/index_build.rs"),
         project_root.join("src/storage/paged_engine/index_maint.rs"),
+        project_root.join("src/storage/paged_engine/publish.rs"),
         project_root.join("src/storage/paged_engine/snapshot_ops.rs"),
     ];
 
@@ -547,17 +546,15 @@ fn test_us005_header_catalog_root_owner_replaces_retired_helpers() {
          StructuralPageBatch",
     );
 
-    let catalog_ops = std::fs::read_to_string(&catalog_ops_path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", catalog_ops_path.display()));
-    assert!(
-        !catalog_ops.contains("TxnOverlay") && !catalog_ops.contains("new_txn_store"),
-        "US-005 catalog helpers must not expose the retired header path",
-    );
-
     for path in production_paths {
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        for token in ["sync_catalog_root_overlay", "txn_update_header"] {
+        for token in [
+            "TxnOverlay",
+            "new_txn_store",
+            "sync_catalog_root_overlay",
+            "txn_update_header",
+        ] {
             assert!(
                 !source.contains(token),
                 "{} must not contain deleted US-005 helper `{token}`",
