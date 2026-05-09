@@ -25,8 +25,10 @@ use std::time::Duration;
 use bson::doc;
 use bson::Document;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use mqlite::{Client, DurabilityMode, IndexModel, OpenOptions};
+use mqlite::IndexModel;
 use tempfile::TempDir;
+
+mod common;
 
 const DOC_COUNT: usize = 10_000;
 const PAYLOAD_BYTES: usize = 64;
@@ -35,32 +37,12 @@ const INDEX_SPEC: &str = "category:1 non-unique";
 const INDEX_NAME: &str = "category_1";
 
 fn metadata() -> String {
-    let rustc = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned());
-
-    let cpu_count = num_cpus();
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    let durability = "Interval(100ms)";
-
     format!(
         "doc_count={DOC_COUNT} payload_class={PAYLOAD_CLASS} actual_bytes={PAYLOAD_BYTES} \
-         index_spec=\"{INDEX_SPEC}\" durability={durability} rustc=\"{rustc}\" \
-         cpu_count={cpu_count} arch={arch} os={os}"
+         index_spec=\"{INDEX_SPEC}\" durability={} {}",
+        common::INTERVAL_100MS_LABEL,
+        common::host_metadata()
     )
-}
-
-fn num_cpus() -> usize {
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg("nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(1)
 }
 
 fn category_index_model() -> IndexModel {
@@ -79,8 +61,7 @@ fn bench_index_build(c: &mut Criterion) {
     // Seed the collection once outside the Criterion timing loop.
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("bench.mqlite");
-    let opts = OpenOptions::new().durability(DurabilityMode::Interval(Duration::from_millis(100)));
-    let client = Client::open_with_options(&path, opts).expect("open must succeed");
+    let client = common::open_client(&path, common::interval_100ms());
     let col = client.database("bench").collection::<Document>("big_col");
 
     let payload = "x".repeat(PAYLOAD_BYTES);

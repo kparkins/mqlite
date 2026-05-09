@@ -210,11 +210,7 @@ impl BTreePageStore for ObservedStore {
     }
 
     fn take_all_chains(&mut self, page: u32) -> Result<ChainDrain> {
-        self.take_all_chains_on_page(page)
-    }
-
-    fn take_all_chains_on_page(&mut self, page: u32) -> Result<ChainDrain> {
-        let chains = self.with_store_mut(|store| store.take_all_chains_on_page(page))?;
+        let chains = self.with_store_mut(|store| store.take_all_chains(page))?;
         self.split_window.after_chain_drain(page);
         Ok(chains)
     }

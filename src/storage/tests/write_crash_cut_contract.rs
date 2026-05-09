@@ -4,13 +4,13 @@
 //! contract. It exists only because integration tests need to freeze specific
 //! crash points in the current write envelope.
 
-/// Phase 0 write-envelope probe cut point.
+/// Write-envelope probe cut point.
 ///
 /// This is a `#[doc(hidden)]` integration-test support type. It is not part of
 /// the stable storage API.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Phase0ProbeCut {
+pub enum WriteEnvelopeProbeCut {
     /// Stop after body staging, before `allocate_commit_ts`.
     AfterStageBeforeCommitTs,
     /// Stop after `allocate_commit_ts`, before logical-frame build.
@@ -25,10 +25,10 @@ pub enum Phase0ProbeCut {
     AfterDurabilityWaitBeforePublish,
 }
 
-/// Result returned by the hidden Phase 0 write-envelope probe.
+/// Result returned by the hidden write-envelope probe.
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Phase0ProbeReport {
+pub struct WriteEnvelopeProbeReport {
     /// Commit timestamp allocated for the probed write.
     pub commit_ts: Option<(u64, u32)>,
     /// Publish timestamp used when the probe completed publication.

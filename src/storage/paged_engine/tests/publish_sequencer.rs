@@ -354,7 +354,7 @@ fn mark_ready_publishes_frontier_after_closure() {
     assert_eq!(post, commit_ts);
 }
 
-/// AC #11 — `new_from(recovered_max_commit_ts)` initializes the dense
+/// AC #11 — `new_with_published_frontier(recovered_max_commit_ts)` initializes the dense
 /// window fresh and seeds `published_frontier` with the recovered HLC.
 #[test]
 fn new_from_seeds_frontier_with_recovered_max_commit_ts() {
@@ -362,7 +362,7 @@ fn new_from_seeds_frontier_with_recovered_max_commit_ts() {
         physical_ms: 12_345,
         logical: 7,
     };
-    let seq = PublishSequencer::new_from(recovered);
+    let seq = PublishSequencer::new_with_published_frontier(recovered);
 
     // Dense window is fresh: no previous slots.
     assert_eq!(seq.last_published_seq(), 0);

@@ -34,7 +34,7 @@ fn view(read_ts: crate::mvcc::Ts, txn_id: u64, frontier: crate::mvcc::Ts) -> Rea
             catalog_generation: 1,
         }),
         txn_id,
-        PublishSequencer::new_from(frontier),
+        PublishSequencer::new_with_published_frontier(frontier),
     )
 }
 

@@ -46,7 +46,9 @@ fn collection_entry(engine: &PagedEngine, ns: &str) -> Result<CollectionEntry> {
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    let entry = engine.metadata_state.catalog_lock()
+    let entry = engine
+        .metadata_state
+        .catalog_lock()
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal("collection missing".into()))?;
     Ok(entry)

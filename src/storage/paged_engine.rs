@@ -130,7 +130,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 #[cfg(any(test, feature = "test-hooks"))]
-use self::hidden_accessors::{Phase3CommitFailpoint, Us026PostRegisterFailpoint};
+use self::hidden_accessors::{LegacyCommitFailpoint, Us026PostRegisterFailpoint};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
@@ -155,13 +155,13 @@ use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::structural_page_batch::StructuralPageBatch;
 
-use self::publish::{rebuild_and_publish, sync_catalog_root_structural};
 use self::doc_helpers::now_millis;
 use self::index_maint::{
     flip_pending_to_aborted_for, flip_pending_to_committed_for, install_pending_primary,
     install_pending_sec_index,
 };
 use self::publish::PublishDirty;
+use self::publish::{rebuild_and_publish, sync_catalog_root_structural};
 use self::publish_sequencer::PublishSlotGuard;
 use self::state::{MetadataState, SharedState};
 use self::visibility::WriteVisibility;
@@ -556,7 +556,9 @@ impl PagedEngine {
             .metadata
             .read()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        let ns_missing = self.metadata_state.catalog_lock()
+        let ns_missing = self
+            .metadata_state
+            .catalog_lock()
             .get_collection(ns)?
             .is_none();
         if ns_missing {
@@ -781,7 +783,7 @@ impl PagedEngine {
                     return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
                 }
                 #[cfg(any(test, feature = "test-hooks"))]
-                self::hidden_accessors::phase8_before_reservation_if_installed(&self.shared);
+                self::hidden_accessors::before_log_reservation_if_installed(&self.shared);
 
                 let reserved = match self.shared.handle.reserve_log_record(draft) {
                     Ok(reserved) => reserved,
@@ -797,8 +799,7 @@ impl PagedEngine {
                 // Unflushable before reservation; this post-reservation stamp
                 // is the first point where those pages become flushable by LSN.
                 #[cfg(any(test, feature = "test-hooks"))]
-                if let Err(e) =
-                    self::hidden_accessors::phase8_fail_dirty_lsn_stamp_if_armed(&self.shared)
+                if let Err(e) = self::hidden_accessors::fail_dirty_lsn_stamp_if_armed(&self.shared)
                 {
                     return Err(self.poison_after_reserved_log_failure(&reserved, e));
                 }
@@ -811,7 +812,7 @@ impl PagedEngine {
                 }
                 #[cfg(any(test, feature = "test-hooks"))]
                 if let Err(e) =
-                    self::hidden_accessors::phase8_fail_after_dirty_lsn_stamp_if_armed(&self.shared)
+                    self::hidden_accessors::fail_after_dirty_lsn_stamp_if_armed(&self.shared)
                 {
                     return Err(self.poison_after_reserved_log_failure(&reserved, e));
                 }
@@ -824,10 +825,8 @@ impl PagedEngine {
                 crate::mvcc::metrics::record_journal_chain_commit_frame();
                 self.wait_for_commit_durability(commit_end_lsn)?;
                 #[cfg(any(test, feature = "test-hooks"))]
-                if self::hidden_accessors::phase8_fail_after_durable_before_flip_if_armed(
-                    &self.shared,
-                )
-                .is_err()
+                if self::hidden_accessors::fail_after_durable_before_flip_if_armed(&self.shared)
+                    .is_err()
                 {
                     return Err(self.engine_fatal(
                         crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
@@ -861,8 +860,8 @@ impl PagedEngine {
                 }
 
                 #[cfg(any(test, feature = "test-hooks"))]
-                self::hidden_accessors::phase3_abort_if_armed(
-                    Phase3CommitFailpoint::AfterLegacyCommitBeforePublish,
+                self::hidden_accessors::legacy_commit_abort_if_armed(
+                    LegacyCommitFailpoint::AfterLegacyCommitBeforePublish,
                 );
 
                 let shared = Arc::clone(&self.shared);
@@ -873,13 +872,7 @@ impl PagedEngine {
                         .mark_ready(slot, move |publish_ts| {
                             #[cfg(any(test, feature = "test-hooks"))]
                             self::hidden_accessors::us009_record_publish_ready(&shared);
-                            rebuild_and_publish(
-                                &shared,
-                                &metadata_state,
-                                publish_ts,
-                                dirty,
-                                None,
-                            )
+                            rebuild_and_publish(&shared, &metadata_state, publish_ts, dirty, None)
                         });
                 match publish_result {
                     Ok(()) => {}
@@ -950,7 +943,7 @@ impl PagedEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Storage operations (inherent impl — was StorageEngine trait impl)
+// Document operations
 // ---------------------------------------------------------------------------
 
 impl PagedEngine {

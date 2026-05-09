@@ -10,13 +10,13 @@ use crate::error::{EngineFatalReason, Error, Result};
 use crate::journal::log_file::LogRecordDraft;
 use crate::mvcc::transaction::WriteTxn;
 use crate::options::FindOptions;
-use crate::storage::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
+use crate::storage::write_crash_cut_contract::{WriteEnvelopeProbeCut, WriteEnvelopeProbeReport};
 
-use super::publish::rebuild_and_publish;
 use super::doc_ops;
 use super::index_maint::{
     flip_pending_to_committed_for, install_pending_primary, install_pending_sec_index,
 };
+use super::publish::rebuild_and_publish;
 use super::visibility::WriteVisibility;
 use super::PagedEngine;
 
@@ -27,10 +27,10 @@ impl PagedEngine {
         Ok(!docs.is_empty())
     }
 
-    fn phase0_stop_before_recovery(
-        report: Phase0ProbeReport,
+    fn stop_before_recovery(
+        report: WriteEnvelopeProbeReport,
         txn: WriteTxn,
-    ) -> Result<Phase0ProbeReport> {
+    ) -> Result<WriteEnvelopeProbeReport> {
         std::mem::forget(txn);
         Ok(report)
     }
@@ -39,14 +39,16 @@ impl PagedEngine {
         &self,
         ns: &str,
         doc: Document,
-        cut: Phase0ProbeCut,
-    ) -> Result<Phase0ProbeReport> {
+        cut: WriteEnvelopeProbeCut,
+    ) -> Result<WriteEnvelopeProbeReport> {
         let _checkpoint_writer_admission = self.shared.checkpoint_admission.admit_writer()?;
         let _crud_read = self
             .metadata
             .read()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        if self.metadata_state.catalog_lock()
+        if self
+            .metadata_state
+            .catalog_lock()
             .get_collection(ns)?
             .is_none()
         {
@@ -58,22 +60,16 @@ impl PagedEngine {
         let vis = WriteVisibility::new(&self.shared, ns)?;
         let txn_id = vis.read_view.txn_id;
         let mut txn = WriteTxn::new(txn_id);
-        let inserted_id = doc_ops::stage_insert(
-            &self.shared,
-            &self.metadata_state,
-            &mut txn,
-            &vis,
-            ns,
-            doc,
-        )?;
-        let mut report = Phase0ProbeReport {
+        let inserted_id =
+            doc_ops::stage_insert(&self.shared, &self.metadata_state, &mut txn, &vis, ns, doc)?;
+        let mut report = WriteEnvelopeProbeReport {
             commit_ts: None,
             publish_ts: None,
             pre_publish_visible: None,
             post_publish_visible: None,
         };
-        if cut == Phase0ProbeCut::AfterStageBeforeCommitTs {
-            return Self::phase0_stop_before_recovery(report, txn);
+        if cut == WriteEnvelopeProbeCut::AfterStageBeforeCommitTs {
+            return Self::stop_before_recovery(report, txn);
         }
 
         let sec_writes = std::mem::take(&mut txn.pending_sec_index);
@@ -89,13 +85,13 @@ impl PagedEngine {
         let commit_ts = slot.commit_ts();
         txn.commit_ts.set(Some(commit_ts));
         report.commit_ts = Some((commit_ts.physical_ms, commit_ts.logical));
-        if matches!(cut, Phase0ProbeCut::AfterCommitTsBeforeLogicalFrame) {
-            return Self::phase0_stop_before_recovery(report, txn);
+        if matches!(cut, WriteEnvelopeProbeCut::AfterCommitTsBeforeLogicalFrame) {
+            return Self::stop_before_recovery(report, txn);
         }
 
         let frame = txn.build_logical_txn_frame(&self.shared.handle, &primary_writes, &sec_writes);
-        if cut == Phase0ProbeCut::AfterLogicalFrameBeforeReservation {
-            return Self::phase0_stop_before_recovery(report, txn);
+        if cut == WriteEnvelopeProbeCut::AfterLogicalFrameBeforeReservation {
+            return Self::stop_before_recovery(report, txn);
         }
 
         let dirty = txn.publish_dirty;
@@ -136,8 +132,11 @@ impl PagedEngine {
         let root_changing = root_changing | primary_structural_tree_change;
         let mut pending_pages = sec_pages;
         pending_pages.extend(primary_pages);
-        if matches!(cut, Phase0ProbeCut::AfterPendingInstallBeforeReservation) {
-            return Self::phase0_stop_before_recovery(report, txn);
+        if matches!(
+            cut,
+            WriteEnvelopeProbeCut::AfterPendingInstallBeforeReservation
+        ) {
+            return Self::stop_before_recovery(report, txn);
         }
         let prepared = match txn.prepare_chain_commit_payload(&self.shared.handle, commit_ts) {
             Ok(prepared) => prepared,
@@ -174,12 +173,15 @@ impl PagedEngine {
             Err(e) => return Err(self.poison_after_log_manager_failure(e)),
         };
         debug_assert_eq!(written_end_lsn, commit_end_lsn);
-        if matches!(cut, Phase0ProbeCut::AfterLogRecordWriteBeforeDurabilityWait) {
+        if matches!(
+            cut,
+            WriteEnvelopeProbeCut::AfterLogRecordWriteBeforeDurabilityWait
+        ) {
             return Ok(report);
         }
 
         self.wait_for_commit_durability(commit_end_lsn)?;
-        if matches!(cut, Phase0ProbeCut::AfterDurabilityWaitBeforePublish) {
+        if matches!(cut, WriteEnvelopeProbeCut::AfterDurabilityWaitBeforePublish) {
             return Ok(report);
         }
 

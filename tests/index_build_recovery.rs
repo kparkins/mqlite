@@ -9,25 +9,17 @@
 #![doc = "Integration tests requiring the test-hooks feature."]
 #![cfg(feature = "test-hooks")]
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 use std::path::Path;
 use std::sync::Mutex;
 
 use bson::{doc, Document};
-use mqlite::{Client, DurabilityMode, IndexModel, OpenOptions, Result};
+use mqlite::{Client, IndexModel, Result};
 
 const DOC_COUNT: i32 = 240;
 const TAG_MATCH_COUNT: usize = 48;
 static CRASH_RECOVERY_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-fn open_fullsync(path: &Path) -> Result<Client> {
-    Client::open_with_options(
-        path,
-        OpenOptions::new().durability(DurabilityMode::FullSync),
-    )
-}
 
 fn seed_collection(client: &Client) -> mqlite::Collection<Document> {
     let collection = client.database("db").collection::<Document>("docs");
@@ -80,7 +72,7 @@ fn test_class_b_b_index_build_reopens_without_legacy_ready_commit() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("us018c_b_b.mqlite");
 
-    let client = open_fullsync(&path).expect("open");
+    let client = crash_harness::open_fullsync(&path).expect("open");
     let collection = seed_collection(&client);
     collection
         .create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
@@ -99,7 +91,7 @@ fn test_class_b_c_ready_durable_index_intact() {
     let path = dir.path().join("us018c_b_c.mqlite");
 
     {
-        let client = open_fullsync(&path).expect("open");
+        let client = crash_harness::open_fullsync(&path).expect("open");
         let collection = seed_collection(&client);
         collection
             .create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())

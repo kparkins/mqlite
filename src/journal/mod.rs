@@ -1103,7 +1103,7 @@ impl JournalManager {
     /// scans `ChainCommit` frames linearly.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn append_chain_commit(
-        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
+        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
         &mut self,
         commit_ts: crate::mvcc::timestamp::Ts,
         refcount_deltas: Vec<(u32, i32)>,
@@ -1117,7 +1117,7 @@ impl JournalManager {
     /// Append a `ChainCommit` frame and return its exclusive end LSN.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn append_chain_commit_end_lsn(
-        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
+        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
         &mut self,
         commit_ts: crate::mvcc::timestamp::Ts,
         refcount_deltas: Vec<(u32, i32)>,
@@ -1166,7 +1166,7 @@ impl JournalManager {
     /// no `page_number` and recovery scans them linearly (§5).
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn append_logical_txn(
-        // allow-phase8-legacy-audit: test-only retired logical append probe
+        // allow-legacy-journal-audit: test-only retired logical append probe
         &mut self,
         frame: LogicalTxnFrame,
     ) -> Result<u64> {
@@ -1182,7 +1182,7 @@ impl JournalManager {
         let receipt = self.log_manager.mark_written(&slot)?;
         self.write_cursor = receipt.ready_lsn();
         crate::mvcc::metrics::record_logical_txn_append_bytes(bytes.len() as u64);
-        // allow-phase8-legacy-audit: this retired append helper is test-only.
+        // allow-legacy-journal-audit: this retired append helper is test-only.
         // Production CRUD uses one Phase 8 LogRecord; the percentile guard in
         // `PagedEngine` samples the full draft/reserve/write/ready envelope.
         Ok(frame_offset)
@@ -1648,7 +1648,7 @@ impl JournalManager {
     /// the dropped frames were commit or non-commit frames.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn truncate_to(
-        // allow-phase8-legacy-audit: test-only retired live-tail rollback probe
+        // allow-legacy-journal-audit: test-only retired live-tail rollback probe
         &mut self,
         cursor: u64,
     ) -> Result<()> {

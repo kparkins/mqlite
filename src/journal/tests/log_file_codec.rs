@@ -1616,7 +1616,7 @@ fn logical_and_chain_readers_rewind_on_page_record() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn phase6_us009_old_page_frame_commit_aliases_logical_as_torn_tail() {
+fn old_page_frame_commit_aliases_logical_as_torn_tail() {
     let page_data = vec![0xC3u8; PAGE_SIZE_INTERNAL as usize];
     let bytes = write_test_page_frame_record(
         u32::from(FRAME_KIND_LOGICAL_TXN),
@@ -1656,7 +1656,7 @@ fn phase6_us009_old_page_frame_commit_aliases_logical_as_torn_tail() {
 }
 
 #[test]
-fn phase6_us009_torn_page0_checkpoint_boundary_rewinds() {
+fn torn_page0_checkpoint_boundary_rewinds() {
     let boundary = sample_page0_boundary(Ts {
         physical_ms: 333,
         logical: 1,
@@ -1677,7 +1677,7 @@ fn phase6_us009_torn_page0_checkpoint_boundary_rewinds() {
 }
 
 #[test]
-fn phase6_us009_checkpoint_shaped_checksum_and_salt_mismatches_rewind() {
+fn checkpoint_checksum_and_salt_mismatches_rewind() {
     let batch = CheckpointBatchPageRecord {
         page_number: 11,
         salt1: TEST_SALT1,
@@ -1727,7 +1727,7 @@ fn phase6_us009_checkpoint_shaped_checksum_and_salt_mismatches_rewind() {
 }
 
 #[test]
-fn phase6_us009_invalid_checkpoint_provenance_is_not_silently_accepted() {
+fn invalid_checkpoint_provenance_is_not_silently_accepted() {
     let mut header = crate::storage::header::FileHeader::new_now();
     header.total_page_count = 55;
     header.last_checkpoint_ts = Ts::default();
@@ -1770,7 +1770,7 @@ fn phase6_us009_invalid_checkpoint_provenance_is_not_silently_accepted() {
 }
 
 #[test]
-fn phase6_us009_arbitrary_legacy_shaped_bytes_do_not_consume_valid_logical_prefix() {
+fn legacy_shaped_bytes_do_not_consume_valid_logical_prefix() {
     let valid_frame = sample_empty_logical_frame();
     let valid_bytes = valid_frame.encode().unwrap();
     let arbitrary_legacy = write_test_page_frame_record(

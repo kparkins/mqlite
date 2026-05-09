@@ -71,13 +71,6 @@ pub(crate) struct CheckpointLifetimeDrain {
     entries: Vec<PageLifetimeEntry>,
 }
 
-impl CheckpointLifetimeDrain {
-    /// Publish the staged lifetime-free deltas by consuming this drain.
-    pub(crate) fn publish(self) {
-        drop(self.entries);
-    }
-}
-
 /// FIFO-ish queue of pages whose lifetime cannot end until a checkpoint
 /// advances past the enqueue fence.
 ///

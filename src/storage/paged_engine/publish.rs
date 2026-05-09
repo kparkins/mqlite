@@ -98,7 +98,6 @@ pub(crate) fn build_published_catalog(
             coll.id,
             NamespaceSnapshot {
                 id: coll.id,
-                name: coll.name.clone(),
                 data_root_page: coll.data_root_page,
                 data_root_level: coll.data_root_level,
                 indexes: idxs,
@@ -180,8 +179,8 @@ pub(crate) fn publish_commit(
         catalog_generation,
     });
     #[cfg(any(test, feature = "test-hooks"))]
-    super::hidden_accessors::phase3_abort_if_armed(
-        super::hidden_accessors::Phase3CommitFailpoint::DuringPublishBeforeStore,
+    super::hidden_accessors::legacy_commit_abort_if_armed(
+        super::hidden_accessors::LegacyCommitFailpoint::DuringPublishBeforeStore,
     );
     shared.published.store(Arc::clone(&new_epoch));
     // §10.19 C-1 / US-037: store the new epoch first, then the live

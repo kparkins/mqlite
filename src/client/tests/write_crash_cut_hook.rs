@@ -1,7 +1,7 @@
 //! Hidden Phase 0 integration-test client hooks.
 
 use crate::error::Result;
-use crate::{Phase0ProbeCut, Phase0ProbeReport};
+use crate::{WriteEnvelopeProbeCut, WriteEnvelopeProbeReport};
 
 use super::Client;
 
@@ -17,8 +17,8 @@ impl Client {
         &self,
         ns: &str,
         doc: bson::Document,
-        cut: Phase0ProbeCut,
-    ) -> Result<Phase0ProbeReport> {
+        cut: WriteEnvelopeProbeCut,
+    ) -> Result<WriteEnvelopeProbeReport> {
         self.inner.engine.crash_cut_probe_insert(ns, doc, cut)
     }
 }

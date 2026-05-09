@@ -15,7 +15,6 @@
 //! writes remain visible, and the cut write is visible after reopen only once
 //! the authoritative log record exists.
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 use std::collections::BTreeSet;
@@ -24,7 +23,7 @@ use std::sync::Mutex;
 
 use bson::doc;
 use bson::Document;
-use mqlite::{Client, DurabilityMode, OpenOptions, Phase0ProbeCut};
+use mqlite::{Client, DurabilityMode, OpenOptions, WriteEnvelopeProbeCut};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -37,7 +36,7 @@ fn with_test_lock<R>(f: impl FnOnce() -> R) -> R {
 struct CrashCut {
     cut_id: &'static str,
     source_range: &'static str,
-    probe_cut: Phase0ProbeCut,
+    probe_cut: WriteEnvelopeProbeCut,
     cut_commit_visible_expected: bool,
     truncate_unflushed_journal_tail: bool,
 }
@@ -46,42 +45,42 @@ const REBASELINE_CUTS: [CrashCut; 6] = [
     CrashCut {
         cut_id: "stage",
         source_range: "staged body before commit timestamp",
-        probe_cut: Phase0ProbeCut::AfterStageBeforeCommitTs,
+        probe_cut: WriteEnvelopeProbeCut::AfterStageBeforeCommitTs,
         cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
         cut_id: "timestamp",
         source_range: "commit timestamp before logical frame",
-        probe_cut: Phase0ProbeCut::AfterCommitTsBeforeLogicalFrame,
+        probe_cut: WriteEnvelopeProbeCut::AfterCommitTsBeforeLogicalFrame,
         cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
         cut_id: "logical",
         source_range: "logical frame before log reservation",
-        probe_cut: Phase0ProbeCut::AfterLogicalFrameBeforeReservation,
+        probe_cut: WriteEnvelopeProbeCut::AfterLogicalFrameBeforeReservation,
         cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
         cut_id: "pending",
         source_range: "pending install before log reservation",
-        probe_cut: Phase0ProbeCut::AfterPendingInstallBeforeReservation,
+        probe_cut: WriteEnvelopeProbeCut::AfterPendingInstallBeforeReservation,
         cut_commit_visible_expected: false,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
         cut_id: "written",
         source_range: "log record write before durability wait",
-        probe_cut: Phase0ProbeCut::AfterLogRecordWriteBeforeDurabilityWait,
+        probe_cut: WriteEnvelopeProbeCut::AfterLogRecordWriteBeforeDurabilityWait,
         cut_commit_visible_expected: true,
         truncate_unflushed_journal_tail: false,
     },
     CrashCut {
         cut_id: "durable",
         source_range: "durable log record before publish",
-        probe_cut: Phase0ProbeCut::AfterDurabilityWaitBeforePublish,
+        probe_cut: WriteEnvelopeProbeCut::AfterDurabilityWaitBeforePublish,
         cut_commit_visible_expected: true,
         truncate_unflushed_journal_tail: false,
     },

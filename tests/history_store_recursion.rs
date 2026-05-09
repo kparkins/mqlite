@@ -18,7 +18,7 @@
 //! scan. The insertion phase drives main-pool evictions (which run
 //! reconciliation); the scan phase traverses every key, exercising
 //! the reader-path history fallthrough (`BTree::range_scan_mvcc` →
-//! [`HistoryProbe::probe`]). In a debug build either phase would
+//! `HistoryProbe::probe_visible_version`). In a debug build either phase would
 //! panic if the invariant were violated — the test asserts the loop
 //! completes cleanly and every document is returned.
 

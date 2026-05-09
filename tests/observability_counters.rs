@@ -37,7 +37,6 @@ use mqlite::mvcc::metrics::{
     reset_recovery_legacy_page_frames,
 };
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 /// Process-global test serialization lock.
@@ -274,7 +273,7 @@ fn recovery_frame_counters_rise_on_reopen_after_workload() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn emergency_checkpoint_triggers_stays_zero_for_phase6_logical_workload() {
+fn emergency_checkpoint_trigger_stays_zero_for_logical_workload() {
     let _guard = COUNTER_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ec.mqlite");

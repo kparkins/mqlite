@@ -145,8 +145,7 @@ fn commit_transfers_pending_ownership_to_caller() {
     let r = OverflowRef::new_owned(77, 128, alloc.clone()).unwrap();
     assert_eq!(alloc.overflow_refcount(77), 1);
 
-    let mut t =
-        WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
+    let mut t = WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
     t.attach_overflow(r);
 
     let (_ts, pending, sec) = t.commit(&oracle, &handle).expect("commit");
@@ -168,8 +167,7 @@ fn drop_drops_pending_and_decrefs() {
     let alloc = handle.allocator().clone();
 
     let r = OverflowRef::new_owned(88, 256, alloc.clone()).unwrap();
-    let mut t =
-        WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
+    let mut t = WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
     t.attach_overflow(r);
     assert_eq!(alloc.overflow_refcount(88), 1);
 
@@ -189,8 +187,7 @@ fn finalized_txn_drop_does_not_decref_pending() {
     let oracle = TimestampOracle::new();
 
     let r = OverflowRef::new_owned(55, 64, alloc.clone()).unwrap();
-    let mut t =
-        WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
+    let mut t = WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
     t.attach_overflow(r);
 
     let (_ts, pending, _sec) = t.commit(&oracle, &handle).expect("commit");
@@ -256,8 +253,7 @@ fn commit_drains_pending_sec_index_to_caller() {
     let alloc = handle.allocator().clone();
     let oracle = TimestampOracle::new();
 
-    let mut t =
-        WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
+    let mut t = WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
     t.stage_sec_index_insert(42, 3, b"k".to_vec(), b"id".to_vec());
     t.stage_sec_index_delete(42, 3, b"d".to_vec());
 
@@ -278,8 +274,7 @@ fn drop_discards_pending_sec_index() {
     let handle = fresh_handle();
     let alloc = handle.allocator().clone();
 
-    let mut t =
-        WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
+    let mut t = WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
     t.stage_sec_index_insert(50, 9, b"k".to_vec(), b"id".to_vec());
     assert_eq!(t.pending_sec_index.len(), 1);
 
@@ -579,8 +574,8 @@ fn production_emitter_carries_stage_time_ids_under_mutation() {
         .write(true)
         .open(&db_path)
         .expect("reopen main");
-    let mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file)
-        .expect("journal manager");
+    let mgr =
+        JournalManager::open_or_create(&db_path, &header, &mut main_file).expect("journal manager");
     let journal = Arc::new(StdMutex::new(mgr));
 
     // Pool wiring (mirrors `fresh_handle` but with a journal

@@ -185,7 +185,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn phase8_journal_log_manager_concurrent_reservations_are_disjoint_monotonic() {
+    fn log_manager_concurrent_reservations_are_disjoint_monotonic() {
         let (_dir, manager) = make_log_manager(100);
         let manager = Arc::new(manager);
         let workers = 8usize;
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_reserve_does_not_mutate_record_metadata() {
+    fn log_manager_reserve_does_not_mutate_record_metadata() {
         use crate::journal::log_file::{LogRecord, LogRecordDraft};
         use crate::mvcc::timestamp::Ts;
 
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_ready_lsn_advances_only_contiguous_slots() {
+    fn log_manager_ready_lsn_advances_only_contiguous_slots() {
         let io = TestPositionedLogIo::new(usize::MAX, None);
         let manager = log_manager_from_io(io, 0);
         let first = manager.reserve(4).unwrap();
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_mark_before_write_poisons_gap_and_waiters() {
+    fn log_manager_mark_before_write_poisons_gap_and_waiters() {
         let io = TestPositionedLogIo::new(usize::MAX, None);
         let manager = log_manager_from_io(io, 0);
         let first = manager.reserve(4).unwrap();
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_short_positioned_writes_retry_before_mark() {
+    fn log_manager_short_positioned_writes_retry_before_mark() {
         let io = TestPositionedLogIo::new(2, None);
         let manager = log_manager_from_io(io.clone(), 0);
         let slot = manager.reserve(5).unwrap();
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_write_failure_poisons_gap_and_waiters() {
+    fn log_manager_write_failure_poisons_gap_and_waiters() {
         let io = TestPositionedLogIo::new(usize::MAX, Some(0));
         let manager = log_manager_from_io(io.clone(), 0);
         let first = manager.reserve(4).unwrap();
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_partial_failure_preserves_neighbor_records() {
+    fn log_manager_partial_failure_preserves_neighbor_records() {
         let io = TestPositionedLogIo::new(2, Some(6));
         let manager = log_manager_from_io(io.clone(), 0);
         let first = manager.reserve(4).unwrap();
@@ -410,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_poisoned_log_manager_blocks_truncate_rollback() {
+    fn poisoned_log_manager_blocks_truncate_rollback() {
         let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
@@ -448,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_wait_durable_syncs_ready_prefix() {
+    fn log_manager_wait_durable_syncs_ready_prefix() {
         let io = TestPositionedLogIo::new(usize::MAX, None);
         let manager = log_manager_from_io(io.clone(), 0);
         let slot = manager.reserve(3).unwrap();
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_log_manager_durable_lsn_stays_at_closed_sync_target() {
+    fn log_manager_durable_lsn_stays_at_closed_sync_target() {
         crate::storage::paged_engine::group_commit_observations::reset();
         let io = TestPositionedLogIo::new(usize::MAX, None);
         let manager = log_manager_from_io(io.clone(), 0);
@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_sync_journal_advances_log_manager_durable_lsn() {
+    fn sync_journal_advances_log_manager_durable_lsn() {
         let (_dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn phase8_journal_commit_append_uses_log_manager_not_seek_write_all() {
+    fn commit_append_uses_log_manager_not_seek_write_all() {
         let source = include_str!("../mod.rs");
         let chain_body = source
             .split("fn append_chain_commit_record")
@@ -2517,7 +2517,7 @@ mod tests {
     /// extended for US-015 AC#6.
     #[test]
     #[ignore = "Phase 4 exit criterion §8.13.3"]
-    fn test_phase4_case_c_is_hard_error() {
+    fn test_unpaired_chain_commit_is_hard_error() {
         // Phase 4 implementation will populate this test body with two
         // assertions: (a) Err from JournalManager::open_or_create for a
         // ChainCommit-without-logical journal, and (b) Err from
@@ -3052,7 +3052,7 @@ mod crash_recovery_tests {
         }
     }
 
-    mod phase8_log_record_codec_tests {
+    mod log_record_codec_tests {
         use crate::journal::log_file::{
             FinalizedLogRecord, LogRecord, LogRecordDraft, LogRecordFlags, LogRecordKind,
             LogRecordPayload, JOURNAL_FORMAT_VERSION, LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET,
@@ -3126,13 +3126,13 @@ mod crash_recovery_tests {
         }
 
         #[test]
-        fn phase8_journal_format_version_is_bumped() {
+        fn journal_format_version_is_bumped() {
             assert_eq!(JOURNAL_FORMAT_VERSION, 3);
             assert_eq!(RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS, &[1, 2]);
         }
 
         #[test]
-        fn log_record_constants_match_phase8_wire_contract() {
+        fn log_record_constants_match_current_wire_contract() {
             assert_eq!(LOG_RECORD_MAGIC.to_le_bytes(), *b"MQL8");
             assert_eq!(LOG_RECORD_FORMAT_VERSION, 1);
             assert_eq!(LOG_RECORD_HEADER_LEN, 72);

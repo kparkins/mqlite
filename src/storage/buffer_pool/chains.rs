@@ -12,28 +12,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::mvcc::read_view::{ChainSnapshot, ReadView};
 use crate::mvcc::version::VersionEntry;
 
-#[cfg(test)]
-use crate::mvcc::metrics;
-#[cfg(test)]
-use crate::mvcc::read_view::ReadViewRegistry;
-#[cfg(test)]
-use crate::mvcc::timestamp::Ts;
-#[cfg(test)]
-use crate::storage::allocator::AllocatorHandle;
-#[cfg(test)]
-use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
-
 use super::{BufferPool, PageSize};
-#[cfg(test)]
-use super::{ReplaceLeafError, RetainedLeafChains};
 
 type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
-
-#[cfg(test)]
-const RECONCILE_COMPAT_COLLECTION_ID: i64 = 0;
 
 impl BufferPool {
     // -----------------------------------------------------------------------
@@ -88,36 +71,6 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Build a [`ChainSnapshot`] from the per-key MVCC delta chains on
-    /// leaf page `page`. Returns `None` if the page is not currently
-    /// resident (the caller must have the frame pinned via `pin_page` for
-    /// the snapshot to reflect the live chains).
-    ///
-    /// Deep-clones every `VersionEntry` under the partition mutex,
-    /// which runs `OverflowRef::Clone` on `VersionData::Overflow` entries
-    /// (CAS-loop incref on the page's refcount header). The partition
-    /// mutex and the overflow refcount atomics are orthogonal: the CAS
-    /// loop touches an `AtomicU32` off the `AllocatorHandle::overflow_refcounts`
-    /// table, never the partition mutex itself.
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_chains(
-        &self,
-        page: u32,
-        view: Option<Arc<ReadView>>,
-    ) -> Result<Option<ChainSnapshot>> {
-        let guard = self
-            .inner_32k
-            .lock()
-            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-        let Some(&idx) = guard.page_map.get(&page) else {
-            return Ok(None);
-        };
-        let frame = guard.frames[idx].as_ref().ok_or_else(|| {
-            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
-        })?;
-        Ok(Some(ChainSnapshot::new(&frame.deltas, view)))
-    }
-
     /// Clear all delta chains attached to the resident frame for `page`
     /// in the partition selected by `size`.
     ///
@@ -155,7 +108,7 @@ impl BufferPool {
     /// entries (whose cells were already removed earlier in the txn)
     /// onto the merged-into sibling so MVCC readers whose ReadView
     /// predates the delete still observe them.
-    pub(crate) fn take_all_chains_on_page(&self, page: u32) -> Result<VersionChainDrain> {
+    pub(crate) fn drain_leaf_chains(&self, page: u32) -> Result<VersionChainDrain> {
         let mut guard = self
             .inner_32k
             .lock()
@@ -184,125 +137,12 @@ impl BufferPool {
         })?;
         Ok(frame.deltas.is_empty())
     }
-
-    // -----------------------------------------------------------------------
-    // Reconciliation (T6)
-    // -----------------------------------------------------------------------
-
-    /// Reconcile the per-key delta chains on leaf page `page`.
-    ///
-    /// Walks every chain on the frame and drops entries whose `stop_ts`
-    /// is `<= oldest_required_ts` — no live reader can see them, so they
-    /// are pure garbage. Phase 3 never collapses a live non-tombstone head;
-    /// that value-equivalence rule returns with Phase 4 reconcile.
-    ///
-    /// `OverflowRef::Drop` RAII runs on every dropped `VersionEntry`. When
-    /// a drop brings an overflow refcount to 0, the page is enqueued on
-    /// `PageLifetimeQueue` (lock position 1.5 — a leaf mutex, safe to
-    /// acquire transiently while holding the partition mutex at position 3).
-    /// After releasing the partition mutex, the caller's writer-serialization
-    /// context guarantees it is safe to drain the queue via
-    /// `AllocatorHandle::drain_free_queue`.
-    ///
-    /// **Lock-order contract (T4 / T6):**
-    /// 1. `ReadViewRegistry::oldest_required_ts()` is snapshotted *before*
-    ///    acquiring the partition mutex. Position 5 is below positions 3/4
-    ///    in the total order; re-acquiring it under the partition mutex is
-    ///    forbidden.
-    /// 2. The partition mutex is released before `drain_free_queue` is
-    ///    invoked, so the allocator-state mutex (position 2) is never
-    ///    nested under a partition mutex (positions 3/4).
-    ///
-    /// Returns the number of `VersionEntry` objects dropped.
-    #[cfg(test)]
-    pub(crate) fn reconcile(
-        &self,
-        page: u32,
-        registry: &ReadViewRegistry,
-        allocator: &AllocatorHandle,
-    ) -> Result<usize> {
-        // 1. Snapshot the horizon BEFORE any partition latch.
-        let ort = registry.oldest_required_ts();
-
-        // 2. Snapshot retained chains and the current page image under the
-        //    partition mutex. The actual install goes through the Phase 4
-        //    guarded replacement primitive below.
-        let Some((new_base, retained_chains, dropped)) = ({
-            let guard = self
-                .inner_32k
-                .lock()
-                .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-            let Some(&idx) = guard.page_map.get(&page) else {
-                return Ok(0);
-            };
-            let frame = guard.frames[idx].as_ref().ok_or_else(|| {
-                Error::Internal("page_map invariant: frame must exist at mapped slot".into())
-            })?;
-
-            let mut dropped_count = 0usize;
-            let mut retained_chains = RetainedLeafChains::new();
-
-            for (key, chain_arc) in &frame.deltas {
-                let before = chain_arc.len();
-                let retained: VecDeque<VersionEntry> = chain_arc
-                    .iter()
-                    .filter(|entry| entry.stop_ts == Ts::MAX || entry.stop_ts > ort)
-                    .cloned()
-                    .collect();
-                dropped_count += before - retained.len();
-
-                if !retained.is_empty() {
-                    retained_chains.insert(key.clone(), Arc::new(retained));
-                }
-            }
-
-            Some((
-                frame.data.load_full().as_ref().clone(),
-                retained_chains,
-                dropped_count,
-            ))
-        }) else {
-            return Ok(0);
-        };
-
-        if dropped > 0 {
-            let pin = self
-                .pin_leaf_for_reconcile(
-                    TreeIdent {
-                        collection_id: RECONCILE_COMPAT_COLLECTION_ID,
-                        kind: TreeKind::Primary,
-                    },
-                    page,
-                )
-                .map_err(|err| match err {
-                    ReplaceLeafError::NotResident => {
-                        Error::Internal("buffer pool reconcile: resident frame disappeared".into())
-                    }
-                    ReplaceLeafError::NotLeaf => {
-                        Error::Internal("buffer pool reconcile: target frame is not a leaf".into())
-                    }
-                })?;
-            let mut pin = pin;
-            self.replace_leaf_and_chains(&mut pin, new_base, retained_chains)
-                .map_err(|err| match err {
-                    ReplaceLeafError::NotResident => {
-                        Error::Internal("buffer pool reconcile: resident frame disappeared".into())
-                    }
-                    ReplaceLeafError::NotLeaf => Error::Internal(
-                        "buffer pool reconcile: replacement frame is not a leaf".into(),
-                    ),
-                })?;
-        }
-
-        // 3. Tick the reconcile counter and refresh the queue-depth gauge
-        //    using the current queue size (drain below is authoritative).
-        metrics::record_reconcile_entries_dropped(dropped as u64);
-        metrics::set_deferred_free_queue_depth(allocator.page_lifetime_queue().depth() as u64);
-
-        // 4. Writer-serialized drain — caller holds the writer lock. The
-        //    drain re-checks refcount under Acquire before freeing.
-        allocator.drain_free_queue(self.io.as_ref())?;
-
-        Ok(dropped)
-    }
 }
+
+#[cfg(test)]
+#[path = "tests/chains_accessors.rs"]
+mod chains_accessors;
+
+#[cfg(test)]
+#[path = "tests/chains_reconcile.rs"]
+mod chains_reconcile;

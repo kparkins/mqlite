@@ -42,9 +42,9 @@ use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::secondary_index::build_index_keys;
 #[cfg(any(test, feature = "test-hooks"))]
-static PHASE3_COMMIT_FAILPOINT: AtomicU8 = AtomicU8::new(0);
+static LEGACY_COMMIT_FAILPOINT: AtomicU8 = AtomicU8::new(0);
 #[cfg(any(test, feature = "test-hooks"))]
-static PHASE8_CHECKPOINT_FAILPOINT: AtomicU8 = AtomicU8::new(0);
+static CHECKPOINT_BOUNDARY_FAILPOINT: AtomicU8 = AtomicU8::new(0);
 
 /// US-026 post-register cleanup failpoints.
 #[cfg(any(test, feature = "test-hooks"))]
@@ -80,6 +80,7 @@ pub(crate) fn us026_arm_post_register_failpoint(
     failpoint: Us026PostRegisterFailpoint,
 ) {
     shared
+        .test_hooks
         .us026_post_register_failpoint
         .store(failpoint.slot(), Ordering::Release);
 }
@@ -90,6 +91,7 @@ pub(crate) fn us026_fail_if_armed(
     failpoint: Us026PostRegisterFailpoint,
 ) -> Result<()> {
     if shared
+        .test_hooks
         .us026_post_register_failpoint
         .compare_exchange(failpoint.slot(), 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -100,63 +102,69 @@ pub(crate) fn us026_fail_if_armed(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_arm_dirty_lsn_stamp_failure(shared: &SharedState) {
+pub(crate) fn arm_dirty_lsn_stamp_failure(shared: &SharedState) {
     shared
-        .phase8_fail_next_dirty_lsn_stamp
+        .test_hooks
+        .fail_next_dirty_lsn_stamp
         .store(1, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_fail_dirty_lsn_stamp_if_armed(shared: &SharedState) -> Result<()> {
+pub(crate) fn fail_dirty_lsn_stamp_if_armed(shared: &SharedState) -> Result<()> {
     if shared
-        .phase8_fail_next_dirty_lsn_stamp
+        .test_hooks
+        .fail_next_dirty_lsn_stamp
         .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
         return Err(Error::Internal(
-            "Phase 8 injected stamp_dirty_pages_lsn failure".into(),
+            "injected dirty-page LSN stamp failure".into(),
         ));
     }
     Ok(())
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_arm_after_dirty_lsn_stamp_failure(shared: &SharedState) {
+pub(crate) fn arm_after_dirty_lsn_stamp_failure(shared: &SharedState) {
     shared
-        .phase8_fail_next_after_dirty_lsn_stamp
+        .test_hooks
+        .fail_next_after_dirty_lsn_stamp
         .store(1, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_fail_after_dirty_lsn_stamp_if_armed(shared: &SharedState) -> Result<()> {
+pub(crate) fn fail_after_dirty_lsn_stamp_if_armed(shared: &SharedState) -> Result<()> {
     if shared
-        .phase8_fail_next_after_dirty_lsn_stamp
+        .test_hooks
+        .fail_next_after_dirty_lsn_stamp
         .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
         return Err(Error::Internal(
-            "Phase 8 injected after dirty LSN stamp before write failure".into(),
+            "injected failure after dirty-page LSN stamp before record write".into(),
         ));
     }
     Ok(())
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_arm_after_durable_before_flip_failure(shared: &SharedState) {
+pub(crate) fn arm_after_durable_before_flip_failure(shared: &SharedState) {
     shared
-        .phase8_fail_next_after_durable_before_flip
+        .test_hooks
+        .fail_next_after_durable_before_flip
         .store(1, Ordering::Release);
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_fail_after_durable_before_flip_if_armed(shared: &SharedState) -> Result<()> {
+pub(crate) fn fail_after_durable_before_flip_if_armed(shared: &SharedState) -> Result<()> {
     if shared
-        .phase8_fail_next_after_durable_before_flip
+        .test_hooks
+        .fail_next_after_durable_before_flip
         .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
         return Err(Error::Internal(
-            "Phase 8 injected after durable sync before Pending flip failure".into(),
+            "injected failure after durable record write before committed flip".into(),
         ));
     }
     Ok(())
@@ -165,13 +173,13 @@ pub(crate) fn phase8_fail_after_durable_before_flip_if_armed(shared: &SharedStat
 /// Pending test-only hook consumed after Pending install and before
 /// reservation.
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) struct Phase8BeforeReservationHook {
+pub(crate) struct BeforeLogReservationHook {
     entered_tx: Sender<()>,
     release_rx: Receiver<()>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Phase8BeforeReservationHook {
+impl BeforeLogReservationHook {
     fn fire(self) {
         if self.entered_tx.send(()).is_ok() {
             let _ = self.release_rx.recv();
@@ -182,14 +190,14 @@ impl Phase8BeforeReservationHook {
 /// RAII guard for the Phase 8 before-reservation pause hook.
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub struct Phase8BeforeReservationHookGuard {
+pub struct BeforeLogReservationHookGuard {
     shared: Arc<SharedState>,
     entered_rx: Receiver<()>,
     release_tx: Option<Sender<()>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Phase8BeforeReservationHookGuard {
+impl BeforeLogReservationHookGuard {
     /// Wait until the hooked writer reaches the before-reservation point.
     ///
     /// # Errors
@@ -213,31 +221,32 @@ impl Phase8BeforeReservationHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Drop for Phase8BeforeReservationHookGuard {
+impl Drop for BeforeLogReservationHookGuard {
     fn drop(&mut self) {
         let _ = self.release();
-        if let Ok(mut hook) = self.shared.phase8_before_reservation_hook.lock() {
+        if let Ok(mut hook) = self.shared.test_hooks.before_log_reservation_hook.lock() {
             *hook = None;
         }
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn install_phase8_before_reservation_hook(
+pub(crate) fn install_before_log_reservation_hook(
     shared: &Arc<SharedState>,
-) -> Phase8BeforeReservationHookGuard {
+) -> BeforeLogReservationHookGuard {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let hook = Phase8BeforeReservationHook {
+    let hook = BeforeLogReservationHook {
         entered_tx,
         release_rx,
     };
     let mut slot = shared
-        .phase8_before_reservation_hook
+        .test_hooks
+        .before_log_reservation_hook
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = Some(hook);
-    Phase8BeforeReservationHookGuard {
+    BeforeLogReservationHookGuard {
         shared: Arc::clone(shared),
         entered_rx,
         release_tx: Some(release_tx),
@@ -245,9 +254,9 @@ pub(crate) fn install_phase8_before_reservation_hook(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_before_reservation_if_installed(shared: &SharedState) {
+pub(crate) fn before_log_reservation_if_installed(shared: &SharedState) {
     let hook = {
-        let Ok(mut slot) = shared.phase8_before_reservation_hook.lock() else {
+        let Ok(mut slot) = shared.test_hooks.before_log_reservation_hook.lock() else {
             return;
         };
         slot.take()
@@ -260,7 +269,7 @@ pub(crate) fn phase8_before_reservation_if_installed(shared: &SharedState) {
 /// Test-hook failpoints around the remaining publish-boundary crash cuts.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Phase3CommitFailpoint {
+pub enum LegacyCommitFailpoint {
     /// After pending heads flip committed and before publish.
     AfterLegacyCommitBeforePublish,
     /// During publish, immediately before the `PublishedEpoch` store.
@@ -268,7 +277,7 @@ pub enum Phase3CommitFailpoint {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Phase3CommitFailpoint {
+impl LegacyCommitFailpoint {
     fn slot(self) -> u8 {
         match self {
             Self::AfterLegacyCommitBeforePublish => 1,
@@ -280,14 +289,14 @@ impl Phase3CommitFailpoint {
 /// RAII guard that clears the armed Phase 3 failpoint on drop.
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub struct Phase3CommitFailpointGuard {
+pub struct LegacyCommitFailpointGuard {
     slot: u8,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Drop for Phase3CommitFailpointGuard {
+impl Drop for LegacyCommitFailpointGuard {
     fn drop(&mut self) {
-        let _ = PHASE3_COMMIT_FAILPOINT.compare_exchange(
+        let _ = LEGACY_COMMIT_FAILPOINT.compare_exchange(
             self.slot,
             0,
             Ordering::AcqRel,
@@ -303,20 +312,20 @@ impl Drop for Phase3CommitFailpointGuard {
 /// Returns [`Error::Internal`] if another Phase 3 failpoint is already armed.
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub fn arm_phase3_commit_failpoint(
-    failpoint: Phase3CommitFailpoint,
-) -> Result<Phase3CommitFailpointGuard> {
+pub fn arm_legacy_commit_failpoint(
+    failpoint: LegacyCommitFailpoint,
+) -> Result<LegacyCommitFailpointGuard> {
     let slot = failpoint.slot();
-    PHASE3_COMMIT_FAILPOINT
+    LEGACY_COMMIT_FAILPOINT
         .compare_exchange(0, slot, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| Error::Internal("Phase 3 commit failpoint already armed".into()))?;
-    Ok(Phase3CommitFailpointGuard { slot })
+    Ok(LegacyCommitFailpointGuard { slot })
 }
 
 /// Abort the process if the requested Phase 3 commit failpoint is armed.
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase3_abort_if_armed(failpoint: Phase3CommitFailpoint) {
-    if PHASE3_COMMIT_FAILPOINT.load(Ordering::Acquire) == failpoint.slot() {
+pub(crate) fn legacy_commit_abort_if_armed(failpoint: LegacyCommitFailpoint) {
+    if LEGACY_COMMIT_FAILPOINT.load(Ordering::Acquire) == failpoint.slot() {
         std::process::abort();
     }
 }
@@ -324,14 +333,14 @@ pub(crate) fn phase3_abort_if_armed(failpoint: Phase3CommitFailpoint) {
 /// Phase 8 checkpoint crash-cut failpoints at durable-boundary edges.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Phase8CheckpointFailpoint {
+pub enum CheckpointBoundaryFailpoint {
     /// After the checkpoint materialization flush and before any
     /// `checkpoint_applied_lsn` header advance or CheckpointBoundary record.
     AfterMaterializationFlushBeforeBoundary,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Phase8CheckpointFailpoint {
+impl CheckpointBoundaryFailpoint {
     fn slot(self) -> u8 {
         match self {
             Self::AfterMaterializationFlushBeforeBoundary => 1,
@@ -342,14 +351,14 @@ impl Phase8CheckpointFailpoint {
 /// RAII guard that clears the armed Phase 8 checkpoint failpoint on drop.
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub struct Phase8CheckpointFailpointGuard {
+pub struct CheckpointBoundaryFailpointGuard {
     slot: u8,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Drop for Phase8CheckpointFailpointGuard {
+impl Drop for CheckpointBoundaryFailpointGuard {
     fn drop(&mut self) {
-        let _ = PHASE8_CHECKPOINT_FAILPOINT.compare_exchange(
+        let _ = CHECKPOINT_BOUNDARY_FAILPOINT.compare_exchange(
             self.slot,
             0,
             Ordering::AcqRel,
@@ -365,20 +374,20 @@ impl Drop for Phase8CheckpointFailpointGuard {
 /// Returns [`Error::Internal`] if another checkpoint failpoint is already armed.
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub fn arm_phase8_checkpoint_failpoint(
-    failpoint: Phase8CheckpointFailpoint,
-) -> Result<Phase8CheckpointFailpointGuard> {
+pub fn arm_checkpoint_boundary_failpoint(
+    failpoint: CheckpointBoundaryFailpoint,
+) -> Result<CheckpointBoundaryFailpointGuard> {
     let slot = failpoint.slot();
-    PHASE8_CHECKPOINT_FAILPOINT
+    CHECKPOINT_BOUNDARY_FAILPOINT
         .compare_exchange(0, slot, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| Error::Internal("Phase 8 checkpoint failpoint already armed".into()))?;
-    Ok(Phase8CheckpointFailpointGuard { slot })
+    Ok(CheckpointBoundaryFailpointGuard { slot })
 }
 
 /// Abort the process if the requested Phase 8 checkpoint failpoint is armed.
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn phase8_checkpoint_abort_if_armed(failpoint: Phase8CheckpointFailpoint) {
-    if PHASE8_CHECKPOINT_FAILPOINT.load(Ordering::Acquire) == failpoint.slot() {
+pub(crate) fn checkpoint_boundary_abort_if_armed(failpoint: CheckpointBoundaryFailpoint) {
+    if CHECKPOINT_BOUNDARY_FAILPOINT.load(Ordering::Acquire) == failpoint.slot() {
         std::process::abort();
     }
 }
@@ -502,7 +511,7 @@ impl Drop for WriteBodyEntryHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn clear_write_body_entry_hook(shared: &SharedState, ns: &str, id: u64) {
-    let Ok(mut hooks) = shared.write_body_entry_hooks.lock() else {
+    let Ok(mut hooks) = shared.test_hooks.write_body_entry_hooks.lock() else {
         return;
     };
     let remove_ns = if let Some(queue) = hooks.get_mut(ns) {
@@ -524,6 +533,7 @@ pub(crate) fn install_write_body_entry_hook(
 ) -> WriteBodyEntryHookGuard {
     // Multiple hooks for one namespace are consumed in FIFO order.
     let id = shared
+        .test_hooks
         .write_body_entry_hook_next_id
         .fetch_add(1, Ordering::AcqRel);
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -535,6 +545,7 @@ pub(crate) fn install_write_body_entry_hook(
         observe_flag,
     };
     let mut hooks = shared
+        .test_hooks
         .write_body_entry_hooks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -551,7 +562,7 @@ pub(crate) fn install_write_body_entry_hook(
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn write_body_entry_if_installed(shared: &SharedState, ns: &str) {
     let hook = {
-        let Ok(mut hooks) = shared.write_body_entry_hooks.lock() else {
+        let Ok(mut hooks) = shared.test_hooks.write_body_entry_hooks.lock() else {
             return;
         };
         let Some(queue) = hooks.get_mut(ns) else {
@@ -658,7 +669,7 @@ impl Drop for CreateIndexBuildHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn clear_create_index_build_hook(shared: &SharedState, ns: &str, index_name: &str, id: u64) {
-    let Ok(mut hooks) = shared.create_index_build_hooks.lock() else {
+    let Ok(mut hooks) = shared.test_hooks.create_index_build_hooks.lock() else {
         return;
     };
     let key = (ns.to_owned(), index_name.to_owned());
@@ -690,6 +701,7 @@ pub(crate) fn install_create_index_build_hook_with_failure(
     fail_after_release: bool,
 ) -> CreateIndexBuildHookGuard {
     let id = shared
+        .test_hooks
         .write_body_entry_hook_next_id
         .fetch_add(1, Ordering::AcqRel);
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -701,6 +713,7 @@ pub(crate) fn install_create_index_build_hook_with_failure(
         fail_after_release,
     };
     shared
+        .test_hooks
         .create_index_build_hooks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -724,7 +737,7 @@ pub(crate) fn create_index_build_if_installed(
     index_name: &str,
 ) -> Result<()> {
     let hook = {
-        let Ok(mut hooks) = shared.create_index_build_hooks.lock() else {
+        let Ok(mut hooks) = shared.test_hooks.create_index_build_hooks.lock() else {
             return Ok(());
         };
         let key = (ns.to_owned(), index_name.to_owned());
@@ -748,12 +761,11 @@ pub(crate) fn create_index_build_if_installed(
 // `commit_txn` and `publish_commit` in the CRUD commit path.
 // ---------------------------------------------------------------------------
 //
-// Hook state lives on `SharedState::publish_pause_hook` (engine-local,
-// `#[cfg(test)]`-gated), so parallel tests using independent
-// `PagedEngine` instances cannot consume each other's barriers.
-// Production builds carry neither the `Mutex` nor the `Arc<Barrier>`
-// (§11 #10: no new `Mutex` / `Arc` on the `cfg(not(test))` commit
-// path). The paired unit test lives in
+// Hook state lives on `SharedState::test_hooks` (engine-local), so
+// parallel tests using independent `PagedEngine` instances cannot consume
+// each other's barriers. Production builds use an empty hook-state stub,
+// so the commit path carries neither the `Mutex` nor the `Arc<Barrier>`.
+// The paired unit test lives in
 // `src/storage/paged_engine/tests.rs::publish_happens_strictly_after_commit_txn`.
 
 /// Install a 2-party `Barrier` that the next CRUD commit on `shared`
@@ -765,7 +777,7 @@ pub(crate) fn install_publish_pause(
     shared: &SharedState,
     barrier: Arc<Barrier>,
 ) -> PublishPauseGuard<'_> {
-    *shared.publish_pause_hook.lock().unwrap() = Some(barrier);
+    *shared.test_hooks.publish_pause_hook.lock().unwrap() = Some(barrier);
     PublishPauseGuard { shared }
 }
 
@@ -779,7 +791,7 @@ pub struct PublishPauseGuard<'a> {
 #[cfg(test)]
 impl<'a> Drop for PublishPauseGuard<'a> {
     fn drop(&mut self) {
-        if let Ok(mut slot) = self.shared.publish_pause_hook.lock() {
+        if let Ok(mut slot) = self.shared.test_hooks.publish_pause_hook.lock() {
             *slot = None;
         }
     }
@@ -791,6 +803,7 @@ impl<'a> Drop for PublishPauseGuard<'a> {
 #[cfg(test)]
 pub(crate) fn publish_pause_if_installed(shared: &SharedState) {
     let maybe = shared
+        .test_hooks
         .publish_pause_hook
         .lock()
         .ok()
@@ -803,19 +816,19 @@ pub(crate) fn publish_pause_if_installed(shared: &SharedState) {
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn us019_maybe_fail_primary_install(shared: &SharedState) -> Result<()> {
     shared
+        .test_hooks
         .us019_primary_install_attempts
         .fetch_add(1, Ordering::AcqRel);
-    let decremented = shared.us019_primary_install_failures.fetch_update(
-        Ordering::AcqRel,
-        Ordering::Acquire,
-        |remaining| {
+    let decremented = shared
+        .test_hooks
+        .us019_primary_install_failures
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
             if remaining == 0 {
                 None
             } else {
                 Some(remaining - 1)
             }
-        },
-    );
+        });
     if decremented.is_ok() {
         return Err(Error::Internal(
             "US-019 injected primary install failure".into(),
@@ -827,10 +840,12 @@ pub(crate) fn us019_maybe_fail_primary_install(shared: &SharedState) -> Result<(
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn us009_record_committed_flip(shared: &SharedState) {
     let order = shared
+        .test_hooks
         .us009_event_order_counter
         .fetch_add(1, Ordering::AcqRel)
         + 1;
     shared
+        .test_hooks
         .us009_committed_flip_order
         .store(order, Ordering::Release);
 }
@@ -838,10 +853,12 @@ pub(crate) fn us009_record_committed_flip(shared: &SharedState) {
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn us009_record_publish_ready(shared: &SharedState) {
     let order = shared
+        .test_hooks
         .us009_event_order_counter
         .fetch_add(1, Ordering::AcqRel)
         + 1;
     shared
+        .test_hooks
         .us009_publish_ready_order
         .store(order, Ordering::Release);
 }
@@ -849,6 +866,7 @@ pub(crate) fn us009_record_publish_ready(shared: &SharedState) {
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn us009_fail_after_committed_flip_if_armed(shared: &SharedState) -> Result<()> {
     if shared
+        .test_hooks
         .us009_fail_after_committed_flip
         .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -915,6 +933,7 @@ impl PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn recovery_open_published_store_count(&self) -> u64 {
         self.shared
+            .test_hooks
             .recovery_open_published_store_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -933,9 +952,11 @@ impl PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn us019_set_primary_install_failures(&self, failures: u8) {
         self.shared
+            .test_hooks
             .us019_primary_install_attempts
             .store(0, Ordering::Release);
         self.shared
+            .test_hooks
             .us019_primary_install_failures
             .store(failures, Ordering::Release);
     }
@@ -943,6 +964,7 @@ impl PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn us019_primary_install_attempts(&self) -> u64 {
         self.shared
+            .test_hooks
             .us019_primary_install_attempts
             .load(Ordering::Acquire)
     }
@@ -953,7 +975,9 @@ impl PagedEngine {
         ns: &str,
         id: &bson::Bson,
     ) -> Result<Vec<String>> {
-        let coll = self.metadata_state.catalog_lock()
+        let coll = self
+            .metadata_state
+            .catalog_lock()
             .get_collection(ns)?
             .ok_or_else(|| Error::Internal(format!("namespace '{ns}' not found")))?;
         let key = encode_key(id);
@@ -978,7 +1002,9 @@ impl PagedEngine {
         commit_ts: Ts,
         txn_id: u64,
     ) -> Result<()> {
-        let coll = self.metadata_state.catalog_lock()
+        let coll = self
+            .metadata_state
+            .catalog_lock()
             .get_collection(ns)?
             .ok_or_else(|| Error::Internal(format!("namespace '{ns}' not found")))?;
         let id = doc.get("_id").cloned().unwrap_or(bson::Bson::Null);
@@ -1020,7 +1046,9 @@ impl PagedEngine {
         doc: &bson::Document,
         id: &bson::Bson,
     ) -> Result<Vec<String>> {
-        let index = self.metadata_state.catalog_lock()
+        let index = self
+            .metadata_state
+            .catalog_lock()
             .get_index(ns, index_name)?
             .ok_or_else(|| Error::Internal(format!("index '{index_name}' not found")))?;
         let (keys, _) = build_index_keys(doc, &index.key_pattern, id, index.sparse)?;
@@ -1028,7 +1056,11 @@ impl PagedEngine {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Internal("US-009 secondary probe got no index key".into()))?;
-        let tree = BTree::open(self.shared.new_btree_store(), index.root_page, index.root_level);
+        let tree = BTree::open(
+            self.shared.new_btree_store(),
+            index.root_page,
+            index.root_level,
+        );
         let leaf = tree.find_leaf(&key)?;
         self.shared
             .handle
@@ -1039,7 +1071,9 @@ impl PagedEngine {
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn test_us028_primary_leaf_ident(&self, ns: &str, id: &bson::Bson) -> Result<(TreeIdent, u32)> {
-        let coll = self.metadata_state.catalog_lock()
+        let coll = self
+            .metadata_state
+            .catalog_lock()
             .get_collection(ns)?
             .ok_or_else(|| Error::Internal(format!("namespace '{ns}' not found")))?;
         let key = encode_key(id);
@@ -1140,15 +1174,19 @@ impl PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn us009_reset_flip_publish_order(&self) {
         self.shared
+            .test_hooks
             .us009_event_order_counter
             .store(0, Ordering::Release);
         self.shared
+            .test_hooks
             .us009_committed_flip_order
             .store(0, Ordering::Release);
         self.shared
+            .test_hooks
             .us009_publish_ready_order
             .store(0, Ordering::Release);
         self.shared
+            .test_hooks
             .us009_fail_after_committed_flip
             .store(0, Ordering::Release);
     }
@@ -1157,9 +1195,11 @@ impl PagedEngine {
     pub(crate) fn us009_flip_publish_order(&self) -> (u64, u64) {
         (
             self.shared
+                .test_hooks
                 .us009_committed_flip_order
                 .load(Ordering::Acquire),
             self.shared
+                .test_hooks
                 .us009_publish_ready_order
                 .load(Ordering::Acquire),
         )
@@ -1168,43 +1208,39 @@ impl PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn us009_fail_after_committed_flip_once(&self) {
         self.shared
+            .test_hooks
             .us009_fail_after_committed_flip
             .store(1, Ordering::Release);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us026_arm_post_register_failpoint(
-        &self,
-        failpoint: Us026PostRegisterFailpoint,
-    ) {
+    pub(crate) fn us026_arm_post_register_failpoint(&self, failpoint: Us026PostRegisterFailpoint) {
         us026_arm_post_register_failpoint(&self.shared, failpoint);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn phase8_journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
+    pub(crate) fn journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
         self.shared.handle.journal_lsn_snapshot()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn phase8_fail_next_dirty_lsn_stamp(&self) {
-        phase8_arm_dirty_lsn_stamp_failure(&self.shared);
+    pub(crate) fn fail_next_dirty_lsn_stamp(&self) {
+        arm_dirty_lsn_stamp_failure(&self.shared);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn phase8_fail_next_after_dirty_lsn_stamp(&self) {
-        phase8_arm_after_dirty_lsn_stamp_failure(&self.shared);
+    pub(crate) fn fail_next_after_dirty_lsn_stamp(&self) {
+        arm_after_dirty_lsn_stamp_failure(&self.shared);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn phase8_fail_next_after_durable_before_flip(&self) {
-        phase8_arm_after_durable_before_flip_failure(&self.shared);
+    pub(crate) fn fail_next_after_durable_before_flip(&self) {
+        arm_after_durable_before_flip_failure(&self.shared);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn install_phase8_before_reservation_hook(
-        &self,
-    ) -> Phase8BeforeReservationHookGuard {
-        install_phase8_before_reservation_hook(&self.shared)
+    pub(crate) fn install_before_log_reservation_hook(&self) -> BeforeLogReservationHookGuard {
+        install_before_log_reservation_hook(&self.shared)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1254,7 +1290,9 @@ impl PagedEngine {
         email: &str,
         txn_id: u64,
     ) -> Result<()> {
-        let index = self.metadata_state.catalog_lock()
+        let index = self
+            .metadata_state
+            .catalog_lock()
             .get_index(ns, index_name)?
             .ok_or_else(|| Error::Internal(format!("index '{index_name}' not found")))?;
         if !index.unique {

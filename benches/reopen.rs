@@ -38,6 +38,8 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use mqlite::{Client, DurabilityMode, OpenOptions};
 use tempfile::TempDir;
 
+mod common;
+
 const SEED_DOCS: usize = 200;
 const PAYLOAD_BYTES: usize = 512;
 
@@ -47,33 +49,14 @@ fn metadata(
     legacy_page_frames: u64,
     chain_commit_frames: u64,
 ) -> String {
-    let rustc = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned());
-
-    let cpu_count = num_cpus();
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
     let durability = "FullSync";
 
     format!(
         "scenario={scenario} journal_bytes={journal_bytes} \
          legacy_page_frames={legacy_page_frames} chain_commit_frames={chain_commit_frames} \
-         durability={durability} rustc=\"{rustc}\" cpu_count={cpu_count} \
-         arch={arch} os={os}"
+         durability={durability} {}",
+        common::host_metadata()
     )
-}
-
-fn num_cpus() -> usize {
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg("nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(1)
 }
 
 /// Seed `count` documents into a fresh database at `path`.

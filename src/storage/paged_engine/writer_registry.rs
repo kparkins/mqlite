@@ -21,6 +21,11 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::error::{Error, Result};
 
+fn record_lane_wait_since(start: Instant) {
+    let waited_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    crate::mvcc::metrics::record_lane_wait_ns(waited_ns);
+}
+
 /// One entry per namespace. Populated lazily on first explicit admit.
 ///
 /// Tests use `(admits - releases) == active_writers` to assert balance.
@@ -49,30 +54,36 @@ pub(crate) struct NsWriteTicket {
 }
 
 impl NsWriteTicket {
-    /// Release the same-namespace body-entry mutex while retaining the DDL
-    /// drain ticket through the durability and publish envelope.
-    pub(crate) fn finish_body(&mut self) {
+    fn clear_body_active(&mut self, g: &mut NsWriterLaneInner) -> bool {
         if !self.body_active {
-            return;
+            return false;
         }
-        let mut g = self.lane.inner.lock();
         if g.body_active {
             g.body_active = false;
         }
         self.body_active = false;
-        self.lane.cvar.notify_all();
+        true
+    }
+
+    /// Release the same-namespace body-entry mutex while retaining the DDL
+    /// drain ticket through the durability and publish envelope.
+    pub(crate) fn finish_body(&mut self) {
+        let lane = Arc::clone(&self.lane);
+        let mut g = lane.inner.lock();
+        if self.clear_body_active(&mut g) {
+            lane.cvar.notify_all();
+        }
     }
 }
 
 impl Drop for NsWriteTicket {
     fn drop(&mut self) {
-        let mut g = self.lane.inner.lock();
-        if self.body_active && g.body_active {
-            g.body_active = false;
-        }
+        let lane = Arc::clone(&self.lane);
+        let mut g = lane.inner.lock();
+        self.clear_body_active(&mut g);
         g.releases = g.releases.saturating_add(1);
         if !g.body_active || g.admits == g.releases {
-            self.lane.cvar.notify_all();
+            lane.cvar.notify_all();
         }
     }
 }
@@ -124,21 +135,18 @@ impl NsWriterRegistry {
             if g.closed || g.body_active {
                 let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
                 if remaining.is_zero() {
-                    let waited_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    crate::mvcc::metrics::record_lane_wait_ns(waited_ns);
+                    record_lane_wait_since(start);
                     return Err(Error::WriterBusy);
                 }
                 let wr = lane.cvar.wait_for(&mut g, remaining);
                 if wr.timed_out() && (g.closed || g.body_active) {
-                    let waited_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    crate::mvcc::metrics::record_lane_wait_ns(waited_ns);
+                    record_lane_wait_since(start);
                     return Err(Error::WriterBusy);
                 }
                 continue;
             }
             g.admits = g.admits.saturating_add(1);
-            let waited_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            crate::mvcc::metrics::record_lane_wait_ns(waited_ns);
+            record_lane_wait_since(start);
             return Ok(NsWriteTicket {
                 lane: lane.clone(),
                 body_active: true,

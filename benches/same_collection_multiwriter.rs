@@ -17,6 +17,8 @@
 )]
 #![allow(missing_docs)]
 
+mod common;
+
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -28,6 +30,8 @@ use criterion::{
 };
 use mqlite::{Client, DurabilityMode, OpenOptions};
 use tempfile::TempDir;
+
+use common::non_empty_command_output;
 
 const DATABASE_NAME: &str = "multiwriter_bench";
 const COLLECTION_NAME: &str = "multiwriter";
@@ -80,8 +84,8 @@ fn durability_cases() -> [DurabilityCase; 2] {
 }
 
 fn metadata(writer_count: usize, payload: PayloadClass, durability: &str) -> String {
-    let rustc = command_output("rustc", &["--version"]);
-    let git_commit = command_output("git", &["rev-parse", "HEAD"]);
+    let rustc = non_empty_command_output("rustc", &["--version"]);
+    let git_commit = non_empty_command_output("git", &["rev-parse", "HEAD"]);
     let cpu_model = cpu_model().replace('"', "'");
     let core_count = core_count();
     let arch = std::env::consts::ARCH;
@@ -103,19 +107,8 @@ fn metadata(writer_count: usize, payload: PayloadClass, durability: &str) -> Str
     )
 }
 
-fn command_output(program: &str, args: &[&str]) -> String {
-    std::process::Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
 fn cpu_model() -> String {
-    command_output(
+    non_empty_command_output(
         "sh",
         &[
             "-c",

@@ -9,6 +9,8 @@
 #![doc = "Integration test target for Phase 8 journal group commit stories."]
 #![cfg(feature = "test-hooks")]
 
+mod crash_harness;
+
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,19 +21,21 @@ use std::{env, fs, path::Path, path::PathBuf};
 use bson::{doc, Bson, Document};
 use mqlite::error::{EngineFatalReason, WriteConflictReason};
 use mqlite::{
-    arm_phase8_checkpoint_failpoint, Client, DurabilityMode, Error, IndexModel, OpenOptions,
-    Phase8CatalogCommitKind, Phase8CheckpointFailpoint, Phase8LogRecordKind,
-    Phase8LogRecordSummary, Us026PostRegisterFailpoint,
+    arm_checkpoint_boundary_failpoint, CheckpointBoundaryFailpoint, Client, DurabilityMode, Error,
+    IndexModel, JournalCatalogCommitKind, JournalLogRecordKind, JournalLogRecordSummary,
+    OpenOptions, Us026PostRegisterFailpoint,
 };
 use serial_test::serial;
 
-const PHASE8_NS: &str = "phase8.docs";
+use crash_harness::journal_path;
+
+const JOURNAL_GROUP_COMMIT_NS: &str = "phase8.docs";
 const HEADER_PAGE_SIZE: usize = 4096;
 const LAST_CHECKPOINT_TS_OFFSET: usize = 24;
 const CHECKPOINT_APPLIED_LSN_OFFSET: usize = 102;
-const PHASE8_CHECKPOINT_CRASH_CHILD_ENV: &str = "MQLITE_PHASE8_CHECKPOINT_CRASH_CHILD";
-const PHASE8_CHECKPOINT_CRASH_DB_ENV: &str = "MQLITE_PHASE8_CHECKPOINT_CRASH_DB";
-const PHASE8_SETTLE_DEADLINE: Duration = Duration::from_secs(2);
+const CHECKPOINT_CRASH_CHILD_ENV: &str = "MQLITE_PHASE8_CHECKPOINT_CRASH_CHILD";
+const CHECKPOINT_CRASH_DB_ENV: &str = "MQLITE_PHASE8_CHECKPOINT_CRASH_DB";
+const JOURNAL_GROUP_COMMIT_SETTLE_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HeaderState {
@@ -39,7 +43,10 @@ struct HeaderState {
     checkpoint_applied_lsn: u64,
 }
 
-fn open_phase8_client(name: &str, durability: DurabilityMode) -> (tempfile::TempDir, Client) {
+fn open_journal_group_commit_client(
+    name: &str,
+    durability: DurabilityMode,
+) -> (tempfile::TempDir, Client) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(name);
     let client = Client::open_with_options(&path, OpenOptions::new().durability(durability))
@@ -55,19 +62,13 @@ fn open_fullsync(path: &Path) -> Client {
     .expect("open fullsync phase8 test database")
 }
 
-fn journal_path(path: &Path) -> PathBuf {
-    let mut journal = path.as_os_str().to_owned();
-    journal.push("-journal");
-    PathBuf::from(journal)
-}
-
-fn phase8_records(client: &Client) -> Vec<Phase8LogRecordSummary> {
+fn journal_log_records(client: &Client) -> Vec<JournalLogRecordSummary> {
     client
-        .__phase8_log_records()
+        .__journal_log_records()
         .expect("decode phase8 log records")
 }
 
-fn catalog_kinds(records: &[Phase8LogRecordSummary]) -> Vec<Phase8CatalogCommitKind> {
+fn catalog_kinds(records: &[JournalLogRecordSummary]) -> Vec<JournalCatalogCommitKind> {
     records
         .iter()
         .filter_map(|record| record.catalog_kind)
@@ -75,8 +76,8 @@ fn catalog_kinds(records: &[Phase8LogRecordSummary]) -> Vec<Phase8CatalogCommitK
 }
 
 fn assert_catalog_kinds_in_order(
-    records: &[Phase8LogRecordSummary],
-    expected: &[Phase8CatalogCommitKind],
+    records: &[JournalLogRecordSummary],
+    expected: &[JournalCatalogCommitKind],
 ) {
     let actual = catalog_kinds(records);
     let mut cursor = 0;
@@ -88,7 +89,7 @@ fn assert_catalog_kinds_in_order(
     }
 }
 
-fn assert_phase8_doc_value(client: &Client, id: i32, expected: Option<&str>) {
+fn assert_doc_value(client: &Client, id: i32, expected: Option<&str>) {
     let got = client
         .database("phase8")
         .collection::<Document>("docs")
@@ -103,10 +104,10 @@ fn assert_phase8_doc_value(client: &Client, id: i32, expected: Option<&str>) {
     }
 }
 
-fn phase8_crud_records(client: &Client) -> Vec<Phase8LogRecordSummary> {
-    phase8_records(client)
+fn crud_log_records(client: &Client) -> Vec<JournalLogRecordSummary> {
+    journal_log_records(client)
         .into_iter()
-        .filter(|record| record.kind == Phase8LogRecordKind::CrudCommit)
+        .filter(|record| record.kind == JournalLogRecordKind::CrudCommit)
         .collect()
 }
 
@@ -138,19 +139,18 @@ fn ts_gt(left: (u64, u32), right: (u64, u32)) -> bool {
     left.0 > right.0 || (left.0 == right.0 && left.1 > right.1)
 }
 
-fn run_phase8_checkpoint_crash_child_if_requested() -> bool {
-    if env::var(PHASE8_CHECKPOINT_CRASH_CHILD_ENV).ok().as_deref() != Some("1") {
+fn run_checkpoint_crash_child_if_requested() -> bool {
+    if env::var(CHECKPOINT_CRASH_CHILD_ENV).ok().as_deref() != Some("1") {
         return false;
     }
-    let path =
-        PathBuf::from(env::var(PHASE8_CHECKPOINT_CRASH_DB_ENV).expect("checkpoint crash db env"));
+    let path = PathBuf::from(env::var(CHECKPOINT_CRASH_DB_ENV).expect("checkpoint crash db env"));
     let client = open_fullsync(&path);
     let collection = client.database("phase8").collection::<Document>("docs");
     collection
         .insert_one(&doc! { "_id": 1i32, "phase": "before-crash-cut" })
         .expect("child insert before checkpoint crash cut");
-    let _guard = arm_phase8_checkpoint_failpoint(
-        Phase8CheckpointFailpoint::AfterMaterializationFlushBeforeBoundary,
+    let _guard = arm_checkpoint_boundary_failpoint(
+        CheckpointBoundaryFailpoint::AfterMaterializationFlushBeforeBoundary,
     )
     .expect("arm checkpoint crash failpoint");
     client
@@ -160,7 +160,7 @@ fn run_phase8_checkpoint_crash_child_if_requested() -> bool {
 }
 
 #[test]
-fn phase8_journal_group_commit_target_is_wired() {
+fn journal_group_commit_target_is_wired() {
     assert_eq!("phase8_journal_group_commit", module_path!());
 }
 
@@ -175,7 +175,7 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
-fn phase8_commit_append_hot_path_uses_log_manager_reservations() {
+fn commit_append_hot_path_uses_log_manager_reservations() {
     let source = include_str!("../src/journal/mod.rs");
     let chain_body = source_between(
         source,
@@ -199,7 +199,7 @@ fn phase8_commit_append_hot_path_uses_log_manager_reservations() {
 }
 
 #[test]
-fn phase8_sync_journal_uses_log_manager_durable_frontier() {
+fn sync_journal_uses_log_manager_durable_frontier() {
     let source = include_str!("../src/journal/mod.rs");
     let sync_body = source_between(
         source,
@@ -212,7 +212,7 @@ fn phase8_sync_journal_uses_log_manager_durable_frontier() {
 }
 
 #[test]
-fn phase8_fullsync_commit_waits_on_end_lsn_not_ticket_manager() {
+fn fullsync_commit_waits_on_end_lsn_not_ticket_manager() {
     let engine = include_str!("../src/storage/paged_engine.rs");
     let state = include_str!("../src/storage/paged_engine/state.rs");
 
@@ -228,7 +228,7 @@ fn phase8_fullsync_commit_waits_on_end_lsn_not_ticket_manager() {
 }
 
 #[test]
-fn phase8_interval_and_none_use_ready_frontier_without_commit_sync_wait() {
+fn interval_and_none_use_ready_frontier_without_commit_sync_wait() {
     let engine = include_str!("../src/storage/paged_engine.rs");
 
     assert!(engine.contains("fn maybe_sync_interval_after_publish"));
@@ -239,7 +239,7 @@ fn phase8_interval_and_none_use_ready_frontier_without_commit_sync_wait() {
 }
 
 #[test]
-fn phase8_dirty_pages_have_explicit_lsn_state() {
+fn dirty_pages_have_explicit_lsn_state() {
     let partition = include_str!("../src/storage/buffer_pool/partition.rs");
 
     assert!(partition.contains("enum PageDirtyLsn"));
@@ -254,7 +254,7 @@ fn phase8_dirty_pages_have_explicit_lsn_state() {
 }
 
 #[test]
-fn phase8_dirty_eviction_skips_unflushable_or_undurable_pages() {
+fn dirty_eviction_skips_unflushable_or_undurable_pages() {
     let partition = include_str!("../src/storage/buffer_pool/partition.rs");
 
     assert!(partition.contains("fn find_victim(&mut self, durable_lsn: u64)"));
@@ -267,7 +267,7 @@ fn phase8_dirty_eviction_skips_unflushable_or_undurable_pages() {
 }
 
 #[test]
-fn phase8_main_file_flush_is_lsn_fenced() {
+fn main_file_flush_is_lsn_fenced() {
     let handle = include_str!("../src/storage/handle.rs");
     let buffer_pool = include_str!("../src/storage/buffer_pool/mod.rs");
 
@@ -282,7 +282,7 @@ fn phase8_main_file_flush_is_lsn_fenced() {
 }
 
 #[test]
-fn phase8_checkpoint_fsyncs_main_file_before_boundary_record() {
+fn checkpoint_fsyncs_main_file_before_boundary_record() {
     let snapshot_ops = include_str!("../src/storage/paged_engine/snapshot_ops.rs");
     let checkpoint_body = source_between(
         snapshot_ops,
@@ -323,7 +323,7 @@ fn phase8_checkpoint_fsyncs_main_file_before_boundary_record() {
 }
 
 #[test]
-fn phase8_commit_stamps_dirty_pages_with_commit_end_lsn_before_waiting() {
+fn commit_stamps_dirty_pages_with_commit_end_lsn_before_waiting() {
     let engine = include_str!("../src/storage/paged_engine.rs");
     let run_write_commit_envelope = source_between(
         engine,
@@ -366,7 +366,7 @@ fn phase8_commit_stamps_dirty_pages_with_commit_end_lsn_before_waiting() {
 }
 
 #[test]
-fn phase8_pre_durable_cleanup_does_not_drop_global_dirty_pages() {
+fn pre_durable_cleanup_does_not_drop_global_dirty_pages() {
     let engine = include_str!("../src/storage/paged_engine.rs");
     let cleanup = source_between(
         engine,
@@ -384,8 +384,9 @@ fn phase8_pre_durable_cleanup_does_not_drop_global_dirty_pages() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_none_commit_waits_ready_without_syncing() {
-    let (_dir, client) = open_phase8_client("phase8_none.mqlite", DurabilityMode::None);
+fn none_commit_waits_ready_without_syncing() {
+    let (_dir, client) =
+        open_journal_group_commit_client("phase8_none.mqlite", DurabilityMode::None);
     client.__us017_reset_group_commit_probe();
     client.__us039_reset_append_sync_observations();
 
@@ -407,7 +408,7 @@ fn phase8_none_commit_waits_ready_without_syncing() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_interval_sync_failure_poisons_after_visible_interval_write() {
+fn interval_sync_failure_poisons_after_visible_interval_write() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_interval_failure.mqlite");
     let client = Client::open_with_options(
@@ -487,11 +488,11 @@ fn phase8_interval_sync_failure_poisons_after_visible_interval_write() {
 }
 
 #[test]
-fn phase8_recovery_scans_contiguous_log_records_and_truncates_once() {
+fn recovery_scans_contiguous_log_records_and_truncates_once() {
     let source = include_str!("../src/journal/recovery.rs");
 
-    assert!(source.contains("fn scan_phase8_log_records("));
-    assert!(source.contains("fn read_phase8_record_at("));
+    assert!(source.contains("fn scan_log_records("));
+    assert!(source.contains("fn read_log_record_at("));
     assert!(source.contains("fn truncate_tail_to_valid_end_lsn("));
     assert!(source.contains("LogRecord::decode(&bytes)"));
     assert!(source.contains("record.start_lsn != cursor"));
@@ -501,20 +502,20 @@ fn phase8_recovery_scans_contiguous_log_records_and_truncates_once() {
 }
 
 #[test]
-fn phase8_reopen_seeds_live_publish_sequencer_above_recovered_floor() {
+fn reopen_seeds_live_publish_sequencer_above_recovered_floor() {
     let state = include_str!("../src/storage/paged_engine/state.rs");
     let sequencer = include_str!("../src/storage/paged_engine/publish_sequencer.rs");
 
     assert!(state.contains("let recovered_max_publish_seq = handle.recovered_max_publish_seq()?"));
     assert!(state.contains("seq.checked_add(1)"));
-    assert!(state.contains("PublishSequencer::new_from_recovered_floors"));
-    assert!(sequencer.contains("pub(crate) fn new_from_recovered_floors"));
+    assert!(state.contains("PublishSequencer::new_with_recovery_state"));
+    assert!(sequencer.contains("pub(crate) fn new_with_recovery_state"));
     assert!(sequencer.contains("last_published: next_seq.saturating_sub(1)"));
 }
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_same_key_conflict_after_peer_commit_does_not_advance_lsn() {
+fn same_key_conflict_after_peer_commit_does_not_advance_lsn() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_same_key_conflict.mqlite");
     let client = Client::open_with_options(
@@ -527,7 +528,7 @@ fn phase8_same_key_conflict_after_peer_commit_does_not_advance_lsn() {
         .create_collection("docs")
         .expect("create docs collection");
 
-    let mut hook = client.__install_write_body_entry_hook(PHASE8_NS);
+    let mut hook = client.__install_write_body_entry_hook(JOURNAL_GROUP_COMMIT_NS);
     let stalled = client.clone();
     let stalled_writer = thread::spawn(move || {
         stalled
@@ -543,7 +544,7 @@ fn phase8_same_key_conflict_after_peer_commit_does_not_advance_lsn() {
         .insert_one(&doc! { "_id": 1i32, "mark": "winner" })
         .expect("peer writer commits first");
     let after_winner = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot after winning commit");
 
     hook.release().expect("release stalled writer");
@@ -557,7 +558,7 @@ fn phase8_same_key_conflict_after_peer_commit_does_not_advance_lsn() {
         })
     ));
     let after_conflict = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot after same-key conflict");
     assert_eq!(
         after_conflict, after_winner,
@@ -588,7 +589,7 @@ fn phase8_same_key_conflict_after_peer_commit_does_not_advance_lsn() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_pre_reservation_failure_writes_no_complete_record() {
+fn pre_reservation_failure_writes_no_complete_record() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_pre_reservation_failure.mqlite");
     let client = Client::open_with_options(
@@ -602,7 +603,7 @@ fn phase8_pre_reservation_failure_writes_no_complete_record() {
         .expect("create docs collection");
     let collection = client.database("phase8").collection::<Document>("docs");
     let before = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot before pre-reservation failure");
 
     client.__us026_arm_post_register_failpoint(Us026PostRegisterFailpoint::BeforeLogReservation);
@@ -612,14 +613,14 @@ fn phase8_pre_reservation_failure_writes_no_complete_record() {
     assert!(matches!(err, Error::Internal(message) if message.contains("US-026 injected")));
 
     let after = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot after pre-reservation failure");
     assert_eq!(
         after, before,
         "pre-reservation abort must not advance next/ready/durable LSN"
     );
     let states = client
-        .__us009_primary_chain_states(PHASE8_NS, &Bson::Int32(7))
+        .__us009_primary_chain_states(JOURNAL_GROUP_COMMIT_NS, &Bson::Int32(7))
         .expect("inspect aborted pending chain");
     assert_eq!(
         states.first().map(String::as_str),
@@ -643,7 +644,7 @@ fn phase8_pre_reservation_failure_writes_no_complete_record() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_pre_reservation_cleanup_preserves_other_writer_pending_pages() {
+fn pre_reservation_cleanup_preserves_other_writer_pending_pages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_cleanup_preserves_peer.mqlite");
     let client = Client::open_with_options(
@@ -656,7 +657,7 @@ fn phase8_pre_reservation_cleanup_preserves_other_writer_pending_pages() {
         .create_collection("docs")
         .expect("create docs collection");
 
-    let mut before_reservation = client.__phase8_install_before_reservation_hook();
+    let mut before_reservation = client.__install_before_log_reservation_hook();
     let peer = client.clone();
     let peer_writer = thread::spawn(move || {
         peer.database("phase8")
@@ -720,7 +721,7 @@ fn phase8_pre_reservation_cleanup_preserves_other_writer_pending_pages() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_us007_namespace_create_drop_recover_from_catalog_commits() {
+fn namespace_create_drop_recovers_catalog_commits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_namespace_recovery.mqlite");
     let client = open_fullsync(&path);
@@ -729,12 +730,12 @@ fn phase8_us007_namespace_create_drop_recover_from_catalog_commits() {
         .database("phase8")
         .create_collection("ddl")
         .expect("create namespace through Client");
-    let create_records = phase8_records(&client);
+    let create_records = journal_log_records(&client);
     let create = create_records
         .iter()
-        .find(|record| record.catalog_kind == Some(Phase8CatalogCommitKind::NamespaceCreate))
+        .find(|record| record.catalog_kind == Some(JournalCatalogCommitKind::NamespaceCreate))
         .expect("namespace create writes CatalogCommit");
-    assert_eq!(create.kind, Phase8LogRecordKind::CatalogCommit);
+    assert_eq!(create.kind, JournalLogRecordKind::CatalogCommit);
     assert!(create.publish_seq > 0);
     assert!(
         create.catalog_generation_after > create.catalog_generation_before,
@@ -756,12 +757,12 @@ fn phase8_us007_namespace_create_drop_recover_from_catalog_commits() {
         .database("phase8")
         .drop_collection("ddl")
         .expect("drop namespace through Client");
-    let drop_records = phase8_records(&reopened);
+    let drop_records = journal_log_records(&reopened);
     let drop_record = drop_records
         .iter()
-        .find(|record| record.catalog_kind == Some(Phase8CatalogCommitKind::NamespaceDrop))
+        .find(|record| record.catalog_kind == Some(JournalCatalogCommitKind::NamespaceDrop))
         .expect("namespace drop writes CatalogCommit");
-    assert_eq!(drop_record.kind, Phase8LogRecordKind::CatalogCommit);
+    assert_eq!(drop_record.kind, JournalLogRecordKind::CatalogCommit);
     assert!(drop_record.publish_seq > create.publish_seq);
     std::mem::forget(reopened);
 
@@ -778,7 +779,7 @@ fn phase8_us007_namespace_create_drop_recover_from_catalog_commits() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_us007_create_and_drop_index_recover_from_typed_catalog_records() {
+fn create_and_drop_index_recovers_typed_catalog_records() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_index_recovery.mqlite");
     let client = open_fullsync(&path);
@@ -793,25 +794,25 @@ fn phase8_us007_create_and_drop_index_recover_from_typed_catalog_records() {
             .expect("seed index document");
     }
 
-    let baseline = phase8_records(&client).len();
+    let baseline = journal_log_records(&client).len();
     let index_name = collection
         .create_index(IndexModel::builder().keys(doc! { "tag": 1 }).build())
         .expect("create index through Client");
     assert_eq!(index_name, "tag_1");
-    let create_records = phase8_records(&client);
+    let create_records = journal_log_records(&client);
     let create_delta = &create_records[baseline..];
     assert_catalog_kinds_in_order(
         create_delta,
         &[
-            Phase8CatalogCommitKind::IndexReserve,
-            Phase8CatalogCommitKind::IndexBuild,
-            Phase8CatalogCommitKind::IndexBuildCommit,
+            JournalCatalogCommitKind::IndexReserve,
+            JournalCatalogCommitKind::IndexBuild,
+            JournalCatalogCommitKind::IndexBuildCommit,
         ],
     );
     assert!(
         create_delta
             .iter()
-            .filter(|record| record.kind == Phase8LogRecordKind::CatalogCommit)
+            .filter(|record| record.kind == JournalLogRecordKind::CatalogCommit)
             .all(|record| record.publish_seq > 0),
         "index catalog records must use nonzero publish sequences"
     );
@@ -831,14 +832,14 @@ fn phase8_us007_create_and_drop_index_recover_from_typed_catalog_records() {
     assert_eq!(explain.index_used.as_deref(), Some("tag_1"));
     assert_eq!(docs.len(), 20);
 
-    let before_drop = phase8_records(&reopened).len();
+    let before_drop = journal_log_records(&reopened).len();
     recovered
         .drop_index("tag_1")
         .expect("drop index through Client");
-    let drop_records = phase8_records(&reopened);
+    let drop_records = journal_log_records(&reopened);
     assert_catalog_kinds_in_order(
         &drop_records[before_drop..],
-        &[Phase8CatalogCommitKind::IndexDrop],
+        &[JournalCatalogCommitKind::IndexDrop],
     );
     drop(recovered);
     std::mem::forget(reopened);
@@ -857,7 +858,7 @@ fn phase8_us007_create_and_drop_index_recover_from_typed_catalog_records() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_us007_failed_create_index_cleans_up_building_record() {
+fn failed_create_index_cleans_up_building_record() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_index_cleanup.mqlite");
     let client = open_fullsync(&path);
@@ -868,8 +869,9 @@ fn phase8_us007_failed_create_index_cleans_up_building_record() {
             .expect("seed cleanup document");
     }
 
-    let baseline = phase8_records(&client).len();
-    let mut hook = client.__install_create_index_build_failure_hook(PHASE8_NS, "tag_1");
+    let baseline = journal_log_records(&client).len();
+    let mut hook =
+        client.__install_create_index_build_failure_hook(JOURNAL_GROUP_COMMIT_NS, "tag_1");
     let worker_client = client.clone();
     let worker = thread::spawn(move || {
         worker_client
@@ -886,17 +888,17 @@ fn phase8_us007_failed_create_index_cleans_up_building_record() {
         .expect_err("injected build failure must surface");
     assert!(matches!(err, Error::Internal(message) if message.contains("US-038 injected")));
 
-    let records = phase8_records(&client);
+    let records = journal_log_records(&client);
     let delta = &records[baseline..];
     assert_catalog_kinds_in_order(
         delta,
         &[
-            Phase8CatalogCommitKind::IndexReserve,
-            Phase8CatalogCommitKind::IndexCleanup,
+            JournalCatalogCommitKind::IndexReserve,
+            JournalCatalogCommitKind::IndexCleanup,
         ],
     );
     assert!(
-        !catalog_kinds(delta).contains(&Phase8CatalogCommitKind::IndexBuildCommit),
+        !catalog_kinds(delta).contains(&JournalCatalogCommitKind::IndexBuildCommit),
         "failed create_index must not publish a Ready transition"
     );
     assert!(
@@ -924,7 +926,7 @@ fn phase8_us007_failed_create_index_cleans_up_building_record() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_us007_checkpoint_boundary_skips_prefix_and_replays_tail() {
+fn checkpoint_boundary_skips_prefix_and_replays_tail() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_checkpoint_skip.mqlite");
     let client = open_fullsync(&path);
@@ -942,9 +944,9 @@ fn phase8_us007_checkpoint_boundary_skips_prefix_and_replays_tail() {
     );
     let checkpoint_header = read_header_state(&path);
     assert!(checkpoint_header.checkpoint_applied_lsn > 0);
-    let boundary = phase8_records(&client)
+    let boundary = journal_log_records(&client)
         .into_iter()
-        .find(|record| record.kind == Phase8LogRecordKind::CheckpointBoundary)
+        .find(|record| record.kind == JournalLogRecordKind::CheckpointBoundary)
         .expect("checkpoint writes CheckpointBoundary");
     assert_eq!(boundary.publish_seq, 0);
     assert_eq!(
@@ -958,7 +960,7 @@ fn phase8_us007_checkpoint_boundary_skips_prefix_and_replays_tail() {
     collection
         .insert_one(&doc! { "_id": 2i32, "phase": "after-checkpoint" })
         .expect("insert post-checkpoint doc");
-    let post_checkpoint_records = phase8_records(&client);
+    let post_checkpoint_records = journal_log_records(&client);
     assert!(
         post_checkpoint_records
             .iter()
@@ -968,7 +970,7 @@ fn phase8_us007_checkpoint_boundary_skips_prefix_and_replays_tail() {
     let post_checkpoint_publish_seq = post_checkpoint_records
         .iter()
         .filter(|record| record.end_lsn > checkpoint_header.checkpoint_applied_lsn)
-        .filter(|record| record.kind != Phase8LogRecordKind::CheckpointBoundary)
+        .filter(|record| record.kind != JournalLogRecordKind::CheckpointBoundary)
         .map(|record| record.publish_seq)
         .max()
         .expect("post-checkpoint commit exists");
@@ -1000,14 +1002,14 @@ fn phase8_us007_checkpoint_boundary_skips_prefix_and_replays_tail() {
         "checkpoint timestamp must contribute to the recovered HLC floor"
     );
 
-    let before_new_commit = phase8_records(&reopened).len();
+    let before_new_commit = journal_log_records(&reopened).len();
     recovered
         .insert_one(&doc! { "_id": 3i32, "phase": "after-reopen" })
         .expect("insert after checkpoint recovery");
-    let records = phase8_records(&reopened);
+    let records = journal_log_records(&reopened);
     let new_publish_seq = records[before_new_commit..]
         .iter()
-        .find(|record| record.kind == Phase8LogRecordKind::CrudCommit)
+        .find(|record| record.kind == JournalLogRecordKind::CrudCommit)
         .expect("post-reopen insert writes CrudCommit")
         .publish_seq;
     assert!(
@@ -1018,17 +1020,17 @@ fn phase8_us007_checkpoint_boundary_skips_prefix_and_replays_tail() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_us007_checkpoint_crash_before_boundary_does_not_advance_header() {
-    if run_phase8_checkpoint_crash_child_if_requested() {
+fn checkpoint_crash_before_boundary_does_not_advance_header() {
+    if run_checkpoint_crash_child_if_requested() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_checkpoint_crash_cut.mqlite");
     let status = Command::new(env::current_exe().expect("current test binary"))
-        .arg("phase8_us007_checkpoint_crash_before_boundary_does_not_advance_header")
+        .arg("checkpoint_crash_before_boundary_does_not_advance_header")
         .arg("--exact")
-        .env(PHASE8_CHECKPOINT_CRASH_CHILD_ENV, "1")
-        .env(PHASE8_CHECKPOINT_CRASH_DB_ENV, &path)
+        .env(CHECKPOINT_CRASH_CHILD_ENV, "1")
+        .env(CHECKPOINT_CRASH_DB_ENV, &path)
         .status()
         .expect("spawn checkpoint crash-cut child");
     assert!(
@@ -1055,7 +1057,7 @@ fn phase8_us007_checkpoint_crash_before_boundary_does_not_advance_header() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_us007_reopen_after_checkpoint_seeds_hlc_without_tail_commits() {
+fn reopen_after_checkpoint_seeds_hlc_without_tail_commits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_checkpoint_hlc.mqlite");
     let client = open_fullsync(&path);
@@ -1077,16 +1079,16 @@ fn phase8_us007_reopen_after_checkpoint_seeds_hlc_without_tail_commits() {
         Some(checkpoint_header.last_checkpoint_ts),
         "clean checkpoint reopen must seed HLC from last_checkpoint_ts"
     );
-    let before_insert = phase8_records(&reopened).len();
+    let before_insert = journal_log_records(&reopened).len();
     reopened
         .database("phase8")
         .collection::<Document>("docs")
         .insert_one(&doc! { "_id": 2i32, "phase": "after-hlc-reopen" })
         .expect("insert after HLC recovery");
-    let records = phase8_records(&reopened);
+    let records = journal_log_records(&reopened);
     let new_commit_ts = records[before_insert..]
         .iter()
-        .find(|record| record.kind == Phase8LogRecordKind::CrudCommit)
+        .find(|record| record.kind == JournalLogRecordKind::CrudCommit)
         .expect("post-reopen insert writes CrudCommit")
         .commit_ts;
     assert!(
@@ -1097,7 +1099,7 @@ fn phase8_us007_reopen_after_checkpoint_seeds_hlc_without_tail_commits() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_post_reservation_dirty_stamp_failure_poisons_gap() {
+fn post_reservation_dirty_stamp_failure_poisons_gap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_post_reservation_failure.mqlite");
     let client = Client::open_with_options(
@@ -1111,10 +1113,10 @@ fn phase8_post_reservation_dirty_stamp_failure_poisons_gap() {
         .expect("create docs collection");
     let collection = client.database("phase8").collection::<Document>("docs");
     let before = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot before post-reservation failure");
 
-    client.__phase8_fail_next_dirty_lsn_stamp();
+    client.__fail_next_dirty_lsn_stamp();
     let err = collection
         .insert_one(&doc! { "_id": 9i32, "mode": "post-reservation" })
         .expect_err("post-reservation failure poisons the engine");
@@ -1130,7 +1132,7 @@ fn phase8_post_reservation_dirty_stamp_failure_poisons_gap() {
     );
 
     let after = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot after post-reservation failure");
     assert!(
         after.0 > before.0,
@@ -1173,7 +1175,7 @@ fn phase8_post_reservation_dirty_stamp_failure_poisons_gap() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_crash_cut_after_dirty_install_before_write_ignores_reserved_gap() {
+fn crash_cut_after_dirty_install_before_write_ignores_reserved_gap() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_after_dirty_before_write.mqlite");
     let client = Client::open_with_options(
@@ -1187,10 +1189,10 @@ fn phase8_crash_cut_after_dirty_install_before_write_ignores_reserved_gap() {
         .expect("create docs collection");
     let collection = client.database("phase8").collection::<Document>("docs");
     let before = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot before after-dirty-before-write failure");
 
-    client.__phase8_fail_next_after_dirty_lsn_stamp();
+    client.__fail_next_after_dirty_lsn_stamp();
     let err = collection
         .insert_one(&doc! { "_id": 11i32, "mode": "after-dirty-before-write" })
         .expect_err("after-dirty-before-write cut poisons the engine");
@@ -1202,7 +1204,7 @@ fn phase8_crash_cut_after_dirty_install_before_write_ignores_reserved_gap() {
     ));
 
     let after = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot after after-dirty-before-write failure");
     assert!(
         after.0 > before.0,
@@ -1220,12 +1222,12 @@ fn phase8_crash_cut_after_dirty_install_before_write_ignores_reserved_gap() {
     drop(collection);
     drop(client);
     let reopened = Client::open(&path).expect("reopen after dirty-before-write poison");
-    assert_phase8_doc_value(&reopened, 11, None);
+    assert_doc_value(&reopened, 11, None);
 }
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_crash_cut_after_sync_before_pending_flip_recovers_durable_record() {
+fn crash_cut_after_sync_before_pending_flip_recovers_durable_record() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_after_sync_before_flip.mqlite");
     let client = Client::open_with_options(
@@ -1239,7 +1241,7 @@ fn phase8_crash_cut_after_sync_before_pending_flip_recovers_durable_record() {
         .expect("create docs collection");
     let collection = client.database("phase8").collection::<Document>("docs");
 
-    client.__phase8_fail_next_after_durable_before_flip();
+    client.__fail_next_after_durable_before_flip();
     let err = collection
         .insert_one(&doc! { "_id": 12i32, "mode": "after-sync-before-flip" })
         .expect_err("after-sync-before-flip cut poisons the engine");
@@ -1251,7 +1253,7 @@ fn phase8_crash_cut_after_sync_before_pending_flip_recovers_durable_record() {
     ));
 
     let (_, ready_lsn, durable_lsn) = client
-        .__phase8_journal_lsn_snapshot()
+        .__journal_lsn_snapshot()
         .expect("snapshot after after-sync-before-flip cut");
     assert_eq!(
         ready_lsn, durable_lsn,
@@ -1261,12 +1263,12 @@ fn phase8_crash_cut_after_sync_before_pending_flip_recovers_durable_record() {
     drop(client);
 
     let reopened = Client::open(&path).expect("reopen after sync-before-flip poison");
-    assert_phase8_doc_value(&reopened, 12, Some("after-sync-before-flip"));
+    assert_doc_value(&reopened, 12, Some("after-sync-before-flip"));
 }
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_crash_cut_after_pending_flip_before_publish_recovers_durable_record() {
+fn crash_cut_after_pending_flip_before_publish_recovers_durable_record() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_after_flip_before_publish.mqlite");
     let client = Client::open_with_options(
@@ -1294,12 +1296,12 @@ fn phase8_crash_cut_after_pending_flip_before_publish_recovers_durable_record() 
     drop(client);
 
     let reopened = Client::open(&path).expect("reopen after flip-before-publish poison");
-    assert_phase8_doc_value(&reopened, 13, Some("after-flip-before-publish"));
+    assert_doc_value(&reopened, 13, Some("after-flip-before-publish"));
 }
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_crash_cut_mid_record_ignores_torn_tail_and_keeps_valid_prefix() {
+fn crash_cut_mid_record_ignores_torn_tail_and_keeps_valid_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_mid_record_tail.mqlite");
     let client = open_fullsync(&path);
@@ -1311,7 +1313,7 @@ fn phase8_crash_cut_mid_record_ignores_torn_tail_and_keeps_valid_prefix() {
         .insert_one(&doc! { "_id": 15i32, "mode": "torn-tail" })
         .expect("insert tail record to tear");
 
-    let crud = phase8_crud_records(&client);
+    let crud = crud_log_records(&client);
     let tail = crud.last().expect("tail CRUD record exists");
     let cut_lsn = tail.start_lsn + ((tail.end_lsn - tail.start_lsn) / 2);
     fs::OpenOptions::new()
@@ -1324,9 +1326,9 @@ fn phase8_crash_cut_mid_record_ignores_torn_tail_and_keeps_valid_prefix() {
     std::mem::forget(client);
 
     let reopened = open_fullsync(&path);
-    assert_phase8_doc_value(&reopened, 14, Some("valid-prefix"));
-    assert_phase8_doc_value(&reopened, 15, None);
-    let recovered_records = phase8_crud_records(&reopened);
+    assert_doc_value(&reopened, 14, Some("valid-prefix"));
+    assert_doc_value(&reopened, 15, None);
+    let recovered_records = crud_log_records(&reopened);
     assert!(
         recovered_records
             .iter()
@@ -1337,7 +1339,7 @@ fn phase8_crash_cut_mid_record_ignores_torn_tail_and_keeps_valid_prefix() {
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_crash_cut_after_write_before_sync_uses_valid_prefix_if_tail_lost() {
+fn crash_cut_after_write_before_sync_uses_valid_prefix_if_tail_lost() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_after_write_before_sync.mqlite");
     let client = open_fullsync(&path);
@@ -1349,7 +1351,7 @@ fn phase8_crash_cut_after_write_before_sync_uses_valid_prefix_if_tail_lost() {
         .insert_one(&doc! { "_id": 17i32, "mode": "lost-unsynced-tail" })
         .expect("insert tail record to remove");
 
-    let crud = phase8_crud_records(&client);
+    let crud = crud_log_records(&client);
     let tail = crud.last().expect("tail CRUD record exists");
     fs::OpenOptions::new()
         .write(true)
@@ -1361,13 +1363,13 @@ fn phase8_crash_cut_after_write_before_sync_uses_valid_prefix_if_tail_lost() {
     std::mem::forget(client);
 
     let reopened = open_fullsync(&path);
-    assert_phase8_doc_value(&reopened, 16, Some("valid-prefix"));
-    assert_phase8_doc_value(&reopened, 17, None);
+    assert_doc_value(&reopened, 16, Some("valid-prefix"));
+    assert_doc_value(&reopened, 17, None);
 }
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_crash_cut_post_publish_covers_in_process_and_close_reopen() {
+fn crash_cut_post_publish_covers_in_process_and_close_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_post_publish.mqlite");
     let client = open_fullsync(&path);
@@ -1376,19 +1378,19 @@ fn phase8_crash_cut_post_publish_covers_in_process_and_close_reopen() {
     collection
         .insert_one(&doc! { "_id": 18i32, "mode": "post-publish" })
         .expect("post-publish insert succeeds");
-    assert_phase8_doc_value(&client, 18, Some("post-publish"));
+    assert_doc_value(&client, 18, Some("post-publish"));
     drop(collection);
     client
         .close()
         .expect("close checkpoints post-publish commit");
 
     let reopened = open_fullsync(&path);
-    assert_phase8_doc_value(&reopened, 18, Some("post-publish"));
+    assert_doc_value(&reopened, 18, Some("post-publish"));
 }
 
 #[test]
 #[serial(phase8_journal_group_commit_hooks)]
-fn phase8_earlier_publish_slot_stalls_before_reservation_later_lsn_writes_first() {
+fn earlier_publish_slot_stalls_before_reservation_later_lsn_writes_first() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("phase8_out_of_order_lsn.mqlite");
     let client = Client::open_with_options(
@@ -1401,7 +1403,7 @@ fn phase8_earlier_publish_slot_stalls_before_reservation_later_lsn_writes_first(
         .create_collection("docs")
         .expect("create docs collection");
 
-    let mut early_hook = client.__phase8_install_before_reservation_hook();
+    let mut early_hook = client.__install_before_log_reservation_hook();
     let early_client = client.clone();
     let early = thread::spawn(move || {
         early_client
@@ -1425,10 +1427,10 @@ fn phase8_earlier_publish_slot_stalls_before_reservation_later_lsn_writes_first(
         result
     });
 
-    let deadline = Instant::now() + PHASE8_SETTLE_DEADLINE;
+    let deadline = Instant::now() + JOURNAL_GROUP_COMMIT_SETTLE_DEADLINE;
     let mut observed_late_record = None;
     while Instant::now() < deadline {
-        let crud = phase8_crud_records(&client);
+        let crud = crud_log_records(&client);
         if let Some(record) = crud.last().cloned() {
             observed_late_record = Some(record);
             break;
@@ -1450,7 +1452,7 @@ fn phase8_earlier_publish_slot_stalls_before_reservation_later_lsn_writes_first(
         .expect("late writer thread must not panic")
         .expect("late writer eventually commits");
 
-    let crud = phase8_crud_records(&client);
+    let crud = crud_log_records(&client);
     let early_record = crud
         .iter()
         .find(|record| record.start_lsn > late_record.start_lsn)
@@ -1462,6 +1464,6 @@ fn phase8_earlier_publish_slot_stalls_before_reservation_later_lsn_writes_first(
     std::mem::forget(client);
 
     let reopened = open_fullsync(&path);
-    assert_phase8_doc_value(&reopened, 19, Some("early-publish-seq"));
-    assert_phase8_doc_value(&reopened, 20, Some("later-lsn-first"));
+    assert_doc_value(&reopened, 19, Some("early-publish-seq"));
+    assert_doc_value(&reopened, 20, Some("later-lsn-first"));
 }

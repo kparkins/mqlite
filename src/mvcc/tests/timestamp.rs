@@ -170,8 +170,7 @@ fn ts_successor_wraps_logical_into_physical() {
 #[test]
 fn commit_strictly_monotonic_under_regressing_wall_clock_s7() {
     // Wall clock regresses at step 2 (100 → 50).
-    let oracle =
-        TimestampOracle::with_clock(Box::new(ScriptedClock::new(vec![100, 50, 100, 150])));
+    let oracle = TimestampOracle::with_clock(Box::new(ScriptedClock::new(vec![100, 50, 100, 150])));
 
     let mut prev = None;
     for _ in 0..4 {

@@ -60,7 +60,7 @@ fn run_case(writer_count: usize, single_writer_p50_latency_us: u128) -> BenchCas
         .database(DATABASE_NAME)
         .create_collection(COLLECTION_NAME)
         .expect("pre-create benchmark collection");
-    client.__phase8_bench_reset_sync_observations();
+    client.__reset_journal_sync_observations();
 
     let start = Arc::new(Barrier::new(writer_count));
     let latencies = Arc::new(Mutex::new(Vec::with_capacity(
@@ -103,7 +103,7 @@ fn run_case(writer_count: usize, single_writer_p50_latency_us: u128) -> BenchCas
     }
 
     let commits = writer_count * COMMITS_PER_WRITER;
-    let observed = client.__phase8_bench_journal_sync_os_boundaries();
+    let observed = client.__journal_sync_os_boundaries();
     let docs = client
         .database(DATABASE_NAME)
         .collection::<Document>(COLLECTION_NAME)

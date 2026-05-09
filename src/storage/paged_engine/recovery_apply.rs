@@ -68,6 +68,7 @@ pub(crate) fn install_recovered_published_epoch(
     shared.published.store(epoch);
     #[cfg(any(test, feature = "test-hooks"))]
     shared
+        .test_hooks
         .recovery_open_published_store_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())

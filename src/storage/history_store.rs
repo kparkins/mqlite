@@ -269,14 +269,6 @@ fn history_ident_from_parts(collection_id: i64, tree_kind: u8, index_id: i64) ->
     })
 }
 
-/// Build the inclusive upper bound for a probe over one length-delimited key.
-fn probe_upper_bound(ident: &TreeIdent, key_bytes: &[u8], read_ts: Ts) -> Vec<u8> {
-    let mut out = probe_prefix(ident, key_bytes);
-    out.extend_from_slice(&read_ts.to_be_bytes());
-    out.extend_from_slice(&u32::MAX.to_be_bytes());
-    out
-}
-
 /// Build the prefix that every entry for `(TreeIdent, key_bytes)` shares.
 fn probe_prefix(ident: &TreeIdent, key_bytes: &[u8]) -> Vec<u8> {
     let (tree_kind, index_id) = history_tree_parts(ident);
@@ -561,7 +553,7 @@ impl<S: BTreePageStore> HistoryStore<S> {
             collection_id,
             kind: TreeKind::Primary,
         };
-        self.probe(&ident, doc_id, read_ts, false)
+        self.probe_visible_entry(&ident, doc_id, read_ts, false)
     }
 
     /// Probe for the newest sec-index version with `start_ts <= read_ts`
@@ -579,12 +571,12 @@ impl<S: BTreePageStore> HistoryStore<S> {
             collection_id,
             kind: TreeKind::Secondary { index_id },
         };
-        self.probe(&ident, sec_key, read_ts, true)
+        self.probe_visible_entry(&ident, sec_key, read_ts, true)
     }
 
     /// Inner shared probe. `skip_tombstones` toggles the sec-index
     /// "tombstone wins → hide" rule.
-    fn probe(
+    fn probe_visible_entry(
         &self,
         ident: &TreeIdent,
         key_bytes: &[u8],
@@ -592,8 +584,10 @@ impl<S: BTreePageStore> HistoryStore<S> {
         skip_tombstones: bool,
     ) -> Result<Option<VersionEntry>> {
         let _guard = HistoryStoreGuard::enter();
-        let upper = probe_upper_bound(ident, key_bytes, read_ts);
         let prefix = probe_prefix(ident, key_bytes);
+        let mut upper = prefix.clone();
+        upper.extend_from_slice(&read_ts.to_be_bytes());
+        upper.extend_from_slice(&u32::MAX.to_be_bytes());
 
         // Range-scan ascending over the full prefix, truncated at `upper`.
         // Descending scans are not exposed on `BTree`; the scan is bounded

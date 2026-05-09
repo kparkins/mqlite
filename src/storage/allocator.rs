@@ -45,8 +45,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Error, Result};
-use crate::journal::BoundaryAppended;
-use crate::mvcc::deferred_free::{CheckpointLifetimeDrain, PageLifetimeKind, PageLifetimeQueue};
+use crate::mvcc::deferred_free::{PageLifetimeKind, PageLifetimeQueue};
 use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 
@@ -707,17 +706,21 @@ impl AllocatorHandle {
         ready
     }
 
-    /// Test-only: force-set the refcount for a page (used by CAS-saturation
-    /// contract tests).
-    #[cfg(test)]
-    pub(crate) fn set_overflow_refcount_for_test(&self, first_page: u32, value: u32) {
-        let atomic = self.refcount_handle(first_page);
-        atomic.store(value, Ordering::Release);
-    }
-
     // -----------------------------------------------------------------------
     // Allocation
     // -----------------------------------------------------------------------
+
+    fn mutate_allocator<T>(
+        &self,
+        io: &dyn PageSource,
+        op: impl FnOnce(&mut PageAllocator<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut state = self.lock_mutable_state()?;
+        let mut alloc = PageAllocator::new(&mut state.header, io);
+        let result = op(&mut alloc)?;
+        state.header_dirty = true;
+        Ok(result)
+    }
 
     /// Allocate a 4 KB internal-node page.
     ///
@@ -725,22 +728,14 @@ impl AllocatorHandle {
     /// caller must call [`flush_header`](Self::flush_header) (or flush the
     /// buffer pool) to persist the change to disk.
     pub(crate) fn alloc_4k(&self, io: &dyn PageSource) -> Result<u32> {
-        let mut state = self.lock_mutable_state()?;
-        let mut alloc = PageAllocator::new(&mut state.header, io);
-        let page_no = alloc.allocate_4k()?;
-        state.header_dirty = true;
-        Ok(page_no)
+        self.mutate_allocator(io, |alloc| alloc.allocate_4k())
     }
 
     /// Allocate a 32 KB leaf / overflow page.
     ///
     /// Updates the in-memory free list and marks the header dirty.
     pub(crate) fn alloc_32k(&self, io: &dyn PageSource) -> Result<u32> {
-        let mut state = self.lock_mutable_state()?;
-        let mut alloc = PageAllocator::new(&mut state.header, io);
-        let page_no = alloc.allocate_32k()?;
-        state.header_dirty = true;
-        Ok(page_no)
+        self.mutate_allocator(io, |alloc| alloc.allocate_32k())
     }
 
     // -----------------------------------------------------------------------
@@ -752,11 +747,7 @@ impl AllocatorHandle {
     /// Marks the header dirty.  The freed page's first 4 bytes are
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_4k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
-        let mut state = self.lock_mutable_state()?;
-        let mut alloc = PageAllocator::new(&mut state.header, io);
-        alloc.free_4k(page_number)?;
-        state.header_dirty = true;
-        Ok(())
+        self.mutate_allocator(io, |alloc| alloc.free_4k(page_number))
     }
 
     /// Return a 32 KB page to the free list.
@@ -764,11 +755,7 @@ impl AllocatorHandle {
     /// Marks the header dirty.  The freed page's first 4 bytes are
     /// overwritten with the free-list head pointer via `io`.
     pub(crate) fn free_32k(&self, page_number: u32, io: &dyn PageSource) -> Result<()> {
-        let mut state = self.lock_mutable_state()?;
-        let mut alloc = PageAllocator::new(&mut state.header, io);
-        alloc.free_32k(page_number)?;
-        state.header_dirty = true;
-        Ok(())
+        self.mutate_allocator(io, |alloc| alloc.free_32k(page_number))
     }
 
     // -----------------------------------------------------------------------
@@ -800,39 +787,6 @@ impl AllocatorHandle {
         f(&mut state.header);
         state.header_dirty = true;
         Ok(())
-    }
-
-    /// Commit a staged checkpoint header after the durable boundary exists.
-    #[allow(
-        dead_code,
-        reason = "Phase 7 US-004 lands the staged-header primitive before the checkpoint driver consumes it"
-    )]
-    pub(crate) fn commit_staged_header_after_boundary(
-        &self,
-        mut freeze: AllocatorFreezeGuard,
-        staged_header: FileHeader,
-        boundary: BoundaryAppended,
-        checkpoint_lifetime_drain: CheckpointLifetimeDrain,
-    ) -> Result<()> {
-        let boundary_page_count = boundary.db_page_count();
-        let result = if staged_header.total_page_count != boundary_page_count {
-            Err(Error::Internal(format!(
-                "boundary page count {boundary_page_count} does not match staged header {}",
-                staged_header.total_page_count
-            )))
-        } else {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .map_err(|_| Error::Internal("allocator mutex poisoned".into()))?;
-            state.header = staged_header;
-            state.header_dirty = false;
-            checkpoint_lifetime_drain.publish();
-            Ok(())
-        };
-        freeze.release();
-        result
     }
 
     // -----------------------------------------------------------------------
@@ -867,6 +821,10 @@ impl AllocatorHandle {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tests/allocator_accessors.rs"]
+mod allocator_accessors;
 
 #[cfg(test)]
 #[path = "tests/allocator.rs"]

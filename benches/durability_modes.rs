@@ -21,8 +21,10 @@ use std::time::Duration;
 use bson::doc;
 use bson::Document;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use mqlite::{Client, DurabilityMode, OpenOptions};
+use mqlite::DurabilityMode;
 use tempfile::TempDir;
+
+mod common;
 
 const PAYLOAD_BYTES: usize = 230;
 const DOCS_PER_ITER: usize = 10;
@@ -30,37 +32,11 @@ const WRITER_COUNT: usize = 1;
 const PAYLOAD_CLASS: &str = "~256B";
 
 fn metadata(durability: &str) -> String {
-    let rustc = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned());
-
-    let cpu_count = num_cpus();
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-
     format!(
         "durability={durability} writers={WRITER_COUNT} payload_class={PAYLOAD_CLASS} \
-         actual_bytes={PAYLOAD_BYTES} rustc=\"{rustc}\" cpu_count={cpu_count} \
-         arch={arch} os={os}"
+         actual_bytes={PAYLOAD_BYTES} {}",
+        common::host_metadata()
     )
-}
-
-fn num_cpus() -> usize {
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg("nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(1)
-}
-
-fn open_client(dir: &TempDir, mode: DurabilityMode) -> Client {
-    let path = dir.path().join("bench.mqlite");
-    let opts = OpenOptions::new().durability(mode);
-    Client::open_with_options(&path, opts).expect("open must succeed")
 }
 
 fn bench_durability_modes(c: &mut Criterion) {
@@ -85,7 +61,7 @@ fn bench_durability_modes(c: &mut Criterion) {
 
         group.bench_with_input(id, label, |b, _label| {
             let dir = TempDir::new().expect("tempdir");
-            let client = open_client(&dir, mode.clone());
+            let client = common::open_client(&dir.path().join("bench.mqlite"), mode.clone());
             let col = client
                 .database("bench")
                 .collection::<Document>("durability_col");

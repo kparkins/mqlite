@@ -162,32 +162,6 @@ pub(crate) fn internal_page_checksum(page: &[u8; PAGE_SIZE_INTERNAL as usize]) -
     crc32c::crc32c_append(digest, &page[8..])
 }
 
-/// Verify the CRC32C checksum stored in an internal page.
-///
-/// Returns `Err` if the stored checksum at offset 4–7 does not match the
-/// checksum computed from the page contents.
-#[allow(dead_code)]
-pub(crate) fn verify_internal_page_checksum(
-    page: &[u8; PAGE_SIZE_INTERNAL as usize],
-) -> Result<()> {
-    let header = InternalPageHeader::from_bytes(page)?;
-    let computed = internal_page_checksum(page);
-    if header.checksum != computed {
-        #[cfg(feature = "tracing")]
-        tracing::error!(
-            target: "mqlite",
-            stored = header.checksum,
-            computed,
-            "mqlite::corrupt_page"
-        );
-        return Err(Error::Internal(format!(
-            "internal page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
-            header.checksum, computed
-        )));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Leaf page header  (20 bytes)
 // ---------------------------------------------------------------------------
@@ -275,12 +249,6 @@ impl LeafPageHeader {
         }
         Ok(())
     }
-
-    /// Returns `true` if the [`LEAF_FLAG_HAS_OVERFLOW`] flag is set.
-    #[allow(dead_code)]
-    pub(crate) fn has_overflow(&self) -> bool {
-        self.flags & LEAF_FLAG_HAS_OVERFLOW != 0
-    }
 }
 
 /// Compute the CRC32C checksum for a leaf page.
@@ -290,27 +258,6 @@ impl LeafPageHeader {
 pub(crate) fn leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> u32 {
     let digest = crc32c::crc32c(&page[..4]);
     crc32c::crc32c_append(digest, &page[8..])
-}
-
-/// Verify the CRC32C checksum stored in a leaf page.
-#[allow(dead_code)]
-pub(crate) fn verify_leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()> {
-    let header = LeafPageHeader::from_bytes(page)?;
-    let computed = leaf_page_checksum(page);
-    if header.checksum != computed {
-        #[cfg(feature = "tracing")]
-        tracing::error!(
-            target: "mqlite",
-            stored = header.checksum,
-            computed,
-            "mqlite::corrupt_page"
-        );
-        return Err(Error::Internal(format!(
-            "leaf page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
-            header.checksum, computed
-        )));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -408,27 +355,6 @@ impl OverflowPageHeader {
 pub(crate) fn overflow_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> u32 {
     let digest = crc32c::crc32c(&page[..4]);
     crc32c::crc32c_append(digest, &page[12..])
-}
-
-/// Verify the CRC32C checksum stored in an overflow page.
-#[allow(dead_code)]
-pub(crate) fn verify_overflow_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()> {
-    let header = OverflowPageHeader::from_bytes(page)?;
-    let computed = overflow_page_checksum(page);
-    if header.checksum != computed {
-        #[cfg(feature = "tracing")]
-        tracing::error!(
-            target: "mqlite",
-            stored = header.checksum,
-            computed,
-            "mqlite::corrupt_page"
-        );
-        return Err(Error::Internal(format!(
-            "overflow page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
-            header.checksum, computed
-        )));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

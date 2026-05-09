@@ -20,7 +20,6 @@
 //! # Ok::<(), mqlite::Error>(())
 //! ```
 
-pub mod commands;
 pub(super) mod errors;
 pub(super) mod framing;
 pub(super) mod handlers;

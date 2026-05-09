@@ -1,5 +1,45 @@
 use super::*;
 
+fn verify_internal_page_checksum(page: &[u8; PAGE_SIZE_INTERNAL as usize]) -> Result<()> {
+    let header = InternalPageHeader::from_bytes(page)?;
+    let computed = internal_page_checksum(page);
+    if header.checksum != computed {
+        return Err(Error::Internal(format!(
+            "internal page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
+            header.checksum, computed
+        )));
+    }
+    Ok(())
+}
+
+fn verify_leaf_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()> {
+    let header = LeafPageHeader::from_bytes(page)?;
+    let computed = leaf_page_checksum(page);
+    if header.checksum != computed {
+        return Err(Error::Internal(format!(
+            "leaf page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
+            header.checksum, computed
+        )));
+    }
+    Ok(())
+}
+
+fn verify_overflow_page_checksum(page: &[u8; PAGE_SIZE_LEAF as usize]) -> Result<()> {
+    let header = OverflowPageHeader::from_bytes(page)?;
+    let computed = overflow_page_checksum(page);
+    if header.checksum != computed {
+        return Err(Error::Internal(format!(
+            "overflow page checksum mismatch: stored 0x{:08X}, computed 0x{:08X}",
+            header.checksum, computed
+        )));
+    }
+    Ok(())
+}
+
+fn leaf_has_overflow(header: &LeafPageHeader) -> bool {
+    header.flags & LEAF_FLAG_HAS_OVERFLOW != 0
+}
+
 // -----------------------------------------------------------------------
 // Internal page tests
 // -----------------------------------------------------------------------
@@ -113,7 +153,7 @@ fn leaf_page_roundtrip() {
 fn leaf_page_has_overflow_flag() {
     let page = make_leaf_page();
     let hdr = LeafPageHeader::from_bytes(&page).unwrap();
-    assert!(hdr.has_overflow());
+    assert!(leaf_has_overflow(&hdr));
 }
 
 #[test]
@@ -136,7 +176,7 @@ fn leaf_page_no_overflow_flag() {
     hdr.write_to(&mut buf);
 
     let parsed = LeafPageHeader::from_bytes(&buf).unwrap();
-    assert!(!parsed.has_overflow());
+    assert!(!leaf_has_overflow(&parsed));
 }
 
 #[test]
@@ -236,8 +276,7 @@ fn overflow_page_checksum_excludes_refcount_bytes() {
         );
         // And verification still succeeds — the stored checksum is unchanged
         // and the recomputed checksum matches.
-        verify_overflow_page_checksum(&mutated)
-            .expect("refcount flip must not invalidate page");
+        verify_overflow_page_checksum(&mutated).expect("refcount flip must not invalidate page");
     }
 }
 

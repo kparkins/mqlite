@@ -25,7 +25,7 @@ use super::handle::Client;
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[doc(hidden)]
-pub enum Phase8LogRecordKind {
+pub enum JournalLogRecordKind {
     /// CRUD commit record.
     CrudCommit,
     /// Catalog commit record.
@@ -38,7 +38,7 @@ pub enum Phase8LogRecordKind {
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[doc(hidden)]
-pub enum Phase8CatalogCommitKind {
+pub enum JournalCatalogCommitKind {
     /// Namespace create or implicit collection bootstrap.
     NamespaceCreate,
     /// Namespace drop.
@@ -59,7 +59,7 @@ pub enum Phase8CatalogCommitKind {
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[doc(hidden)]
-pub struct Phase8LogRecordSummary {
+pub struct JournalLogRecordSummary {
     /// Inclusive byte-LSN where the record starts.
     pub start_lsn: u64,
     /// Exclusive byte-LSN where the record ends.
@@ -71,9 +71,9 @@ pub struct Phase8LogRecordSummary {
     /// Commit timestamp as `(physical_ms, logical)`.
     pub commit_ts: (u64, u32),
     /// Outer Phase 8 record kind.
-    pub kind: Phase8LogRecordKind,
+    pub kind: JournalLogRecordKind,
     /// Catalog operation kind for `CatalogCommit` records.
-    pub catalog_kind: Option<Phase8CatalogCommitKind>,
+    pub catalog_kind: Option<JournalCatalogCommitKind>,
     /// Catalog generation before the operation.
     pub catalog_generation_before: Option<u64>,
     /// Catalog generation after the operation.
@@ -87,51 +87,51 @@ pub struct Phase8LogRecordSummary {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn phase8_kind(kind: crate::journal::log_file::LogRecordKind) -> Phase8LogRecordKind {
+fn journal_log_record_kind(kind: crate::journal::log_file::LogRecordKind) -> JournalLogRecordKind {
     match kind {
-        crate::journal::log_file::LogRecordKind::CrudCommit => Phase8LogRecordKind::CrudCommit,
+        crate::journal::log_file::LogRecordKind::CrudCommit => JournalLogRecordKind::CrudCommit,
         crate::journal::log_file::LogRecordKind::CatalogCommit => {
-            Phase8LogRecordKind::CatalogCommit
+            JournalLogRecordKind::CatalogCommit
         }
         crate::journal::log_file::LogRecordKind::CheckpointBoundary => {
-            Phase8LogRecordKind::CheckpointBoundary
+            JournalLogRecordKind::CheckpointBoundary
         }
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn phase8_catalog_kind(
+fn journal_catalog_kind(
     kind: crate::journal::log_file::CatalogCommitKind,
-) -> Phase8CatalogCommitKind {
+) -> JournalCatalogCommitKind {
     match kind {
         crate::journal::log_file::CatalogCommitKind::NamespaceCreate => {
-            Phase8CatalogCommitKind::NamespaceCreate
+            JournalCatalogCommitKind::NamespaceCreate
         }
         crate::journal::log_file::CatalogCommitKind::NamespaceDrop => {
-            Phase8CatalogCommitKind::NamespaceDrop
+            JournalCatalogCommitKind::NamespaceDrop
         }
         crate::journal::log_file::CatalogCommitKind::IndexReserve => {
-            Phase8CatalogCommitKind::IndexReserve
+            JournalCatalogCommitKind::IndexReserve
         }
         crate::journal::log_file::CatalogCommitKind::IndexBuild => {
-            Phase8CatalogCommitKind::IndexBuild
+            JournalCatalogCommitKind::IndexBuild
         }
         crate::journal::log_file::CatalogCommitKind::IndexBuildCommit => {
-            Phase8CatalogCommitKind::IndexBuildCommit
+            JournalCatalogCommitKind::IndexBuildCommit
         }
         crate::journal::log_file::CatalogCommitKind::IndexCleanup => {
-            Phase8CatalogCommitKind::IndexCleanup
+            JournalCatalogCommitKind::IndexCleanup
         }
         crate::journal::log_file::CatalogCommitKind::IndexDrop => {
-            Phase8CatalogCommitKind::IndexDrop
+            JournalCatalogCommitKind::IndexDrop
         }
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn phase8_log_summary(
+fn journal_log_record_summary(
     record: crate::journal::log_file::LogRecord,
-) -> crate::error::Result<Phase8LogRecordSummary> {
+) -> crate::error::Result<JournalLogRecordSummary> {
     let mut catalog_kind = None;
     let mut catalog_generation_before = None;
     let mut catalog_generation_after = None;
@@ -142,7 +142,7 @@ fn phase8_log_summary(
     match &record.payload {
         crate::journal::log_file::LogRecordPayload::CatalogCommit(payload) => {
             let payload = crate::journal::log_file::CatalogCommitPayload::decode(payload)?;
-            catalog_kind = Some(phase8_catalog_kind(payload.kind));
+            catalog_kind = Some(journal_catalog_kind(payload.kind));
             catalog_generation_before = Some(payload.catalog_generation_before);
             catalog_generation_after = Some(payload.catalog_generation_after);
             catalog_header_checkpoint_applied_lsn = Some(payload.header.checkpoint_applied_lsn);
@@ -158,13 +158,13 @@ fn phase8_log_summary(
         crate::journal::log_file::LogRecordPayload::CrudCommit { .. } => {}
     }
 
-    Ok(Phase8LogRecordSummary {
+    Ok(JournalLogRecordSummary {
         start_lsn: record.start_lsn,
         end_lsn: record.end_lsn,
         txn_id: record.txn_id,
         publish_seq: record.publish_seq,
         commit_ts: (record.commit_ts.physical_ms, record.commit_ts.logical),
-        kind: phase8_kind(record.kind),
+        kind: journal_log_record_kind(record.kind),
         catalog_kind,
         catalog_generation_before,
         catalog_generation_after,
@@ -175,9 +175,9 @@ fn phase8_log_summary(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn read_phase8_log_records(
+fn read_journal_log_records(
     path: &std::path::Path,
-) -> crate::error::Result<Vec<Phase8LogRecordSummary>> {
+) -> crate::error::Result<Vec<JournalLogRecordSummary>> {
     use crate::journal::log_file::{
         LogRecord, JOURNAL_HEADER_SIZE, LOG_RECORD_HEADER_LEN, LOG_RECORD_TOTAL_LEN_OFFSET,
         MAX_LOG_RECORD_BYTES,
@@ -225,7 +225,7 @@ fn read_phase8_log_records(
             break;
         }
         cursor = record.end_lsn;
-        records.push(phase8_log_summary(record)?);
+        records.push(journal_log_record_summary(record)?);
     }
 
     Ok(records)
@@ -322,12 +322,12 @@ impl Client {
     /// read, or a complete record is structurally invalid.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    pub fn __phase8_log_records(&self) -> crate::error::Result<Vec<Phase8LogRecordSummary>> {
+    pub fn __journal_log_records(&self) -> crate::error::Result<Vec<JournalLogRecordSummary>> {
         let path =
             self.inner.path.as_ref().ok_or_else(|| {
                 crate::error::Error::Internal("client has no database path".into())
             })?;
-        read_phase8_log_records(path)
+        read_journal_log_records(path)
     }
 
     /// Test-only US-019 fault injector: fail the next `failures`
@@ -515,37 +515,33 @@ impl Client {
     /// # Errors
     /// Returns an internal error if the journal manager cannot be inspected.
     #[doc(hidden)]
-    pub fn __phase8_journal_lsn_snapshot(&self) -> crate::error::Result<(u64, u64, u64)> {
-        self.inner.engine.phase8_journal_lsn_snapshot()
+    pub fn __journal_lsn_snapshot(&self) -> crate::error::Result<(u64, u64, u64)> {
+        self.inner.engine.journal_lsn_snapshot()
     }
 
     /// Test-only Phase 8 hook: fail after log reservation before dirty LSN stamp.
     #[doc(hidden)]
-    pub fn __phase8_fail_next_dirty_lsn_stamp(&self) {
-        self.inner.engine.phase8_fail_next_dirty_lsn_stamp();
+    pub fn __fail_next_dirty_lsn_stamp(&self) {
+        self.inner.engine.fail_next_dirty_lsn_stamp();
     }
 
     /// Test-only Phase 8 hook: fail after dirty LSN stamp before log write.
     #[doc(hidden)]
-    pub fn __phase8_fail_next_after_dirty_lsn_stamp(&self) {
-        self.inner.engine.phase8_fail_next_after_dirty_lsn_stamp();
+    pub fn __fail_next_after_dirty_lsn_stamp(&self) {
+        self.inner.engine.fail_next_after_dirty_lsn_stamp();
     }
 
     /// Test-only Phase 8 hook: fail after durability before Pending flip.
     #[doc(hidden)]
-    pub fn __phase8_fail_next_after_durable_before_flip(&self) {
-        self.inner
-            .engine
-            .phase8_fail_next_after_durable_before_flip();
+    pub fn __fail_next_after_durable_before_flip(&self) {
+        self.inner.engine.fail_next_after_durable_before_flip();
     }
 
     /// Test-only Phase 8 hook: pause after Pending install before reservation.
     #[doc(hidden)]
     #[must_use]
-    pub fn __phase8_install_before_reservation_hook(
-        &self,
-    ) -> crate::Phase8BeforeReservationHookGuard {
-        self.inner.engine.install_phase8_before_reservation_hook()
+    pub fn __install_before_log_reservation_hook(&self) -> crate::BeforeLogReservationHookGuard {
+        self.inner.engine.install_before_log_reservation_hook()
     }
 
     /// Test-only US-021c hook: pause the next write body for `ns`.

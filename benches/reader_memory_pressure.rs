@@ -17,6 +17,8 @@
 )]
 #![allow(missing_docs)]
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -404,8 +406,8 @@ fn write_artifact(
         baseline.read_throughput_ops_per_sec,
     );
     let required_remediation = peak_rss_delta_pct > REMEDIATION_RSS_THRESHOLD_PCT;
-    let source_commit = command_output("git", &["rev-parse", "HEAD"]);
-    let working_tree_state = if command_output("git", &["status", "--short"]).is_empty() {
+    let source_commit = common::command_output("git", &["rev-parse", "HEAD"]);
+    let working_tree_state = if common::command_output("git", &["status", "--short"]).is_empty() {
         "clean".to_owned()
     } else {
         "dirty".to_owned()
@@ -548,16 +550,6 @@ fn delta_pct(current: f64, baseline: f64) -> f64 {
 fn artifact_value_or_unknown(value: Option<u64>) -> String {
     value
         .map(|raw| raw.to_string())
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn command_output(program: &str, args: &[&str]) -> String {
-    std::process::Command::new(program)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_else(|| "unknown".to_owned())
 }
 

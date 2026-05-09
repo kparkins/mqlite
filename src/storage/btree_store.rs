@@ -53,8 +53,7 @@ struct LeafHoldScope {
 #[cfg(any(test, feature = "test-hooks"))]
 impl LeafHoldScope {
     fn new(page: u32) -> Self {
-        let start =
-            crate::storage::btree::range_scan_latch_scope::begin_leaf_hold(page, 0);
+        let start = crate::storage::btree::range_scan_latch_scope::begin_leaf_hold(page, 0);
         Self { start: Some(start) }
     }
 }
@@ -330,7 +329,7 @@ impl BTreePageStore for BufferPoolPageStore {
         if self.is_history {
             return Ok(Vec::new());
         }
-        self.handle.pool().take_all_chains_on_page(page)
+        self.handle.pool().drain_leaf_chains(page)
     }
 }
 

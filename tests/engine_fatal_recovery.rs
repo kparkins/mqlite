@@ -9,15 +9,10 @@
 #![doc = "Integration test requiring the test-hooks feature."]
 #![cfg(feature = "test-hooks")]
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 use bson::{doc, Document};
-use mqlite::{Client, DurabilityMode, Error, OpenOptions};
-
-fn fullsync_options() -> OpenOptions {
-    OpenOptions::new().durability(DurabilityMode::FullSync)
-}
+use mqlite::{Client, Error};
 
 fn assert_internal<T>(result: mqlite::Result<T>) {
     assert!(
@@ -31,7 +26,7 @@ fn test_primary_install_failure_aborts_pre_durable_without_poison() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("us019-fatal.mqlite");
 
-    let client = Client::open_with_options(&path, fullsync_options()).expect("open");
+    let client = Client::open_with_options(&path, crash_harness::fullsync_options()).expect("open");
     let db = client.database("db");
     db.create_collection("c").expect("create collection");
     client.checkpoint().expect("checkpoint baseline catalog");
@@ -80,7 +75,8 @@ fn test_primary_install_failure_aborts_pre_durable_without_poison() {
     );
 
     std::mem::forget(client);
-    let reopened = Client::open_with_options(&path, fullsync_options()).expect("reopen");
+    let reopened =
+        Client::open_with_options(&path, crash_harness::fullsync_options()).expect("reopen");
     let db = reopened.database("db");
     let doc = db
         .collection::<Document>("c")

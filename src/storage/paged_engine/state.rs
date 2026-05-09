@@ -2,8 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-#[cfg(any(test, feature = "test-hooks"))]
-use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +31,22 @@ use super::recovery_apply::{
     install_recovered_published_epoch,
 };
 use super::writer_registry::NsWriterRegistry;
+
+#[cfg(test)]
+#[path = "tests/read_op_scope.rs"]
+mod read_op_scope;
+#[cfg(not(any(test, feature = "test-hooks")))]
+#[path = "state_no_test_hooks.rs"]
+mod state_test_hooks;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "tests/state_test_hooks.rs"]
+mod state_test_hooks;
+
+#[cfg(test)]
+pub(crate) use read_op_scope::ReadOpScope;
+#[cfg(test)]
+use read_op_scope::EPOCH_LOAD_COUNT;
+use state_test_hooks::SharedStateTestHooks;
 
 // ---------------------------------------------------------------------------
 // SharedState — fields shared by read path (no mutex) and writer (mutex held)
@@ -214,74 +228,11 @@ pub(crate) struct SharedState {
     /// Initialized to the live `PublishedEpoch.catalog_generation` so a
     /// later DDL's first reservation produces a strictly larger value.
     pub(crate) next_catalog_gen: AtomicU64,
-    /// §10.8 #19 publish-pause rendezvous hook. Per-engine (NOT
-    /// process-global) so parallel tests using independent engines
-    /// cannot consume each other's barriers. Under `#[cfg(test)]`
-    /// only — production builds carry neither the `Mutex` nor the
-    /// `Arc<Barrier>` (§11 #10: no new `Mutex` / `Arc` on commit path).
-    #[cfg(test)]
-    pub publish_pause_hook: std::sync::Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
-    /// Test-only counter for the post-open recovery epoch store. This is
-    /// per-engine so integration tests do not race on a global metric.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub recovery_open_published_store_count: AtomicU64,
-    /// Test-only S9 primary-install fault injector for US-019.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us019_primary_install_failures: AtomicU8,
-    /// Test-only S9 primary-install attempt counter for US-019.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us019_primary_install_attempts: AtomicU64,
-    /// Test-only US-009 event order counter.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us009_event_order_counter: AtomicU64,
-    /// Test-only order at which Pending entries flipped to Committed.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us009_committed_flip_order: AtomicU64,
-    /// Test-only order at which the CRUD publish step became ready.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us009_publish_ready_order: AtomicU64,
-    /// Test-only one-shot failure after committed flip and before publish.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us009_fail_after_committed_flip: AtomicU8,
-    /// Test-only US-026 one-shot post-register cleanup failpoint.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub us026_post_register_failpoint: AtomicU8,
-    /// Test-only Phase 8 failure injected after log reservation and before
-    /// dirty pages can be stamped with the reserved record's end LSN.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub phase8_fail_next_dirty_lsn_stamp: AtomicU8,
-    /// Test-only Phase 8 failure injected after dirty pages are stamped with
-    /// the reserved record's end LSN and before the record bytes are written.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub phase8_fail_next_after_dirty_lsn_stamp: AtomicU8,
-    /// Test-only Phase 8 failure injected after the commit record is durable
-    /// and before Pending heads flip to Committed.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub phase8_fail_next_after_durable_before_flip: AtomicU8,
-    /// Test-only namespace-keyed write-body entry rendezvous hooks.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub write_body_entry_hooks: std::sync::Mutex<
-        std::collections::HashMap<
-            String,
-            std::collections::VecDeque<super::hidden_accessors::WriteBodyEntryHook>,
-        >,
-    >,
-    /// Test-only one-shot pause after Pending install and before log
-    /// reservation.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub phase8_before_reservation_hook:
-        std::sync::Mutex<Option<super::hidden_accessors::Phase8BeforeReservationHook>>,
-    /// Test-only create-index build-scan rendezvous hooks.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub create_index_build_hooks: std::sync::Mutex<
-        std::collections::HashMap<
-            (String, String),
-            std::collections::VecDeque<super::hidden_accessors::CreateIndexBuildHook>,
-        >,
-    >,
-    /// Monotonic ids for test-only write-body entry hooks.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub write_body_entry_hook_next_id: AtomicU64,
+    #[allow(
+        dead_code,
+        reason = "normal builds carry an empty hook-state stub; test-hooks builds read the field"
+    )]
+    pub test_hooks: SharedStateTestHooks,
 }
 
 impl SharedState {
@@ -450,55 +401,6 @@ pub(crate) fn poison_after_durable_commit(
 }
 
 // ---------------------------------------------------------------------------
-// Test-only EPOCH_LOAD_COUNT + ReadOpScope (Phase 1 §10.5, US-008)
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static EPOCH_LOAD_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// Test-only RAII guard that enforces the Phase 1 §10.5 single-load
-/// discipline: every read-path entry point performs at most `limit`
-/// calls to `SharedState::load_published`. Constructed at the top of
-/// the test that drives a read; on `Drop` it asserts the observed
-/// delta does not exceed the limit. Compound operations that
-/// deliberately re-load (documented and rare) use `ReadOpScope::new(2)`
-/// with an inline comment.
-///
-/// Gated under `#[cfg(test)]` so release builds carry no runtime cost.
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct ReadOpScope {
-    start: u32,
-    limit: u32,
-}
-
-#[cfg(test)]
-impl ReadOpScope {
-    /// Begin a scope that tolerates up to `limit` epoch loads. Snapshots
-    /// the thread-local `EPOCH_LOAD_COUNT` at construction.
-    pub(crate) fn new(limit: u32) -> Self {
-        let start = EPOCH_LOAD_COUNT.with(|c| c.get());
-        Self { start, limit }
-    }
-}
-
-#[cfg(test)]
-impl Drop for ReadOpScope {
-    fn drop(&mut self) {
-        let end = EPOCH_LOAD_COUNT.with(|c| c.get());
-        let delta = end.saturating_sub(self.start);
-        assert!(
-            delta <= self.limit,
-            "operation performed {} epoch loads, limit {}",
-            delta,
-            self.limit
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MetadataState — catalog wrapped in metadata RwLock
 // ---------------------------------------------------------------------------
 
@@ -595,7 +497,7 @@ where
     Ok(())
 }
 
-fn validate_phase7_case_c_candidates(parsed: &ParsedLogicalFrames) -> Result<()> {
+fn reject_unpaired_chain_commits(parsed: &ParsedLogicalFrames) -> Result<()> {
     if let Some(candidate) = parsed.case_c_candidates.first() {
         return Err(Error::Recovery {
             detail: format!(
@@ -687,7 +589,7 @@ impl MetadataState {
         // tolerance: unresolved ids are log-and-proceed. The validation
         // pass itself does not mutate durable state.
         let parsed_logical = handle.take_parsed_logical_frames();
-        validate_phase7_case_c_candidates(&parsed_logical)?;
+        reject_unpaired_chain_commits(&parsed_logical)?;
         validate_parsed_logical_frames_against_catalog(&catalog, &parsed_logical)?;
         check_recovery_replay_pool_bound(&handle, &catalog, &parsed_logical)?;
         // T7 — journal-tail HLC oracle recovery: floor the oracle above
@@ -752,11 +654,11 @@ impl MetadataState {
             oracle,
             published: ArcSwap::from_pointee(initial_epoch),
             engine_poisoned: PlMutex::new(None),
-            // Phase 8 recovery initializes the lock-free
-            // `published_frontier` with the recovered HLC floor and starts
-            // the live `publish_seq` window above the highest accepted
-            // non-control record. A fresh DB uses the default floors.
-            publish_sequencer: PublishSequencer::new_from_recovered_floors(
+            // Journal recovery initializes the lock-free `published_frontier`
+            // with the recovered HLC floor and starts the live `publish_seq`
+            // window above the highest accepted non-control record. A fresh
+            // DB uses the default floors.
+            publish_sequencer: PublishSequencer::new_with_recovery_state(
                 recovered_max_commit_ts.unwrap_or_default(),
                 next_publish_seq,
             ),
@@ -770,38 +672,7 @@ impl MetadataState {
             // generation. Reopen recovery bumps this to the recovered
             // published value via `install_recovered_published_epoch`.
             next_catalog_gen: AtomicU64::new(1),
-            #[cfg(test)]
-            publish_pause_hook: std::sync::Mutex::new(None),
-            #[cfg(any(test, feature = "test-hooks"))]
-            recovery_open_published_store_count: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us019_primary_install_failures: AtomicU8::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us019_primary_install_attempts: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us009_event_order_counter: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us009_committed_flip_order: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us009_publish_ready_order: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us009_fail_after_committed_flip: AtomicU8::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            us026_post_register_failpoint: AtomicU8::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            phase8_fail_next_dirty_lsn_stamp: AtomicU8::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            phase8_fail_next_after_dirty_lsn_stamp: AtomicU8::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            phase8_fail_next_after_durable_before_flip: AtomicU8::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            write_body_entry_hooks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            #[cfg(any(test, feature = "test-hooks"))]
-            phase8_before_reservation_hook: std::sync::Mutex::new(None),
-            #[cfg(any(test, feature = "test-hooks"))]
-            create_index_build_hooks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            #[cfg(any(test, feature = "test-hooks"))]
-            write_body_entry_hook_next_id: AtomicU64::new(1),
+            test_hooks: SharedStateTestHooks::default(),
         });
         let weak_shared = Arc::downgrade(&shared);
         shared

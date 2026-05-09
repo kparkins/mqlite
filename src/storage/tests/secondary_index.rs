@@ -1,6 +1,6 @@
 use super::*;
 use crate::mvcc::{ReadView, Ts};
-use crate::storage::btree::{BTree, MemPageStore};
+use crate::storage::btree::{BTree, CellValue, MemPageStore};
 use crate::storage::catalog::IndexEntry;
 use bson::{doc, oid::ObjectId, Bson};
 
@@ -16,6 +16,41 @@ const READER_TXN_ID: u64 = 99;
 
 fn fresh_tree() -> BTree<MemPageStore> {
     BTree::create(MemPageStore::new()).expect("create tree")
+}
+
+fn build_index<S1, S2>(
+    data_tree: &BTree<S1>,
+    index_tree: &mut BTree<S2>,
+    index_entry: &IndexEntry,
+) -> Result<bool>
+where
+    S1: BTreePageStore,
+    S2: BTreePageStore,
+{
+    let all_entries = data_tree.range_scan(None, None)?;
+    let mut any_multikey = false;
+
+    for (_, cell_value) in &all_entries {
+        let doc_bytes = match cell_value {
+            CellValue::Inline(b) => b.clone(),
+            CellValue::Overflow {
+                first_page,
+                total_length,
+            } => data_tree.read_overflow(*first_page, *total_length)?,
+        };
+
+        let doc: Document = bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
+        let doc_id = doc.get("_id").ok_or_else(|| {
+            Error::Internal("document missing '_id' field during index build".into())
+        })?;
+
+        let is_multikey = update_index_on_insert_direct(&doc, doc_id, index_tree, index_entry)?;
+        if is_multikey {
+            any_multikey = true;
+        }
+    }
+
+    Ok(any_multikey)
 }
 
 fn read_view() -> ReadView {

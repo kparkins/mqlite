@@ -385,7 +385,7 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
             // page-byte staging does not duplicate chains. Pin-and-snapshot
             // against the real frame so MVCC visibility logic keeps working
             // for in-flight reads by this writer.
-            let (_disk, snap) = self.base.read_leaf(page)?;
+            let (_, snap) = self.base.read_leaf(page)?;
             return Ok((LeafPageImage::owned(buf), snap));
         }
         self.base.read_leaf(page)
@@ -528,7 +528,7 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
         &mut self,
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        self.base.take_all_chains_on_page(page)
+        self.base.take_all_chains(page)
     }
 }
 

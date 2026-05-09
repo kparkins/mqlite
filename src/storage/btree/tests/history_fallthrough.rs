@@ -73,7 +73,7 @@ impl StaticHistoryProbe {
 }
 
 impl HistoryProbe for StaticHistoryProbe {
-    fn probe(&self, key: &[u8], _read_ts: Ts) -> Result<Option<VersionEntry>> {
+    fn probe_visible_version(&self, key: &[u8], _read_ts: Ts) -> Result<Option<VersionEntry>> {
         self.calls.borrow_mut().push(key.to_vec());
         Ok(self.entry.clone())
     }

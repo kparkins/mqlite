@@ -28,7 +28,6 @@
     reason = "test target uses assertion-style panics and setup unwraps"
 )]
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 use std::env;
@@ -43,8 +42,8 @@ use std::time::{Duration, Instant};
 use bson::{doc, Document};
 use mqlite::error::EngineFatalReason;
 use mqlite::{
-    __us018_append_logical_replay_frames, arm_phase3_commit_failpoint, Client, DurabilityMode,
-    Error, OpenOptions, Phase3CommitFailpoint, Us018LogicalReplayFrame,
+    __us018_append_logical_replay_frames, arm_legacy_commit_failpoint, Client, DurabilityMode,
+    Error, LegacyCommitFailpoint, OpenOptions, Us018LogicalReplayFrame,
 };
 use serial_test::serial;
 
@@ -164,10 +163,6 @@ fn assert_group_commit_docs_present(client: &Client, count: usize) {
     }
 }
 
-fn fullsync_options() -> OpenOptions {
-    OpenOptions::new().durability(DurabilityMode::FullSync)
-}
-
 fn prepare_us018_replay_db(path: &Path) -> i64 {
     let client = Client::open_with_options(path, OpenOptions::new()).unwrap();
     let db = client.database("p5crash");
@@ -216,9 +211,10 @@ fn run_us018_crash_child_if_requested() -> bool {
     }
 
     let db_path = env::var(US018_DBPATH_ENV).expect("US-018 child database path env");
-    let _guard = arm_phase3_commit_failpoint(Phase3CommitFailpoint::AfterLegacyCommitBeforePublish)
+    let _guard = arm_legacy_commit_failpoint(LegacyCommitFailpoint::AfterLegacyCommitBeforePublish)
         .expect("arm US-018 crash failpoint");
-    let client = Client::open_with_options(&db_path, fullsync_options()).expect("child open");
+    let client =
+        Client::open_with_options(&db_path, crash_harness::fullsync_options()).expect("child open");
     client
         .database("p5crash")
         .collection::<Document>("docs")
@@ -266,7 +262,7 @@ fn test_crash_before_sequencer_publish_preserves_durability() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("us018_crash_before_publish.mqlite");
-    let client = Client::open_with_options(&path, fullsync_options()).unwrap();
+    let client = Client::open_with_options(&path, crash_harness::fullsync_options()).unwrap();
     client
         .database("p5crash")
         .create_collection("docs")
@@ -279,7 +275,7 @@ fn test_crash_before_sequencer_publish_preserves_durability() {
     );
     assert_child_aborted(status);
 
-    let reopened = Client::open_with_options(&path, fullsync_options()).unwrap();
+    let reopened = Client::open_with_options(&path, crash_harness::fullsync_options()).unwrap();
     assert_doc_value(
         &reopened,
         "docs",
@@ -346,7 +342,7 @@ fn test_crash_mid_out_of_order_install_does_not_expose_partial_frontier() {
 fn test_recovery_tolerates_missing_publish_for_durable_commit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("us018_missing_publish.mqlite");
-    let client = Client::open_with_options(&path, fullsync_options()).unwrap();
+    let client = Client::open_with_options(&path, crash_harness::fullsync_options()).unwrap();
     client
         .database("p5crash")
         .create_collection("docs")
@@ -364,7 +360,7 @@ fn test_recovery_tolerates_missing_publish_for_durable_commit() {
     );
     drop(client);
 
-    let reopened = Client::open_with_options(&path, fullsync_options()).unwrap();
+    let reopened = Client::open_with_options(&path, crash_harness::fullsync_options()).unwrap();
     assert_doc_value(
         &reopened,
         "docs",

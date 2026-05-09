@@ -1,15 +1,14 @@
-//! `PublishSequencer` — Phase 5 §10.19 dense publish-slot sequencer.
+//! `PublishSequencer` — dense publish-slot sequencer.
 //!
-//! Owns the dense `publish_seq: u64` window that orders Phase 5 commit
-//! publishes against each other independently of the sparse HLC
-//! `commit_ts`. Allocation of `(publish_seq, commit_ts)` happens as a
-//! single ordered pair under the sequencer mutex inside
-//! [`PublishSequencer::register_with_oracle`]; the prior split sequence
-//! `oracle.commit() -> register(commit_ts)` is forbidden by the §10.19
-//! grep gate because the split would let publish-slot order diverge
-//! from commit-timestamp order.
+//! Owns the dense `publish_seq: u64` window that orders commit publishes
+//! independently of the sparse HLC `commit_ts`. Allocation of
+//! `(publish_seq, commit_ts)` happens as a single ordered pair under the
+//! sequencer mutex inside [`PublishSequencer::register_with_oracle`];
+//! splitting timestamp allocation from slot registration is forbidden
+//! because it would let publish-slot order diverge from commit-timestamp
+//! order.
 //!
-//! The §10.19 protocol has three terminal states for a registered slot:
+//! The publish-slot protocol has three terminal states:
 //!
 //! 1. `Ready` — `mark_ready(guard, closure)` runs the publish closure
 //!    once every earlier slot is also Ready (or Aborted) and advances
@@ -21,20 +20,15 @@
 //!    called. `mark_ready`/`mark_aborted` complete the guard before
 //!    returning, so post-durability failures never reach this path.
 //!    Post-durability failures route through the engine-fatal poison
-//!    path owned by US-036 — see [`PublishSequencer::poison`].
+//!    path — see [`PublishSequencer::poison`].
 //!
-//! `PublishSequencer.published_frontier: AtomicTs` (§10.19 C-1) is the
-//! lock-free live frontier consumed by foreign-Pending visibility in
-//! §10.20. `mark_ready` publishes the new `ReadEpoch` and the frontier
-//! as an ordered pair: the publish closure stores the new epoch first,
-//! then `mark_ready` stores `published_frontier` with `Release`. Readers
-//! load the epoch with Acquire, then load `published_frontier` with
-//! Acquire and retry the pair if `frontier < epoch.visible_ts`.
-
-#![allow(
-    dead_code,
-    reason = "US-005 lands the sequencer primitive; production CRUD/DDL call sites land in US-012 / US-031."
-)]
+//! `PublishSequencer.published_frontier: AtomicTs` is the lock-free live
+//! frontier consumed by foreign-Pending visibility. `mark_ready` publishes
+//! the new `ReadEpoch` and the frontier as an ordered pair: the publish
+//! closure stores the new epoch first, then `mark_ready` stores
+//! `published_frontier` with `Release`. Readers load the epoch with
+//! Acquire, then load `published_frontier` with Acquire and retry the
+//! pair if `frontier < epoch.visible_ts`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -49,7 +43,7 @@ use super::publish::PublishDirty;
 /// `parking_lot::Mutex` for the unfair / fast path; loom permutation
 /// harnesses substitute `loom::sync::Mutex` so the scheduler can interleave
 /// the register / mark_ready / mark_aborted critical sections required by
-/// the §10.19 dense-window contract (§10.13.9 loom-shim requirement).
+/// the dense-window contract.
 #[cfg(loom)]
 type SequencerMutex<T> = loom::sync::Mutex<T>;
 #[cfg(not(loom))]
@@ -234,23 +228,18 @@ impl Drop for PublishSlotGuard {
 }
 
 impl PublishSequencer {
-    /// Construct a fresh sequencer with `published_frontier == Ts::default()`.
-    pub(crate) fn new() -> Arc<Self> {
-        Self::new_inner(Ts::default(), 1)
-    }
-
     /// Construct a fresh sequencer for reopen recovery (§10.29 rule 3).
     ///
     /// The dense slot window is reinitialized (`next_seq = 1`,
     /// `last_published = 0`, empty `pending`) so recovered HLC
     /// timestamps never seed the dense slot counter; only the
     /// lock-free `published_frontier` carries the recovered HLC value.
-    pub(crate) fn new_from(recovered_max_commit_ts: Ts) -> Arc<Self> {
+    pub(crate) fn new_with_published_frontier(recovered_max_commit_ts: Ts) -> Arc<Self> {
         Self::new_inner(recovered_max_commit_ts, 1)
     }
 
-    /// Construct a sequencer from Phase 8 recovery floors.
-    pub(crate) fn new_from_recovered_floors(
+    /// Construct a sequencer from recovered frontier state.
+    pub(crate) fn new_with_recovery_state(
         recovered_max_commit_ts: Ts,
         next_publish_seq: u64,
     ) -> Arc<Self> {
@@ -310,25 +299,6 @@ impl PublishSequencer {
             commit_ts,
             completed: false,
         })
-    }
-
-    /// Block until either `seq`'s direct predecessor has completed
-    /// (`last_published + 1 == seq`) or the sequencer is poisoned.
-    ///
-    /// # Errors
-    /// - [`Error::EngineFatal`] when the sequencer is poisoned (either
-    ///   on entry or while waiting).
-    pub(crate) fn wait_until_predecessors_complete(&self, seq: u64) -> Result<()> {
-        let mut g = lock_seq(&self.inner);
-        loop {
-            if let Some(reason) = g.poisoned.clone() {
-                return Err(Error::EngineFatal { reason });
-            }
-            if g.last_published.saturating_add(1) >= seq {
-                return Ok(());
-            }
-            g = wait_seq(&self.cvar, g);
-        }
     }
 
     /// Transition `guard` to `Ready { closure }`, run the window-advance
@@ -520,68 +490,11 @@ impl PublishSequencer {
         }
         self.cvar.notify_all();
     }
-
-    /// Return the recorded poison reason, if any.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn poisoned_reason(&self) -> Option<EngineFatalReason> {
-        lock_seq(&self.inner).poisoned.clone()
-    }
-
-    /// Highest `publish_seq` whose slot has completed window-advance.
-    pub(crate) fn last_published_seq(&self) -> u64 {
-        lock_seq(&self.inner).last_published
-    }
-
-    /// Test-only: poison-aware Pending-slot register without an HLC
-    /// allocation. Used by the US-036 successor-wake regression
-    /// fixtures that exercise the poison path independently of the
-    /// production register-with-oracle entry point.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn register_for_test(self: &Arc<Self>) -> Result<PublishSlotGuard> {
-        let mut g = lock_seq(&self.inner);
-        if let Some(reason) = g.poisoned.clone() {
-            return Err(Error::EngineFatal { reason });
-        }
-        let seq = g.next_seq;
-        g.next_seq = seq
-            .checked_add(1)
-            .ok_or_else(|| Error::Internal("publish_sequencer next_seq overflowed u64".into()))?;
-        g.pending.insert(
-            seq,
-            PublishSlot {
-                commit_ts: Ts::default(),
-                state: PublishSlotState::Pending,
-            },
-        );
-        Ok(PublishSlotGuard {
-            sequencer: Arc::clone(self),
-            seq,
-            commit_ts: Ts::default(),
-            completed: false,
-        })
-    }
-
-    /// Test-only: advance the sequencer past `guard` without running a
-    /// publish closure. Used by the US-036 fixtures where the test
-    /// poisons the engine and observes successor wake-up; the durable
-    /// commit envelope is not exercised so the closure variant is
-    /// unnecessary.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn mark_ready_for_test(self: &Arc<Self>, mut guard: PublishSlotGuard) -> Result<()> {
-        let mut g = lock_seq(&self.inner);
-        if let Some(reason) = g.poisoned.clone() {
-            return Err(Error::EngineFatal { reason });
-        }
-        guard.completed = true;
-        // Drop the guard's slot directly: the test path doesn't store a
-        // closure, so window-advance treats this as if the slot had
-        // been Aborted (advance and remove without publishing).
-        if let Some(slot) = g.pending.get_mut(&guard.seq) {
-            slot.state = PublishSlotState::Aborted;
-        }
-        self.advance_window_locked(&mut g)
-    }
 }
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "tests/publish_sequencer_accessors.rs"]
+mod publish_sequencer_accessors;
 
 #[cfg(test)]
 #[path = "tests/publish_sequencer.rs"]

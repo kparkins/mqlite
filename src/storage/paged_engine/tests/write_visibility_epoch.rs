@@ -59,7 +59,7 @@ fn test_run_write_commit_envelope_constructs_single_write_visibility() {
 }
 
 #[test]
-fn test_phase3_secondary_history_is_none_and_correct() {
+fn test_secondary_history_is_none_and_correct() {
     let engine = buffered_engine();
     let ns = "test.us008.secondary";
     engine.create_namespace(ns).unwrap();

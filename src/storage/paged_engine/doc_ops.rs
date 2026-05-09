@@ -22,11 +22,13 @@ use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
     maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
 };
-use super::snapshot_ops::{apply_find_opts, execute_pairs};
+use super::snapshot_ops::{apply_find_opts, plan_and_collect_snapshot_pairs};
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::root_snapshot::NamespaceSnapshot;
+
+type MutationCandidate = (Vec<u8>, Document, Option<ExpectedHead>);
 
 fn expected_head_for_key(
     shared: &SharedState,
@@ -47,7 +49,7 @@ fn attach_expected_heads(
     shared: &SharedState,
     ns_snap: &NamespaceSnapshot,
     pairs: Vec<(Vec<u8>, Document)>,
-) -> Result<Vec<(Vec<u8>, Document, Option<ExpectedHead>)>> {
+) -> Result<Vec<MutationCandidate>> {
     pairs
         .into_iter()
         .map(|(key, doc)| {
@@ -55,6 +57,16 @@ fn attach_expected_heads(
             Ok((key, doc, expected_head))
         })
         .collect()
+}
+
+fn collect_mutation_candidates(
+    shared: &SharedState,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    epoch: Arc<crate::storage::root_snapshot::PublishedEpoch>,
+) -> Result<Vec<MutationCandidate>> {
+    let (_, pairs) = plan_and_collect_snapshot_pairs(shared, ns_snap, filter, epoch, false)?;
+    attach_expected_heads(shared, ns_snap, pairs)
 }
 
 pub(super) fn stage_insert(
@@ -66,7 +78,8 @@ pub(super) fn stage_insert(
     mut doc: Document,
 ) -> Result<Bson> {
     let ns_arc = Ns::from(ns);
-    let entry = md.catalog_lock()
+    let entry = md
+        .catalog_lock()
         .get_collection(ns)?
         .ok_or_else(|| Error::Internal(format!("namespace '{}' vanished mid-write", ns)))?;
     let tree = BTree::open(
@@ -106,14 +119,8 @@ pub(super) fn find(
         }
         Some(n) => n,
     };
-    let (plan, pairs) = execute_pairs(
-        &engine.shared,
-        ns,
-        ns_snap,
-        filter,
-        Arc::clone(&snap),
-        true,
-    )?;
+    let (plan, pairs) =
+        plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, filter, Arc::clone(&snap), true)?;
     let docs_examined = pairs.len() as u64;
     let matched: Vec<Document> = pairs.into_iter().map(|(_, doc)| doc).collect();
     let explain = crate::query::explain::ExplainResult::from_plan(&plan, docs_examined);
@@ -148,19 +155,9 @@ pub(super) fn update(
                 upserted_id: None,
             });
         }
-        Some(ns_snap) => attach_expected_heads(
-            &engine.shared,
-            ns_snap,
-            execute_pairs(
-                &engine.shared,
-                ns,
-                ns_snap,
-                filter,
-                Arc::clone(&snap),
-                false,
-            )
-            .map(|(_, p)| p)?,
-        )?,
+        Some(ns_snap) => {
+            collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
+        }
     };
 
     if matched_pairs.is_empty() && opts.upsert {
@@ -215,30 +212,21 @@ pub(super) fn delete(
     many: bool,
 ) -> Result<DeleteResult> {
     let snap = engine.shared.load_published();
-    let pairs_to_delete: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
-        match snap.catalog.get_by_name(ns) {
-            None => return Ok(DeleteResult { deleted_count: 0 }),
-            Some(ns_snap) => {
-                let pairs = attach_expected_heads(
-                    &engine.shared,
-                    ns_snap,
-                    execute_pairs(
-                        &engine.shared,
-                        ns,
-                        ns_snap,
-                        filter,
-                        Arc::clone(&snap),
-                        false,
-                    )
-                    .map(|(_, p)| p)?,
-                )?;
-                if many {
-                    pairs
-                } else {
-                    pairs.into_iter().take(1).collect()
-                }
+    let pairs_to_delete: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = match snap
+        .catalog
+        .get_by_name(ns)
+    {
+        None => return Ok(DeleteResult { deleted_count: 0 }),
+        Some(ns_snap) => {
+            let pairs =
+                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?;
+            if many {
+                pairs
+            } else {
+                pairs.into_iter().take(1).collect()
             }
-        };
+        }
+    };
 
     let deleted_count = pairs_to_delete.len() as u64;
     if deleted_count == 0 {
@@ -260,26 +248,17 @@ pub(super) fn delete(
     Ok(DeleteResult { deleted_count })
 }
 
-pub(super) fn count(
-    engine: &super::PagedEngine,
-    ns: &str,
-    filter: &Document,
-) -> Result<u64> {
+pub(super) fn count(engine: &super::PagedEngine, ns: &str, filter: &Document) -> Result<u64> {
     let snap = engine.shared.load_published();
     let ns_snap = match snap.catalog.get_by_name(ns) {
         None => return Ok(0),
         Some(n) => n,
     };
-    Ok(execute_pairs(
-        &engine.shared,
-        ns,
-        ns_snap,
-        filter,
-        Arc::clone(&snap),
-        false,
+    Ok(
+        plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, filter, Arc::clone(&snap), false)
+            .map(|(_, p)| p)?
+            .len() as u64,
     )
-    .map(|(_, p)| p)?
-    .len() as u64)
 }
 
 pub(super) fn find_one_and_update(
@@ -304,19 +283,9 @@ pub(super) fn find_one_and_update(
                 }
                 return Ok(None);
             }
-            Some(ns_snap) => attach_expected_heads(
-                &engine.shared,
-                ns_snap,
-                execute_pairs(
-                    &engine.shared,
-                    ns,
-                    ns_snap,
-                    filter,
-                    Arc::clone(&snap),
-                    false,
-                )
-                .map(|(_, p)| p)?,
-            )?,
+            Some(ns_snap) => {
+                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
+            }
         };
 
     if matched.is_empty() {
@@ -362,21 +331,9 @@ pub(super) fn find_one_and_delete(
     let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
         match snap.catalog.get_by_name(ns) {
             None => return Ok(None),
-            Some(ns_snap) => attach_expected_heads(
-                &engine.shared,
-                ns_snap,
-                {
-                    let (_, pairs) = execute_pairs(
-                        &engine.shared,
-                        ns,
-                        ns_snap,
-                        filter,
-                        Arc::clone(&snap),
-                        false,
-                    )?;
-                    pairs
-                },
-            )?,
+            Some(ns_snap) => {
+                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
+            }
         };
 
     if matched.is_empty() {
@@ -418,21 +375,9 @@ pub(super) fn find_one_and_replace(
                 }
                 return Ok(None);
             }
-            Some(ns_snap) => attach_expected_heads(
-                &engine.shared,
-                ns_snap,
-                {
-                    let (_, pairs) = execute_pairs(
-                        &engine.shared,
-                        ns,
-                        ns_snap,
-                        filter,
-                        Arc::clone(&snap),
-                        false,
-                    )?;
-                    pairs
-                },
-            )?,
+            Some(ns_snap) => {
+                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
+            }
         };
 
     if matched.is_empty() {
@@ -480,11 +425,7 @@ pub(super) fn find_one_and_replace(
     }))
 }
 
-fn upsert_stage(
-    engine: &super::PagedEngine,
-    ns: &str,
-    doc: Document,
-) -> Result<(Bson, Document)> {
+fn upsert_stage(engine: &super::PagedEngine, ns: &str, doc: Document) -> Result<(Bson, Document)> {
     let snapshot = doc.clone();
     let id = engine.run_write(ns, |shared, md, txn, vis| {
         stage_insert(shared, md, txn, vis, ns, doc)
@@ -501,7 +442,11 @@ pub(super) fn upsert_for_update(
     let mut doc = upsert_base_from_filter(filter);
     apply_update(&mut doc, update_doc, true)?;
     let (id, _) = upsert_stage(engine, ns, doc)?;
-    Ok(UpdateResult { matched_count: 0, modified_count: 0, upserted_id: Some(id) })
+    Ok(UpdateResult {
+        matched_count: 0,
+        modified_count: 0,
+        upserted_id: Some(id),
+    })
 }
 
 pub(super) fn upsert_for_find_one_and_update(

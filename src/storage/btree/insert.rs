@@ -213,10 +213,9 @@ impl<S: BTreePageStore> BTree<S> {
         let right_cells: Vec<LeafCell> = left_node.cells.drain(split_at..).collect();
         let promoted_key = right_cells[0].key.clone();
 
-        // PHASE-5-REAUDIT: §10.5 PASS-3 drain-and-partition window.
-        // This window needs an atomic primitive analogous to Phase 4 §8.7
-        // replace_leaf_and_chains.
-        let all_chains = self.store.take_all_chains_on_page(left_page)?;
+        // Drain-and-partition window: split routing must move every resident
+        // delta chain atomically with the leaf-page split.
+        let all_chains = self.store.take_all_chains(left_page)?;
         let (left_chains, right_chains): (Vec<_>, Vec<_>) = all_chains
             .into_iter()
             .partition(|(key, _)| key.as_slice() < promoted_key.as_slice());

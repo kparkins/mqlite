@@ -21,11 +21,12 @@
 //! #27: crash between log-record durability and `published.store`
 //!      loses only the publish — recovery completes it.
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 use bson::{doc, Document};
-use mqlite::{read_durable_header_counters, Client, DurabilityMode, OpenOptions, Phase0ProbeCut};
+use mqlite::{
+    read_durable_header_counters, Client, DurabilityMode, OpenOptions, WriteEnvelopeProbeCut,
+};
 use std::sync::Mutex;
 
 /// Shared lock serializing tests that rely on `reopen_inspect`'s
@@ -219,7 +220,7 @@ fn crash_between_chain_commit_and_publish_loses_publish_only() {
         .__crash_cut_probe_insert(
             "db.c",
             doc! { "_id": 99i32, "kind": "probe" },
-            Phase0ProbeCut::AfterDurabilityWaitBeforePublish,
+            WriteEnvelopeProbeCut::AfterDurabilityWaitBeforePublish,
         )
         .expect("probe");
     std::mem::forget(client);

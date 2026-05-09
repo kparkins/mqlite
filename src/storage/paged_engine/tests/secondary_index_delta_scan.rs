@@ -211,9 +211,8 @@ fn test_index_scan_and_collscan_agree_on_delta_only_entry() {
         .catalog
         .get_by_name(NS)
         .expect("namespace snapshot exists");
-    let (_, collscan_pairs) = super::snapshot_ops::execute_pairs(
+    let (_, collscan_pairs) = super::snapshot_ops::plan_and_collect_snapshot_pairs(
         &engine.shared,
-        NS,
         ns_snap,
         &filter,
         Arc::clone(&epoch),

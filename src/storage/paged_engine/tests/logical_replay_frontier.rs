@@ -1,5 +1,3 @@
-#![allow(non_snake_case)]
-
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -92,7 +90,7 @@ fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
 
 #[test]
 #[serial(logical_txn_pass2_metrics)]
-fn F_test_recovered_page0_last_checkpoint_ts_is_logical_replay_frontier() {
+fn recovered_page0_last_checkpoint_ts_is_logical_replay_frontier() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("phase7-us008-frontier.mqlite");
     seed_database(&db_path);

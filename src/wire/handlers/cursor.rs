@@ -6,7 +6,7 @@ use bson::{doc, Document};
 
 use super::super::errors::err_bad_value;
 use super::super::server::{ConnectionCursors, ServerState};
-use super::{get_i64, qualified_coll};
+use super::{batch_size, get_i64, qualified_coll};
 
 /// `getMore` — fetch the next batch of results from an open server-side cursor.
 ///
@@ -35,10 +35,7 @@ pub(super) fn handle_get_more(
         Err(_) => return err_bad_value("getMore requires a \"collection\" field"),
     };
 
-    // Default batch size mirrors MongoDB 8.0 (101 documents).
-    let batch_size = get_i64(body, "batchSize")
-        .map(|n| if n <= 0 { 101usize } else { n as usize })
-        .unwrap_or(101);
+    let batch_size = batch_size(body);
 
     // Drain up to `batch_size` documents from the cursor in a single critical section.
     let (next_batch, returned_id) = {

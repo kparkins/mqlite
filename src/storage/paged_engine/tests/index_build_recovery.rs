@@ -56,7 +56,9 @@ fn tag_index_entry(engine: &PagedEngine) -> Result<IndexEntry> {
         .metadata
         .read()
         .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-    engine.metadata_state.catalog_lock()
+    engine
+        .metadata_state
+        .catalog_lock()
         .get_index(NS, TAG_INDEX)?
         .ok_or_else(|| Error::Internal("tag index missing".into()))
 }

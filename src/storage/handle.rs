@@ -162,28 +162,6 @@ pub(crate) struct BufferPoolHandle {
 }
 
 impl BufferPoolHandle {
-    /// Create a `BufferPoolHandle` without a journal — test-only.
-    ///
-    /// Production code always wires a journal via [`Self::with_journal`].
-    #[cfg(test)]
-    pub(crate) fn new(
-        pool: Arc<BufferPool>,
-        history_pool: Arc<BufferPool>,
-        header: FileHeader,
-    ) -> Self {
-        let allocator = AllocatorHandle::new(header);
-        let pool_io = BufferPoolPageSource::new(Arc::clone(&pool));
-        Self {
-            pool,
-            history_pool,
-            allocator,
-            pool_io,
-            read_view_registry: ReadViewRegistry::new(),
-            journal: None,
-            journal_main_file: None,
-        }
-    }
-
     /// Create a `BufferPoolHandle` with an attached [`JournalManager`].
     ///
     /// Journal rollback and checkpoint helpers become active when a journal is
@@ -469,15 +447,6 @@ impl BufferPoolHandle {
         &self.read_view_registry
     }
 
-    /// Borrow the `BufferPoolPageSource` routing allocator I/O through the pool.
-    ///
-    /// Used by writer-path code that needs a `PageSource` for
-    /// [`AllocatorHandle::drain_free_queue`] without re-constructing one.
-    #[cfg(test)]
-    pub(crate) fn page_source(&self) -> &BufferPoolPageSource {
-        &self.pool_io
-    }
-
     /// Highest `ChainCommit::commit_ts` that the journal observed during
     /// recovery, or `None` when no journal is attached or it carried no
     /// ChainCommit frames. The MVCC backend folds this into
@@ -686,16 +655,7 @@ impl BufferPoolHandle {
         self.history_pool.set_main_file_flush_lsn(durable_lsn);
     }
 
-    /// Return the current contiguous ready journal frontier.
-    #[allow(dead_code)]
-    pub(crate) fn journal_ready_lsn(&self) -> Result<u64> {
-        let Some(log_manager) = self.journal_log_manager()? else {
-            return Ok(0);
-        };
-        Ok(log_manager.ready_lsn())
-    }
-
-    /// Return `(next_lsn, ready_lsn, durable_lsn)` for Phase 8 tests.
+    /// Return `(next_lsn, ready_lsn, durable_lsn)` for journal tests.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
         let Some(log_manager) = self.journal_log_manager()? else {
@@ -775,7 +735,7 @@ impl BufferPoolHandle {
     /// the same journal sync primitive as the rest of the handle.
     #[allow(
         dead_code,
-        reason = "phase0 test probe still uses this hook; production US-012 path no longer does"
+        reason = "legacy crash-cut probe still uses this hook; production commit path no longer does"
     )]
     pub(crate) fn fsync_logical_tail(&self) -> Result<()> {
         self.journal_sync()
@@ -784,7 +744,7 @@ impl BufferPoolHandle {
     /// Append an MVCC `ChainCommit` frame and return its exclusive end LSN.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn append_chain_commit_end_lsn(
-        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
+        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
         &self,
         commit_ts: crate::mvcc::timestamp::Ts,
         refcount_deltas: Vec<(u32, i32)>,
@@ -813,7 +773,7 @@ impl BufferPoolHandle {
     /// (returns `Ok(0)`) on journal-less handles.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn append_logical_txn(
-        // allow-phase8-legacy-audit: test-only retired logical append probe
+        // allow-legacy-journal-audit: test-only retired logical append probe
         &self,
         frame: crate::journal::log_file::LogicalTxnFrame,
     ) -> Result<u64> {
@@ -854,6 +814,10 @@ impl BufferPoolHandle {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tests/handle_accessors.rs"]
+mod handle_accessors;
 
 #[cfg(test)]
 #[path = "tests/handle.rs"]

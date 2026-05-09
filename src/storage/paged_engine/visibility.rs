@@ -102,7 +102,7 @@ pub(in crate::storage::paged_engine) struct SecondaryHistoryProbe<'a, S: BTreePa
 }
 
 impl<S: BTreePageStore> HistoryProbe for SecondaryHistoryProbe<'_, S> {
-    fn probe(
+    fn probe_visible_version(
         &self,
         key: &[u8],
         read_ts: crate::mvcc::timestamp::Ts,

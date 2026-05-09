@@ -196,7 +196,11 @@ fn plan_targets(shared: &SharedState, targets: &[SmoWriteTarget]) -> Result<Vec<
     let mut planned = Vec::with_capacity(targets.len());
     for target in targets {
         let path = {
-            let tree = BTree::open(shared.new_btree_store(), target.root_page, target.root_level);
+            let tree = BTree::open(
+                shared.new_btree_store(),
+                target.root_page,
+                target.root_level,
+            );
             tree.path_to_leaf(&target.key)?
         };
         let leaf = path

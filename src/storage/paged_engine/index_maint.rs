@@ -740,7 +740,11 @@ pub(super) fn materialize_primary_deltas_for_checkpoint(
             continue;
         }
 
-        let read_tree = BTree::open(shared.new_btree_store(), coll.data_root_page, coll.data_root_level);
+        let read_tree = BTree::open(
+            shared.new_btree_store(),
+            coll.data_root_page,
+            coll.data_root_level,
+        );
         let deltas = read_tree.visible_delta_entries(&view)?;
         if deltas.is_empty() {
             requires_logical_tail = true;

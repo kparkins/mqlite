@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -193,7 +192,7 @@ fn post_step_8_checkpoint_batch_without_boundary_discards_batch() {
 }
 
 #[test]
-fn F_test_torn_non_commit_frame_before_intact_commit_boundary_discards_batch() {
+fn torn_non_commit_frame_before_intact_commit_boundary_discards_batch() {
     let JournalFixture {
         _dir,
         db_path,
@@ -239,7 +238,7 @@ fn F_test_torn_non_commit_frame_before_intact_commit_boundary_discards_batch() {
 }
 
 #[test]
-fn F_test_checkpoint_boundary_rejects_preexisting_pending_legacy_frame() {
+fn checkpoint_boundary_rejects_preexisting_pending_legacy_frame() {
     let JournalFixture {
         _dir,
         db_path,

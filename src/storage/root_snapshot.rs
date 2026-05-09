@@ -32,16 +32,10 @@ pub(crate) type IndexId = i64;
 
 /// Root-of-tree metadata for one namespace.
 ///
-/// The `id` field is the durable identity allocated by §10.7; `name` is
-/// kept alongside for logging and MongoDB-compatible lookups but is not a
-/// stable key.
+/// The `id` field is the durable identity allocated by §10.7.
 #[derive(Clone)]
 pub(crate) struct NamespaceSnapshot {
     pub id: NamespaceId,
-    // `name` is part of the §10.1 published contract surface and must
-    // remain available even when production read paths key by id/name maps.
-    #[allow(dead_code)]
-    pub name: String,
     pub data_root_page: u32,
     pub data_root_level: u8,
     pub indexes: Vec<PublishedIndex>,
@@ -88,20 +82,6 @@ impl PublishedCatalog {
         self.namespace_id_by_name
             .get(name)
             .and_then(|id| self.namespaces.get(id))
-    }
-
-    /// Look up a namespace snapshot by durable id.
-    #[allow(dead_code)]
-    pub(crate) fn get_by_id(&self, id: NamespaceId) -> Option<&NamespaceSnapshot> {
-        self.namespaces.get(&id)
-    }
-
-    /// Resolve a name to its durable namespace id. One-line accessor over
-    /// `namespace_id_by_name`; Phase 4/5 consumers depend on this method
-    /// being present from Phase 1 onward.
-    #[allow(dead_code)]
-    pub(crate) fn id_for_name(&self, name: &str) -> Option<NamespaceId> {
-        self.namespace_id_by_name.get(name).copied()
     }
 }
 

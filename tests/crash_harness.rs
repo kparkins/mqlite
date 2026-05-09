@@ -48,7 +48,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use mqlite::{Client, OpenOptions as DbOpenOptions, Result};
+use mqlite::{Client, DurabilityMode, OpenOptions as DbOpenOptions, Result};
 
 // ---------------------------------------------------------------------------
 // Journal format constants (duplicated from src/journal/log_file.rs which is
@@ -96,6 +96,16 @@ pub fn journal_path(db_path: &Path) -> std::path::PathBuf {
     let mut s = db_path.as_os_str().to_owned();
     s.push("-journal");
     std::path::PathBuf::from(s)
+}
+
+/// Return FullSync open options for crash/recovery integration tests.
+pub fn fullsync_options() -> DbOpenOptions {
+    DbOpenOptions::new().durability(DurabilityMode::FullSync)
+}
+
+/// Open a database with FullSync durability.
+pub fn open_fullsync(db_path: &Path) -> Result<Client> {
+    Client::open_with_options(db_path, fullsync_options())
 }
 
 // ---------------------------------------------------------------------------

@@ -55,7 +55,9 @@ fn buffered_engine() -> PagedEngine {
 
 fn collection(engine: &PagedEngine) -> CollectionEntry {
     let _md = engine.metadata.read().expect("metadata read");
-    engine.metadata_state.catalog_lock()
+    engine
+        .metadata_state
+        .catalog_lock()
         .get_collection(NS)
         .expect("read catalog")
         .expect("collection exists")
@@ -200,6 +202,7 @@ fn test_replay_applier_is_idempotent_on_double_apply() {
     engine.create_namespace(NS).expect("create namespace");
     engine
         .shared
+        .test_hooks
         .recovery_open_published_store_count
         .store(0, Ordering::Relaxed);
 
@@ -232,6 +235,7 @@ fn test_replay_applier_is_idempotent_on_double_apply() {
     assert_eq!(
         engine
             .shared
+            .test_hooks
             .recovery_open_published_store_count
             .load(Ordering::Relaxed),
         0,
@@ -245,6 +249,7 @@ fn test_replay_applier_failure_leaves_no_reader_visible_partial_state() {
     engine.create_namespace(NS).expect("create namespace");
     engine
         .shared
+        .test_hooks
         .recovery_open_published_store_count
         .store(0, Ordering::Relaxed);
 
@@ -300,6 +305,7 @@ fn test_replay_applier_failure_leaves_no_reader_visible_partial_state() {
     assert_eq!(
         engine
             .shared
+            .test_hooks
             .recovery_open_published_store_count
             .load(Ordering::Relaxed),
         0,

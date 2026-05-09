@@ -27,12 +27,12 @@ use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedEpoch, Published
 use crate::storage::structural_page_batch::StructuralPageBatch;
 
 use super::btree_ops::btree_collscan;
-use super::publish::rebuild_and_publish;
 use super::doc_helpers::{apply_projection_to_doc, compare_docs};
 use super::index_maint::{
     index_bounds_free, index_entry_id_free, materialize_primary_deltas_for_checkpoint,
     materialize_ready_secondary_deltas_for_checkpoint,
 };
+use super::publish::rebuild_and_publish;
 use super::publish::PublishDirty;
 use super::state::SharedState;
 
@@ -133,7 +133,7 @@ pub(super) struct PrimaryHistoryProbe<'a, S: BTreePageStore> {
 }
 
 impl<S: BTreePageStore> crate::storage::btree::HistoryProbe for PrimaryHistoryProbe<'_, S> {
-    fn probe(
+    fn probe_visible_version(
         &self,
         key: &[u8],
         read_ts: crate::mvcc::timestamp::Ts,
@@ -268,9 +268,8 @@ fn execute_collscan_from_snap(
     btree_collscan(&tree, filter, &view, Some(&probe))
 }
 
-pub(super) fn execute_pairs(
+pub(super) fn plan_and_collect_snapshot_pairs(
     shared: &SharedState,
-    _ns: &str,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
@@ -297,7 +296,6 @@ pub(super) fn execute_pairs(
     let pairs = execute_plan_from_snap(&plan, shared, ns_snap, &ready_indexes, filter, epoch)?;
     Ok((plan, pairs))
 }
-
 
 fn execute_plan_from_snap(
     plan: &ScanPlan,
@@ -552,8 +550,8 @@ fn checkpoint_after_reconcile_plan(
         return Ok(());
     }
     #[cfg(any(test, feature = "test-hooks"))]
-    super::hidden_accessors::phase8_checkpoint_abort_if_armed(
-        super::hidden_accessors::Phase8CheckpointFailpoint::AfterMaterializationFlushBeforeBoundary,
+    super::hidden_accessors::checkpoint_boundary_abort_if_armed(
+        super::hidden_accessors::CheckpointBoundaryFailpoint::AfterMaterializationFlushBeforeBoundary,
     );
     let checkpoint_applied_lsn = checkpoint_applied_lsn.ok_or_else(|| {
         Error::Internal("checkpoint boundary requested without an applied LSN".into())
@@ -594,7 +592,6 @@ fn poison_checkpoint_post_mutation(engine: &super::PagedEngine, err: Error) -> E
     engine.shared.poison_engine(reason.clone());
     Error::EngineFatal { reason }
 }
-
 
 #[allow(
     dead_code,

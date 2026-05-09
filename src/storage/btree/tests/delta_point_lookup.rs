@@ -74,7 +74,7 @@ fn remove_chain(tree: &mut BTree<MemPageStore>, key: &[u8]) -> Result<()> {
 struct EmptyHistoryProbe;
 
 impl HistoryProbe for EmptyHistoryProbe {
-    fn probe(&self, _key: &[u8], _read_ts: Ts) -> Result<Option<VersionEntry>> {
+    fn probe_visible_version(&self, _key: &[u8], _read_ts: Ts) -> Result<Option<VersionEntry>> {
         Ok(None)
     }
 }

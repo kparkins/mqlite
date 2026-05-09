@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_phase7_checkpoint_codecs_survive_phase6_legacy_grep_gate() {
+    fn test_checkpoint_codecs_survive_legacy_grep_gate() {
         let log_file_src = include_str!("../log_file.rs");
         let journal_src = include_str!("../mod.rs");
         let recovery_src = include_str!("../recovery.rs");

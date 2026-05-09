@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::btree::MemPageStore;
 use bson::doc;
 
 // -----------------------------------------------------------------------
@@ -14,7 +15,7 @@ fn now() -> i64 {
 }
 
 fn make_catalog() -> Catalog<MemPageStore> {
-    new_mem_catalog().expect("create catalog")
+    Catalog::create(MemPageStore::new()).expect("create catalog")
 }
 
 fn index_model(keys: Document) -> IndexModel {

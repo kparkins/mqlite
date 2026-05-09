@@ -135,7 +135,7 @@ fn expect_recovery_error(db_path: &Path) -> String {
 }
 
 #[test]
-fn test_phase7_case_c_is_hard_error() {
+fn test_unpaired_chain_commit_is_hard_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("phase7-us009-hard-error.mqlite");
     seed_database(&db_path);
@@ -160,7 +160,7 @@ fn test_phase7_case_c_is_hard_error() {
 }
 
 #[test]
-fn test_phase7_case_c_does_not_trip_for_pre_frontier_chain_commits() {
+fn test_unpaired_chain_commit_does_not_trip_for_pre_frontier_chain_commits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("phase7-us009-pre-frontier.mqlite");
     seed_database(&db_path);
@@ -172,7 +172,7 @@ fn test_phase7_case_c_does_not_trip_for_pre_frontier_chain_commits() {
 }
 
 #[test]
-fn test_phase7_case_c_error_detail_includes_chain_commit_offset() {
+fn test_unpaired_chain_commit_error_detail_includes_chain_commit_offset() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("phase7-us009-offset-detail.mqlite");
     seed_database(&db_path);
@@ -187,7 +187,7 @@ fn test_phase7_case_c_error_detail_includes_chain_commit_offset() {
 }
 
 #[test]
-fn test_phase7_case_c_refuses_open_when_only_orphan_chain_commit_differs() {
+fn test_unpaired_chain_commit_refuses_open_when_only_orphan_chain_commit_differs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("phase7-us009-only-orphan-differs.mqlite");
     seed_database(&db_path);
@@ -215,7 +215,7 @@ fn test_phase7_case_c_refuses_open_when_only_orphan_chain_commit_differs() {
 }
 
 #[test]
-fn test_phase7_case_c_read_only_open_refuses_orphan_chain_commit() {
+fn test_unpaired_chain_commit_read_only_open_refuses_orphan_chain_commit() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("phase7-us012-read-only-case-c.mqlite");
     seed_database(&db_path);

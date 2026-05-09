@@ -23,7 +23,6 @@
 //!   5. For the untruncated full-journal case, assert committed data remains
 //!      visible.
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 use bson::doc;

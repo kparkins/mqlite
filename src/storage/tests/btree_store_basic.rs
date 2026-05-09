@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::storage::btree::{BTree, BTreePageStore};
+use crate::storage::btree_store::{BufferPoolPageStore, INTERNAL_SIZE, LEAF_SIZE};
 use crate::storage::buffer_pool::default_sizes;
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::btree_store::{BufferPoolPageStore, INTERNAL_SIZE, LEAF_SIZE};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::test_support::{ArcIo, MockIo};

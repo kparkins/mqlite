@@ -13,7 +13,7 @@ use mqlite::error::EngineFatalReason;
 use mqlite::Error;
 
 #[test]
-fn phase3_buffer_pool_eviction_blocked_display_is_stable() {
+fn buffer_pool_eviction_blocked_display_is_stable() {
     let err = Error::BufferPoolEvictionBlocked {
         page: 42,
         reason: "live committed delta head",
@@ -27,7 +27,7 @@ fn phase3_buffer_pool_eviction_blocked_display_is_stable() {
 }
 
 #[test]
-fn phase3_recovery_pool_exhausted_display_has_operator_guidance() {
+fn recovery_pool_exhausted_display_has_operator_guidance() {
     let err = Error::RecoveryPoolExhausted;
 
     assert_eq!(
@@ -40,7 +40,7 @@ fn phase3_recovery_pool_exhausted_display_has_operator_guidance() {
 }
 
 #[test]
-fn phase3_engine_fatal_display_describes_reopen_requirement() {
+fn engine_fatal_display_describes_reopen_requirement() {
     let err = Error::EngineFatal {
         reason: EngineFatalReason::PostDurablePendingFlipFailure,
     };

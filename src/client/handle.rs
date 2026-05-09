@@ -130,7 +130,7 @@ impl Client {
     /// This hidden hook is used by release-profile benchmark targets. It is
     /// not part of the stable application API.
     #[doc(hidden)]
-    pub fn __phase8_bench_reset_sync_observations(&self) {
+    pub fn __reset_journal_sync_observations(&self) {
         crate::journal::append_sync_observations::reset();
     }
 
@@ -140,7 +140,7 @@ impl Client {
     /// not part of the stable application API.
     #[doc(hidden)]
     #[must_use]
-    pub fn __phase8_bench_journal_sync_os_boundaries(&self) -> u64 {
+    pub fn __journal_sync_os_boundaries(&self) -> u64 {
         crate::journal::append_sync_observations::snapshot().journal_sync_os_boundaries
     }
 }

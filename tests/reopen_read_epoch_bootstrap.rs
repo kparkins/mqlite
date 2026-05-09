@@ -22,7 +22,6 @@
 use bson::{doc, Document};
 use mqlite::Client;
 
-#[path = "crash_harness.rs"]
 mod crash_harness;
 
 /// §10.6: on reopen the initial PublishedEpoch.visible_ts is floored above

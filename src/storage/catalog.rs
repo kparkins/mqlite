@@ -44,7 +44,7 @@ use bson::{doc, DateTime, Document};
 
 use crate::error::{Error, Result};
 use crate::index::IndexModel;
-use crate::storage::btree::{BTree, BTreePageStore, CellValue, MemPageStore};
+use crate::storage::btree::{BTree, BTreePageStore, CellValue};
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::root_snapshot::{IndexId, NamespaceId};
 
@@ -458,30 +458,33 @@ impl<S: BTreePageStore> Catalog<S> {
         self.next_index_id
     }
 
+    fn allocate_durable_id(counter: &mut i64, counter_name: &str, overflow_message: &str) -> i64 {
+        let id = *counter;
+        debug_assert!(id >= 1, "{counter_name} must never allocate id 0");
+        *counter = counter.checked_add(1).expect(overflow_message);
+        id
+    }
+
     /// Allocate a fresh durable `NamespaceId` (§10.7). Bumps the counter
     /// by 1 and returns the pre-bump value. Always returns a value `>= 1`
     /// because id `0` is reserved and the counter starts at `1` on fresh
     /// DB + is loaded from the header on reopen.
     pub(crate) fn allocate_namespace_id(&mut self) -> NamespaceId {
-        let id = self.next_namespace_id;
-        debug_assert!(id >= 1, "allocate_namespace_id must never return 0");
-        self.next_namespace_id = self
-            .next_namespace_id
-            .checked_add(1)
-            .expect("next_namespace_id overflow");
-        id
+        Self::allocate_durable_id(
+            &mut self.next_namespace_id,
+            "next_namespace_id",
+            "next_namespace_id overflow",
+        )
     }
 
     /// Allocate a fresh durable `IndexId` (§10.7). Same protocol as
     /// `allocate_namespace_id`.
     pub(crate) fn allocate_index_id(&mut self) -> IndexId {
-        let id = self.next_index_id;
-        debug_assert!(id >= 1, "allocate_index_id must never return 0");
-        self.next_index_id = self
-            .next_index_id
-            .checked_add(1)
-            .expect("next_index_id overflow");
-        id
+        Self::allocate_durable_id(
+            &mut self.next_index_id,
+            "next_index_id",
+            "next_index_id overflow",
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -799,19 +802,6 @@ impl<S: BTreePageStore> Catalog<S> {
         }
         Ok(result)
     }
-}
-
-// ---------------------------------------------------------------------------
-// In-memory constructor helper
-// ---------------------------------------------------------------------------
-
-/// Create a [`Catalog`] backed by an in-memory [`MemPageStore`].
-///
-/// Useful for tests and for building the catalog before wiring it to a
-/// file-backed store.
-#[allow(dead_code)]
-pub(crate) fn new_mem_catalog() -> Result<Catalog<MemPageStore>> {
-    Catalog::create(MemPageStore::new())
 }
 
 // ---------------------------------------------------------------------------

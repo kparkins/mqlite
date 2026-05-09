@@ -702,7 +702,7 @@ fn tc11_collect_sorted_indexes(
         .collect()
 }
 
-fn tc11_assert_phase6_logical_tail_checkpoint_contract() {
+fn tc11_assert_logical_tail_checkpoint_contract() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let engine_path = project_root.join("src/storage/paged_engine.rs");
     let snapshot_path = project_root.join("src/storage/paged_engine/snapshot_ops.rs");
@@ -895,7 +895,7 @@ fn tc11_emergency_checkpoint_semantic_equivalence_after_reopen() {
 
     let after_emergency = emergency_checkpoint_triggers_snapshot();
     if after_emergency == before_emergency {
-        tc11_assert_phase6_logical_tail_checkpoint_contract();
+        tc11_assert_logical_tail_checkpoint_contract();
     } else {
         assert!(
             after_emergency > before_emergency,

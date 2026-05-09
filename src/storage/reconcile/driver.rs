@@ -491,4 +491,3 @@ fn commit_history_spills(engine: &PagedEngine, synthesized: &PageSynthesisResult
         })?;
     history.commit_spill_txn_durable(spill_txn)
 }
-

@@ -48,7 +48,7 @@ use crate::error::{Error, Result};
 use crate::keys::{encode_compound_key, COMPOUND_SEP};
 use crate::mvcc::read_view::ReadView;
 use crate::mvcc::transaction::{SecIndexOp, SecIndexWrite, WriteTxn};
-use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
+use crate::storage::btree::{BTree, BTreePageStore, HistoryProbe};
 use crate::storage::catalog::IndexEntry;
 
 // ---------------------------------------------------------------------------
@@ -204,6 +204,27 @@ fn unique_range(field_values: &[(&Bson, bool)]) -> (Vec<u8>, Vec<u8>) {
     (start, end)
 }
 
+fn unique_doc_key(field_values: &[(&Bson, bool)], doc_id: &Bson) -> Vec<u8> {
+    let mut entry = field_values.to_vec();
+    entry.push((doc_id, true));
+    encode_compound_key(&entry)
+}
+
+fn index_field_values<'a>(
+    doc: &'a Document,
+    key_pattern: &'a Document,
+    null_bson: &'a Bson,
+) -> Vec<(&'a Bson, bool)> {
+    key_pattern
+        .iter()
+        .map(|(field, dir)| {
+            let ascending = !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
+            let val = extract_field_value(doc, field).unwrap_or(null_bson);
+            (val, ascending)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Unique constraint check
 // ---------------------------------------------------------------------------
@@ -236,11 +257,7 @@ pub(crate) fn check_unique_constraint_base_only<S: BTreePageStore>(
 
     // Build the key that *this* document would produce — the only acceptable
     // match (would mean we're updating a document in-place).
-    let my_key = {
-        let mut entry = field_values.to_vec();
-        entry.push((doc_id, true));
-        encode_compound_key(&entry)
-    };
+    let my_key = unique_doc_key(field_values, doc_id);
 
     for (existing_key, _) in &existing {
         if existing_key != &my_key {
@@ -282,11 +299,7 @@ pub(crate) fn check_unique_constraint_mvcc<S: BTreePageStore>(
         view,
         history,
     )?;
-    let my_key = {
-        let mut entry = field_values.to_vec();
-        entry.push((doc_id, true));
-        encode_compound_key(&entry)
-    };
+    let my_key = unique_doc_key(field_values, doc_id);
 
     let mut pending_deletes: HashSet<Vec<u8>> = HashSet::new();
     let mut pending_inserts: HashSet<Vec<u8>> = HashSet::new();
@@ -376,15 +389,7 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
     // semantics are not yet enforced).
     if index_entry.unique && !is_multikey {
         let null_bson = Bson::Null;
-        let field_values: Vec<(&Bson, bool)> = index_entry
-            .key_pattern
-            .iter()
-            .map(|(field, dir)| {
-                let ascending = !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
-                let val = extract_field_value(doc, field).unwrap_or(&null_bson);
-                (val, ascending)
-            })
-            .collect();
+        let field_values = index_field_values(doc, &index_entry.key_pattern, &null_bson);
         check_unique_constraint_mvcc(
             index_tree,
             &index_entry.key_pattern,
@@ -464,8 +469,8 @@ pub(crate) fn update_index_on_update<S: BTreePageStore>(
     update_index_on_insert(new_doc, new_id, index_tree, index_entry, view, history, txn)
 }
 
-/// Direct-insert variant used by `build_index` (one-shot index build during
-/// `create_index`). Unlike `update_index_on_insert`, this mutates the tree
+/// Direct-insert variant used by one-shot index builders. Unlike
+/// `update_index_on_insert`, this mutates the tree
 /// in place rather than staging through a `WriteTxn` — a full-collection
 /// build would otherwise accumulate every document's key in
 /// `pending_sec_index` for one monolithic install, which is wasteful when
@@ -485,15 +490,7 @@ fn update_index_on_insert_direct<S: BTreePageStore>(
 
     if index_entry.unique && !is_multikey {
         let null_bson = Bson::Null;
-        let field_values: Vec<(&Bson, bool)> = index_entry
-            .key_pattern
-            .iter()
-            .map(|(field, dir)| {
-                let ascending = !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
-                let val = extract_field_value(doc, field).unwrap_or(&null_bson);
-                (val, ascending)
-            })
-            .collect();
+        let field_values = index_field_values(doc, &index_entry.key_pattern, &null_bson);
         check_unique_constraint_base_only(
             index_tree,
             &index_entry.key_pattern,
@@ -516,68 +513,12 @@ fn update_index_on_insert_direct<S: BTreePageStore>(
     Ok(is_multikey)
 }
 
-/// Build (or rebuild) a secondary index by scanning all documents in the
-/// collection's primary data tree.
-///
-/// `data_tree` is the clustered (`_id`) B+ tree:
-/// - key: `encode_key(_id)` (any BSON type)
-/// - value: raw BSON document bytes
-///
-/// Every document is scanned and a corresponding entry is inserted into
-/// `index_tree`.  This is a **blocking** build — the caller must hold a writer
-/// lock for the entire duration (background builds are not yet implemented).
-///
-/// Returns `true` if any document triggered multikey behaviour; the caller
-/// should persist this flag to the catalog's [`IndexEntry`].
-///
-/// # Errors
-///
-/// Propagates storage errors.  `Error::DuplicateKey` is returned if a unique
-/// index would be violated by existing data.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn build_index<S1, S2>(
-    data_tree: &BTree<S1>,
-    index_tree: &mut BTree<S2>,
-    index_entry: &IndexEntry,
-) -> Result<bool>
-where
-    S1: BTreePageStore,
-    S2: BTreePageStore,
-{
-    let all_entries = data_tree.range_scan(None, None)?;
-    let mut any_multikey = false;
-
-    for (_, cell_value) in &all_entries {
-        let doc_bytes = match cell_value {
-            CellValue::Inline(b) => b.clone(),
-            CellValue::Overflow {
-                first_page,
-                total_length,
-            } => data_tree.read_overflow(*first_page, *total_length)?,
-        };
-
-        let doc: Document = bson::from_slice(&doc_bytes).map_err(Error::BsonDeserialization)?;
-
-        let doc_id = doc.get("_id").ok_or_else(|| {
-            Error::Internal("document missing '_id' field during index build".into())
-        })?;
-
-        let is_multikey = update_index_on_insert_direct(&doc, doc_id, index_tree, index_entry)?;
-        if is_multikey {
-            any_multikey = true;
-        }
-    }
-
-    Ok(any_multikey)
-}
-
 /// Build (or rebuild) a secondary index from MVCC-visible primary rows.
 ///
 /// Ordinary CRUD now keeps logical row authority in resident delta chains, so
 /// DDL-style index builds must scan the primary tree through the same MVCC
-/// merge path used by readers. Base-only cells remain sufficient for legacy
-/// callers of [`build_index`], while this helper is used by the paged engine's
-/// online `create_index` path.
+/// merge path used by readers. This helper is used by the paged engine's online
+/// `create_index` path.
 pub(crate) fn build_index_mvcc<S1, S2>(
     data_tree: &BTree<S1>,
     index_tree: &mut BTree<S2>,

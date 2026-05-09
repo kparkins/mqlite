@@ -6,11 +6,16 @@ use bson::{doc, Document};
 
 use super::super::errors::{err_bad_value, err_collation_unsupported, err_from_mqlite};
 use super::super::server::{ConnectionCursors, ServerState};
-use super::{get_i64, qualified_coll};
+use super::{batch_size, get_i64, qualified_coll};
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndUpdateOptions, FindOptions, InsertManyOptions,
     ReturnDocument, UpdateOptions,
 };
+
+fn reject_collation(doc: &Document) -> Option<Document> {
+    doc.contains_key("collation")
+        .then(err_collation_unsupported)
+}
 
 /// `insert` — insert one or more documents.
 ///
@@ -22,8 +27,8 @@ use crate::options::{
 /// { "n": <count>, "writeErrors": [...], "ok": 1.0 }
 /// ```
 pub(super) fn handle_insert(body: &Document, state: &ServerState) -> Document {
-    if body.contains_key("collation") {
-        return err_collation_unsupported();
+    if let Some(error) = reject_collation(body) {
+        return error;
     }
 
     let coll_name = match body.get_str("insert") {
@@ -91,8 +96,8 @@ pub(super) fn handle_find(
     state: &ServerState,
     cursors: &Arc<Mutex<ConnectionCursors>>,
 ) -> Document {
-    if body.contains_key("collation") {
-        return err_collation_unsupported();
+    if let Some(error) = reject_collation(body) {
+        return error;
     }
 
     let coll_name = match body.get_str("find") {
@@ -116,10 +121,7 @@ pub(super) fn handle_find(
         opts.skip = Some(skip as u64);
     }
 
-    // Default first-batch size mirrors MongoDB 8.0 (101 documents).
-    let batch_size = get_i64(body, "batchSize")
-        .map(|n| if n <= 0 { 101usize } else { n as usize })
-        .unwrap_or(101);
+    let batch_size = batch_size(body);
 
     let ns = qualified_coll(body, &coll_name);
     let cursor = match state.database.find::<Document>(&ns, filter, opts) {
@@ -175,8 +177,8 @@ pub(super) fn handle_find(
 /// { "n": <matched>, "nModified": <modified>, "upserted": [...], "ok": 1.0 }
 /// ```
 pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
-    if body.contains_key("collation") {
-        return err_collation_unsupported();
+    if let Some(error) = reject_collation(body) {
+        return error;
     }
 
     let coll_name = match body.get_str("update") {
@@ -201,9 +203,8 @@ pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
             None => continue,
         };
 
-        // Per-spec collation check.
-        if spec.contains_key("collation") {
-            return err_collation_unsupported();
+        if let Some(error) = reject_collation(spec) {
+            return error;
         }
 
         let filter = spec.get_document("q").cloned().unwrap_or_default();
@@ -274,8 +275,8 @@ pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
 /// { "n": <deleted>, "ok": 1.0 }
 /// ```
 pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
-    if body.contains_key("collation") {
-        return err_collation_unsupported();
+    if let Some(error) = reject_collation(body) {
+        return error;
     }
 
     let coll_name = match body.get_str("delete") {
@@ -298,9 +299,8 @@ pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
             None => continue,
         };
 
-        // Per-spec collation check.
-        if spec.contains_key("collation") {
-            return err_collation_unsupported();
+        if let Some(error) = reject_collation(spec) {
+            return error;
         }
 
         let filter = spec.get_document("q").cloned().unwrap_or_default();
@@ -350,8 +350,8 @@ pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
 /// }
 /// ```
 pub(super) fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
-    if body.contains_key("collation") {
-        return err_collation_unsupported();
+    if let Some(error) = reject_collation(body) {
+        return error;
     }
 
     // Command key can be either "findAndModify" or "findandmodify" (case-insensitive

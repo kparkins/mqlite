@@ -31,6 +31,9 @@ use mqlite::error::{Error, WriteConflictReason};
 use mqlite::Client;
 
 #[cfg(feature = "test-hooks")]
+mod crash_harness;
+
+#[cfg(feature = "test-hooks")]
 use std::collections::{BTreeMap, VecDeque};
 #[cfg(feature = "test-hooks")]
 use std::sync::mpsc;
@@ -46,7 +49,7 @@ use bson::{Bson, Document};
 #[cfg(feature = "test-hooks")]
 use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry, VersionState};
 #[cfg(feature = "test-hooks")]
-use mqlite::{DurabilityMode, IndexModel, IndexOptions, OpenOptions, Us026PostRegisterFailpoint};
+use mqlite::{IndexModel, IndexOptions, OpenOptions, Us026PostRegisterFailpoint};
 
 #[cfg(feature = "test-hooks")]
 const READ_TS: Ts = Ts {
@@ -219,13 +222,8 @@ fn test_primary_insert_after_committed_tombstone_succeeds() {
 }
 
 #[cfg(feature = "test-hooks")]
-fn fullsync_options() -> OpenOptions {
-    OpenOptions::new().durability(DurabilityMode::FullSync)
-}
-
-#[cfg(feature = "test-hooks")]
 fn open_client(name: &str) -> (tempfile::TempDir, Client) {
-    open_client_with_options(name, fullsync_options())
+    open_client_with_options(name, crash_harness::fullsync_options())
 }
 
 #[cfg(feature = "test-hooks")]
@@ -326,7 +324,11 @@ fn assert_successor_insert_completes(client: &Client) {
 
 #[cfg(feature = "test-hooks")]
 fn assert_post_register_cleanup(failpoint: Us026PostRegisterFailpoint, file_name: &str) {
-    assert_post_register_cleanup_with_options(failpoint, file_name, fullsync_options());
+    assert_post_register_cleanup_with_options(
+        failpoint,
+        file_name,
+        crash_harness::fullsync_options(),
+    );
 }
 
 #[cfg(feature = "test-hooks")]

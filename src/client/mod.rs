@@ -57,5 +57,7 @@ pub use database::Database;
 pub use handle::Client;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use hidden_accessors::{Phase8CatalogCommitKind, Phase8LogRecordKind, Phase8LogRecordSummary};
+pub use hidden_accessors::{
+    JournalCatalogCommitKind, JournalLogRecordKind, JournalLogRecordSummary,
+};
 pub(crate) use inner::ClientInner;

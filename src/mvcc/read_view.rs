@@ -146,7 +146,7 @@ impl ReadView {
         Self::new_for_epoch(
             standalone_epoch(read_ts),
             txn_id,
-            PublishSequencer::new_from(Ts::default()),
+            PublishSequencer::new_with_published_frontier(Ts::default()),
         )
     }
 
@@ -161,7 +161,7 @@ impl ReadView {
         Self::new_for_epoch(
             standalone_epoch(read_ts),
             txn_id,
-            PublishSequencer::new_from(frontier),
+            PublishSequencer::new_with_published_frontier(frontier),
         )
     }
 
@@ -204,7 +204,7 @@ impl ReadView {
             registry,
             standalone_epoch(read_ts),
             txn_id,
-            PublishSequencer::new_from(Ts::default()),
+            PublishSequencer::new_with_published_frontier(Ts::default()),
         )
     }
 
@@ -347,7 +347,7 @@ impl TestFrontierHandle {
     #[must_use]
     pub fn new(initial_frontier: Ts) -> Self {
         Self {
-            sequencer: PublishSequencer::new_from(initial_frontier),
+            sequencer: PublishSequencer::new_with_published_frontier(initial_frontier),
         }
     }
 

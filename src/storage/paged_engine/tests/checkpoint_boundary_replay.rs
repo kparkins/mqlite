@@ -1,5 +1,3 @@
-#![allow(non_snake_case)]
-
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -185,7 +183,7 @@ fn seed_stale_main_page(db_path: &std::path::Path) -> Result<()> {
 }
 
 #[test]
-fn F_test_eio_mid_emergency_checkpoint_resumes_on_reopen() -> Result<()> {
+fn eio_mid_emergency_checkpoint_resumes_on_reopen() -> Result<()> {
     let dir = tempfile::tempdir().map_err(Error::Io)?;
     let db_path = dir.path().join("phase7-us007-eio.mqlite");
     let initial_header = FileHeader::new_now();

@@ -433,7 +433,7 @@ impl WriteTxn {
     /// mutability scoped to this transaction.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn emit_logical_txn_frame(
-        // allow-phase8-legacy-audit: test-only retired logical append probe
+        // allow-legacy-journal-audit: test-only retired logical append probe
         &self,
         journal: &BufferPoolHandle,
         primary_writes: &[PrimaryWrite],
@@ -492,7 +492,7 @@ impl WriteTxn {
     /// `OverflowRef::Drop` on every entry — correct for no-op commits.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn commit(
-        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
+        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
         self,
         oracle: &TimestampOracle,
         journal: &BufferPoolHandle,
@@ -524,7 +524,7 @@ impl WriteTxn {
     /// on success.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn commit_with_ts(
-        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
+        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
         self,
         commit_ts: Ts,
         journal: &BufferPoolHandle,
@@ -542,7 +542,7 @@ impl WriteTxn {
     /// and aborts their refcounts normally.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn commit_chain_commit(
-        // allow-phase8-legacy-audit: test-only retired ChainCommit append probe
+        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
         mut self,
         journal: &BufferPoolHandle,
         commit_ts: Ts,

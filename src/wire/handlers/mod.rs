@@ -12,6 +12,20 @@ pub(super) mod crud;
 pub(super) mod cursor;
 pub(super) mod index;
 
+const DEFAULT_CURSOR_BATCH_SIZE: usize = 101;
+
+pub(super) fn batch_size(body: &Document) -> usize {
+    get_i64(body, "batchSize")
+        .map(|n| {
+            if n <= 0 {
+                DEFAULT_CURSOR_BATCH_SIZE
+            } else {
+                n as usize
+            }
+        })
+        .unwrap_or(DEFAULT_CURSOR_BATCH_SIZE)
+}
+
 pub(super) fn handle_hello(state: &ServerState, connection_id: i32) -> Document {
     admin::handle_hello(state, connection_id)
 }

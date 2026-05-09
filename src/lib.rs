@@ -159,7 +159,7 @@ pub mod wire;
 pub use client::{Client, Collection, Database};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use client::{Phase8CatalogCommitKind, Phase8LogRecordKind, Phase8LogRecordSummary};
+pub use client::{JournalCatalogCommitKind, JournalLogRecordKind, JournalLogRecordSummary};
 pub use cursor::Cursor;
 pub use query::explain::ExplainResult;
 
@@ -170,7 +170,7 @@ pub use error::{Error, Result};
 pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub use storage::write_crash_cut_contract::{Phase0ProbeCut, Phase0ProbeReport};
+pub use storage::write_crash_cut_contract::{WriteEnvelopeProbeCut, WriteEnvelopeProbeReport};
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
@@ -179,9 +179,9 @@ pub use storage::header::{read_durable_header_counters, DurableHeaderCounters};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use storage::paged_engine::hidden_accessors::{
-    arm_phase3_commit_failpoint, arm_phase8_checkpoint_failpoint, CreateIndexBuildHookGuard,
-    Phase3CommitFailpoint, Phase3CommitFailpointGuard, Phase8BeforeReservationHookGuard,
-    Phase8CheckpointFailpoint, Phase8CheckpointFailpointGuard, Us026PostRegisterFailpoint,
+    arm_checkpoint_boundary_failpoint, arm_legacy_commit_failpoint, BeforeLogReservationHookGuard,
+    CheckpointBoundaryFailpoint, CheckpointBoundaryFailpointGuard, CreateIndexBuildHookGuard,
+    LegacyCommitFailpoint, LegacyCommitFailpointGuard, Us026PostRegisterFailpoint,
     WriteBodyEntryEvent, WriteBodyEntryHookGuard,
 };
 

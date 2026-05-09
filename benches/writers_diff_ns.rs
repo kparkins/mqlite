@@ -24,46 +24,22 @@ use std::time::Duration;
 use bson::doc;
 use bson::Document;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use mqlite::{Client, DurabilityMode, OpenOptions};
 use tempfile::TempDir;
+
+mod common;
 
 const PAYLOAD_BYTES: usize = 256;
 const DOCS_PER_WRITER: usize = 20;
 
 fn metadata(writer_count: usize) -> String {
-    let rustc = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned());
-
-    let cpu_count = num_cpus();
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
     let payload_class = "~256B";
-    let durability = "Interval(100ms)";
 
     format!(
         "writers={writer_count} ns_count={writer_count} payload={payload_class} \
-         bytes={PAYLOAD_BYTES} durability={durability} rustc=\"{rustc}\" \
-         cpu_count={cpu_count} arch={arch} os={os}"
+         bytes={PAYLOAD_BYTES} durability={} {}",
+        common::INTERVAL_100MS_LABEL,
+        common::host_metadata()
     )
-}
-
-fn num_cpus() -> usize {
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg("nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 1")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(1)
-}
-
-fn open_client(dir: &TempDir) -> Client {
-    let path = dir.path().join("bench.mqlite");
-    let opts = OpenOptions::new().durability(DurabilityMode::Interval(Duration::from_millis(100)));
-    Client::open_with_options(&path, opts).expect("open must succeed")
 }
 
 fn bench_writers_diff_ns(c: &mut Criterion) {
@@ -83,7 +59,7 @@ fn bench_writers_diff_ns(c: &mut Criterion) {
 
         group.bench_with_input(id, &writer_count, |b, &wc| {
             let dir = TempDir::new().expect("tempdir");
-            let client = open_client(&dir);
+            let client = common::open_interval_client(&dir);
 
             // Pre-create one collection per namespace.
             for ns in 0..wc {

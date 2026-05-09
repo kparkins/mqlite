@@ -119,7 +119,7 @@ impl<S: BTreePageStore> BTree<S> {
             .map_or(true, |snap| snap.history_is_candidate(key, view.read_ts));
         if history_is_candidate {
             if let Some(probe) = history {
-                if let Some(entry) = probe.probe(key, view.read_ts)? {
+                if let Some(entry) = probe.probe_visible_version(key, view.read_ts)? {
                     if entry.is_tombstone {
                         return Ok(None);
                     }
@@ -301,7 +301,8 @@ impl<S: BTreePageStore> BTree<S> {
                         };
                         if history_is_candidate {
                             if let Some(probe) = history {
-                                let maybe_entry = probe.probe(&cell.key, view.read_ts)?;
+                                let maybe_entry =
+                                    probe.probe_visible_version(&cell.key, view.read_ts)?;
                                 if let Some(entry) = maybe_entry {
                                     if !entry.is_tombstone {
                                         let bytes = resolve_entry(&entry)?;
