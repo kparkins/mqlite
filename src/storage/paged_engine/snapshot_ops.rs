@@ -26,7 +26,7 @@ use crate::storage::reconcile::driver::{
 use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedEpoch, PublishedIndex};
 use crate::storage::structural_page_batch::StructuralPageBatch;
 
-use super::btree_ops::btree_collscan;
+use super::btree_ops::{btree_collscan, btree_collscan_limited};
 use super::doc_helpers::{apply_projection_to_doc, compare_docs};
 use super::index_maint::{
     index_bounds_free, index_entry_id_free, materialize_primary_deltas_for_checkpoint,
@@ -275,6 +275,27 @@ pub(super) fn plan_and_collect_snapshot_pairs(
     epoch: Arc<PublishedEpoch>,
     allow_secondary_indexes: bool,
 ) -> Result<PlannedSnapshotPairs> {
+    plan_and_collect_snapshot_pairs_limited(
+        shared,
+        ns_snap,
+        filter,
+        epoch,
+        allow_secondary_indexes,
+        None,
+    )
+}
+
+/// Like [`plan_and_collect_snapshot_pairs`] but stops collecting after
+/// `match_limit` matches. On the collscan path this avoids decoding
+/// documents that cannot contribute to the result.
+pub(super) fn plan_and_collect_snapshot_pairs_limited(
+    shared: &SharedState,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    epoch: Arc<PublishedEpoch>,
+    allow_secondary_indexes: bool,
+    match_limit: Option<usize>,
+) -> Result<PlannedSnapshotPairs> {
     let ready_indexes: Vec<&PublishedIndex> = if allow_secondary_indexes {
         ns_snap
             .indexes
@@ -293,8 +314,27 @@ pub(super) fn plan_and_collect_snapshot_pairs(
         .collect();
 
     let plan = select_plan(filter, &index_metas);
-    let pairs = execute_plan_from_snap(&plan, shared, ns_snap, &ready_indexes, filter, epoch)?;
+    let pairs = match (&plan, match_limit) {
+        (ScanPlan::CollScan, Some(limit)) => {
+            execute_collscan_from_snap_limited(shared, ns_snap, filter, epoch, limit)?
+        }
+        _ => execute_plan_from_snap(&plan, shared, ns_snap, &ready_indexes, filter, epoch)?,
+    };
     Ok((plan, pairs))
+}
+
+fn execute_collscan_from_snap_limited(
+    shared: &SharedState,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    epoch: Arc<PublishedEpoch>,
+    match_limit: usize,
+) -> Result<SnapshotPairs> {
+    let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
+    let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
+    let view = open_snapshot_read_view(shared, epoch);
+    let probe = primary_history_probe(shared, ns_snap.id);
+    btree_collscan_limited(&tree, filter, &view, Some(&probe), Some(match_limit))
 }
 
 fn execute_plan_from_snap(

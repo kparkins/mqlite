@@ -966,9 +966,7 @@ impl PagedEngine {
 
     pub(crate) fn find_one(&self, ns: &str, filter: &Document) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
-        let opts = FindOptions::default();
-        let (results, _explain) = doc_ops::find(self, ns, filter, &opts)?;
-        Ok(results.into_iter().next())
+        doc_ops::find_first(self, ns, filter)
     }
 
     pub(crate) fn update(

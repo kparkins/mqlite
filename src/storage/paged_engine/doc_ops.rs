@@ -22,7 +22,9 @@ use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
     maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
 };
-use super::snapshot_ops::{apply_find_opts, plan_and_collect_snapshot_pairs};
+use super::snapshot_ops::{
+    apply_find_opts, plan_and_collect_snapshot_pairs, plan_and_collect_snapshot_pairs_limited,
+};
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -125,6 +127,30 @@ pub(super) fn find(
     let matched: Vec<Document> = pairs.into_iter().map(|(_, doc)| doc).collect();
     let explain = crate::query::explain::ExplainResult::from_plan(&plan, docs_examined);
     Ok((apply_find_opts(matched, opts), explain))
+}
+
+/// Return the first document that matches `filter`, short-circuiting after
+/// one match. Callers that only need a single result should prefer this over
+/// [`find`] to avoid decoding the entire collection.
+pub(super) fn find_first(
+    engine: &super::PagedEngine,
+    ns: &str,
+    filter: &Document,
+) -> Result<Option<Document>> {
+    let snap = engine.shared.load_published();
+    let ns_snap = match snap.catalog.get_by_name(ns) {
+        None => return Ok(None),
+        Some(n) => n,
+    };
+    let (_, pairs) = plan_and_collect_snapshot_pairs_limited(
+        &engine.shared,
+        ns_snap,
+        filter,
+        Arc::clone(&snap),
+        true,
+        Some(1),
+    )?;
+    Ok(pairs.into_iter().next().map(|(_, doc)| doc))
 }
 
 pub(super) fn update(

@@ -68,12 +68,29 @@ pub(super) fn btree_collscan<S: BTreePageStore>(
     view: &ReadView,
     history: Option<&dyn HistoryProbe>,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
+    btree_collscan_limited(tree, filter, view, history, None)
+}
+
+/// Like [`btree_collscan`] but stops decoding after `match_limit` matches.
+///
+/// Passing `None` is equivalent to calling [`btree_collscan`] directly.
+pub(super) fn btree_collscan_limited<S: BTreePageStore>(
+    tree: &BTree<S>,
+    filter: &Document,
+    view: &ReadView,
+    history: Option<&dyn HistoryProbe>,
+    match_limit: Option<usize>,
+) -> Result<Vec<(Vec<u8>, Document)>> {
     let pairs = tree.range_scan_mvcc(None, None, view, history)?;
-    let mut result = Vec::with_capacity(pairs.len());
+    let capacity = match_limit.map_or(pairs.len(), |l| l.min(pairs.len()));
+    let mut result = Vec::with_capacity(capacity);
     for (key, bson_bytes) in pairs {
         let doc: Document = bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
         if eval_filter(&doc, filter)? {
             result.push((key, doc));
+            if match_limit.is_some_and(|limit| result.len() >= limit) {
+                break;
+            }
         }
     }
     Ok(result)
