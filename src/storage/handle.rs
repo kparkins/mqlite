@@ -737,53 +737,6 @@ impl BufferPoolHandle {
         self.journal_sync()
     }
 
-    /// Append an MVCC `ChainCommit` frame and return its exclusive end LSN.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn append_chain_commit_end_lsn(
-        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
-        &self,
-        commit_ts: crate::mvcc::timestamp::Ts,
-        refcount_deltas: Vec<(u32, i32)>,
-        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
-    ) -> Result<u64> {
-        match &self.journal {
-            None => Ok(0),
-            Some(journal) => {
-                let mut guard = journal
-                    .lock()
-                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                let end_lsn =
-                    guard.append_chain_commit_end_lsn(commit_ts, refcount_deltas, page_writes)?;
-                crate::mvcc::metrics::record_journal_chain_commit_frame();
-                Ok(end_lsn)
-            }
-        }
-    }
-
-    /// Append a Phase 2 `LogicalTxnFrame` (§3, §4, §6.4) between
-    /// `allocate_commit_ts` and the subsequent `ChainCommit`. Encodes before
-    /// any file I/O so an oversize frame returns [`Error::JournalFrameTooLarge`]
-    /// without touching the journal.
-    ///
-    /// Returns the byte offset at which the frame was written. No-op
-    /// (returns `Ok(0)`) on journal-less handles.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn append_logical_txn(
-        // allow-legacy-journal-audit: test-only retired logical append probe
-        &self,
-        frame: crate::journal::log_file::LogicalTxnFrame,
-    ) -> Result<u64> {
-        match &self.journal {
-            None => Ok(0),
-            Some(journal) => {
-                let mut guard = journal
-                    .lock()
-                    .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-                guard.append_logical_txn(frame)
-            }
-        }
-    }
-
     /// Expose the journal's database-lifetime salt values for callers that
     /// need to stamp new journal frames outside `JournalManager::append_*`.
     /// Returns `None` on journal-less handles.

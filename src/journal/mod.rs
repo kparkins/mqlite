@@ -68,9 +68,7 @@ pub(crate) use self::recovery::ParsedLogicalFrames;
 #[cfg(any(test, feature = "test-hooks"))]
 use self::log_file::LogicalTxnFrame;
 use self::log_file::{
-    read_chain_commit_at_cursor, try_skip_logical_txn, CheckpointBatchPageRecord, JournalHeader,
-    JournalOffset, JournalPageSize, Page0BoundaryRecord, PageId, PositionedLogFile,
-    JOURNAL_HEADER_SIZE,
+    JournalHeader, JournalOffset, JournalPageSize, PageId, PositionedLogFile, JOURNAL_HEADER_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -815,21 +813,6 @@ struct CheckpointFrameTag {
     page_id: PageId,
 }
 
-#[derive(Debug)]
-struct CheckpointRecoveryFrame {
-    next_cursor: u64,
-    kind: CheckpointRecoveryFrameKind,
-}
-
-#[derive(Debug)]
-enum CheckpointRecoveryFrameKind {
-    BatchPage,
-    Boundary {
-        checkpoint_ts: Ts,
-        db_page_count: u32,
-    },
-}
-
 /// Manages the journal and its in-memory page-offset index for one database.
 ///
 /// Created via [`JournalManager::open_or_create`].  On clean shutdown call
@@ -982,35 +965,6 @@ impl JournalManager {
         id
     }
 
-    fn try_checkpoint_recovery_frame(
-        journal_file: &mut File,
-        salt1: u32,
-        salt2: u32,
-    ) -> Result<Option<CheckpointRecoveryFrame>> {
-        let frame_offset = journal_file.stream_position().map_err(Error::Io)?;
-        if CheckpointBatchPageRecord::read_with_data(journal_file, salt1, salt2)?.is_some() {
-            return Ok(Some(CheckpointRecoveryFrame {
-                next_cursor: journal_file.stream_position().map_err(Error::Io)?,
-                kind: CheckpointRecoveryFrameKind::BatchPage,
-            }));
-        }
-
-        if let Some(boundary) = Page0BoundaryRecord::read(journal_file, salt1, salt2)? {
-            return Ok(Some(CheckpointRecoveryFrame {
-                next_cursor: journal_file.stream_position().map_err(Error::Io)?,
-                kind: CheckpointRecoveryFrameKind::Boundary {
-                    checkpoint_ts: boundary.checkpoint_ts(),
-                    db_page_count: boundary.db_page_count(),
-                },
-            }));
-        }
-
-        journal_file
-            .seek(SeekFrom::Start(frame_offset))
-            .map_err(Error::Io)?;
-        Ok(None)
-    }
-
     /// Open a checkpoint-owned pending range at the current clean cursor.
     ///
     /// # Errors
@@ -1119,91 +1073,6 @@ impl JournalManager {
     /// The in-memory index is NOT updated — `ChainCommit` frames carry no
     /// single page number (every `page_writes` entry has its own). Recovery
     /// scans `ChainCommit` frames linearly.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn append_chain_commit(
-        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
-        &mut self,
-        commit_ts: crate::mvcc::timestamp::Ts,
-        refcount_deltas: Vec<(u32, i32)>,
-        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
-    ) -> Result<u64> {
-        let (frame_offset, _end_lsn) =
-            self.append_chain_commit_record(commit_ts, refcount_deltas, page_writes)?;
-        Ok(frame_offset)
-    }
-
-    /// Append a `ChainCommit` frame and return its exclusive end LSN.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn append_chain_commit_end_lsn(
-        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
-        &mut self,
-        commit_ts: crate::mvcc::timestamp::Ts,
-        refcount_deltas: Vec<(u32, i32)>,
-        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
-    ) -> Result<u64> {
-        let (_frame_offset, end_lsn) =
-            self.append_chain_commit_record(commit_ts, refcount_deltas, page_writes)?;
-        Ok(end_lsn)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn append_chain_commit_record(
-        &mut self,
-        commit_ts: crate::mvcc::timestamp::Ts,
-        refcount_deltas: Vec<(u32, i32)>,
-        page_writes: Vec<crate::journal::log_file::ChainPageWrite>,
-    ) -> Result<(u64, u64)> {
-        if self.checkpoint_batch_active.is_some() {
-            return Err(Error::Internal(
-                "chain commit cannot be appended inside checkpoint batch".into(),
-            ));
-        }
-        let frame = crate::journal::log_file::ChainCommitFrame {
-            salt1: self.salt1,
-            salt2: self.salt2,
-            commit_ts,
-            refcount_deltas,
-            page_writes,
-        };
-        let bytes = frame.encode()?;
-        let slot = self.log_manager.reserve(bytes.len())?;
-        let frame_offset = slot.start_lsn();
-        self.log_manager.write_reserved(&slot, &bytes)?;
-        let receipt = self.log_manager.mark_written(&slot)?;
-        Ok((frame_offset, receipt.end_lsn()))
-    }
-
-    /// Append a `LogicalTxnFrame` to the journal (§6.4). Returns the byte
-    /// offset at which the frame was written.
-    ///
-    /// Encodes before any file I/O, so an oversize frame returns
-    /// [`Error::JournalFrameTooLarge`] without touching the journal.
-    ///
-    /// The in-memory [`JournalIndex`] is not updated: logical frames carry
-    /// no `page_number` and recovery scans them linearly (§5).
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn append_logical_txn(
-        // allow-legacy-journal-audit: test-only retired logical append probe
-        &mut self,
-        frame: LogicalTxnFrame,
-    ) -> Result<u64> {
-        if self.checkpoint_batch_active.is_some() {
-            return Err(Error::Internal(
-                "logical transaction cannot be appended inside checkpoint batch".into(),
-            ));
-        }
-        let bytes = frame.encode()?;
-        let slot = self.log_manager.reserve(bytes.len())?;
-        let frame_offset = slot.start_lsn();
-        self.log_manager.write_reserved(&slot, &bytes)?;
-        let _receipt = self.log_manager.mark_written(&slot)?;
-        crate::mvcc::metrics::record_logical_txn_append_bytes(bytes.len() as u64);
-        // allow-legacy-journal-audit: this retired append helper is test-only.
-        // Production CRUD uses one Phase 8 LogRecord; the percentile guard in
-        // `PagedEngine` samples the full draft/reserve/write/ready envelope.
-        Ok(frame_offset)
-    }
-
     /// Append a page-0 checkpoint commit boundary to the journal.
     ///
     /// Returns the [`BoundaryAppended`] token for the durable page-0 frame.

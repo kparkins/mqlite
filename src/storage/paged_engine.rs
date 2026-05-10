@@ -96,9 +96,6 @@ mod index_build_recovery;
 #[path = "paged_engine/tests/logical_replay_frontier.rs"]
 mod logical_replay_frontier;
 #[cfg(test)]
-#[path = "paged_engine/tests/orphan_chain_commit_recovery.rs"]
-mod orphan_chain_commit_recovery;
-#[cfg(test)]
 #[path = "paged_engine/tests/pending_write_visibility.rs"]
 mod pending_write_visibility;
 #[cfg(test)]

@@ -459,19 +459,6 @@ impl WriteTxn {
     ///
     /// No new `Mutex` / `Arc` — the Cell provides single-threaded interior
     /// mutability scoped to this transaction.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn emit_logical_txn_frame(
-        // allow-legacy-journal-audit: test-only retired logical append probe
-        &self,
-        journal: &BufferPoolHandle,
-        primary_writes: &[PrimaryWrite],
-        sec_writes: &[SecIndexWrite],
-    ) -> Result<()> {
-        let frame = self.build_logical_txn_frame(journal, primary_writes, sec_writes);
-        journal.append_logical_txn(frame)?;
-        Ok(())
-    }
-
     /// Build and consume this transaction's Phase 2 `LogicalTxnFrame`.
     ///
     /// This is the S5-only half of [`emit_logical_txn_frame`]: it consumes
@@ -518,74 +505,6 @@ impl WriteTxn {
     /// Returns `(commit_ts, pending, pending_sec_index)`. Callers that
     /// stage no overflow data may drop the returned vecs, which runs
     /// `OverflowRef::Drop` on every entry — correct for no-op commits.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn commit(
-        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
-        self,
-        oracle: &TimestampOracle,
-        journal: &BufferPoolHandle,
-    ) -> Result<(Ts, Vec<OverflowRef>, Vec<SecIndexWrite>)> {
-        let commit_ts = match self.commit_ts.get() {
-            Some(ts) => ts,
-            None => {
-                let ts = oracle.commit()?;
-                self.commit_ts.set(Some(ts));
-                ts
-            }
-        };
-
-        let (pending, pending_sec_index) = self.commit_with_ts(commit_ts, journal)?;
-        Ok((commit_ts, pending, pending_sec_index))
-    }
-
-    /// Finalize the transaction with an explicit, caller-provided
-    /// `commit_ts` — mirrors [`commit`](Self::commit) but does not read
-    /// the `commit_ts` Cell. Required by the Phase 2 commit-envelope
-    /// rewire (US-011) where `emit_logical_txn_frame` consumes the Cell
-    /// at S5 and the subsequent `ChainCommit` frame at S7 must use the
-    /// same pre-allocated `ts` that `allocate_commit_ts` (S4) returned.
-    ///
-    /// Draining semantics match `commit`: `pending`, `page_writes`,
-    /// `refcount_deltas`, and `pending_sec_index` are moved out of `self`
-    /// BEFORE journaling so a journal failure leaves the caller with
-    /// `pending` refcount ownership. Returns `(pending, pending_sec_index)`
-    /// on success.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn commit_with_ts(
-        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
-        self,
-        commit_ts: Ts,
-        journal: &BufferPoolHandle,
-    ) -> Result<(Vec<OverflowRef>, Vec<SecIndexWrite>)> {
-        let (pending, pending_sec_index, _end_lsn) =
-            self.commit_chain_commit(journal, commit_ts)?;
-        Ok((pending, pending_sec_index))
-    }
-
-    /// Append the S7 `ChainCommit` frame for this transaction.
-    ///
-    /// Returns the drained overflow refs, secondary-index write list, and
-    /// chain-commit end LSN after the frame has been appended. This consumes
-    /// `self`; on any append failure, `Drop` still owns the drained vectors
-    /// and aborts their refcounts normally.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn commit_chain_commit(
-        // allow-legacy-journal-audit: test-only retired ChainCommit append probe
-        mut self,
-        journal: &BufferPoolHandle,
-        commit_ts: Ts,
-    ) -> Result<(Vec<OverflowRef>, Vec<SecIndexWrite>, u64)> {
-        let pending = std::mem::take(&mut self.pending).into_vec();
-        let page_writes = std::mem::take(&mut self.page_writes).into_vec();
-        let refcount_deltas = std::mem::take(&mut self.refcount_deltas).into_vec();
-        let pending_sec_index = std::mem::take(&mut self.pending_sec_index).into_vec();
-
-        let end_lsn =
-            journal.append_chain_commit_end_lsn(commit_ts, refcount_deltas, page_writes)?;
-
-        Ok((pending, pending_sec_index, end_lsn))
-    }
-
     /// Build and drain the ChainCommit payload without appending it.
     pub(crate) fn prepare_chain_commit_payload(
         mut self,
