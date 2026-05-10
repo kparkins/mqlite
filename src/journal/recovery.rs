@@ -90,6 +90,15 @@ struct LogRecordRecoveryScan {
     /// records, used to seed `next_checkpoint_batch_id` so post-restart
     /// batches do not collide with persisted ids.
     max_boundary_batch_id: Option<u64>,
+    /// `total_page_count` carried by the latest replayed boundary header.
+    /// Surfaces through [`JournalManager::did_recover_pages`] so the engine
+    /// knows recovery materialised checkpoint pages into the main file.
+    recovered_db_page_count: Option<u32>,
+    /// `true` when every record encountered by the scan was a
+    /// checkpoint-related kind (boundary, per-page, catalog) and at least one
+    /// boundary was applied. The journal can be truncated to its header
+    /// because no CRUD record remains pending in the journal.
+    journal_truncatable: bool,
 }
 
 impl JournalManager {
@@ -100,7 +109,7 @@ impl JournalManager {
         main_header: &FileHeader,
         salt1: u32,
         salt2: u32,
-        checkpoint_seq: u32,
+        mut checkpoint_seq: u32,
     ) -> Result<Option<JournalManager>> {
         let scan = Self::scan_log_records(
             journal_path,
@@ -113,7 +122,33 @@ impl JournalManager {
         if scan.applied_catalog_commit {
             main_file.flush().map_err(Error::Io)?;
         }
-        Self::truncate_tail_to_valid_end_lsn(&mut journal_file, scan.valid_end_lsn)?;
+
+        // Reset the journal to its bare header when every replayed record was
+        // already materialised into the main file. Mirrors the legacy
+        // `truncate_journal()` step that emergency_checkpoint_after_boundary
+        // used to perform once it had finished copying the boundary's pages.
+        let resume_lsn = if scan.journal_truncatable {
+            checkpoint_seq = checkpoint_seq.wrapping_add(1);
+            let mut header = super::log_file::JournalHeader::new(salt1, salt2);
+            header.checkpoint_seq = checkpoint_seq;
+            journal_file
+                .seek(SeekFrom::Start(0))
+                .map_err(Error::Io)?;
+            journal_file
+                .write_all(&header.to_bytes())
+                .map_err(Error::Io)?;
+            journal_file
+                .set_len(JOURNAL_HEADER_SIZE as u64)
+                .map_err(Error::Io)?;
+            journal_file.sync_data().map_err(Error::Io)?;
+            journal_file
+                .seek(SeekFrom::Start(JOURNAL_HEADER_SIZE as u64))
+                .map_err(Error::Io)?;
+            JOURNAL_HEADER_SIZE as u64
+        } else {
+            Self::truncate_tail_to_valid_end_lsn(&mut journal_file, scan.valid_end_lsn)?;
+            scan.valid_end_lsn
+        };
         let log_manager_file = journal_file.try_clone().map_err(Error::Io)?;
 
         let next_checkpoint_batch_id = scan
@@ -126,14 +161,14 @@ impl JournalManager {
             salt1,
             salt2,
             checkpoint_seq,
-            write_cursor: scan.valid_end_lsn,
-            log_manager: Arc::new(super::LogManager::new(log_manager_file, scan.valid_end_lsn)),
-            last_committed_db_page_count: None,
+            write_cursor: resume_lsn,
+            log_manager: Arc::new(super::LogManager::new(log_manager_file, resume_lsn)),
+            last_committed_db_page_count: scan.recovered_db_page_count,
             recovered_max_commit_ts: scan.recovered_max_commit_ts,
             recovered_max_publish_seq: scan.recovered_max_publish_seq,
             parsed_logical_frames: scan.parsed_logical,
             legacy_pending_start_offset: None,
-            last_legacy_commit_end_offset: scan.valid_end_lsn,
+            last_legacy_commit_end_offset: resume_lsn,
             checkpoint_batch_active: None,
             next_checkpoint_batch_id,
             checkpoint_frame_tags: std::collections::BTreeMap::new(),
@@ -182,27 +217,58 @@ impl JournalManager {
 
         let checkpoint_applied_lsn = main_header.checkpoint_applied_lsn;
 
-        // Compute the maximum boundary batch_id across all accepted boundary
-        // records (regardless of checkpoint_applied_lsn) so we can seed the
-        // next batch id monotonically. Decode boundaries up front so we can
-        // also drain matching CheckpointPageFrame records by batch_id.
+        // Decode every boundary record up front so we can:
+        //   1. Seed `next_checkpoint_batch_id` past every persisted batch id.
+        //   2. Drain matching `CheckpointPageFrame` records by batch_id.
+        //   3. Enforce `last_checkpoint_ts` monotonicity across replayed
+        //      boundaries (mirrors the legacy regression check).
+        //   4. Track the highest replayed boundary header so it can refresh
+        //      the main-file header image and drive `recovered_max_commit_ts`.
         let mut max_boundary_batch_id: Option<u64> = None;
         let mut boundary_batch_ids: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut highest_boundary_ts: Option<Ts> = None;
+        let mut latest_boundary_header: Option<FileHeader> = None;
         for record in &accepted {
             if let LogRecordPayload::CheckpointBoundary(payload) = &record.record.payload {
-                if let Ok(boundary) = CheckpointBoundaryPayload::decode(payload) {
-                    max_boundary_batch_id = Some(
-                        max_boundary_batch_id
-                            .map_or(boundary.batch_id, |prev| prev.max(boundary.batch_id)),
-                    );
-                    boundary_batch_ids.insert(record.record.start_lsn, boundary.batch_id);
+                let boundary = CheckpointBoundaryPayload::decode(payload).map_err(|error| {
+                    Self::log_record_recovery_corruption(
+                        journal_path,
+                        format!("invalid CheckpointBoundary payload: {error}"),
+                    )
+                })?;
+                max_boundary_batch_id = Some(
+                    max_boundary_batch_id
+                        .map_or(boundary.batch_id, |prev| prev.max(boundary.batch_id)),
+                );
+                boundary_batch_ids.insert(record.record.start_lsn, boundary.batch_id);
+                let ts = boundary.header.last_checkpoint_ts;
+                if let Some(prev) = highest_boundary_ts {
+                    if ts < prev {
+                        return Err(Self::log_record_recovery_corruption(
+                            journal_path,
+                            format!(
+                                "page-0 checkpoint boundary last_checkpoint_ts regressed: \
+                                 prev={prev:?}, new={ts:?}"
+                            ),
+                        ));
+                    }
+                }
+                highest_boundary_ts = Some(highest_boundary_ts.map_or(ts, |prev| prev.max(ts)));
+                if record.record.end_lsn > checkpoint_applied_lsn {
+                    latest_boundary_header = Some(boundary.header);
                 }
             }
         }
 
-        // Group CheckpointPageFrame records by batch_id, in LSN order.
+        // Group CheckpointPageFrame records by batch_id, in LSN order. Frames
+        // whose batch never reached its commit boundary are "orphans" — the
+        // legacy recovery path discarded them by truncating past their first
+        // byte; we mirror that by tracking the lowest orphan LSN and trimming
+        // `valid_end_lsn` to it before returning the scan.
         let mut pending_pages_by_batch: BTreeMap<u64, Vec<CheckpointPageFramePayload>> =
             BTreeMap::new();
+        let mut orphan_truncate_lsn: Option<u64> = None;
+        let known_batch_ids: BTreeSet<u64> = boundary_batch_ids.values().copied().collect();
         for record in &accepted {
             if record.record.end_lsn <= checkpoint_applied_lsn {
                 continue;
@@ -211,9 +277,16 @@ impl JournalManager {
                 let frame = CheckpointPageFramePayload::decode(payload).map_err(|error| {
                     Self::log_record_recovery_corruption(
                         journal_path,
-                        format!("invalid Phase 8 CheckpointPageFrame payload: {error}"),
+                        format!("invalid CheckpointPageFrame payload: {error}"),
                     )
                 })?;
+                if !known_batch_ids.contains(&frame.batch_id) {
+                    orphan_truncate_lsn = Some(
+                        orphan_truncate_lsn
+                            .map_or(record.record.start_lsn, |prev| prev.min(record.record.start_lsn)),
+                    );
+                    continue;
+                }
                 pending_pages_by_batch
                     .entry(frame.batch_id)
                     .or_default()
@@ -235,6 +308,11 @@ impl JournalManager {
         let mut parsed_logical = ParsedLogicalFrames::default();
         let mut recovered_max_commit_ts = (main_header.last_checkpoint_ts != Ts::default())
             .then_some(main_header.last_checkpoint_ts);
+        if let Some(boundary_ts) = highest_boundary_ts {
+            recovered_max_commit_ts = Some(
+                recovered_max_commit_ts.map_or(boundary_ts, |prev| prev.max(boundary_ts)),
+            );
+        }
         let mut recovered_max_publish_seq = None;
         let mut applied_catalog_commit = false;
         let mut recovered_header = main_header.clone();
@@ -328,13 +406,62 @@ impl JournalManager {
             }
         }
 
+        // The journal can be truncated to its header iff every record was
+        // already materialised into the main file: boundaries + per-page
+        // records replay above and CatalogCommit records replay through the
+        // apply_set loop. The presence of a CrudCommit means there is MVCC
+        // version-chain state in the journal that has not yet been
+        // checkpointed, so truncation must wait for the next normal
+        // checkpoint pass.
+        let recovered_db_page_count = latest_boundary_header
+            .as_ref()
+            .map(|header| header.total_page_count);
+        let journal_truncatable = recovered_db_page_count.is_some()
+            && accepted.iter().all(|record| {
+                matches!(
+                    record.record.kind,
+                    LogRecordKind::CheckpointBoundary
+                        | LogRecordKind::CheckpointPageFrame
+                        | LogRecordKind::CatalogCommit
+                )
+            });
+
+        // Persist the latest replayed boundary header so the next open observes
+        // the advanced checkpoint frontier in the main-file header (mirrors the
+        // page-0 image the legacy boundary record used to write directly).
+        // When the journal will be truncated to its header, reset the
+        // `checkpoint_applied_lsn` filter to `JOURNAL_HEADER_SIZE` so records
+        // appended after this open are not silently dropped on the next
+        // recovery scan by the `end_lsn > checkpoint_applied_lsn` filter.
+        if let Some(header) = latest_boundary_header {
+            let mut header = header;
+            header.last_checkpoint_ts = header
+                .last_checkpoint_ts
+                .max(recovered_header.last_checkpoint_ts);
+            if journal_truncatable {
+                header.checkpoint_applied_lsn = JOURNAL_HEADER_SIZE as u64;
+            } else {
+                header.checkpoint_applied_lsn = header
+                    .checkpoint_applied_lsn
+                    .max(recovered_header.checkpoint_applied_lsn);
+            }
+            let bytes = header.to_bytes();
+            write_page_to_main(main_file, 0, bytes.len(), &bytes)?;
+            recovered_header = FileHeader::from_bytes(&bytes)?;
+            applied_catalog_commit = true;
+        }
+        let _ = recovered_header;
+
+        let valid_end_lsn = orphan_truncate_lsn.map_or(cursor, |orphan| orphan.min(cursor));
         Ok(LogRecordRecoveryScan {
-            valid_end_lsn: cursor,
+            valid_end_lsn,
             parsed_logical,
             recovered_max_commit_ts,
             recovered_max_publish_seq,
             applied_catalog_commit,
             max_boundary_batch_id,
+            recovered_db_page_count,
+            journal_truncatable,
         })
     }
 
@@ -426,10 +553,7 @@ impl JournalManager {
             }),
             LogRecordPayload::CheckpointBoundary(payload) => {
                 let checkpoint = CheckpointBoundaryPayload::decode(payload).ok()?;
-                let checkpoint_applied_lsn = checkpoint.checkpoint_applied_lsn;
-                if checkpoint_applied_lsn < JOURNAL_HEADER_SIZE as u64
-                    || checkpoint_applied_lsn > record.end_lsn
-                {
+                if checkpoint.checkpoint_applied_lsn > record.end_lsn {
                     return None;
                 }
                 Some(RecoveredLogRecord {

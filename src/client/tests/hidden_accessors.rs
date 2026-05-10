@@ -32,6 +32,8 @@ pub enum JournalLogRecordKind {
     CatalogCommit,
     /// Checkpoint boundary control record.
     CheckpointBoundary,
+    /// Checkpoint per-page record (carries one in-flight dirty frame).
+    CheckpointPageFrame,
 }
 
 /// Test-only Phase 8 catalog-commit kind summary.
@@ -96,6 +98,9 @@ fn journal_log_record_kind(kind: crate::journal::log_file::LogRecordKind) -> Jou
         crate::journal::log_file::LogRecordKind::CheckpointBoundary => {
             JournalLogRecordKind::CheckpointBoundary
         }
+        crate::journal::log_file::LogRecordKind::CheckpointPageFrame => {
+            JournalLogRecordKind::CheckpointPageFrame
+        }
     }
 }
 
@@ -156,6 +161,7 @@ fn journal_log_record_summary(
             ));
         }
         crate::journal::log_file::LogRecordPayload::CrudCommit { .. } => {}
+        crate::journal::log_file::LogRecordPayload::CheckpointPageFrame(_) => {}
     }
 
     Ok(JournalLogRecordSummary {

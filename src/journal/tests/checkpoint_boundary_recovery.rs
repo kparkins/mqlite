@@ -237,50 +237,6 @@ fn torn_non_commit_frame_before_intact_commit_boundary_discards_batch() {
     );
 }
 
-#[test]
-fn checkpoint_boundary_rejects_preexisting_pending_legacy_frame() {
-    let JournalFixture {
-        _dir,
-        db_path,
-        mut main_file,
-        header,
-    } = fixture("phase7-us011-pending-legacy.mqlite");
-    let mut journal =
-        JournalManager::open_or_create(&db_path, &header, &mut main_file).expect("open journal");
-    let legacy_start = journal
-        .append_non_commit(
-            CHECKPOINT_PAGE,
-            JournalPageSize::Large32k,
-            &vec![0xC0; JournalPageSize::Large32k.bytes()],
-        )
-        .expect("append ordinary legacy frame");
-    let cursor_before = journal.write_cursor();
-
-    let batch_id = journal.next_checkpoint_batch_id();
-    let forged_cursor = CheckpointBatchCursor {
-        expected_pending_start: legacy_start,
-        clean_start_offset: legacy_start,
-        batch_id,
-        _private: (),
-    };
-    journal.checkpoint_batch_active = Some((batch_id, legacy_start));
-    journal.legacy_pending_start_offset = Some(legacy_start);
-
-    let err = journal
-        .append_checkpoint_commit_boundary(&staged_header(&header), forged_cursor)
-        .expect_err("boundary must reject preexisting legacy pending frames");
-    assert!(
-        matches!(err, Error::Internal(ref message) if message.contains("legacy pending")),
-        "expected legacy-pending rejection, got {err:?}"
-    );
-    assert_eq!(
-        journal.write_cursor(),
-        cursor_before,
-        "rejected boundary must not append bytes"
-    );
-    assert_eq!(
-        journal.legacy_pending_start_offset,
-        Some(legacy_start),
-        "ordinary pending range must remain owned by the ordinary commit path"
-    );
-}
+// `checkpoint_boundary_rejects_preexisting_pending_legacy_frame` deleted —
+// the legacy 24-byte page-frame allocator (and its `legacy_pending_start_offset`
+// validator) is gone now that every journal write goes through `LogManager`.

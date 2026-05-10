@@ -180,6 +180,11 @@ impl ReservedLogRecord {
         }
     }
 
+    /// Inclusive byte-LSN where the reserved record begins.
+    pub(crate) fn start_lsn(&self) -> u64 {
+        self.record.start_lsn()
+    }
+
     /// Exclusive end LSN of this complete record.
     pub(crate) fn end_lsn(&self) -> u64 {
         self.record.end_lsn()
@@ -722,6 +727,14 @@ impl LogManager {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CheckpointBatchId(u64);
 
+impl CheckpointBatchId {
+    /// Wire-format identifier carried by Phase 8 `CheckpointPageFrame` and
+    /// `CheckpointBoundary` records.
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 /// Pool that produced a checkpoint journal frame.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum CheckpointPoolKind {
@@ -1068,8 +1081,14 @@ impl JournalManager {
     }
 
     /// Append a checkpoint-owned page frame tagged with `batch_id`.
-    pub(crate) fn append_checkpoint_frame(
-        &mut self,
+    ///
+    /// Reserves through [`LogManager`] so concurrent CRUD reservations cannot
+    /// interleave bytes with the per-page record. Returns the exclusive end
+    /// LSN of the written record so callers may stamp the dirty buffer-pool
+    /// frame with that LSN to arm the eviction pin invariant
+    /// (`src/storage/buffer_pool/partition.rs`).
+    pub(crate) fn append_checkpoint_page_frame(
+        &self,
         batch_id: CheckpointBatchId,
         pool: CheckpointPoolKind,
         page_number: u32,
@@ -1088,17 +1107,42 @@ impl JournalManager {
                 batch_id, active_batch
             )));
         }
-        self.append_frame(
+        let pool_kind = match pool {
+            CheckpointPoolKind::Main => log_file::CheckpointPagePool::Main,
+            CheckpointPoolKind::History => log_file::CheckpointPagePool::History,
+        };
+        let payload = log_file::CheckpointPageFramePayload {
+            batch_id: batch_id.as_u64(),
+            pool: pool_kind,
             page_number,
-            0,
             page_size,
-            page_data,
-            Some(CheckpointFrameTag {
-                batch_id,
-                pool,
-                page_id: PageId(page_number),
-            }),
-        )
+            data: page_data.to_vec(),
+        }
+        .encode()?;
+        let draft = log_file::LogRecordDraft::checkpoint_page_frame(Ts::default(), payload);
+        let reserved = Self::reserve_log_record_on(&self.log_manager, draft)?;
+        let end_lsn = reserved.end_lsn();
+        reserved.write_and_mark()?;
+        Ok(end_lsn)
+    }
+
+    /// Test-only `&mut self` wrapper preserving the historical signature.
+    /// Returns the inclusive byte LSN where the per-page record starts so
+    /// callers that previously located a 24-byte legacy frame at that offset
+    /// keep computing offsets that fall inside the new Phase 8 record's
+    /// header bytes.
+    pub(crate) fn append_checkpoint_frame(
+        &mut self,
+        batch_id: CheckpointBatchId,
+        pool: CheckpointPoolKind,
+        page_number: u32,
+        page_size: JournalPageSize,
+        page_data: &[u8],
+    ) -> Result<u64> {
+        let start_lsn = self.log_manager.next_lsn();
+        let _end_lsn =
+            self.append_checkpoint_page_frame(batch_id, pool, page_number, page_size, page_data)?;
+        Ok(start_lsn)
     }
 
     /// Append an MVCC `ChainCommit` frame to the journal.
@@ -1209,26 +1253,38 @@ impl JournalManager {
         staged_header: &FileHeader,
         checkpoint_batch: CheckpointBatchCursor,
     ) -> Result<BoundaryAppended> {
-        self.validate_active_checkpoint_batch_before_boundary(&checkpoint_batch)?;
+        let Some((batch_id, expected_start)) = self.checkpoint_batch_active else {
+            return Err(Error::Internal(
+                "checkpoint boundary requires an active checkpoint batch".into(),
+            ));
+        };
+        if batch_id != checkpoint_batch.batch_id
+            || expected_start != checkpoint_batch.expected_pending_start
+        {
+            return Err(Error::Internal(
+                "checkpoint boundary cursor does not match active checkpoint batch".into(),
+            ));
+        }
         self.log_manager.check_poisoned()?;
-        let record = Page0BoundaryRecord::new(self.salt1, self.salt2, staged_header.clone());
-        let frame_offset = self.write_cursor;
-        self.journal_file
-            .seek(SeekFrom::Start(frame_offset))
-            .map_err(Error::Io)?;
-        record.write(&mut self.journal_file).map_err(Error::Io)?;
-        self.journal_file.flush().map_err(Error::Io)?;
-        self.write_cursor += (JOURNAL_FRAME_HEADER_SIZE + JournalPageSize::Small4k.bytes()) as u64;
-        self.log_manager.reset_ready_to_unsynced(self.write_cursor);
-        self.last_committed_db_page_count = Some(staged_header.total_page_count);
+
+        let db_page_count = staged_header.total_page_count;
+        let checkpoint_ts = staged_header.last_checkpoint_ts;
+        let payload = log_file::CheckpointBoundaryPayload {
+            checkpoint_applied_lsn: staged_header.checkpoint_applied_lsn,
+            batch_id: batch_id.as_u64(),
+            header: staged_header.clone(),
+        }
+        .encode()?;
+        let draft = log_file::LogRecordDraft::checkpoint_boundary(0, checkpoint_ts, payload);
+        let reserved = Self::reserve_log_record_on(&self.log_manager, draft)?;
+        let frame_offset = reserved.start_lsn();
+        reserved.write_and_mark()?;
+        self.last_committed_db_page_count = Some(db_page_count);
         self.checkpoint_batch_active = None;
-        // Keep checkpoint frame provenance until the journal is truncated so
-        // same-process lookup/truncate paths can distinguish checkpoint-owned
-        // page records from unsupported ordinary page-frame bytes.
         Ok(BoundaryAppended {
             journal_offset: frame_offset,
-            db_page_count: record.db_page_count(),
-            checkpoint_ts: record.checkpoint_ts(),
+            db_page_count,
+            checkpoint_ts,
             _private: (),
         })
     }
@@ -1541,7 +1597,7 @@ impl JournalManager {
     /// frontier. Main-file contents are NOT touched — this is the FullSync hot
     /// path, not a checkpoint.
     pub(crate) fn sync_journal(&self) -> Result<()> {
-        self.log_manager.ensure_sync(self.write_cursor)
+        self.log_manager.ensure_sync(self.log_manager.next_lsn())
     }
 
     // -----------------------------------------------------------------------
@@ -1561,18 +1617,27 @@ impl JournalManager {
 
     /// Reserve and finalize one Phase 8 log record.
     ///
-    /// The journal-manager mutex protects `write_cursor` while reservation
-    /// advances the append frontier, so legacy DDL appenders cannot overwrite
-    /// a byte range already handed to `LogManager`.
+    /// `&self` so concurrent CRUD reservations need no outer mutex —
+    /// [`LogManager::reserve`] owns the LSN-allocation atomic and slot map.
     pub(crate) fn reserve_log_record(
-        &mut self,
+        &self,
+        draft: log_file::LogRecordDraft,
+    ) -> Result<ReservedLogRecord> {
+        Self::reserve_log_record_on(&self.log_manager, draft)
+    }
+
+    /// Same as [`reserve_log_record`](Self::reserve_log_record) but driven by
+    /// a caller-held [`Arc<LogManager>`] so callers do not need to acquire the
+    /// outer journal mutex to reserve a slot.
+    pub(crate) fn reserve_log_record_on(
+        log_manager: &Arc<LogManager>,
         draft: log_file::LogRecordDraft,
     ) -> Result<ReservedLogRecord> {
         let bytes_len = draft.encoded_len()?;
-        let slot = self.log_manager.reserve(bytes_len)?;
+        let slot = log_manager.reserve(bytes_len)?;
         let record = match draft.finalize(slot.start_lsn()) {
             Ok(record) => record,
-            Err(error) => return Err(self.log_manager.poison_slot(&slot, error)),
+            Err(error) => return Err(log_manager.poison_slot(&slot, error)),
         };
         if record.end_lsn() != slot.end_lsn() {
             let error = Error::Internal(format!(
@@ -1582,12 +1647,10 @@ impl JournalManager {
                 slot.start_lsn(),
                 slot.end_lsn()
             ));
-            return Err(self.log_manager.poison_slot(&slot, error));
+            return Err(log_manager.poison_slot(&slot, error));
         }
-        self.write_cursor = self.write_cursor.max(slot.end_lsn());
-        self.last_legacy_commit_end_offset = self.write_cursor;
         Ok(ReservedLogRecord::journaled(
-            Arc::clone(&self.log_manager),
+            Arc::clone(log_manager),
             slot,
             record,
         ))

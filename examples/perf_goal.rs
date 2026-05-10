@@ -20,13 +20,27 @@ const PAYLOAD_BYTES: usize = 256;
 const DURABILITY_INTERVAL_MS: u64 = 100;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let single_same_collection = run_same_collection_write_benchmark(WriteMode::Single)?;
-    let batch_same_collection = run_same_collection_write_benchmark(WriteMode::Batch)?;
-    let single_multi_collection = run_multi_collection_write_benchmark(WriteMode::Single)?;
-    let batch_multi_collection = run_multi_collection_write_benchmark(WriteMode::Batch)?;
-    let read = run_read_benchmark()?;
+    let iter = parse_iter_arg()?;
+    let mut single_same: Vec<Measurement> = Vec::with_capacity(iter);
+    let mut batch_same: Vec<Measurement> = Vec::with_capacity(iter);
+    let mut single_multi: Vec<Measurement> = Vec::with_capacity(iter);
+    let mut batch_multi: Vec<Measurement> = Vec::with_capacity(iter);
+    let mut read: Vec<Measurement> = Vec::with_capacity(iter);
+    for _ in 0..iter {
+        single_same.push(run_same_collection_write_benchmark(WriteMode::Single)?);
+        batch_same.push(run_same_collection_write_benchmark(WriteMode::Batch)?);
+        single_multi.push(run_multi_collection_write_benchmark(WriteMode::Single)?);
+        batch_multi.push(run_multi_collection_write_benchmark(WriteMode::Batch)?);
+        read.push(run_read_benchmark()?);
+    }
+    let single_same = median_by_units_per_second(single_same);
+    let batch_same = median_by_units_per_second(batch_same);
+    let single_multi = median_by_units_per_second(single_multi);
+    let batch_multi = median_by_units_per_second(batch_multi);
+    let read = median_by_units_per_second(read);
     println!(
-        "{{\"write_single_same_collection_4\":{{\"writers\":{},\"docs\":{},\
+        "{{\"iter\":{iter},\
+         \"write_single_same_collection_4\":{{\"writers\":{},\"docs\":{},\
          \"elapsed_secs\":{:.9},\"docs_per_second\":{:.6}}},\
          \"write_batch_same_collection_4\":{{\"writers\":{},\"docs\":{},\
          \"elapsed_secs\":{:.9},\"docs_per_second\":{:.6}}},\
@@ -35,27 +49,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          \"write_batch_multi_collection_8\":{{\"writers\":{},\"docs\":{},\
          \"elapsed_secs\":{:.9},\"docs_per_second\":{:.6}}},\
          \"read_mixed\":{{\"ops\":{},\"elapsed_secs\":{:.9},\"ops_per_second\":{:.6}}}}}",
-        single_same_collection.workers,
-        single_same_collection.units,
-        single_same_collection.elapsed_secs,
-        single_same_collection.units_per_second,
-        batch_same_collection.workers,
-        batch_same_collection.units,
-        batch_same_collection.elapsed_secs,
-        batch_same_collection.units_per_second,
-        single_multi_collection.workers,
-        single_multi_collection.units,
-        single_multi_collection.elapsed_secs,
-        single_multi_collection.units_per_second,
-        batch_multi_collection.workers,
-        batch_multi_collection.units,
-        batch_multi_collection.elapsed_secs,
-        batch_multi_collection.units_per_second,
+        single_same.workers,
+        single_same.units,
+        single_same.elapsed_secs,
+        single_same.units_per_second,
+        batch_same.workers,
+        batch_same.units,
+        batch_same.elapsed_secs,
+        batch_same.units_per_second,
+        single_multi.workers,
+        single_multi.units,
+        single_multi.elapsed_secs,
+        single_multi.units_per_second,
+        batch_multi.workers,
+        batch_multi.units,
+        batch_multi.elapsed_secs,
+        batch_multi.units_per_second,
         read.units,
         read.elapsed_secs,
         read.units_per_second
     );
     Ok(())
+}
+
+fn parse_iter_arg() -> Result<usize, Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--iter" {
+            let value = args
+                .next()
+                .ok_or("--iter requires a positive integer argument")?;
+            let parsed: usize = value.parse()?;
+            if parsed == 0 {
+                return Err("--iter must be at least 1".into());
+            }
+            return Ok(parsed);
+        }
+    }
+    Ok(1)
+}
+
+fn median_by_units_per_second(mut runs: Vec<Measurement>) -> Measurement {
+    assert!(!runs.is_empty(), "median requires at least one run");
+    runs.sort_by(|a, b| {
+        a.units_per_second
+            .partial_cmp(&b.units_per_second)
+            .expect("benchmark throughput is finite")
+    });
+    runs.swap_remove(runs.len() / 2)
 }
 
 struct Measurement {

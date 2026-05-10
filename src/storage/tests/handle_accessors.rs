@@ -23,6 +23,7 @@ impl BufferPoolHandle {
             pool_io,
             read_view_registry: crate::mvcc::ReadViewRegistry::new(),
             journal: None,
+            log_manager: None,
             journal_main_file: None,
         }
     }

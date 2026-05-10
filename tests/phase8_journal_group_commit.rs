@@ -207,7 +207,7 @@ fn sync_journal_uses_log_manager_durable_frontier() {
         "// -----------------------------------------------------------------------",
     );
 
-    assert!(sync_body.contains("self.log_manager.ensure_sync(self.write_cursor)"));
+    assert!(sync_body.contains("self.log_manager.ensure_sync(self.log_manager.next_lsn())"));
     assert!(!sync_body.contains("self.journal_file.sync_data()"));
 }
 
@@ -222,7 +222,8 @@ fn fullsync_commit_waits_on_end_lsn_not_ticket_manager() {
     assert!(!state.contains("GroupCommitManager"));
     assert!(engine.contains("let commit_end_lsn = reserved.end_lsn()"));
     assert!(engine.contains("self.wait_for_commit_durability(commit_end_lsn)?"));
-    assert!(engine.contains("DurabilityMode::FullSync => self.shared.handle.wait_journal_durable"));
+    assert!(engine.contains("DurabilityMode::FullSync"));
+    assert!(engine.contains("self.shared.handle.wait_journal_durable(end_lsn)"));
     assert!(engine.contains("DurabilityMode::Interval(_) | DurabilityMode::None"));
     assert!(engine.contains("self.shared.handle.wait_journal_ready(end_lsn)"));
 }

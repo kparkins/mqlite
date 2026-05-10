@@ -155,6 +155,10 @@ pub(crate) struct BufferPoolHandle {
     read_view_registry: Arc<ReadViewRegistry>,
     /// Optional journal manager; `None` for in-memory / test handles.
     journal: Option<Arc<Mutex<JournalManager>>>,
+    /// Cached `Arc<LogManager>` extracted at journal-attach time. Hot paths
+    /// (CRUD `reserve_log_record`, FullSync) read this directly to skip the
+    /// outer `journal.lock()` call that previously serialised every reserve.
+    log_manager: Option<Arc<LogManager>>,
     /// Dedicated fd for writing checkpointed journal pages back to the main file.
     /// Shared with `ClientInner`; held here so `with_txn` can trigger an
     /// emergency checkpoint when the journal index reaches its hot-threshold.
@@ -175,6 +179,13 @@ impl BufferPoolHandle {
     ) -> Self {
         let allocator = AllocatorHandle::new(header);
         let pool_io = BufferPoolPageSource::new(Arc::clone(&pool));
+        let log_manager = {
+            #[allow(clippy::expect_used)]
+            let guard = journal
+                .lock()
+                .expect("freshly attached journal mutex cannot be poisoned");
+            guard.log_manager()
+        };
         Self {
             pool,
             history_pool,
@@ -182,6 +193,7 @@ impl BufferPoolHandle {
             pool_io,
             read_view_registry: ReadViewRegistry::new(),
             journal: Some(journal),
+            log_manager: Some(log_manager),
             journal_main_file: Some(journal_main_file),
         }
     }
@@ -525,6 +537,11 @@ impl BufferPoolHandle {
                 "checkpoint flush requires an attached journal".into(),
             ));
         };
+        let Some(log_manager) = &self.log_manager else {
+            return Err(Error::Internal(
+                "checkpoint flush requires an attached journal".into(),
+            ));
+        };
         let checkpoint_applied_lsn = self.journal_durable_lsn()?.unwrap_or(u64::MAX);
         self.validate_checkpoint_flush_set(&checkpoint_flush_set)?;
         let main_frames = self.pool.checkpoint_dirty_frame_snapshots(
@@ -538,36 +555,49 @@ impl BufferPoolHandle {
             checkpoint_applied_lsn,
         )?;
 
-        let mut guard = journal
+        let cursor = {
+            let mut guard = journal
+                .lock()
+                .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+            let cursor = guard.begin_checkpoint_batch()?;
+            if cursor.batch_id() != checkpoint_flush_set.batch_id() {
+                guard.abort_empty_checkpoint_batch(&cursor);
+                return Err(Error::Internal(
+                    "checkpoint flush set batch id does not match journal cursor".into(),
+                ));
+            }
+            cursor
+        };
+
+        // Per-page records — reserve through the lock-free LogManager and arm
+        // the LSN-pin invariant so CLOCK eviction skips these dirty frames
+        // until the matching boundary record is durable
+        // (`src/storage/buffer_pool/partition.rs:118-120, 247-313`).
+        let guard = journal
             .lock()
             .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        let cursor = guard.begin_checkpoint_batch()?;
-        if cursor.batch_id() != checkpoint_flush_set.batch_id() {
-            guard.abort_empty_checkpoint_batch(&cursor);
-            return Err(Error::Internal(
-                "checkpoint flush set batch id does not match journal cursor".into(),
-            ));
-        }
-
         for (page, size, data) in main_frames {
-            guard.append_checkpoint_frame(
+            let end_lsn = guard.append_checkpoint_page_frame(
                 cursor.batch_id(),
                 CheckpointPoolKind::Main,
                 page,
                 journal_page_size(size),
                 &data,
             )?;
+            self.pool.stamp_dirty_pages_lsn(&[page], end_lsn)?;
         }
         for (page, size, data) in history_frames {
-            guard.append_checkpoint_frame(
+            let end_lsn = guard.append_checkpoint_page_frame(
                 cursor.batch_id(),
                 CheckpointPoolKind::History,
                 page,
                 journal_page_size(size),
                 &data,
             )?;
+            self.history_pool.stamp_dirty_pages_lsn(&[page], end_lsn)?;
         }
-        guard.sync_journal()?;
+        drop(guard);
+        log_manager.ensure_sync(log_manager.next_lsn())?;
         Ok(cursor)
     }
 
@@ -614,34 +644,26 @@ impl BufferPoolHandle {
     /// Called by the engine's FullSync hot path. No-op when no journal is
     /// attached (in-memory / test handles).
     pub(crate) fn journal_sync(&self) -> Result<()> {
-        let Some(journal) = &self.journal else {
+        let Some(log_manager) = &self.log_manager else {
             return Ok(());
         };
-        let guard = journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        guard.sync_journal()
+        log_manager.ensure_sync(log_manager.next_lsn())
     }
 
     fn journal_log_manager(&self) -> Result<Option<Arc<LogManager>>> {
-        let Some(journal) = &self.journal else {
-            return Ok(None);
-        };
-        let guard = journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        Ok(Some(guard.log_manager()))
+        Ok(self.log_manager.as_ref().map(Arc::clone))
     }
 
     /// Reserve and finalize a Phase 8 log record for later positioned write.
+    ///
+    /// Lock-free on the outer journal mutex: the cached `Arc<LogManager>` owns
+    /// the LSN-allocation atomic, and `JournalManager::reserve_log_record_on`
+    /// drives the reservation without acquiring `self.journal`.
     pub(crate) fn reserve_log_record(&self, draft: LogRecordDraft) -> Result<ReservedLogRecord> {
-        let Some(journal) = &self.journal else {
+        let Some(log_manager) = &self.log_manager else {
             return Ok(ReservedLogRecord::journalless(draft.finalize(0)?));
         };
-        let mut guard = journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        guard.reserve_log_record(draft)
+        JournalManager::reserve_log_record_on(log_manager, draft)
     }
 
     fn journal_durable_lsn(&self) -> Result<Option<u64>> {

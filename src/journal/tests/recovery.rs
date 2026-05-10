@@ -159,6 +159,7 @@ fn checkpoint_record(
     header.checkpoint_applied_lsn = checkpoint_applied_lsn;
     let payload = CheckpointBoundaryPayload {
         checkpoint_applied_lsn,
+        batch_id: 0,
         header,
     }
     .encode()

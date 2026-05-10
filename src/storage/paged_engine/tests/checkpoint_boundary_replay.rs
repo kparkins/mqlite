@@ -253,42 +253,7 @@ fn mid_step_10_crash_cut_replays_boundary_and_truncates_journal() -> Result<()> 
     Ok(())
 }
 
-#[test]
-fn emergency_checkpoint_after_boundary_checks_boundary_page_count() -> Result<()> {
-    let fixture = fixture()?;
-    let staged_header = append_durable_boundary(&fixture)?;
-    let allocator_header_before = fixture
-        .handle
-        .allocator()
-        .with_header(|header| header.clone())?;
-
-    let err = fixture
-        .handle
-        .emergency_checkpoint_after_boundary(staged_header.total_page_count + 1)
-        .expect_err("mismatched expected page count must reject before copy");
-    assert!(
-        matches!(err, Error::Internal(ref message) if message.contains("boundary page count")),
-        "expected boundary page count mismatch, got {err:?}"
-    );
-
-    fixture
-        .handle
-        .emergency_checkpoint_after_boundary(staged_header.total_page_count)?;
-    let allocator_header_after = fixture
-        .handle
-        .allocator()
-        .with_header(|header| header.clone())?;
-    assert_eq!(
-        allocator_header_after, allocator_header_before,
-        "post-boundary copy must not mutate allocator header state"
-    );
-    assert_eq!(
-        read_page_byte(&fixture.db_path, CHECKPOINT_PAGE)?,
-        CHECKPOINT_FILL
-    );
-    assert_eq!(
-        journal_len(&fixture.db_path)?,
-        crate::journal::log_file::JOURNAL_HEADER_SIZE as u64
-    );
-    Ok(())
-}
+// `emergency_checkpoint_after_boundary_checks_boundary_page_count` deleted —
+// the explicit `emergency_checkpoint_after_boundary` flow is gone now that
+// the new recovery scan replays `CheckpointPageFrame` records into the main
+// file natively when their matching `CheckpointBoundary` is encountered.
