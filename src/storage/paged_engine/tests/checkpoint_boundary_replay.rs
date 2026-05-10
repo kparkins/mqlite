@@ -1,32 +1,17 @@
-use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::journal::log_file::{JournalPageSize, PageId};
-use crate::journal::{
-    journal_path_for, CheckpointFlushSet, CheckpointPoolKind, JournalLayeredSource, JournalManager,
-};
+use crate::journal::log_file::JournalPageSize;
+use crate::journal::{journal_path_for, CheckpointPoolKind, JournalManager};
 use crate::mvcc::Ts;
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
-use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
 use crate::storage::page::PAGE_SIZE_LEAF;
-use crate::storage::test_support::{ArcIo, MockIo};
 
 const CHECKPOINT_PAGE: u32 = 9;
 const CHECKPOINT_FILL: u8 = 0xA7;
 const STALE_MAIN_FILL: u8 = 0x11;
 const CHECKPOINT_TOTAL_PAGE_COUNT: u32 = 12;
-
-struct BoundaryFixture {
-    _dir: tempfile::TempDir,
-    db_path: std::path::PathBuf,
-    handle: Arc<BufferPoolHandle>,
-    journal: Arc<Mutex<JournalManager>>,
-    initial_header: FileHeader,
-}
 
 fn open_main_file(db_path: &std::path::Path) -> Result<File> {
     OpenOptions::new()
@@ -65,10 +50,6 @@ fn journal_len(db_path: &std::path::Path) -> Result<u64> {
         .map_err(Error::Io)
 }
 
-fn pages<const N: usize>(ids: [u32; N]) -> BTreeSet<PageId> {
-    ids.into_iter().map(PageId).collect()
-}
-
 fn staged_header(initial_header: &FileHeader) -> FileHeader {
     let mut header = initial_header.clone();
     header.total_page_count = CHECKPOINT_TOTAL_PAGE_COUNT;
@@ -80,75 +61,6 @@ fn staged_header(initial_header: &FileHeader) -> FileHeader {
     header.catalog_root_backup = 3;
     header.catalog_root_level = 1;
     header
-}
-
-fn fixture() -> Result<BoundaryFixture> {
-    let dir = tempfile::tempdir().map_err(Error::Io)?;
-    let db_path = dir.path().join("phase7-us007.mqlite");
-    let initial_header = FileHeader::new_now();
-    let mut main_file = open_main_file(&db_path)?;
-    write_header(&mut main_file, &initial_header)?;
-
-    let journal = Arc::new(Mutex::new(JournalManager::open_or_create(
-        &db_path,
-        &initial_header,
-        &mut main_file,
-    )?));
-    let backing_io = MockIo::new();
-    let backing: Arc<dyn PageSource> = Arc::new(ArcIo(Arc::clone(&backing_io)));
-    let pool = Arc::new(BufferPool::new(
-        default_sizes::DESKTOP,
-        Box::new(JournalLayeredSource::new(
-            Arc::clone(&backing),
-            Arc::clone(&journal),
-        )),
-    ));
-    let history_pool = Arc::new(BufferPool::new(
-        default_sizes::HISTORY,
-        Box::new(JournalLayeredSource::new(backing, Arc::clone(&journal))),
-    ));
-    let handle = Arc::new(BufferPoolHandle::with_journal(
-        pool,
-        history_pool,
-        initial_header.clone(),
-        Arc::clone(&journal),
-        Arc::new(Mutex::new(main_file)),
-    ));
-    Ok(BoundaryFixture {
-        _dir: dir,
-        db_path,
-        handle,
-        journal,
-        initial_header,
-    })
-}
-
-fn append_durable_boundary(fixture: &BoundaryFixture) -> Result<FileHeader> {
-    {
-        let mut page = fixture
-            .handle
-            .fetch_page(CHECKPOINT_PAGE, PageSize::Large32k)?;
-        page.data_mut().fill(CHECKPOINT_FILL);
-    }
-    let checkpoint_applied_lsn = fixture.handle.current_journal_durable_lsn()?;
-    fixture
-        .handle
-        .stamp_unflushable_dirty_pages_lsn(checkpoint_applied_lsn)?;
-    let batch_id = fixture.handle.next_checkpoint_batch_id()?;
-    let flush_set = CheckpointFlushSet::new(
-        batch_id,
-        pages([CHECKPOINT_PAGE]),
-        BTreeSet::new(),
-        BTreeSet::new(),
-    )?;
-    let cursor = fixture.handle.flush_journal_durable(flush_set)?;
-    let staged_header = staged_header(&fixture.initial_header);
-    let _boundary = fixture
-        .journal
-        .lock()
-        .expect("journal mutex")
-        .append_checkpoint_commit_boundary(&staged_header, cursor)?;
-    Ok(staged_header)
 }
 
 fn append_durable_boundary_without_handle(

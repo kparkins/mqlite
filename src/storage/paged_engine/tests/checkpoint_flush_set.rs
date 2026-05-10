@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::journal::log_file::PageId;
-use crate::journal::{CheckpointFlushSet, JournalLayeredSource, JournalManager};
+use crate::journal::{CheckpointFlushSet, JournalManager};
 use crate::mvcc::Ts;
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize, PageSource};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::test_support::{ArcIo, MockIo};
@@ -34,17 +34,13 @@ fn journal_fixture() -> Result<JournalFixture> {
         &mut main_file,
     )?));
     let backing_io = MockIo::new();
-    let backing: Arc<dyn PageSource> = Arc::new(ArcIo(Arc::clone(&backing_io)));
     let pool = Arc::new(BufferPool::new(
         default_sizes::DESKTOP,
-        Box::new(JournalLayeredSource::new(
-            Arc::clone(&backing),
-            Arc::clone(&journal),
-        )),
+        Box::new(ArcIo(Arc::clone(&backing_io))),
     ));
     let history_pool = Arc::new(BufferPool::new(
         default_sizes::HISTORY,
-        Box::new(JournalLayeredSource::new(backing, Arc::clone(&journal))),
+        Box::new(ArcIo(Arc::clone(&backing_io))),
     ));
     let handle = Arc::new(BufferPoolHandle::with_journal(
         pool,

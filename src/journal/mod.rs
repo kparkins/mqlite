@@ -49,14 +49,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex as ParkingMutex};
 
 use crate::error::{EngineFatalReason, Error, Result};
 use crate::mvcc::timestamp::Ts;
-use crate::storage::buffer_pool::{PageSize, PageSource};
 use crate::storage::header::FileHeader;
 use crate::storage::page::PAGE_SIZE_LEAF;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1974,57 +1973,6 @@ impl JournalManager {
         self.checkpoint_batch_active = None;
         self.checkpoint_frame_tags.clear();
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// JournalLayeredSource — PageSource that composes a file source with a journal
-// ---------------------------------------------------------------------------
-
-/// A [`PageSource`] that consults the journal before falling back to an
-/// underlying file source.
-///
-/// * **Reads** — the journal is checked first via [`JournalManager::read_page`]; on
-///   miss, the inner `PageSource` (typically [`crate::storage::file_io::FilePageSource`])
-///   services the read.
-/// * **Writes** — active flushes pass through to the inner `PageSource`; logical
-///   journal frames and checkpoint-owned frames are appended by their explicit
-///   owners instead of this generic page source.
-///
-/// The journal state is shared via `Arc<Mutex<JournalManager>>`; contention is
-/// managed at a higher level by the engine's `RwLock<BpBackend>`.
-pub(crate) struct JournalLayeredSource {
-    inner: Arc<dyn PageSource>,
-    journal: Arc<Mutex<JournalManager>>,
-}
-
-impl JournalLayeredSource {
-    pub(crate) fn new(inner: Arc<dyn PageSource>, journal: Arc<Mutex<JournalManager>>) -> Self {
-        Self { inner, journal }
-    }
-}
-
-impl PageSource for JournalLayeredSource {
-    fn read_page(&self, page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
-        let mut guard = self
-            .journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        if let Some(bytes) = guard.read_page(page_number)? {
-            debug_assert_eq!(
-                bytes.len(),
-                size.bytes(),
-                "journal frame size does not match requested PageSize"
-            );
-            buf.copy_from_slice(&bytes);
-            return Ok(());
-        }
-        drop(guard);
-        self.inner.read_page(page_number, size, buf)
-    }
-
-    fn write_page(&self, page_number: u32, size: PageSize, buf: &[u8]) -> Result<()> {
-        self.inner.write_page(page_number, size, buf)
     }
 }
 

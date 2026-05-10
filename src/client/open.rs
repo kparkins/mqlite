@@ -9,10 +9,10 @@ use std::{
 
 use crate::{
     error::{Error, Result},
-    journal::{JournalLayeredSource, JournalManager},
+    journal::JournalManager,
     options::OpenOptions,
     storage::{
-        buffer_pool::{default_sizes, BufferPool, PageSource},
+        buffer_pool::{default_sizes, BufferPool},
         file_io::FilePageSource,
         handle::BufferPoolHandle,
         header::HEADER_PAGE_SIZE,
@@ -177,26 +177,24 @@ impl Client {
 
         let journal = Arc::new(Mutex::new(journal_mgr));
 
-        let file_src = Arc::new(FilePageSource::new(
-            Arc::clone(&file_lock) as Arc<dyn FileLock>
-        ));
-        let layered_source: Box<dyn PageSource> = Box::new(JournalLayeredSource::new(
-            Arc::clone(&file_src) as Arc<dyn PageSource>,
-            Arc::clone(&journal),
-        ));
+        // Plain `FilePageSource` for both pools. The legacy `JournalLayeredSource`
+        // overlay is gone now that buffer-pool LSN pinning
+        // (`src/storage/buffer_pool/partition.rs:118-120, 247-313`) prevents
+        // eviction of dirty frames whose `dirty_lsn > durable_lsn`, so a
+        // cache-miss read for an in-flight checkpoint page is impossible.
         let pool = Arc::new(BufferPool::new_with_delta_bearing_frames_warn_threshold(
             opts.buffer_pool_size,
-            layered_source,
+            Box::new(FilePageSource::new(
+                Arc::clone(&file_lock) as Arc<dyn FileLock>
+            )),
             opts.delta_bearing_frames_warn_threshold,
         ));
-        // Dedicated history-store buffer pool.
-        // Sized conservatively; routes through the same journal-layered source so
-        // recovered history pages are visible after checkpoint.
-        let history_source: Box<dyn PageSource> = Box::new(JournalLayeredSource::new(
-            Arc::clone(&file_src) as Arc<dyn PageSource>,
-            Arc::clone(&journal),
+        let history_pool = Arc::new(BufferPool::new(
+            default_sizes::HISTORY,
+            Box::new(FilePageSource::new(
+                Arc::clone(&file_lock) as Arc<dyn FileLock>
+            )),
         ));
-        let history_pool = Arc::new(BufferPool::new(default_sizes::HISTORY, history_source));
         let journal_main_file = Arc::new(Mutex::new(journal_io_file));
         let buffer_pool = Arc::new(BufferPoolHandle::with_journal(
             pool,
