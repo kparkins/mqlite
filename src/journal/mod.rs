@@ -12,20 +12,11 @@
 //! `db.mqlite` | Main database file (pages after last checkpoint) |
 //! `db.mqlite-journal` | Append-only log of modified pages |
 //!
-//! Lookup acceleration is provided by a **volatile in-memory** journal index
-//! ([`shm::JournalIndex`]) — a `page_number -> latest journal frame offset`
-//! map rebuilt from a journal scan on every open. There is no on-disk
-//! sidecar for the index. This matches the WiredTiger/MongoDB model: the
-//! journal is the only durable artifact, the index is a pure cache.
-//!
-//! Durability is provided by appending commit records to the journal, with
-//! explicit sync ownership at higher-level durability boundaries. Recovery
-//! scans can replay any committed batch and discard any trailing uncommitted
-//! frames.
-//!
-//! On clean close, [`JournalManager::close_and_cleanup`] checkpoints all
-//! journal pages into the main file and deletes the journal, leaving only
-//! `db.mqlite`.
+//! Every journal write is reserved through [`LogManager`] as a Phase 8
+//! `LogRecord`; the journal is the only durable artifact and recovery scans
+//! replay any committed batch and discard trailing uncommitted records.
+//! Durability is provided by explicit sync ownership at higher-level
+//! durability boundaries.
 
 // Crate convention: `expect("N bytes")` on infallible array slices is used
 // throughout the journal module to keep the code readable and is acknowledged
@@ -41,8 +32,6 @@ pub(crate) mod log_file;
 #[path = "tests/logical_replay_fixtures.rs"]
 pub(crate) mod logical_replay_fixtures;
 mod recovery;
-#[allow(dead_code)]
-pub(crate) mod shm;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
