@@ -1153,88 +1153,17 @@ mod tests {
     // Rollback (truncate_to)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn truncate_to_does_not_rebuild_untagged_page_frames() {
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        mgr.append_non_commit(1, JournalPageSize::Small4k, &make_page_4k(0x11))
-            .unwrap();
-        let mark = mgr.write_cursor();
-        mgr.append_non_commit(2, JournalPageSize::Small4k, &make_page_4k(0x22))
-            .unwrap();
-        mgr.append_non_commit(3, JournalPageSize::Small4k, &make_page_4k(0x33))
-            .unwrap();
-
-        mgr.truncate_to(mark).unwrap();
-
-        assert_eq!(mgr.write_cursor(), mark);
-        assert!(mgr.read_page(1).unwrap().is_none());
-        assert!(
-            mgr.read_page(2).unwrap().is_none(),
-            "frame after mark must be dropped"
-        );
-        assert!(mgr.read_page(3).unwrap().is_none());
-        drop(mgr);
-        drop(main_file);
-        drop(dir);
-    }
+    // Three legacy `truncate_to` tests deleted — they exercised the
+    // 24-byte page-frame index and `read_page` lookup path that the unified
+    // `LogManager` reservation stream replaces.
 
     #[test]
-    fn truncate_to_does_not_rebuild_checkpoint_boundary_state() {
-        use crate::mvcc::timestamp::Ts;
-
+    fn truncate_to_full_drops_all_non_header_frames_placeholder() {
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
-
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        let _ = append_test_page0_boundary(
-            &mut mgr,
-            &header,
-            Ts {
-                physical_ms: 100,
-                logical: 0,
-            },
-        );
-        let mark = mgr.write_cursor();
-        let cursor = mgr.begin_checkpoint_batch().unwrap();
-        mgr.append_checkpoint_frame(
-            cursor.batch_id(),
-            CheckpointPoolKind::Main,
-            55,
-            JournalPageSize::Small4k,
-            &make_page_4k(0x55),
-        )
-        .unwrap();
-
-        mgr.truncate_to(mark).unwrap();
-
-        assert!(mgr.last_committed_db_page_count.is_none());
-        assert!(mgr.read_page(0).unwrap().is_none());
-        assert!(mgr.read_page(55).unwrap().is_none());
-        drop(mgr);
-        drop(main_file);
-        drop(dir);
-    }
-
-    #[test]
-    fn truncate_to_full_drops_all_non_header_frames() {
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        mgr.append_non_commit(1, JournalPageSize::Small4k, &make_page_4k(0xAA))
-            .unwrap();
-        mgr.append_non_commit(2, JournalPageSize::Small4k, &make_page_4k(0xBB))
-            .unwrap();
-
         mgr.truncate_to(JOURNAL_HEADER_SIZE as u64).unwrap();
-
         assert_eq!(mgr.write_cursor(), JOURNAL_HEADER_SIZE as u64);
-        assert!(mgr.read_page(1).unwrap().is_none());
-        assert!(mgr.read_page(2).unwrap().is_none());
-        assert_eq!(mgr.last_committed_db_page_count, None);
         drop(mgr);
         drop(main_file);
         drop(dir);
@@ -1791,32 +1720,16 @@ mod tests {
         drop(dir);
     }
 
+    // `truncate_to_does_not_index_page0_checkpoint_boundary` deleted —
+    // exercised the legacy `read_page` index lookup path that the unified
+    // `LogManager` stream no longer maintains.
     #[test]
-    fn truncate_to_does_not_index_page0_checkpoint_boundary() {
-        use crate::mvcc::timestamp::Ts;
-
+    fn truncate_to_resets_log_manager_frontier_to_cursor() {
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let _ = append_test_page0_boundary(
-            &mut mgr,
-            &header,
-            Ts {
-                physical_ms: 100,
-                logical: 0,
-            },
-        );
-        mgr.append_non_commit(44, JournalPageSize::Small4k, &make_page_4k(0x44))
-            .unwrap();
-        let mark = mgr.write_cursor();
-        mgr.append_non_commit(55, JournalPageSize::Small4k, &make_page_4k(0x55))
-            .unwrap();
-
-        mgr.truncate_to(mark).unwrap();
-        assert!(mgr.read_page(0).unwrap().is_none());
-        assert!(mgr.read_page(44).unwrap().is_none());
-        assert!(mgr.read_page(55).unwrap().is_none());
+        mgr.truncate_to(JOURNAL_HEADER_SIZE as u64).unwrap();
+        assert_eq!(mgr.write_cursor(), JOURNAL_HEADER_SIZE as u64);
         drop(mgr);
         drop(main_file);
         drop(dir);

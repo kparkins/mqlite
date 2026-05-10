@@ -1048,17 +1048,12 @@ impl JournalManager {
     /// Returns [`Error::Internal`] if an ordinary legacy page-frame range is
     /// pending or another checkpoint batch is already open.
     pub(crate) fn begin_checkpoint_batch(&mut self) -> Result<CheckpointBatchCursor> {
-        if let Some(start) = self.legacy_pending_start_offset {
-            return Err(Error::Internal(format!(
-                "cannot begin checkpoint batch with legacy pending range at {start}"
-            )));
-        }
         if self.checkpoint_batch_active.is_some() {
             return Err(Error::Internal("checkpoint batch already active".into()));
         }
         let batch_id = CheckpointBatchId(self.next_checkpoint_batch_id);
         self.next_checkpoint_batch_id = self.next_checkpoint_batch_id.saturating_add(1);
-        let clean_start_offset = self.write_cursor;
+        let clean_start_offset = self.log_manager.next_lsn();
         self.checkpoint_batch_active = Some((batch_id, clean_start_offset));
         Ok(CheckpointBatchCursor {
             expected_pending_start: clean_start_offset,
@@ -1070,12 +1065,11 @@ impl JournalManager {
 
     /// Abort an open checkpoint batch before any frame append has happened.
     pub(crate) fn abort_empty_checkpoint_batch(&mut self, cursor: &CheckpointBatchCursor) {
-        if self.write_cursor != cursor.clean_start_offset {
+        if self.log_manager.next_lsn() != cursor.clean_start_offset {
             return;
         }
         if self.checkpoint_batch_active == Some((cursor.batch_id, cursor.clean_start_offset)) {
             self.checkpoint_batch_active = None;
-            self.checkpoint_frame_tags.clear();
         }
     }
 
@@ -1206,7 +1200,6 @@ impl JournalManager {
         let frame_offset = slot.start_lsn();
         self.log_manager.write_reserved(&slot, &bytes)?;
         let receipt = self.log_manager.mark_written(&slot)?;
-        self.write_cursor = receipt.ready_lsn();
         Ok((frame_offset, receipt.end_lsn()))
     }
 
@@ -1233,8 +1226,7 @@ impl JournalManager {
         let slot = self.log_manager.reserve(bytes.len())?;
         let frame_offset = slot.start_lsn();
         self.log_manager.write_reserved(&slot, &bytes)?;
-        let receipt = self.log_manager.mark_written(&slot)?;
-        self.write_cursor = receipt.ready_lsn();
+        let _receipt = self.log_manager.mark_written(&slot)?;
         crate::mvcc::metrics::record_logical_txn_append_bytes(bytes.len() as u64);
         // allow-legacy-journal-audit: this retired append helper is test-only.
         // Production CRUD uses one Phase 8 LogRecord; the percentile guard in
@@ -1604,8 +1596,17 @@ impl JournalManager {
     // -----------------------------------------------------------------------
 
     /// Return the current journal write cursor (byte offset past the last frame).
+    ///
+    /// Delegates to the unified [`LogManager`] reservation frontier so callers
+    /// observe the same value the next reservation will hand out.
     pub(crate) fn write_cursor(&self) -> u64 {
-        self.write_cursor
+        self.log_manager.next_lsn()
+    }
+
+    /// Convenience alias for [`Self::write_cursor`] used by callers that prefer
+    /// the LSN naming when reading the next reservation frontier.
+    pub(crate) fn next_lsn(&self) -> u64 {
+        self.log_manager.next_lsn()
     }
 
     /// Return the shared log manager for ready/durable LSN waits that must
@@ -1703,74 +1704,32 @@ impl JournalManager {
     // Rollback
     // -----------------------------------------------------------------------
 
-    /// Truncate the journal file back to `cursor` bytes and rebuild the
-    /// in-memory index so it reflects only the surviving frames.
+    /// Truncate the journal back to `cursor` bytes and reset every LSN
+    /// frontier in the unified [`LogManager`].
     ///
     /// `cursor` must be a byte offset previously obtained from
     /// [`write_cursor`](Self::write_cursor) at the start of a transaction.
-    /// All frames written since that mark are dropped; this is the rollback
-    /// primitive used by [`crate::storage::paged_engine::PagedEngine`] when a
-    /// mutator returns an error.
-    ///
-    /// A poisoned Phase 8 log manager is fatal to the live engine and cannot
-    /// be cleared by rollback. Reopen/recovery owns any truncation after that
-    /// point.
-    ///
-    /// The index is rebuilt by a linear scan over the surviving frame
-    /// range — O(surviving frames) — which is correct regardless of whether
-    /// the dropped frames were commit or non-commit frames.
+    /// All log records written since that mark are dropped; this is the
+    /// rollback primitive used by [`crate::storage::paged_engine::PagedEngine`]
+    /// when a mutator returns an error. The unified record stream is
+    /// self-describing via `total_len`, so recovery scans the surviving
+    /// records on the next open — no in-memory index to rebuild here.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn truncate_to(
-        // allow-legacy-journal-audit: test-only retired live-tail rollback probe
-        &mut self,
-        cursor: u64,
-    ) -> Result<()> {
-        if cursor < JOURNAL_HEADER_SIZE as u64 || cursor > self.write_cursor {
+    pub(crate) fn truncate_to(&mut self, cursor: u64) -> Result<()> {
+        let next_lsn = self.log_manager.next_lsn();
+        if cursor < JOURNAL_HEADER_SIZE as u64 || cursor > next_lsn {
             return Err(Error::Internal(format!(
                 "journal truncate_to: cursor {cursor} out of range \
-                 [{JOURNAL_HEADER_SIZE}, {}]",
-                self.write_cursor
+                 [{JOURNAL_HEADER_SIZE}, {next_lsn}]"
             )));
         }
         self.log_manager.check_poisoned()?;
 
         self.journal_file.set_len(cursor).map_err(Error::Io)?;
         self.journal_file.flush().map_err(Error::Io)?;
-        self.write_cursor = cursor;
         self.log_manager.reset_to(cursor);
-
-        self.index.clear_index();
-        self.journal_file
-            .seek(SeekFrom::Start(JOURNAL_HEADER_SIZE as u64))
-            .map_err(Error::Io)?;
-        let mut scan = JOURNAL_HEADER_SIZE as u64;
-        while scan < cursor {
-            self.journal_file
-                .seek(SeekFrom::Start(scan))
-                .map_err(Error::Io)?;
-
-            // ChainCommit and logical frames carry no single page number for
-            // the ordinary page index.
-            if let Some((n, _commit_ts, _offset)) =
-                read_chain_commit_at_cursor(&mut self.journal_file, self.salt1, self.salt2)?
-            {
-                scan += n;
-                continue;
-            }
-            if let Some((n, _frame)) =
-                try_skip_logical_txn(&mut self.journal_file, self.salt1, self.salt2)?
-            {
-                scan += n;
-                continue;
-            }
-
-            break;
-        }
         self.last_committed_db_page_count = None;
-        self.legacy_pending_start_offset = None;
-        self.last_legacy_commit_end_offset = self.write_cursor;
         self.checkpoint_batch_active = None;
-        self.checkpoint_frame_tags.clear();
         Ok(())
     }
 
