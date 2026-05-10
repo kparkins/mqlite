@@ -870,6 +870,53 @@ mod compat_tests {
     }
 
     #[test]
+    fn same_key_replace_keeps_secondary_index_entry() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("docs");
+        for id in 0..64i32 {
+            col.insert_one(&doc! { "_id": id, "x": id % 8, "payload": 0i32 })
+                .unwrap();
+        }
+        let model = IndexModel::builder().keys(doc! { "x": 1i32 }).build();
+        col.create_index(model).unwrap();
+
+        let replacement = doc! { "x": 7i32, "payload": 1i32 };
+        let returned: Option<Document> = col
+            .find_one_and_replace(doc! { "_id": 63i32 }, &replacement)
+            .return_document(ReturnDocument::After)
+            .run()
+            .unwrap();
+        assert_eq!(returned.unwrap().get_i32("_id").unwrap(), 63);
+
+        let indexed_docs: Vec<Document> = col
+            .find(doc! { "x": 7i32 })
+            .run()
+            .unwrap()
+            .collect::<crate::error::Result<_>>()
+            .unwrap();
+        let scan_docs: Vec<Document> = col
+            .find(doc! {})
+            .run()
+            .unwrap()
+            .collect::<crate::error::Result<_>>()
+            .unwrap();
+        let indexed_ids: std::collections::BTreeSet<i32> = indexed_docs
+            .iter()
+            .map(|doc| doc.get_i32("_id").unwrap())
+            .collect();
+        let scanned_ids: std::collections::BTreeSet<i32> = scan_docs
+            .iter()
+            .filter(|doc| doc.get_i32("x").unwrap() == 7)
+            .map(|doc| doc.get_i32("_id").unwrap())
+            .collect();
+
+        assert!(indexed_ids.contains(&63));
+        assert_eq!(indexed_ids, scanned_ids);
+    }
+
+    #[test]
     fn upsert_behavioral_contract() {
         let _tempdir = TempDir::new().expect("tempdir");
         let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");

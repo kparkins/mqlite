@@ -446,10 +446,10 @@ pub(crate) fn update_index_on_delete(
 
 /// Stage index-update entries when a document is replaced (MVCC T5').
 ///
-/// Stages the old document's keys for deletion, then the new document's
-/// keys for insertion. The commit-time install pass runs them in order so
-/// the net effect is an overwrite; when `old_key == new_key` the delete +
-/// insert pair reduces to the new value.
+/// Stages only the secondary keys which actually changed. Emitting a delete
+/// and insert for the same key in one transaction would leave the committed
+/// delta head dependent on same-transaction operation ordering instead of the
+/// logical index membership, so unchanged keys are left alone.
 #[allow(
     clippy::too_many_arguments,
     reason = "US-010 threads MVCC uniqueness visibility through the existing update API"
@@ -465,8 +465,52 @@ pub(crate) fn update_index_on_update<S: BTreePageStore>(
     history: Option<&dyn HistoryProbe>,
     txn: &mut WriteTxn,
 ) -> Result<bool> {
-    update_index_on_delete(old_doc, old_id, index_entry, txn)?;
-    update_index_on_insert(new_doc, new_id, index_tree, index_entry, view, history, txn)
+    let (old_keys, _) = build_index_keys(
+        old_doc,
+        &index_entry.key_pattern,
+        old_id,
+        index_entry.sparse,
+    )?;
+    let (new_keys, is_multikey) = build_index_keys(
+        new_doc,
+        &index_entry.key_pattern,
+        new_id,
+        index_entry.sparse,
+    )?;
+
+    let old_keys: HashSet<Vec<u8>> = old_keys.into_iter().collect();
+    let new_keys: HashSet<Vec<u8>> = new_keys.into_iter().collect();
+
+    for key in old_keys.difference(&new_keys) {
+        txn.stage_sec_index_delete(index_entry.id, index_entry.root_page, key.clone());
+    }
+
+    let id_bytes =
+        bson::to_vec(&bson::doc! { "_id": new_id.clone() }).map_err(Error::BsonSerialization)?;
+    let null_bson = Bson::Null;
+    let field_values = index_field_values(new_doc, &index_entry.key_pattern, &null_bson);
+    for key in new_keys.difference(&old_keys) {
+        if index_entry.unique && !is_multikey {
+            check_unique_constraint_mvcc(
+                index_tree,
+                &index_entry.key_pattern,
+                &field_values,
+                new_id,
+                view,
+                history,
+                txn.pending_sec_index.as_slice(),
+                index_entry.root_page,
+            )?;
+        }
+        txn.stage_sec_index_insert(
+            index_entry.id,
+            index_entry.root_page,
+            key.clone(),
+            id_bytes.clone(),
+        );
+    }
+
+    Ok(is_multikey)
 }
 
 /// Direct-insert variant used by one-shot index builders. Unlike

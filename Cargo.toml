@@ -78,6 +78,10 @@ serial_test = "3"
 name = "wire_server"
 required-features = ["wire"]
 
+[[bin]]
+name = "mqlite_jepsen_adapter"
+path = "tests/jepsen/adapter.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
