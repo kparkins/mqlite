@@ -210,91 +210,12 @@ mod tests {
         assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), before_len);
     }
 
-    #[test]
-    fn test_checkpoint_boundary_does_not_claim_crud_chaincommit_coverage() {
-        let frame = ChainCommitFrame {
-            salt1: TEST_SALT1,
-            salt2: TEST_SALT2,
-            commit_ts: Ts {
-                physical_ms: 777,
-                logical: 1,
-            },
-            refcount_deltas: vec![],
-            page_writes: vec![],
-        };
-        let bytes = frame.encode().unwrap();
-        assert!(ChainCommitFrame::decode(&bytes, TEST_SALT1, TEST_SALT2)
-            .unwrap()
-            .is_some());
-
-        let mut cursor = Cursor::new(bytes);
-        assert!(
-            Page0BoundaryRecord::read(&mut cursor, TEST_SALT1, TEST_SALT2)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            cursor.stream_position().unwrap(),
-            0,
-            "page-0 boundary probe must rewind when bytes are a CRUD chain commit"
-        );
-    }
-
-    #[test]
-    fn test_checkpoint_codecs_survive_legacy_grep_gate() {
-        let log_file_src = include_str!("../log_file.rs");
-        let journal_src = include_str!("../mod.rs");
-        let recovery_src = include_str!("../recovery.rs");
-        let metrics_src = include_str!("../../mvcc/metrics.rs");
-        let combined = [log_file_src, journal_src, recovery_src, metrics_src].join("\n");
-
-        assert!(combined.contains("struct CheckpointBatchPageRecord"));
-        assert!(combined.contains("struct Page0BoundaryRecord"));
-        assert!(combined.contains("impl CheckpointBatchPageRecord"));
-        assert!(combined.contains("impl Page0BoundaryRecord"));
-
-        for retired in [
-            concat!("FRAME_KIND_CHECKPOINT", "_COMMIT_BOUNDARY"),
-            concat!("Checkpoint", "CommitBoundaryFrame"),
-            concat!("Checkpoint", "Epoch"),
-            concat!("Boundary", "Scan"),
-            concat!("try_skip_checkpoint", "_commit_boundary"),
-        ] {
-            assert!(
-                !combined.contains(retired),
-                "retired dedicated-boundary symbol still present: {retired}"
-            );
-        }
-    }
-
-    #[test]
-    fn page0_boundary_record_roundtrips_staged_header() {
-        let mut header = FileHeader::new(1_700_000_000_000, TEST_SALT1, TEST_SALT2);
-        header.total_page_count = 42;
-        header.last_checkpoint_ts = Ts {
-            physical_ms: 1_700_000_004_000,
-            logical: 9,
-        };
-        let record = Page0BoundaryRecord::new(TEST_SALT1, TEST_SALT2, header.clone());
-
-        let mut bytes = Vec::new();
-        record.write(&mut bytes).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0);
-        assert_eq!(
-            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            header.total_page_count
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            PAGE_SIZE_INTERNAL
-        );
-
-        let mut cursor = Cursor::new(bytes);
-        let decoded = Page0BoundaryRecord::read(&mut cursor, TEST_SALT1, TEST_SALT2)
-            .unwrap()
-            .expect("page-0 boundary decodes");
-        assert_eq!(decoded.header(), &header);
-        assert_eq!(decoded.db_page_count(), header.total_page_count);
-        assert_eq!(decoded.checkpoint_ts(), header.last_checkpoint_ts);
-    }
+    // Three legacy header-format tests deleted —
+    // `test_checkpoint_boundary_does_not_claim_crud_chaincommit_coverage`,
+    // `test_checkpoint_codecs_survive_legacy_grep_gate`, and
+    // `page0_boundary_record_roundtrips_staged_header` — exercised the
+    // 24-byte `Page0BoundaryRecord` codec that the unified `LogManager`
+    // reservation stream replaced. The legacy boundary record is no longer
+    // written; coverage moved to the `CheckpointBoundaryPayload` round-trip
+    // tests in `log_file_codec.rs`.
 }

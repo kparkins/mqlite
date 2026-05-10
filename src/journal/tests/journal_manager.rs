@@ -626,55 +626,11 @@ mod tests {
     // Append and read back
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn append_and_read_4k() {
-        let (_dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let page_data = make_page_4k(0xAB);
-        mgr.append_non_commit(3, JournalPageSize::Small4k, &page_data)
-            .unwrap();
-
-        let result = mgr.read_page(3).unwrap();
-        assert_eq!(result, Some(page_data));
-        assert!(mgr.read_page(99).unwrap().is_none());
-    }
-
-    #[test]
-    fn append_and_read_32k() {
-        let (_dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let page_data = make_page_32k(0xCC);
-        mgr.append_non_commit(10, JournalPageSize::Large32k, &page_data)
-            .unwrap();
-
-        let result = mgr.read_page(10).unwrap();
-        assert_eq!(result, Some(page_data));
-    }
-
-    #[test]
-    fn latest_write_wins() {
-        let (_dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let page_v1 = make_page_4k(0x01);
-        let page_v2 = make_page_4k(0x02);
-        mgr.append_non_commit(5, JournalPageSize::Small4k, &page_v1)
-            .unwrap();
-        mgr.append_non_commit(5, JournalPageSize::Small4k, &page_v2)
-            .unwrap();
-
-        // Index lookup returns offset of latest (second) frame.
-        let result = mgr.read_page(5).unwrap().unwrap();
-        assert_eq!(result[0], 0x02);
-    }
+    // `append_and_read_4k`, `append_and_read_32k`, and `latest_write_wins`
+    // deleted — exercised the legacy 24-byte `append_non_commit`/`read_page`
+    // index-lookup path. Production CRUD now reserves through `LogManager`
+    // and replay happens via the unified record stream; per-page lookup by
+    // page number is no longer a journal-level concern.
 
     // -----------------------------------------------------------------------
     // append_logical_txn (§6.4)
@@ -1133,21 +1089,9 @@ mod tests {
     // Linear scan fallback
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn linear_scan_ignores_untagged_page_frames() {
-        let (_dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let page_data = make_page_4k(0x77);
-        mgr.append_non_commit(7, JournalPageSize::Small4k, &page_data)
-            .unwrap();
-
-        let result = mgr.read_page_linear(7).unwrap();
-        assert_eq!(result, None);
-        assert!(mgr.read_page_linear(999).unwrap().is_none());
-    }
+    // `linear_scan_ignores_untagged_page_frames` deleted — tested the
+    // legacy `read_page_linear` skip-on-untagged path that the unified
+    // record stream removes.
 
     // -----------------------------------------------------------------------
     // Rollback (truncate_to)
@@ -1693,32 +1637,10 @@ mod tests {
         drop(dir);
     }
 
-    #[test]
-    fn read_page_linear_ignores_page0_checkpoint_boundary() {
-        use crate::mvcc::timestamp::Ts;
-
-        let (dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let _ = append_test_page0_boundary(
-            &mut mgr,
-            &header,
-            Ts {
-                physical_ms: 100,
-                logical: 0,
-            },
-        );
-
-        mgr.index.clear_index();
-        assert!(
-            mgr.read_page_linear(0).unwrap().is_none(),
-            "generic linear lookup must not expose checkpoint page-0 boundaries"
-        );
-        drop(mgr);
-        drop(main_file);
-        drop(dir);
-    }
+    // `read_page_linear_ignores_page0_checkpoint_boundary` deleted — tested
+    // the legacy `index.clear_index()` + `read_page_linear` lookup path that
+    // the unified record stream removes (no per-page index lives on the
+    // journal-side after PR1).
 
     // `truncate_to_does_not_index_page0_checkpoint_boundary` deleted —
     // exercised the legacy `read_page` index lookup path that the unified
