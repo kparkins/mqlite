@@ -419,8 +419,16 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
         keys
     };
 
+    let unique_directions = unique_index_directions(index_entry);
     for key in staged_keys {
-        txn.stage_sec_index_insert(index_entry.id, index_entry.root_page, key, id_bytes.clone());
+        txn.stage_sec_index_insert(
+            index_entry.id,
+            index_entry.root_page,
+            index_entry.root_level,
+            unique_directions.clone(),
+            key,
+            id_bytes.clone(),
+        );
     }
 
     Ok(is_multikey)
@@ -439,7 +447,12 @@ pub(crate) fn update_index_on_delete(
     let (keys, _) = build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
 
     for key in keys {
-        txn.stage_sec_index_delete(index_entry.id, index_entry.root_page, key);
+        txn.stage_sec_index_delete(
+            index_entry.id,
+            index_entry.root_page,
+            index_entry.root_level,
+            key,
+        );
     }
     Ok(())
 }
@@ -482,7 +495,12 @@ pub(crate) fn update_index_on_update<S: BTreePageStore>(
     let new_keys: HashSet<Vec<u8>> = new_keys.into_iter().collect();
 
     for key in old_keys.difference(&new_keys) {
-        txn.stage_sec_index_delete(index_entry.id, index_entry.root_page, key.clone());
+        txn.stage_sec_index_delete(
+            index_entry.id,
+            index_entry.root_page,
+            index_entry.root_level,
+            key.clone(),
+        );
     }
 
     let id_bytes =
@@ -505,12 +523,24 @@ pub(crate) fn update_index_on_update<S: BTreePageStore>(
         txn.stage_sec_index_insert(
             index_entry.id,
             index_entry.root_page,
+            index_entry.root_level,
+            unique_index_directions(index_entry),
             key.clone(),
             id_bytes.clone(),
         );
     }
 
     Ok(is_multikey)
+}
+
+fn unique_index_directions(index_entry: &IndexEntry) -> Option<Vec<bool>> {
+    index_entry.unique.then(|| {
+        index_entry
+            .key_pattern
+            .iter()
+            .map(|(_, dir)| !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1)))
+            .collect()
+    })
 }
 
 /// Direct-insert variant used by one-shot index builders. Unlike

@@ -32,6 +32,7 @@
 //! - `mvcc.checkpoint.frontier_blocked_total` — counter
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 // ===========================================================================
 // 8 — mvcc.secondary_index.tombstone_hits_skipped_total  (counter)
@@ -599,6 +600,74 @@ pub fn reset_lane_wait_ns() {
 }
 
 // ---------------------------------------------------------------------------
+// P3b — CRUD commit-envelope stage timings
+// ---------------------------------------------------------------------------
+
+/// Stage names for cumulative CRUD commit-envelope timing probes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum CommitEnvelopeStage {
+    /// Time spent reserving the Phase 8 log-record byte range.
+    LogReserve = 0,
+    /// Time spent writing the reserved record and advancing the ready prefix.
+    LogWriteReady = 1,
+    /// Time spent waiting for the ready prefix in interval/none durability.
+    JournalReadyWait = 2,
+    /// Time spent waiting for durable fsync completion in FullSync.
+    JournalDurableWait = 3,
+    /// Time spent flipping Pending entries to Committed.
+    PendingFlip = 4,
+    /// Time spent in ordered `PublishSequencer::mark_ready`.
+    PublishReady = 5,
+    /// Time spent syncing the interval-mode ready prefix after publish.
+    IntervalSync = 6,
+}
+
+const COMMIT_ENVELOPE_STAGE_COUNT: usize = 7;
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_COMMIT_STAGE_ATOMIC_U64: AtomicU64 = AtomicU64::new(0);
+static COMMIT_ENVELOPE_STAGE_NS_TOTAL: [AtomicU64; COMMIT_ENVELOPE_STAGE_COUNT] =
+    [ZERO_COMMIT_STAGE_ATOMIC_U64; COMMIT_ENVELOPE_STAGE_COUNT];
+static COMMIT_ENVELOPE_STAGE_SAMPLES_TOTAL: [AtomicU64; COMMIT_ENVELOPE_STAGE_COUNT] =
+    [ZERO_COMMIT_STAGE_ATOMIC_U64; COMMIT_ENVELOPE_STAGE_COUNT];
+
+fn duration_ns_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Record one CRUD commit-envelope stage duration.
+pub fn record_commit_envelope_stage_duration(stage: CommitEnvelopeStage, duration: Duration) {
+    record_commit_envelope_stage_ns(stage, duration_ns_saturating(duration));
+}
+
+/// Record one CRUD commit-envelope stage duration in nanoseconds.
+pub fn record_commit_envelope_stage_ns(stage: CommitEnvelopeStage, ns: u64) {
+    let index = stage as usize;
+    COMMIT_ENVELOPE_STAGE_NS_TOTAL[index].fetch_add(ns, Ordering::Relaxed);
+    COMMIT_ENVELOPE_STAGE_SAMPLES_TOTAL[index].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Snapshot cumulative nanoseconds recorded for one commit-envelope stage.
+pub fn commit_envelope_stage_ns_snapshot(stage: CommitEnvelopeStage) -> u64 {
+    COMMIT_ENVELOPE_STAGE_NS_TOTAL[stage as usize].load(Ordering::Relaxed)
+}
+
+/// Snapshot sample count recorded for one commit-envelope stage.
+pub fn commit_envelope_stage_samples_snapshot(stage: CommitEnvelopeStage) -> u64 {
+    COMMIT_ENVELOPE_STAGE_SAMPLES_TOTAL[stage as usize].load(Ordering::Relaxed)
+}
+
+/// Reset all CRUD commit-envelope stage timing probes.
+pub fn reset_commit_envelope_stage_metrics() {
+    for slot in &COMMIT_ENVELOPE_STAGE_NS_TOTAL {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in &COMMIT_ENVELOPE_STAGE_SAMPLES_TOTAL {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // P4a — recovery_legacy_page_frames_total  (counter)
 // ---------------------------------------------------------------------------
 
@@ -1043,14 +1112,15 @@ pub fn reset_logical_txn_append_bytes() {
 //      commit-envelope critical section and performs only one atomic
 //      `fetch_add` on the ring index plus one atomic `store` on the
 //      slot. O(1).
-//   2. `recompute_logical_txn_append_percentiles()` sorts the 64-slot
-//      ring and stores p50/p95/p99 into the gauge atomics. Called
-//      after the hot append-envelope work by an RAII guard (US-024 AC#3 /
-//      §7 guardrail).
+//   2. The hot writer path calls
+//      `record_logical_txn_append_duration_ms_and_maybe_recompute()`, which
+//      refreshes p50/p95/p99 only when the 64-slot ring wraps. Tests and
+//      maintenance callers can still force an immediate refresh through
+//      `recompute_logical_txn_append_percentiles()`.
 //
 // Lock-free in both phases; uses three independent atomics for the
 // gauges so the recompute window can race without locking. Approximate
-// — the percentile values lag the true distribution by up to ~SAMPLE_RING
+// — the percentile values lag the true distribution by up to one ring of
 // observations, which is acceptable for §7 observability.
 
 /// Latest p50 of `append_logical_txn` durations in ms.
@@ -1072,15 +1142,27 @@ static APPEND_SAMPLE_RING_INDEX: AtomicU64 = AtomicU64::new(0);
 /// Safe to call inside the commit-envelope hot path (§7 guardrail: keep
 /// post-append bookkeeping minimal).
 ///
-/// The percentile gauges are NOT updated by this function. The caller
-/// MUST call [`recompute_logical_txn_append_percentiles`] after the hot
-/// append-envelope work to refresh the p50/p95/p99 gauges. This split keeps
-/// append bookkeeping O(1) and the heavier sort/store work outside the
-/// append path, per the §7 / US-024 AC#3 constraint.
 pub fn record_logical_txn_append_duration_ms(ms: u64) {
+    let _ = record_logical_txn_append_duration_ms_sample(ms);
+}
+
+fn record_logical_txn_append_duration_ms_sample(ms: u64) -> u64 {
     let idx =
         APPEND_SAMPLE_RING_INDEX.fetch_add(1, Ordering::Relaxed) as usize % APPEND_SAMPLE_RING;
     APPEND_SAMPLE_RING_BUF[idx].store(ms, Ordering::Relaxed);
+    idx as u64
+}
+
+/// Push one duration sample and refresh percentile gauges when the ring wraps.
+///
+/// This keeps the single-commit hot path O(1) for 63 out of every 64 samples,
+/// while still advancing the exported p50/p95/p99 gauges regularly under
+/// sustained write load.
+pub fn record_logical_txn_append_duration_ms_and_maybe_recompute(ms: u64) {
+    let idx = record_logical_txn_append_duration_ms_sample(ms);
+    if idx + 1 == APPEND_SAMPLE_RING as u64 {
+        recompute_logical_txn_append_percentiles();
+    }
 }
 
 /// Recompute the p50/p95/p99 gauges from the ring buffer. Sorts a

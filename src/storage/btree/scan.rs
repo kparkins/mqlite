@@ -239,7 +239,25 @@ impl<S: BTreePageStore> BTree<S> {
         history: Option<&dyn HistoryProbe>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        self.try_for_each_range_scan_mvcc_bounded(start, end, view, history, |key, value| {
+            results.push((key, value));
+            Ok(true)
+        })?;
+        Ok(results)
+    }
 
+    /// MVCC-aware range scan with a caller-controlled stop condition.
+    pub(crate) fn try_for_each_range_scan_mvcc_bounded<F>(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        view: &ReadView,
+        history: Option<&dyn HistoryProbe>,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> Result<bool>,
+    {
         let (_, mut leaf_read) = match start {
             Bound::Included(k) | Bound::Excluded(k) => self.read_leaf_for_key(k)?,
             Bound::Unbounded => self.read_leftmost_leaf_latch_coupled()?,
@@ -285,7 +303,7 @@ impl<S: BTreePageStore> BTree<S> {
                 };
 
                 if end_excludes_key(end, source_key) {
-                    return Ok(results);
+                    return Ok(());
                 }
 
                 match source {
@@ -306,13 +324,17 @@ impl<S: BTreePageStore> BTree<S> {
                                 if let Some(entry) = maybe_entry {
                                     if !entry.is_tombstone {
                                         let bytes = resolve_entry(&entry)?;
-                                        results.push((cell.key.clone(), bytes));
+                                        if !visit(cell.key.clone(), bytes)? {
+                                            return Ok(());
+                                        }
                                     }
                                     continue;
                                 }
                             }
                         }
-                        results.push((cell.key.clone(), resolve_cell(&cell.value)?));
+                        if !visit(cell.key.clone(), resolve_cell(&cell.value)?)? {
+                            return Ok(());
+                        }
                     }
                     MergeSource::Chain => {
                         let next = chain_iter.as_mut().and_then(|iter| iter.next());
@@ -320,7 +342,9 @@ impl<S: BTreePageStore> BTree<S> {
                             break;
                         };
                         if !entry.is_tombstone {
-                            results.push((key.to_vec(), resolve_entry(entry)?));
+                            if !visit(key.to_vec(), resolve_entry(entry)?)? {
+                                return Ok(());
+                            }
                         }
                     }
                     MergeSource::Both => {
@@ -332,7 +356,9 @@ impl<S: BTreePageStore> BTree<S> {
                             break;
                         };
                         if !entry.is_tombstone {
-                            results.push((cell.key.clone(), resolve_entry(entry)?));
+                            if !visit(cell.key.clone(), resolve_entry(entry)?)? {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -345,7 +371,7 @@ impl<S: BTreePageStore> BTree<S> {
             leaf_read = self.store.read_leaf(cur_page)?;
         }
 
-        Ok(results)
+        Ok(())
     }
 
     /// Return visible resident delta entries without base-only cells.

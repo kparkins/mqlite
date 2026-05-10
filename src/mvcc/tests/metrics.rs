@@ -229,6 +229,38 @@ fn lane_wait_ns_counter_unit() {
 }
 
 #[test]
+fn commit_envelope_stage_timing_unit() {
+    reset_commit_envelope_stage_metrics();
+    assert_eq!(
+        commit_envelope_stage_ns_snapshot(CommitEnvelopeStage::LogReserve),
+        0
+    );
+    assert_eq!(
+        commit_envelope_stage_samples_snapshot(CommitEnvelopeStage::LogReserve),
+        0
+    );
+    record_commit_envelope_stage_ns(CommitEnvelopeStage::LogReserve, 500);
+    record_commit_envelope_stage_ns(CommitEnvelopeStage::LogReserve, 250);
+    assert_eq!(
+        commit_envelope_stage_ns_snapshot(CommitEnvelopeStage::LogReserve),
+        750
+    );
+    assert_eq!(
+        commit_envelope_stage_samples_snapshot(CommitEnvelopeStage::LogReserve),
+        2
+    );
+    reset_commit_envelope_stage_metrics();
+    assert_eq!(
+        commit_envelope_stage_ns_snapshot(CommitEnvelopeStage::LogReserve),
+        0
+    );
+    assert_eq!(
+        commit_envelope_stage_samples_snapshot(CommitEnvelopeStage::LogReserve),
+        0
+    );
+}
+
+#[test]
 fn recovery_legacy_page_frames_counter_unit() {
     reset_recovery_legacy_page_frames();
     record_recovery_legacy_page_frame();

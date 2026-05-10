@@ -204,12 +204,13 @@ fn finalized_txn_drop_does_not_decref_pending() {
 #[test]
 fn stage_sec_index_insert_accumulates() {
     let mut t = WriteTxn::new(1);
-    t.stage_sec_index_insert(100, 42, b"k1".to_vec(), b"id1".to_vec());
-    t.stage_sec_index_insert(100, 42, b"k2".to_vec(), b"id2".to_vec());
+    t.stage_sec_index_insert(100, 42, 0, None, b"k1".to_vec(), b"id1".to_vec());
+    t.stage_sec_index_insert(100, 42, 0, None, b"k2".to_vec(), b"id2".to_vec());
 
     assert_eq!(t.pending_sec_index.len(), 2);
     assert_eq!(t.pending_sec_index[0].index_id, 100);
     assert_eq!(t.pending_sec_index[0].index_root_page, 42);
+    assert_eq!(t.pending_sec_index[0].index_root_level, 0);
     assert_eq!(t.pending_sec_index[0].key, b"k1");
     match &t.pending_sec_index[0].op {
         SecIndexOp::Insert { id_bytes } => assert_eq!(id_bytes, b"id1"),
@@ -220,19 +221,20 @@ fn stage_sec_index_insert_accumulates() {
 #[test]
 fn stage_sec_index_delete_records_key() {
     let mut t = WriteTxn::new(1);
-    t.stage_sec_index_delete(200, 7, b"ghost".to_vec());
+    t.stage_sec_index_delete(200, 7, 0, b"ghost".to_vec());
 
     assert_eq!(t.pending_sec_index.len(), 1);
     assert_eq!(t.pending_sec_index[0].index_id, 200);
     assert_eq!(t.pending_sec_index[0].index_root_page, 7);
+    assert_eq!(t.pending_sec_index[0].index_root_level, 0);
     assert!(matches!(t.pending_sec_index[0].op, SecIndexOp::Delete));
 }
 
 #[test]
 fn staged_sec_index_delete_then_insert_preserves_order() {
     let mut t = WriteTxn::new(1);
-    t.stage_sec_index_delete(300, 11, b"old".to_vec());
-    t.stage_sec_index_insert(300, 11, b"new".to_vec(), b"id".to_vec());
+    t.stage_sec_index_delete(300, 11, 0, b"old".to_vec());
+    t.stage_sec_index_insert(300, 11, 0, None, b"new".to_vec(), b"id".to_vec());
 
     assert_eq!(t.pending_sec_index.len(), 2);
     assert_eq!(t.pending_sec_index[0].index_id, 300);
@@ -254,8 +256,8 @@ fn commit_drains_pending_sec_index_to_caller() {
     let oracle = TimestampOracle::new();
 
     let mut t = WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
-    t.stage_sec_index_insert(42, 3, b"k".to_vec(), b"id".to_vec());
-    t.stage_sec_index_delete(42, 3, b"d".to_vec());
+    t.stage_sec_index_insert(42, 3, 0, None, b"k".to_vec(), b"id".to_vec());
+    t.stage_sec_index_delete(42, 3, 0, b"d".to_vec());
 
     let (_ts, _pending, sec) = t.commit(&oracle, &handle).expect("commit");
     assert_eq!(sec.len(), 2);
@@ -275,7 +277,7 @@ fn drop_discards_pending_sec_index() {
     let alloc = handle.allocator().clone();
 
     let mut t = WriteTxn::begin(1, &alloc, handle.page_source()).expect("begin with empty queue");
-    t.stage_sec_index_insert(50, 9, b"k".to_vec(), b"id".to_vec());
+    t.stage_sec_index_insert(50, 9, 0, None, b"k".to_vec(), b"id".to_vec());
     assert_eq!(t.pending_sec_index.len(), 1);
 
     drop(t);
@@ -292,6 +294,8 @@ fn stage_primary_insert_accumulates() {
     t.stage_primary_insert(
         777,
         "ns.a".to_string(),
+        9,
+        0,
         b"k1".to_vec(),
         b"v1".to_vec(),
         None,
@@ -299,15 +303,19 @@ fn stage_primary_insert_accumulates() {
     t.stage_primary_update(
         777,
         "ns.a".to_string(),
+        9,
+        0,
         b"k2".to_vec(),
         b"v2".to_vec(),
         None,
     );
-    t.stage_primary_delete(777, "ns.a".to_string(), b"k3".to_vec(), None);
+    t.stage_primary_delete(777, "ns.a".to_string(), 9, 0, b"k3".to_vec(), None);
 
     assert_eq!(t.pending_primary.len(), 3);
     assert_eq!(t.pending_primary[0].ns_id, 777);
     assert_eq!(t.pending_primary[0].ns, "ns.a");
+    assert_eq!(t.pending_primary[0].root_page, 9);
+    assert_eq!(t.pending_primary[0].root_level, 0);
     assert_eq!(t.pending_primary[0].key, b"k1");
     match &t.pending_primary[0].op {
         PrimaryOp::Insert { data } => assert_eq!(data, b"v1"),
@@ -337,11 +345,27 @@ fn stage_primary_insert_accumulates() {
 fn emit_logical_txn_frame_assigns_ordinals_from_zero_in_staging_order() {
     let mut t = WriteTxn::new(1);
     // 2 sec writes + 3 primary writes — staged in the order below.
-    t.stage_sec_index_insert(10, 100, b"s0".to_vec(), b"id0".to_vec());
-    t.stage_sec_index_delete(11, 101, b"s1".to_vec());
-    t.stage_primary_insert(20, "ns".to_string(), b"p0".to_vec(), b"v0".to_vec(), None);
-    t.stage_primary_update(20, "ns".to_string(), b"p1".to_vec(), b"v1".to_vec(), None);
-    t.stage_primary_delete(20, "ns".to_string(), b"p2".to_vec(), None);
+    t.stage_sec_index_insert(10, 100, 0, None, b"s0".to_vec(), b"id0".to_vec());
+    t.stage_sec_index_delete(11, 101, 0, b"s1".to_vec());
+    t.stage_primary_insert(
+        20,
+        "ns".to_string(),
+        200,
+        0,
+        b"p0".to_vec(),
+        b"v0".to_vec(),
+        None,
+    );
+    t.stage_primary_update(
+        20,
+        "ns".to_string(),
+        200,
+        0,
+        b"p1".to_vec(),
+        b"v1".to_vec(),
+        None,
+    );
+    t.stage_primary_delete(20, "ns".to_string(), 200, 0, b"p2".to_vec(), None);
 
     let sec_snap: Vec<SecIndexWrite> = t.pending_sec_index.iter().cloned().collect();
     let pri_snap: Vec<PrimaryWrite> = t.pending_primary.iter().cloned().collect();
@@ -446,6 +470,8 @@ fn rename_safe_staged_ids_survive_rename() {
     t.stage_primary_insert(
         orig_entry.id,
         orig_entry.name.clone(),
+        orig_entry.data_root_page,
+        orig_entry.data_root_level,
         b"k".to_vec(),
         b"v".to_vec(),
         None,
@@ -453,6 +479,8 @@ fn rename_safe_staged_ids_survive_rename() {
     t.stage_sec_index_insert(
         orig_index.id,
         orig_index.root_page,
+        orig_index.root_level,
+        None,
         b"compound".to_vec(),
         b"id".to_vec(),
     );
@@ -608,6 +636,8 @@ fn production_emitter_carries_stage_time_ids_under_mutation() {
     t.stage_primary_insert(
         live_collection.id,
         live_collection.name.clone(),
+        live_collection.data_root_page,
+        live_collection.data_root_level,
         b"k".to_vec(),
         b"v".to_vec(),
         None,
@@ -615,6 +645,8 @@ fn production_emitter_carries_stage_time_ids_under_mutation() {
     t.stage_sec_index_insert(
         live_index.id,
         live_index.root_page,
+        live_index.root_level,
+        None,
         b"key".to_vec(),
         b"id".to_vec(),
     );

@@ -989,6 +989,18 @@ impl JournalManager {
         CheckpointBatchId(self.next_checkpoint_batch_id)
     }
 
+    /// Consume the next checkpoint batch id, advancing the in-memory counter.
+    ///
+    /// The returned id is the value that will be persisted into the next
+    /// `CheckpointBoundary` record. Recovery seeds this counter from the
+    /// maximum boundary `batch_id` observed during scan, so post-restart
+    /// batches do not collide with persisted ids.
+    pub(crate) fn consume_checkpoint_batch_id(&mut self) -> u64 {
+        let id = self.next_checkpoint_batch_id;
+        self.next_checkpoint_batch_id = self.next_checkpoint_batch_id.saturating_add(1);
+        id
+    }
+
     fn try_checkpoint_recovery_frame(
         journal_file: &mut File,
         salt1: u32,

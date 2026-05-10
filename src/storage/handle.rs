@@ -490,6 +490,19 @@ impl BufferPoolHandle {
         Ok(guard.next_checkpoint_batch_id())
     }
 
+    /// Consume the next checkpoint batch id, advancing the journal counter.
+    ///
+    /// Returns `0` when no journal is attached (test handles).
+    pub(crate) fn consume_checkpoint_batch_id(&self) -> Result<u64> {
+        let Some(journal) = &self.journal else {
+            return Ok(0);
+        };
+        let mut guard = journal
+            .lock()
+            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
+        Ok(guard.consume_checkpoint_batch_id())
+    }
+
     /// Flush only checkpoint-owned dirty frames to the journal and sync it.
     ///
     /// The allocator header is intentionally not flushed here; Phase 7 stages

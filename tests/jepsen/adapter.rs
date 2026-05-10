@@ -703,6 +703,7 @@ impl AdapterState {
         let cursor = self
             .long_scan
             .find(doc! {})
+            .limit(0)
             .sort(doc! { "_id": 1_i32 })
             .run()?;
         let mut epochs = Vec::new();
@@ -1321,7 +1322,7 @@ fn upsert_document(
 }
 
 fn read_ids(collection: &Collection<Document>) -> BoxResult<Vec<i64>> {
-    let cursor = collection.find(doc! {}).run()?;
+    let cursor = collection.find(doc! {}).limit(0).run()?;
     let mut values = Vec::new();
 
     for doc in cursor {
@@ -1336,7 +1337,7 @@ fn read_ids(collection: &Collection<Document>) -> BoxResult<Vec<i64>> {
 }
 
 fn read_ids_by_filter(collection: &Collection<Document>, filter: Document) -> BoxResult<Vec<i64>> {
-    let cursor = collection.find(filter).run()?;
+    let cursor = collection.find(filter).limit(0).run()?;
     read_ids_from_cursor(cursor)
 }
 
@@ -1347,7 +1348,7 @@ fn read_ids_by_key(
 ) -> BoxResult<Vec<i64>> {
     let mut filter = Document::new();
     filter.insert(field, value);
-    let cursor = collection.find(filter).run()?;
+    let cursor = collection.find(filter).limit(0).run()?;
     read_ids_from_cursor(cursor)
 }
 
@@ -1374,7 +1375,7 @@ fn read_pairs_by_filter(
     filter: Document,
     field: &str,
 ) -> BoxResult<Vec<(i64, i64)>> {
-    let cursor = collection.find(filter).run()?;
+    let cursor = collection.find(filter).limit(0).run()?;
     read_pairs_from_cursor(cursor, field)
 }
 
@@ -1399,7 +1400,7 @@ fn read_triples(
     first_field: &str,
     second_field: &str,
 ) -> BoxResult<Vec<(i64, i64, i64)>> {
-    let cursor = collection.find(doc! {}).run()?;
+    let cursor = collection.find(doc! {}).limit(0).run()?;
     let mut triples = Vec::new();
 
     for doc in cursor {
@@ -1418,7 +1419,7 @@ fn read_triples(
 }
 
 fn read_array_pairs(collection: &Collection<Document>, field: &str) -> BoxResult<Vec<(i64, i64)>> {
-    let cursor = collection.find(doc! {}).run()?;
+    let cursor = collection.find(doc! {}).limit(0).run()?;
     let mut pairs = Vec::new();
 
     for doc in cursor {

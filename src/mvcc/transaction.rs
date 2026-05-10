@@ -125,6 +125,12 @@ pub(crate) struct SecIndexWrite {
     /// Root page of the target secondary-index B+ tree. The install pass
     /// uses this to locate the tree at commit time.
     pub(crate) index_root_page: u32,
+    /// Root level of the target secondary-index B+ tree captured with the
+    /// root page under the writer's metadata read guard.
+    pub(crate) index_root_level: u8,
+    /// Compound-key sort directions for unique indexes. Non-unique index
+    /// writes do not need prefix conflict ranges at install time.
+    pub(crate) unique_directions: Option<Vec<bool>>,
     /// Compound key bytes (from `encode_compound_key` in `keys`).
     pub(crate) key: Vec<u8>,
     /// Stage-time head observed by the writer, if any.
@@ -161,10 +167,13 @@ pub(crate) struct PrimaryWrite {
     /// Carried into the Phase 2 logical frame without re-resolving at
     /// emit time.
     pub(crate) ns_id: i64,
-    /// Target data-tree namespace. The commit install pass looks up the
-    /// current tree by name so any in-txn root splits between stage and
-    /// install time are transparently followed.
+    /// Target data-tree namespace retained for diagnostics and logical frames.
     pub(crate) ns: Ns,
+    /// Root page of the target primary B+ tree captured under the writer's
+    /// metadata read guard.
+    pub(crate) root_page: u32,
+    /// Root level of the target primary B+ tree captured with `root_page`.
+    pub(crate) root_level: u8,
     /// B+ tree cell key (e.g. `encode_key(_id)`).
     pub(crate) key: Vec<u8>,
     /// Stage-time head observed by the writer, if any.
@@ -307,12 +316,16 @@ impl WriteTxn {
         &mut self,
         index_id: i64,
         index_root_page: u32,
+        index_root_level: u8,
+        unique_directions: Option<Vec<bool>>,
         key: Vec<u8>,
         id_bytes: Vec<u8>,
     ) {
         self.pending_sec_index.push(SecIndexWrite {
             index_id,
             index_root_page,
+            index_root_level,
+            unique_directions,
             key,
             expected_head: None,
             op: SecIndexOp::Insert { id_bytes },
@@ -327,11 +340,14 @@ impl WriteTxn {
         &mut self,
         index_id: i64,
         index_root_page: u32,
+        index_root_level: u8,
         key: Vec<u8>,
     ) {
         self.pending_sec_index.push(SecIndexWrite {
             index_id,
             index_root_page,
+            index_root_level,
+            unique_directions: None,
             key,
             expected_head: None,
             op: SecIndexOp::Delete,
@@ -343,6 +359,8 @@ impl WriteTxn {
         &mut self,
         ns_id: i64,
         ns: impl Into<Ns>,
+        root_page: u32,
+        root_level: u8,
         key: Vec<u8>,
         data: Vec<u8>,
         expected_head: Option<ExpectedHead>,
@@ -350,6 +368,8 @@ impl WriteTxn {
         self.pending_primary.push(PrimaryWrite {
             ns_id,
             ns: ns.into(),
+            root_page,
+            root_level,
             key,
             expected_head,
             op: PrimaryOp::Insert { data },
@@ -361,6 +381,8 @@ impl WriteTxn {
         &mut self,
         ns_id: i64,
         ns: impl Into<Ns>,
+        root_page: u32,
+        root_level: u8,
         key: Vec<u8>,
         data: Vec<u8>,
         expected_head: Option<ExpectedHead>,
@@ -368,6 +390,8 @@ impl WriteTxn {
         self.pending_primary.push(PrimaryWrite {
             ns_id,
             ns: ns.into(),
+            root_page,
+            root_level,
             key,
             expected_head,
             op: PrimaryOp::Update { data },
@@ -379,12 +403,16 @@ impl WriteTxn {
         &mut self,
         ns_id: i64,
         ns: impl Into<Ns>,
+        root_page: u32,
+        root_level: u8,
         key: Vec<u8>,
         expected_head: Option<ExpectedHead>,
     ) {
         self.pending_primary.push(PrimaryWrite {
             ns_id,
             ns: ns.into(),
+            root_page,
+            root_level,
             key,
             expected_head,
             op: PrimaryOp::Delete,

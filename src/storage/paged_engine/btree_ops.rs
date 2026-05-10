@@ -1,5 +1,7 @@
 //! B+ tree doc-storage helpers (generic over S: BTreePageStore).
 
+use std::ops::Bound;
+
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
@@ -67,14 +69,25 @@ pub(super) fn btree_collscan<S: BTreePageStore>(
     filter: &Document,
     view: &ReadView,
     history: Option<&dyn HistoryProbe>,
+    match_limit: Option<usize>,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
-    let pairs = tree.range_scan_mvcc(None, None, view, history)?;
-    let mut result = Vec::with_capacity(pairs.len());
-    for (key, bson_bytes) in pairs {
-        let doc: Document = bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
-        if eval_filter(&doc, filter)? {
-            result.push((key, doc));
-        }
-    }
+    let mut result = Vec::new();
+    tree.try_for_each_range_scan_mvcc_bounded(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        view,
+        history,
+        |key, bson_bytes| {
+            let doc: Document =
+                bson::from_slice(&bson_bytes).map_err(Error::BsonDeserialization)?;
+            if eval_filter(&doc, filter)? {
+                result.push((key, doc));
+                if match_limit.is_some_and(|limit| result.len() >= limit) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        },
+    )?;
     Ok(result)
 }

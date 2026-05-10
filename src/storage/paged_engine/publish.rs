@@ -82,7 +82,6 @@ pub(crate) fn build_published_catalog(
         for idx in indexes {
             index_owner_by_id.insert(idx.id, coll.id);
             idxs.push(PublishedIndex {
-                #[cfg(test)]
                 id: idx.id,
                 name: idx.name.clone(),
                 root_page: idx.root_page,

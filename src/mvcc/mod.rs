@@ -17,6 +17,8 @@ pub use metrics::{
     catalog_header_sync_count_snapshot,
     chain_migration_entries_moved_snapshot,
     checkpoint_frontier_blocked_snapshot,
+    commit_envelope_stage_ns_snapshot,
+    commit_envelope_stage_samples_snapshot,
     crud_commits_root_changing_snapshot,
     crud_commits_root_neutral_snapshot,
     deferred_free_queue_depth_snapshot,
@@ -57,6 +59,8 @@ pub use metrics::{
     record_catalog_header_sync,
     record_chain_migration_entries_moved,
     record_checkpoint_frontier_blocked,
+    record_commit_envelope_stage_duration,
+    record_commit_envelope_stage_ns,
     record_crud_commit_root_changing,
     record_crud_commit_root_neutral,
     record_delta_bearing_frame,
@@ -93,6 +97,7 @@ pub use metrics::{
     reset_catalog_header_sync_count,
     reset_chain_migration_entries_moved,
     reset_checkpoint_frontier_blocked,
+    reset_commit_envelope_stage_metrics,
     reset_crud_commits_root_changing,
     reset_crud_commits_root_neutral,
     reset_deferred_free_queue_depth,
@@ -143,6 +148,7 @@ pub use metrics::{
     set_reconcile_duration_ms_p99,
     set_version_chain_depth_p99,
     version_chain_depth_p99_snapshot,
+    CommitEnvelopeStage,
 };
 pub use read_view::{ChainSnapshot, ReadView, ReadViewRegistry, TestFrontierHandle};
 pub use timestamp::{HlcState, TimestampOracle, Ts};

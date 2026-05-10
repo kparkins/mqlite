@@ -238,15 +238,18 @@ pub(crate) const LOG_RECORD_PAYLOAD_CRC32C_OFFSET: usize = 68;
 const LOG_RECORD_KIND_CRUD_COMMIT: u16 = 1;
 const LOG_RECORD_KIND_CATALOG_COMMIT: u16 = 2;
 const LOG_RECORD_KIND_CHECKPOINT_BOUNDARY: u16 = 3;
+const LOG_RECORD_KIND_CHECKPOINT_PAGE_FRAME: u16 = 4;
 
 const LOG_RECORD_FLAG_HAS_LOGICAL_PAYLOAD: u16 = 0x0001;
 const LOG_RECORD_FLAG_HAS_CHAIN_PAYLOAD: u16 = 0x0002;
 const LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD: u16 = 0x0004;
 const LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY: u16 = 0x0008;
+const LOG_RECORD_FLAG_HAS_CHECKPOINT_PAGE: u16 = 0x0010;
 const LOG_RECORD_KNOWN_FLAGS: u16 = LOG_RECORD_FLAG_HAS_LOGICAL_PAYLOAD
     | LOG_RECORD_FLAG_HAS_CHAIN_PAYLOAD
     | LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD
-    | LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY;
+    | LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY
+    | LOG_RECORD_FLAG_HAS_CHECKPOINT_PAGE;
 
 /// Legal Phase 8 outer-record kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +260,10 @@ pub(crate) enum LogRecordKind {
     CatalogCommit,
     /// Checkpoint control record.
     CheckpointBoundary,
+    /// Per-page checkpoint payload that belongs to an in-flight checkpoint
+    /// batch. Recovery accumulates these by `batch_id` and flushes them when
+    /// the matching `CheckpointBoundary` record is replayed.
+    CheckpointPageFrame,
 }
 
 impl LogRecordKind {
@@ -265,6 +272,7 @@ impl LogRecordKind {
             LOG_RECORD_KIND_CRUD_COMMIT => Ok(Self::CrudCommit),
             LOG_RECORD_KIND_CATALOG_COMMIT => Ok(Self::CatalogCommit),
             LOG_RECORD_KIND_CHECKPOINT_BOUNDARY => Ok(Self::CheckpointBoundary),
+            LOG_RECORD_KIND_CHECKPOINT_PAGE_FRAME => Ok(Self::CheckpointPageFrame),
             _ => Err(invalid_log_record(format!(
                 "Phase 8 LogRecord unknown record_kind {value}"
             ))),
@@ -276,6 +284,7 @@ impl LogRecordKind {
             Self::CrudCommit => LOG_RECORD_KIND_CRUD_COMMIT,
             Self::CatalogCommit => LOG_RECORD_KIND_CATALOG_COMMIT,
             Self::CheckpointBoundary => LOG_RECORD_KIND_CHECKPOINT_BOUNDARY,
+            Self::CheckpointPageFrame => LOG_RECORD_KIND_CHECKPOINT_PAGE_FRAME,
         }
     }
 
@@ -286,6 +295,7 @@ impl LogRecordKind {
             ),
             Self::CatalogCommit => LogRecordFlags(LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD),
             Self::CheckpointBoundary => LogRecordFlags(LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY),
+            Self::CheckpointPageFrame => LogRecordFlags(LOG_RECORD_FLAG_HAS_CHECKPOINT_PAGE),
         }
     }
 }
@@ -303,6 +313,8 @@ impl LogRecordFlags {
     pub(crate) const HAS_CATALOG_PAYLOAD: Self = Self(LOG_RECORD_FLAG_HAS_CATALOG_PAYLOAD);
     /// `CheckpointBoundary` carries checkpoint-frontier payload bytes.
     pub(crate) const CHECKPOINT_BOUNDARY: Self = Self(LOG_RECORD_FLAG_CHECKPOINT_BOUNDARY);
+    /// `CheckpointPageFrame` carries one in-flight checkpoint page payload.
+    pub(crate) const HAS_CHECKPOINT_PAGE: Self = Self(LOG_RECORD_FLAG_HAS_CHECKPOINT_PAGE);
 
     fn from_bits(bits: u16) -> Result<Self> {
         let flags = Self(bits);
@@ -352,6 +364,8 @@ pub(crate) enum LogRecordPayload {
     CatalogCommit(Vec<u8>),
     /// Checkpoint boundary control payload bytes.
     CheckpointBoundary(Vec<u8>),
+    /// In-flight checkpoint page payload bytes.
+    CheckpointPageFrame(Vec<u8>),
 }
 
 impl LogRecordPayload {
@@ -360,6 +374,7 @@ impl LogRecordPayload {
             Self::CrudCommit { .. } => LogRecordKind::CrudCommit,
             Self::CatalogCommit(_) => LogRecordKind::CatalogCommit,
             Self::CheckpointBoundary(_) => LogRecordKind::CheckpointBoundary,
+            Self::CheckpointPageFrame(_) => LogRecordKind::CheckpointPageFrame,
         }
     }
 
@@ -376,7 +391,9 @@ impl LogRecordPayload {
                 .checked_add(logical_payload.len())
                 .and_then(|n| n.checked_add(chain_payload.len()))
                 .ok_or_else(|| log_record_too_large(usize::MAX)),
-            Self::CatalogCommit(payload) | Self::CheckpointBoundary(payload) => Ok(payload.len()),
+            Self::CatalogCommit(payload)
+            | Self::CheckpointBoundary(payload)
+            | Self::CheckpointPageFrame(payload) => Ok(payload.len()),
         }
     }
 
@@ -391,7 +408,9 @@ impl LogRecordPayload {
                 out.extend_from_slice(logical_payload);
                 out.extend_from_slice(chain_payload);
             }
-            Self::CatalogCommit(payload) | Self::CheckpointBoundary(payload) => {
+            Self::CatalogCommit(payload)
+            | Self::CheckpointBoundary(payload)
+            | Self::CheckpointPageFrame(payload) => {
                 out.extend_from_slice(payload);
             }
         }
@@ -428,6 +447,9 @@ impl LogRecordPayload {
             }
             LogRecordKind::CatalogCommit => Ok(Self::CatalogCommit(payload.to_vec())),
             LogRecordKind::CheckpointBoundary => Ok(Self::CheckpointBoundary(payload.to_vec())),
+            LogRecordKind::CheckpointPageFrame => {
+                Ok(Self::CheckpointPageFrame(payload.to_vec()))
+            }
         }
     }
 }
@@ -480,6 +502,16 @@ impl LogRecordDraft {
             0,
             commit_ts,
             LogRecordPayload::CheckpointBoundary(payload),
+        )
+    }
+
+    /// Build a checkpoint per-page draft.
+    pub(crate) fn checkpoint_page_frame(commit_ts: Ts, payload: Vec<u8>) -> Self {
+        Self::from_payload(
+            0,
+            0,
+            commit_ts,
+            LogRecordPayload::CheckpointPageFrame(payload),
         )
     }
 
@@ -577,9 +609,13 @@ impl LogRecordDraft {
                     "Phase 8 LogRecord publish_seq 0 is reserved for CheckpointBoundary",
                 ))
             }
-            LogRecordKind::CheckpointBoundary if self.publish_seq != 0 => Err(invalid_log_record(
-                "Phase 8 CheckpointBoundary publish_seq must be 0",
-            )),
+            LogRecordKind::CheckpointBoundary | LogRecordKind::CheckpointPageFrame
+                if self.publish_seq != 0 =>
+            {
+                Err(invalid_log_record(
+                    "Phase 8 Checkpoint records must use publish_seq 0",
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -739,9 +775,11 @@ impl LogRecord {
                     "Phase 8 LogRecord publish_seq 0 is reserved for CheckpointBoundary",
                 ));
             }
-            LogRecordKind::CheckpointBoundary if publish_seq != 0 => {
+            LogRecordKind::CheckpointBoundary | LogRecordKind::CheckpointPageFrame
+                if publish_seq != 0 =>
+            {
                 return Err(invalid_log_record(
-                    "Phase 8 CheckpointBoundary publish_seq must be 0",
+                    "Phase 8 Checkpoint records must use publish_seq 0",
                 ));
             }
             _ => {}
@@ -986,6 +1024,9 @@ impl CatalogCommitPayload {
 pub(crate) struct CheckpointBoundaryPayload {
     /// Highest byte-LSN durably materialized into the main file.
     pub(crate) checkpoint_applied_lsn: u64,
+    /// Identifier of the checkpoint batch closed by this boundary.
+    /// Recovery uses this to drain accumulated `CheckpointPageFrame` records.
+    pub(crate) batch_id: u64,
     /// Header image written and fsynced before the boundary record.
     pub(crate) header: FileHeader,
 }
@@ -1007,6 +1048,7 @@ impl CheckpointBoundaryPayload {
         out.extend_from_slice(&CHECKPOINT_BOUNDARY_PAYLOAD_VERSION.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&self.checkpoint_applied_lsn.to_le_bytes());
+        out.extend_from_slice(&self.batch_id.to_le_bytes());
         out.extend_from_slice(&len_to_u32(HEADER_PAGE_SIZE)?.to_le_bytes());
         out.extend_from_slice(&self.header.to_bytes());
         Ok(out)
@@ -1018,7 +1060,7 @@ impl CheckpointBoundaryPayload {
     ///
     /// Returns [`Error::CorruptDatabase`] if the payload is malformed.
     pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
-        const PREFIX_LEN: usize = 20;
+        const PREFIX_LEN: usize = 28;
         if buf.len() < PREFIX_LEN {
             return Err(invalid_log_record(
                 "Phase 8 CheckpointBoundary payload truncated fixed header",
@@ -1039,7 +1081,8 @@ impl CheckpointBoundaryPayload {
             ));
         }
         let checkpoint_applied_lsn = read_u64(buf, 8);
-        let header_len = read_u32(buf, 16) as usize;
+        let batch_id = read_u64(buf, 16);
+        let header_len = read_u32(buf, 24) as usize;
         if header_len != HEADER_PAGE_SIZE {
             return Err(invalid_log_record(format!(
                 "Phase 8 CheckpointBoundary header length {header_len} is invalid"
@@ -1060,7 +1103,139 @@ impl CheckpointBoundaryPayload {
         }
         Ok(Self {
             checkpoint_applied_lsn,
+            batch_id,
             header,
+        })
+    }
+}
+
+/// Pool that produced a checkpoint per-page record.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum CheckpointPagePool {
+    /// Main data/catalog buffer pool.
+    Main,
+    /// Dedicated history-store buffer pool.
+    History,
+}
+
+impl CheckpointPagePool {
+    fn wire_value(self) -> u8 {
+        match self {
+            Self::Main => 0,
+            Self::History => 1,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Main),
+            1 => Ok(Self::History),
+            _ => Err(invalid_log_record(format!(
+                "Phase 8 CheckpointPageFrame unknown pool {value}"
+            ))),
+        }
+    }
+}
+
+const CHECKPOINT_PAGE_FRAME_PAYLOAD_MAGIC: [u8; 4] = *b"MQCP";
+const CHECKPOINT_PAGE_FRAME_PAYLOAD_VERSION: u16 = 1;
+
+/// Typed payload carried by `LogRecordKind::CheckpointPageFrame`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckpointPageFramePayload {
+    /// Identifier of the checkpoint batch this page belongs to.
+    pub(crate) batch_id: u64,
+    /// Pool that owns the page (main or history).
+    pub(crate) pool: CheckpointPagePool,
+    /// Page number in the main database file.
+    pub(crate) page_number: u32,
+    /// Physical page size of `data`.
+    pub(crate) page_size: JournalPageSize,
+    /// Full page bytes captured from the dirty frame snapshot.
+    pub(crate) data: Vec<u8>,
+}
+
+impl CheckpointPageFramePayload {
+    /// Encode the payload bytes for `LogRecordPayload::CheckpointPageFrame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptDatabase`] if `data` does not match `page_size`.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        if self.data.len() != self.page_size.bytes() {
+            return Err(invalid_log_record(format!(
+                "Phase 8 CheckpointPageFrame page {} data length {} does not match {:?}",
+                self.page_number,
+                self.data.len(),
+                self.page_size
+            )));
+        }
+        let mut out = Vec::with_capacity(28 + self.data.len());
+        out.extend_from_slice(&CHECKPOINT_PAGE_FRAME_PAYLOAD_MAGIC);
+        out.extend_from_slice(&CHECKPOINT_PAGE_FRAME_PAYLOAD_VERSION.to_le_bytes());
+        out.push(self.pool.wire_value());
+        out.push(0);
+        out.extend_from_slice(&self.batch_id.to_le_bytes());
+        out.extend_from_slice(&self.page_number.to_le_bytes());
+        out.extend_from_slice(&self.page_size.as_u32().to_le_bytes());
+        out.extend_from_slice(&len_to_u32(self.data.len())?.to_le_bytes());
+        out.extend_from_slice(&self.data);
+        Ok(out)
+    }
+
+    /// Decode and validate a `CheckpointPageFrame` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptDatabase`] if the payload is malformed.
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self> {
+        const PREFIX_LEN: usize = 24;
+        if buf.len() < PREFIX_LEN {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointPageFrame payload truncated fixed header",
+            ));
+        }
+        if buf[0..4] != CHECKPOINT_PAGE_FRAME_PAYLOAD_MAGIC {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointPageFrame bad magic",
+            ));
+        }
+        let version = read_u16(buf, 4);
+        if version != CHECKPOINT_PAGE_FRAME_PAYLOAD_VERSION {
+            return Err(invalid_log_record(format!(
+                "Phase 8 CheckpointPageFrame bad version {version}"
+            )));
+        }
+        let pool = CheckpointPagePool::from_wire(buf[6])?;
+        if buf[7] != 0 {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointPageFrame reserved byte must be zero",
+            ));
+        }
+        let batch_id = read_u64(buf, 8);
+        let page_number = read_u32(buf, 16);
+        let page_size = JournalPageSize::from_u32(read_u32(buf, 20))?;
+        let data_len = read_u32(buf, PREFIX_LEN) as usize;
+        let data_start = PREFIX_LEN + 4;
+        if data_len != page_size.bytes() {
+            return Err(invalid_log_record(format!(
+                "Phase 8 CheckpointPageFrame page {page_number} data length {data_len} \
+                 does not match {:?}",
+                page_size
+            )));
+        }
+        if buf.len() != data_start + data_len {
+            return Err(invalid_log_record(
+                "Phase 8 CheckpointPageFrame payload has wrong trailing length",
+            ));
+        }
+        let data = buf[data_start..].to_vec();
+        Ok(Self {
+            batch_id,
+            pool,
+            page_number,
+            page_size,
+            data,
         })
     }
 }

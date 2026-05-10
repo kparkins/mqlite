@@ -53,7 +53,7 @@ fn one_thousand_primary_ops_do_not_recurse_history_store() {
     // A full scan forces a reader path that traverses every primary
     // key. In a debug build the guard in `BufferPoolHandle::fetch_page`
     // panics if history-store work ever re-enters the main pool.
-    let cursor = coll.find(doc! {}).run().expect("find.run");
+    let cursor = coll.find(doc! {}).limit(0).run().expect("find.run");
     let collected: Vec<mqlite::Document> = cursor.collect::<Result<_, _>>().expect("cursor");
     assert_eq!(collected.len(), 1000, "all 1000 docs must be visible");
 }

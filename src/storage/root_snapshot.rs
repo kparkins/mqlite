@@ -44,7 +44,6 @@ pub(crate) struct NamespaceSnapshot {
 /// Stable read-path fields of an `IndexEntry` as of the published catalog.
 #[derive(Clone)]
 pub(crate) struct PublishedIndex {
-    #[cfg(test)]
     pub id: IndexId,
     pub name: String,
     pub root_page: u32,

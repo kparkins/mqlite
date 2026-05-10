@@ -300,6 +300,8 @@ fn test_replayed_same_txn_pending_install_does_not_duplicate_delta_heads() -> Re
     let primary = PrimaryWrite {
         ns_id: coll.id,
         ns: Ns::from(READY_NS),
+        root_page: coll.data_root_page,
+        root_level: coll.data_root_level,
         key: primary_key.clone(),
         expected_head: None,
         op: PrimaryOp::Insert {
@@ -309,6 +311,8 @@ fn test_replayed_same_txn_pending_install_does_not_duplicate_delta_heads() -> Re
     let secondary = SecIndexWrite {
         index_id: index.id,
         index_root_page: index.root_page,
+        index_root_level: index.root_level,
+        unique_directions: None,
         key: secondary_key.clone(),
         expected_head: None,
         op: SecIndexOp::Insert {

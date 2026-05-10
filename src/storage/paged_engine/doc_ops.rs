@@ -20,15 +20,31 @@ use crate::validation::validate_document;
 use super::btree_ops::prepare_insert_document;
 use super::doc_helpers::{compare_docs, ensure_id};
 use super::index_maint::{
-    maintain_secondary_on_delete, maintain_secondary_on_insert, maintain_secondary_on_update,
+    maintain_secondary_on_delete, maintain_secondary_on_insert,
+    maintain_secondary_on_insert_snapshot, maintain_secondary_on_update,
 };
-use super::snapshot_ops::{apply_find_opts, plan_and_collect_snapshot_pairs};
+use super::snapshot_ops::{
+    apply_find_opts, plan_and_collect_snapshot_pairs, plan_and_collect_snapshot_pairs_limited,
+};
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::root_snapshot::NamespaceSnapshot;
 
 type MutationCandidate = (Vec<u8>, Document, Option<ExpectedHead>);
+
+fn unsorted_materialization_limit(opts: &FindOptions) -> Option<usize> {
+    if opts.sort.is_some() {
+        return None;
+    }
+    let limit = opts.limit.filter(|limit| *limit > 0)? as usize;
+    Some(
+        opts.skip
+            .and_then(|skip| usize::try_from(skip).ok())
+            .unwrap_or(0)
+            .saturating_add(limit),
+    )
+}
 
 fn expected_head_for_key(
     shared: &SharedState,
@@ -77,6 +93,11 @@ pub(super) fn stage_insert(
     ns: &str,
     mut doc: Document,
 ) -> Result<Bson> {
+    let snap = vis.read_view.published_epoch();
+    if let Some(ns_snap) = snap.catalog.get_by_name(ns) {
+        return stage_insert_snapshot(shared, md, txn, vis, ns, ns_snap, doc);
+    }
+
     let ns_arc = Ns::from(ns);
     let entry = md
         .catalog_lock()
@@ -95,9 +116,51 @@ pub(super) fn stage_insert(
         txn.pending_primary.as_slice(),
         ns,
     )?;
-    let entry_id = entry.id;
-    txn.stage_primary_insert(entry_id, ns_arc, key, bson_bytes, None);
+    txn.stage_primary_insert(
+        entry.id,
+        ns_arc,
+        entry.data_root_page,
+        entry.data_root_level,
+        key,
+        bson_bytes,
+        None,
+    );
     maintain_secondary_on_insert(shared, md, ns, &doc, &id, vis, txn)?;
+    Ok(id)
+}
+
+fn stage_insert_snapshot(
+    shared: &SharedState,
+    md: &MetadataState,
+    txn: &mut crate::mvcc::transaction::WriteTxn,
+    vis: &WriteVisibility<'_>,
+    ns: &str,
+    ns_snap: &NamespaceSnapshot,
+    mut doc: Document,
+) -> Result<Bson> {
+    let tree = BTree::open(
+        shared.new_btree_store(),
+        ns_snap.data_root_page,
+        ns_snap.data_root_level,
+    );
+    let (id, key, bson_bytes) = prepare_insert_document(
+        &tree,
+        &mut doc,
+        &[],
+        vis,
+        txn.pending_primary.as_slice(),
+        ns,
+    )?;
+    txn.stage_primary_insert(
+        ns_snap.id,
+        ns,
+        ns_snap.data_root_page,
+        ns_snap.data_root_level,
+        key,
+        bson_bytes,
+        None,
+    );
+    maintain_secondary_on_insert_snapshot(shared, md, ns, &ns_snap.indexes, &doc, &id, vis, txn)?;
     Ok(id)
 }
 
@@ -119,8 +182,14 @@ pub(super) fn find(
         }
         Some(n) => n,
     };
-    let (plan, pairs) =
-        plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, filter, Arc::clone(&snap), true)?;
+    let (plan, pairs) = plan_and_collect_snapshot_pairs_limited(
+        &engine.shared,
+        ns_snap,
+        filter,
+        Arc::clone(&snap),
+        true,
+        unsorted_materialization_limit(opts),
+    )?;
     let docs_examined = pairs.len() as u64;
     let matched: Vec<Document> = pairs.into_iter().map(|(_, doc)| doc).collect();
     let explain = crate::query::explain::ExplainResult::from_plan(&plan, docs_examined);
@@ -190,6 +259,8 @@ pub(super) fn update(
                     txn.stage_primary_update(
                         entry.id,
                         ns_arc.clone(),
+                        entry.data_root_page,
+                        entry.data_root_level,
                         key,
                         new_bytes,
                         expected_head,
@@ -239,7 +310,14 @@ pub(super) fn delete(
             let doc_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             maintain_secondary_on_delete(md, ns, doc, &doc_id, txn)?;
             if let Some(entry) = md.catalog_lock().get_collection(ns)? {
-                txn.stage_primary_delete(entry.id, ns_arc.clone(), key.clone(), *expected_head);
+                txn.stage_primary_delete(
+                    entry.id,
+                    ns_arc.clone(),
+                    entry.data_root_page,
+                    entry.data_root_level,
+                    key.clone(),
+                    *expected_head,
+                );
             }
         }
         Ok(())
@@ -310,7 +388,15 @@ pub(super) fn find_one_and_update(
     engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         maintain_secondary_on_update(shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn)?;
         if let Some(entry) = md.catalog_lock().get_collection(ns)? {
-            txn.stage_primary_update(entry.id, ns_arc.clone(), key, new_bytes, expected_head);
+            txn.stage_primary_update(
+                entry.id,
+                ns_arc.clone(),
+                entry.data_root_page,
+                entry.data_root_level,
+                key,
+                new_bytes,
+                expected_head,
+            );
         }
         Ok(())
     })?;
@@ -351,7 +437,14 @@ pub(super) fn find_one_and_delete(
     engine.run_write_commit_envelope(ns, None, |_shared, md, txn, _vis| {
         maintain_secondary_on_delete(md, ns, &doc, &doc_id, txn)?;
         if let Some(entry) = md.catalog_lock().get_collection(ns)? {
-            txn.stage_primary_delete(entry.id, ns_arc.clone(), key, expected_head);
+            txn.stage_primary_delete(
+                entry.id,
+                ns_arc.clone(),
+                entry.data_root_page,
+                entry.data_root_level,
+                key,
+                expected_head,
+            );
         }
         Ok(())
     })?;
@@ -414,7 +507,15 @@ pub(super) fn find_one_and_replace(
             txn,
         )?;
         if let Some(entry) = md.catalog_lock().get_collection(ns)? {
-            txn.stage_primary_update(entry.id, ns_arc.clone(), old_key, new_bytes, expected_head);
+            txn.stage_primary_update(
+                entry.id,
+                ns_arc.clone(),
+                entry.data_root_page,
+                entry.data_root_level,
+                old_key,
+                new_bytes,
+                expected_head,
+            );
         }
         Ok(())
     })?;

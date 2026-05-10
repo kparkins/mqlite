@@ -897,7 +897,7 @@ fn swmr_reader_sees_snapshot_isolation() {
                 publish_ts,
                 txn_id,
             );
-            btree_collscan(&tree, &doc! {}, &view, None).unwrap()
+            btree_collscan(&tree, &doc! {}, &view, None, None).unwrap()
         } else {
             Vec::new()
         };
@@ -1075,6 +1075,25 @@ fn find_one_performs_one_epoch_load() {
     let _ = e
         .find_one("test.find_one", &bson::doc! { "_id": 1 })
         .unwrap();
+}
+
+#[test]
+fn find_one_id_with_extra_predicate_still_filters() {
+    let (e, _io) = buffered_engine();
+    e.create_namespace("test.find_one_filter").unwrap();
+    e.insert(
+        "test.find_one_filter",
+        bson::doc! { "_id": 1, "status": "active" },
+    )
+    .unwrap();
+
+    assert!(e
+        .find_one(
+            "test.find_one_filter",
+            &bson::doc! { "_id": 1, "status": "inactive" },
+        )
+        .unwrap()
+        .is_none());
 }
 
 /// §10.8 #16 — `find` (range scan) performs exactly one epoch load.

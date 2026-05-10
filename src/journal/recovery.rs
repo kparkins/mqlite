@@ -3,7 +3,7 @@
 //! This submodule owns the `recover_existing` entry point called from
 //! [`JournalManager::open_or_create`].
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -15,9 +15,9 @@ use crate::storage::header::FileHeader;
 
 use super::log_file::{
     read_chain_commit_at_cursor, CatalogCommitPayload, ChainCommitFrame, CheckpointBoundaryPayload,
-    DecodeCtx, JournalHeader, LogRecord, LogRecordKind, LogRecordPayload, LogicalTxnFrame,
-    JOURNAL_FORMAT_VERSION, JOURNAL_HEADER_SIZE, JOURNAL_MAGIC, LOG_RECORD_HEADER_LEN,
-    LOG_RECORD_MAGIC, LOG_RECORD_TOTAL_LEN_OFFSET, MAX_LOG_RECORD_BYTES,
+    CheckpointPageFramePayload, DecodeCtx, JournalHeader, LogRecord, LogRecordKind,
+    LogRecordPayload, LogicalTxnFrame, JOURNAL_FORMAT_VERSION, JOURNAL_HEADER_SIZE, JOURNAL_MAGIC,
+    LOG_RECORD_HEADER_LEN, LOG_RECORD_MAGIC, LOG_RECORD_TOTAL_LEN_OFFSET, MAX_LOG_RECORD_BYTES,
     RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
 };
 use super::shm::JournalIndex;
@@ -86,6 +86,10 @@ struct LogRecordRecoveryScan {
     recovered_max_commit_ts: Option<Ts>,
     recovered_max_publish_seq: Option<u64>,
     applied_catalog_commit: bool,
+    /// Highest `batch_id` observed across replayed `CheckpointBoundary`
+    /// records, used to seed `next_checkpoint_batch_id` so post-restart
+    /// batches do not collide with persisted ids.
+    max_boundary_batch_id: Option<u64>,
 }
 
 impl JournalManager {
@@ -112,6 +116,9 @@ impl JournalManager {
         Self::truncate_tail_to_valid_end_lsn(&mut journal_file, scan.valid_end_lsn)?;
         let log_manager_file = journal_file.try_clone().map_err(Error::Io)?;
 
+        let next_checkpoint_batch_id = scan
+            .max_boundary_batch_id
+            .map_or(1, |max| max.saturating_add(1));
         Ok(Some(JournalManager {
             journal_path: journal_path.to_path_buf(),
             journal_file,
@@ -128,7 +135,7 @@ impl JournalManager {
             legacy_pending_start_offset: None,
             last_legacy_commit_end_offset: scan.valid_end_lsn,
             checkpoint_batch_active: None,
-            next_checkpoint_batch_id: 1,
+            next_checkpoint_batch_id,
             checkpoint_frame_tags: std::collections::BTreeMap::new(),
         }))
     }
@@ -175,10 +182,52 @@ impl JournalManager {
 
         let checkpoint_applied_lsn = main_header.checkpoint_applied_lsn;
 
+        // Compute the maximum boundary batch_id across all accepted boundary
+        // records (regardless of checkpoint_applied_lsn) so we can seed the
+        // next batch id monotonically. Decode boundaries up front so we can
+        // also drain matching CheckpointPageFrame records by batch_id.
+        let mut max_boundary_batch_id: Option<u64> = None;
+        let mut boundary_batch_ids: BTreeMap<u64, u64> = BTreeMap::new();
+        for record in &accepted {
+            if let LogRecordPayload::CheckpointBoundary(payload) = &record.record.payload {
+                if let Ok(boundary) = CheckpointBoundaryPayload::decode(payload) {
+                    max_boundary_batch_id = Some(
+                        max_boundary_batch_id
+                            .map_or(boundary.batch_id, |prev| prev.max(boundary.batch_id)),
+                    );
+                    boundary_batch_ids.insert(record.record.start_lsn, boundary.batch_id);
+                }
+            }
+        }
+
+        // Group CheckpointPageFrame records by batch_id, in LSN order.
+        let mut pending_pages_by_batch: BTreeMap<u64, Vec<CheckpointPageFramePayload>> =
+            BTreeMap::new();
+        for record in &accepted {
+            if record.record.end_lsn <= checkpoint_applied_lsn {
+                continue;
+            }
+            if let LogRecordPayload::CheckpointPageFrame(payload) = &record.record.payload {
+                let frame = CheckpointPageFramePayload::decode(payload).map_err(|error| {
+                    Self::log_record_recovery_corruption(
+                        journal_path,
+                        format!("invalid Phase 8 CheckpointPageFrame payload: {error}"),
+                    )
+                })?;
+                pending_pages_by_batch
+                    .entry(frame.batch_id)
+                    .or_default()
+                    .push(frame);
+            }
+        }
+
         let mut apply_set: Vec<_> = accepted
             .iter()
             .filter(|record| record.record.end_lsn > checkpoint_applied_lsn)
-            .filter(|record| record.record.kind != LogRecordKind::CheckpointBoundary)
+            .filter(|record| {
+                record.record.kind != LogRecordKind::CheckpointBoundary
+                    && record.record.kind != LogRecordKind::CheckpointPageFrame
+            })
             .collect();
         apply_set.sort_by_key(|record| record.record.publish_seq);
 
@@ -249,7 +298,33 @@ impl JournalManager {
                     recovered_header = FileHeader::from_bytes(&header)?;
                     applied_catalog_commit = true;
                 }
-                LogRecordPayload::CheckpointBoundary(_) => {}
+                LogRecordPayload::CheckpointBoundary(_)
+                | LogRecordPayload::CheckpointPageFrame(_) => {
+                    // Filtered out of apply_set above; never reached here.
+                }
+            }
+        }
+
+        // Drain accumulated CheckpointPageFrame records when their matching
+        // CheckpointBoundary is replayed (boundary records replay above
+        // checkpoint_applied_lsn). Pages flush in strict LSN order.
+        for record in accepted
+            .iter()
+            .filter(|record| record.record.end_lsn > checkpoint_applied_lsn)
+            .filter(|record| record.record.kind == LogRecordKind::CheckpointBoundary)
+        {
+            if let Some(batch_id) = boundary_batch_ids.get(&record.record.start_lsn) {
+                if let Some(pages) = pending_pages_by_batch.remove(batch_id) {
+                    for page in pages {
+                        write_page_to_main(
+                            main_file,
+                            page.page_number,
+                            page.page_size.bytes(),
+                            &page.data,
+                        )?;
+                        applied_catalog_commit = true;
+                    }
+                }
             }
         }
 
@@ -259,6 +334,7 @@ impl JournalManager {
             recovered_max_commit_ts,
             recovered_max_publish_seq,
             applied_catalog_commit,
+            max_boundary_batch_id,
         })
     }
 
@@ -356,6 +432,13 @@ impl JournalManager {
                 {
                     return None;
                 }
+                Some(RecoveredLogRecord {
+                    record,
+                    logical_frame: None,
+                })
+            }
+            LogRecordPayload::CheckpointPageFrame(payload) => {
+                CheckpointPageFramePayload::decode(payload).ok()?;
                 Some(RecoveredLogRecord {
                     record,
                     logical_frame: None,

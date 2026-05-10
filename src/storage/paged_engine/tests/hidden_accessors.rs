@@ -1316,6 +1316,14 @@ impl PagedEngine {
         let write = SecIndexWrite {
             index_id: index.id,
             index_root_page: index.root_page,
+            index_root_level: index.root_level,
+            unique_directions: Some(
+                index
+                    .key_pattern
+                    .iter()
+                    .map(|(_, dir)| !matches!(dir, bson::Bson::Int32(-1) | bson::Bson::Int64(-1)))
+                    .collect(),
+            ),
             key,
             expected_head: None,
             op: SecIndexOp::Insert { id_bytes },

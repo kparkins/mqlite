@@ -262,6 +262,7 @@ fn spawn_us016_range_scan(client: Client) -> thread::JoinHandle<mqlite::Result<u
     thread::spawn(move || {
         let coll = client.database(US016_DB).collection::<Document>(US016_COLL);
         coll.find(doc! {})
+            .limit(0)
             .run()?
             .try_fold(0usize, |count, doc| doc.map(|_| count + 1))
     })

@@ -14,11 +14,11 @@ use crate::storage::page::LEAF_HEADER_SIZE;
 use super::node::{LeafCell, LeafNode};
 use super::CellValue;
 
-const SLOT_POINTER_BYTES: usize = 2;
-const CELL_KEY_LEN_BYTES: usize = 2;
-const CELL_VALUE_TYPE_BYTES: usize = 1;
-const CELL_INLINE_LEN_BYTES: usize = 4;
-const CELL_OVERFLOW_REF_BYTES: usize = 8;
+pub(crate) const SLOT_POINTER_BYTES: usize = 2;
+pub(crate) const CELL_KEY_LEN_BYTES: usize = 2;
+pub(crate) const CELL_VALUE_TYPE_BYTES: usize = 1;
+pub(crate) const CELL_INLINE_LEN_BYTES: usize = 4;
+pub(crate) const CELL_OVERFLOW_REF_BYTES: usize = 8;
 
 const RETAINED_CHAIN_KEY_LEN_BYTES: usize = 2;
 const RETAINED_CHAIN_ENTRY_COUNT_BYTES: usize = 4;

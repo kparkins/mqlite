@@ -15,6 +15,7 @@ use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
+use crate::storage::root_snapshot::PublishedIndex;
 use crate::storage::secondary_index::{
     update_index_on_delete, update_index_on_insert, update_index_on_update,
 };
@@ -135,6 +136,74 @@ pub(super) fn maintain_secondary_on_insert(
             is_multikey,
             txn,
         )?;
+    }
+    Ok(())
+}
+
+/// Maintain secondary indexes from the published catalog snapshot.
+///
+/// Ordinary inserts only need stable index identity, roots, key pattern, and
+/// uniqueness metadata. Those fields are already in the published snapshot, so
+/// the hot path can avoid taking the live catalog mutex. The rare multikey
+/// metadata transition still falls back to the live catalog entry so it does
+/// not clobber non-published counters.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors maintain_secondary_on_insert while avoiding live catalog reads"
+)]
+pub(super) fn maintain_secondary_on_insert_snapshot(
+    shared: &SharedState,
+    md: &MetadataState,
+    ns: &str,
+    indexes: &[PublishedIndex],
+    doc: &Document,
+    doc_id: &Bson,
+    vis: &WriteVisibility<'_>,
+    txn: &mut WriteTxn,
+) -> Result<()> {
+    for index in indexes {
+        let entry = IndexEntry {
+            id: index.id,
+            name: index.name.clone(),
+            collection: ns.to_owned(),
+            root_page: index.root_page,
+            root_level: index.root_level,
+            key_pattern: index.key_pattern.clone(),
+            unique: index.unique,
+            sparse: index.sparse,
+            multikey: false,
+            entry_count: 0,
+            state: index.state,
+        };
+        let store = shared.new_btree_store();
+        let idx_tree = BTree::open(store, entry.root_page, entry.root_level);
+        let history_probe = vis.secondary_history_probe(entry.id);
+        let history = Some(&history_probe as &dyn HistoryProbe);
+        let is_multikey = update_index_on_insert(
+            doc,
+            doc_id,
+            &idx_tree,
+            &entry,
+            vis.read_view.as_ref(),
+            history,
+            txn,
+        )?;
+        if is_multikey {
+            let live_entry = md
+                .catalog_lock()
+                .get_index(ns, &entry.name)?
+                .ok_or_else(|| {
+                    Error::Internal(format!("index '{}' vanished mid-write", entry.name))
+                })?;
+            sync_index_entry_metadata(
+                md,
+                &live_entry,
+                idx_tree.root_page,
+                idx_tree.root_level,
+                true,
+                txn,
+            )?;
+        }
     }
     Ok(())
 }
@@ -351,7 +420,7 @@ fn check_unique_prefix_install(
 /// delta heads.
 pub(super) fn install_pending_sec_index(
     shared: &SharedState,
-    md: &MetadataState,
+    _md: &MetadataState,
     writes: Vec<crate::mvcc::SecIndexWrite>,
     _vis: &WriteVisibility<'_>,
     commit_ts: crate::mvcc::Ts,
@@ -361,44 +430,18 @@ pub(super) fn install_pending_sec_index(
         return Ok(Vec::new());
     }
     use crate::mvcc::{SecIndexOp, Ts, VersionData, VersionEntry, VersionState};
-    use std::collections::HashMap as StdHashMap;
-
-    let mut entry_by_id: StdHashMap<i64, IndexEntry> = StdHashMap::new();
-    {
-        let cat = md.catalog_lock();
-        let collections = cat.list_collections()?;
-        for coll in &collections {
-            for entry in cat.list_indexes(&coll.name)? {
-                entry_by_id.insert(entry.id, entry);
-            }
-        }
-    }
 
     let mut targets = Vec::with_capacity(writes.len());
     for write in &writes {
-        let entry = entry_by_id.get(&write.index_id).ok_or_else(|| {
-            Error::Internal(format!(
-                "pending sec-index write references unknown index_id {}",
-                write.index_id
-            ))
-        })?;
-        let unique_prefix_range =
-            if entry.unique && matches!(write.op, crate::mvcc::SecIndexOp::Insert { .. }) {
-                let directions = entry
-                    .key_pattern
-                    .iter()
-                    .map(|(_, dir)| !matches!(dir, Bson::Int32(-1) | Bson::Int64(-1)))
-                    .collect::<Vec<_>>();
-                Some(compound_prefix_range_excluding_trailing_id(
-                    &write.key,
-                    &directions,
-                )?)
-            } else {
-                None
-            };
+        let unique_prefix_range = match (&write.unique_directions, &write.op) {
+            (Some(directions), crate::mvcc::SecIndexOp::Insert { .. }) => Some(
+                compound_prefix_range_excluding_trailing_id(&write.key, directions)?,
+            ),
+            _ => None,
+        };
         targets.push(SmoWriteTarget {
-            root_page: entry.root_page,
-            root_level: entry.root_level,
+            root_page: write.index_root_page,
+            root_level: write.index_root_level,
             key: write.key.clone(),
             op: SmoWriteOp::from_secondary(&write.key, &write.op),
             unique_prefix_range,
@@ -489,7 +532,7 @@ fn secondary_tree_ident(shared: &SharedState, index_id: i64) -> Result<TreeIdent
 /// per-leaf version chain.
 pub(super) fn install_pending_primary(
     shared: &SharedState,
-    md: &MetadataState,
+    _md: &MetadataState,
     writes: Vec<crate::mvcc::PrimaryWrite>,
     _vis: &WriteVisibility<'_>,
     commit_ts: crate::mvcc::Ts,
@@ -505,13 +548,9 @@ pub(super) fn install_pending_primary(
 
     let mut targets = Vec::with_capacity(writes.len());
     for write in &writes {
-        let coll = match md.catalog_lock().get_collection(&write.ns)? {
-            Some(c) => c,
-            None => continue,
-        };
         targets.push(SmoWriteTarget {
-            root_page: coll.data_root_page,
-            root_level: coll.data_root_level,
+            root_page: write.root_page,
+            root_level: write.root_level,
             key: write.key.clone(),
             op: SmoWriteOp::from_primary(&write.key, &write.op),
             unique_prefix_range: None,
@@ -521,16 +560,10 @@ pub(super) fn install_pending_primary(
     let mut installed_pages = Vec::with_capacity(writes.len());
     let mut structural_tree_change = false;
 
-    let mut target_idx = 0usize;
-    for write in writes {
-        let coll = match md.catalog_lock().get_collection(&write.ns)? {
-            Some(c) => c,
-            None => continue,
-        };
+    for (target_idx, write) in writes.into_iter().enumerate() {
         let leaf_page = smo_latches
             .target_leaf(target_idx)
             .ok_or_else(|| Error::Internal("missing US-010 primary target leaf".into()))?;
-        target_idx += 1;
         let page = smo_latches.page_mut(leaf_page).ok_or_else(|| {
             Error::Internal(format!("missing US-010 primary latch for page {leaf_page}"))
         })?;
@@ -570,7 +603,7 @@ pub(super) fn install_pending_primary(
         structural_tree_change |= page.live_delta_payload_exceeds_leaf_budget()?;
         shared.mark_leaf_dirty(
             TreeIdent {
-                collection_id: coll.id,
+                collection_id: write.ns_id,
                 kind: TreeKind::Primary,
             },
             leaf_page,

@@ -1,5 +1,6 @@
 //! Snapshot-based read helpers — mutex-free read path.
 
+use std::cell::Cell;
 use std::ops::Bound;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -97,6 +98,7 @@ fn execute_primary_key_lookup_from_snap(
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
     condition: &PrimaryKeyCondition,
+    match_limit: Option<usize>,
 ) -> Result<SnapshotPairs> {
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
@@ -118,6 +120,9 @@ fn execute_primary_key_lookup_from_snap(
             for key in keys {
                 if let Some(pair) = fetch_primary_pair(&tree, key, filter, &view, Some(&probe))? {
                     matched.push(pair);
+                    if match_limit.is_some_and(|limit| matched.len() >= limit) {
+                        break;
+                    }
                 }
             }
             Ok(matched)
@@ -182,6 +187,7 @@ fn execute_index_scan_from_snap(
     index_name: &str,
     primary_field: &str,
     condition: &IndexCondition,
+    match_limit: Option<usize>,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
     let idx_snap = ready_indexes
         .iter()
@@ -195,8 +201,28 @@ fn execute_index_scan_from_snap(
         .unwrap_or(true);
 
     let handle = Arc::clone(&shared.handle);
-    let id_bsons: Vec<Bson> = if let IndexCondition::In(vals) = condition {
-        let mut results = Vec::with_capacity(vals.len());
+    let data_store = BufferPoolPageStore::new(Arc::clone(&handle));
+    let data_tree = BTree::open(data_store, ns_snap.data_root_page, ns_snap.data_root_level);
+    let probe = primary_history_probe(shared, ns_snap.id);
+    let mut docs = Vec::new();
+    let limit_reached = Cell::new(false);
+    let mut fetch_index_entry = |entry_bytes: Vec<u8>| -> Result<bool> {
+        let id_bson = index_entry_id_free(&handle, CellValue::Inline(entry_bytes))?;
+        if matches!(id_bson, Bson::Null) {
+            return Ok(true);
+        }
+        let data_key = encode_key(&id_bson);
+        if let Some(pair) = fetch_primary_pair(&data_tree, data_key, filter, view, Some(&probe))? {
+            docs.push(pair);
+            if match_limit.is_some_and(|limit| docs.len() >= limit) {
+                limit_reached.set(true);
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+
+    if let IndexCondition::In(vals) = condition {
         for v in vals {
             let mut p = encode_compound_key(&[(v, ascending)]);
             p.push(COMPOUND_SEP);
@@ -206,51 +232,30 @@ fn execute_index_scan_from_snap(
             }
             let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
             let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
-            for (_, cv) in idx_tree.range_scan_mvcc_bounded(
+            idx_tree.try_for_each_range_scan_mvcc_bounded(
                 Bound::Included(&p),
                 Bound::Excluded(&p_next),
                 view,
                 None,
-            )? {
-                let id = index_entry_id_free(&handle, CellValue::Inline(cv))?;
-                if !matches!(id, Bson::Null) {
-                    results.push(id);
-                }
+                |_, entry_bytes| fetch_index_entry(entry_bytes),
+            )?;
+            if limit_reached.get() {
+                break;
             }
         }
-        results
     } else {
         let (start, end) = index_bounds_free(condition, ascending);
         let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
         let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
         let start_bound = start.as_deref().map_or(Bound::Unbounded, Bound::Included);
         let end_bound = end.as_deref().map_or(Bound::Unbounded, Bound::Included);
-        idx_tree
-            .range_scan_mvcc_bounded(start_bound, end_bound, view, None)?
-            .into_iter()
-            .filter_map(|(_, cv)| {
-                index_entry_id_free(&handle, CellValue::Inline(cv))
-                    .ok()
-                    .filter(|id| !matches!(id, Bson::Null))
-            })
-            .collect()
-    };
-
-    // Fetch matching docs from the data tree using the same MVCC-aware point
-    // lookup path as direct primary-key plans.
-    let mut docs = Vec::new();
-    if !id_bsons.is_empty() {
-        let data_store = BufferPoolPageStore::new(Arc::clone(&handle));
-        let data_tree = BTree::open(data_store, ns_snap.data_root_page, ns_snap.data_root_level);
-        let probe = primary_history_probe(shared, ns_snap.id);
-        for id_bson in id_bsons {
-            let data_key = encode_key(&id_bson);
-            if let Some(pair) =
-                fetch_primary_pair(&data_tree, data_key, filter, view, Some(&probe))?
-            {
-                docs.push(pair);
-            }
-        }
+        idx_tree.try_for_each_range_scan_mvcc_bounded(
+            start_bound,
+            end_bound,
+            view,
+            None,
+            |_, entry_bytes| fetch_index_entry(entry_bytes),
+        )?;
     }
     Ok(docs)
 }
@@ -260,12 +265,13 @@ fn execute_collscan_from_snap(
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
+    match_limit: Option<usize>,
 ) -> Result<SnapshotPairs> {
     let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
     let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
     let view = open_snapshot_read_view(shared, epoch);
     let probe = primary_history_probe(shared, ns_snap.id);
-    btree_collscan(&tree, filter, &view, Some(&probe))
+    btree_collscan(&tree, filter, &view, Some(&probe), match_limit)
 }
 
 pub(super) fn plan_and_collect_snapshot_pairs(
@@ -274,6 +280,24 @@ pub(super) fn plan_and_collect_snapshot_pairs(
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
     allow_secondary_indexes: bool,
+) -> Result<PlannedSnapshotPairs> {
+    plan_and_collect_snapshot_pairs_limited(
+        shared,
+        ns_snap,
+        filter,
+        epoch,
+        allow_secondary_indexes,
+        None,
+    )
+}
+
+pub(super) fn plan_and_collect_snapshot_pairs_limited(
+    shared: &SharedState,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    epoch: Arc<PublishedEpoch>,
+    allow_secondary_indexes: bool,
+    match_limit: Option<usize>,
 ) -> Result<PlannedSnapshotPairs> {
     let ready_indexes: Vec<&PublishedIndex> = if allow_secondary_indexes {
         ns_snap
@@ -293,7 +317,15 @@ pub(super) fn plan_and_collect_snapshot_pairs(
         .collect();
 
     let plan = select_plan(filter, &index_metas);
-    let pairs = execute_plan_from_snap(&plan, shared, ns_snap, &ready_indexes, filter, epoch)?;
+    let pairs = execute_plan_from_snap(
+        &plan,
+        shared,
+        ns_snap,
+        &ready_indexes,
+        filter,
+        epoch,
+        match_limit,
+    )?;
     Ok((plan, pairs))
 }
 
@@ -304,11 +336,17 @@ fn execute_plan_from_snap(
     ready_indexes: &[&PublishedIndex],
     filter: &Document,
     epoch: Arc<PublishedEpoch>,
+    match_limit: Option<usize>,
 ) -> Result<SnapshotPairs> {
     match plan {
-        ScanPlan::PrimaryKeyLookup { condition } => {
-            execute_primary_key_lookup_from_snap(shared, ns_snap, filter, epoch, condition)
-        }
+        ScanPlan::PrimaryKeyLookup { condition } => execute_primary_key_lookup_from_snap(
+            shared,
+            ns_snap,
+            filter,
+            epoch,
+            condition,
+            match_limit,
+        ),
         ScanPlan::IndexScan {
             index_name,
             primary_field,
@@ -324,9 +362,12 @@ fn execute_plan_from_snap(
                 index_name,
                 primary_field,
                 condition,
+                match_limit,
             )
         }
-        ScanPlan::CollScan => execute_collscan_from_snap(shared, ns_snap, filter, epoch),
+        ScanPlan::CollScan => {
+            execute_collscan_from_snap(shared, ns_snap, filter, epoch, match_limit)
+        }
     }
 }
 
@@ -563,8 +604,10 @@ fn checkpoint_after_reconcile_plan(
     engine.shared.handle.flush()?;
     engine.shared.handle.sync_main_file()?;
     let header = engine.shared.handle.allocator().with_header(Clone::clone)?;
+    let batch_id = engine.shared.handle.consume_checkpoint_batch_id()?;
     let payload = CheckpointBoundaryPayload {
         checkpoint_applied_lsn: header.checkpoint_applied_lsn,
+        batch_id,
         header,
     }
     .encode()?;

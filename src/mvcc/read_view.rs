@@ -236,6 +236,12 @@ impl ReadView {
         self.epoch.visible_ts
     }
 
+    /// Published epoch pinned by this view.
+    #[must_use]
+    pub(crate) fn published_epoch(&self) -> &Arc<PublishedEpoch> {
+        &self.epoch
+    }
+
     /// Live sequencer frontier published by `PublishSequencer` (§10.19
     /// C-1, US-037). Loads `publish_sequencer.published_frontier` with
     /// `Acquire`; never reads a cached `PublishedEpoch` field.

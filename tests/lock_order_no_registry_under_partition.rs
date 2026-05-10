@@ -3,15 +3,15 @@
 //! mutex (positions 3/4). Acquiring the registry under a partition mutex
 //! inverts the canonical total order — the plan explicitly forbids it.
 //!
-//! `BufferPool::reconcile` is crate-private, so this file guards the
+//! `BufferPool::pin_with_reconcile` is crate-private, so this file guards the
 //! invariant two ways:
 //!
 //! 1. A runtime stress reproduces the canonical acquisition order on a
 //!    surrogate mutex pair at the same relative positions and asserts it
 //!    completes without hanging (no circular-wait cycle is reachable
 //!    through the canonical order).
-//! 2. A source-audit test opens `src/storage/buffer_pool/chains.rs` and
-//!    checks that the `BufferPool::reconcile` body contains the
+//! 2. A source-audit test opens `src/storage/buffer_pool/mod.rs` and
+//!    checks that the `BufferPool::pin_with_reconcile` body contains the
 //!    `registry.oldest_required_ts()` call **before** any
 //!    `inner_32k.lock()` — any refactor that inverts those two lines
 //!    will fail the audit.
@@ -80,8 +80,8 @@ fn canonical_order_does_not_deadlock_under_contention() {
     );
 }
 
-/// Source-audit: in `BufferPool::reconcile`, the registry snapshot must
-/// appear textually BEFORE the first `inner_32k.lock()`. This is the
+/// Source-audit: in `BufferPool::pin_with_reconcile`, the registry snapshot must
+/// appear textually BEFORE the first partition lock. This is the
 /// hard, unambiguous check — it fails loudly if a future refactor
 /// inverts the two lines.
 #[test]
@@ -91,14 +91,14 @@ fn reconcile_snapshots_registry_before_partition_lock() {
         .join("src")
         .join("storage")
         .join("buffer_pool")
-        .join("chains.rs");
+        .join("mod.rs");
     let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("cannot read {}: {e}", path.display());
     });
 
     let fn_start = body
-        .find("pub(crate) fn reconcile(")
-        .expect("reconcile function not found in buffer_pool/chains.rs");
+        .find("pub(crate) fn pin_with_reconcile")
+        .expect("pin_with_reconcile function not found in buffer_pool/mod.rs");
     // Grab a generous slice — enough to include both key calls.
     let fn_slice = &body[fn_start..fn_start.saturating_add(4096).min(body.len())];
 
@@ -106,13 +106,13 @@ fn reconcile_snapshots_registry_before_partition_lock() {
         .find("registry.oldest_required_ts()")
         .expect("reconcile must call registry.oldest_required_ts()");
     let lock_call = fn_slice
-        .find("inner_32k")
-        .expect("reconcile must lock inner_32k partition");
+        .find(".lock()")
+        .expect("pin_with_reconcile must lock a buffer-pool partition");
 
     assert!(
         ort_call < lock_call,
         "LOCK-ORDER VIOLATION: registry.oldest_required_ts() must appear \
-         BEFORE inner_32k partition acquisition in BufferPool::reconcile"
+         BEFORE partition acquisition in BufferPool::pin_with_reconcile"
     );
 }
 

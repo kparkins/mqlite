@@ -19,6 +19,8 @@ use crate::{
     results::{DeleteResult, InsertOneResult},
 };
 
+const DEFAULT_FIND_LIMIT: i64 = 100;
+
 /// A typed handle to a named collection within a [`crate::Database`].
 ///
 /// `Collection<T>` is cheap to clone — all clones share the same underlying storage.
@@ -158,7 +160,10 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
         Find {
             coll: self,
             filter,
-            options: FindOptions::default(),
+            options: FindOptions {
+                limit: Some(DEFAULT_FIND_LIMIT),
+                ..FindOptions::default()
+            },
         }
     }
 

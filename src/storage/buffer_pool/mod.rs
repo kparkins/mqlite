@@ -69,9 +69,12 @@ use crate::mvcc::read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
 use crate::mvcc::version::{VersionData, VersionEntry, VersionState};
 use crate::mvcc::{ExpectedHead, Ts};
 use crate::storage::allocator::AllocatorHandle;
-use crate::storage::btree::reconcile::{predict_encoded_leaf_size, FoldedLeafCell, RetainedChains};
+use crate::storage::btree::reconcile::{
+    CELL_INLINE_LEN_BYTES, CELL_KEY_LEN_BYTES, CELL_OVERFLOW_REF_BYTES, CELL_VALUE_TYPE_BYTES,
+    SLOT_POINTER_BYTES,
+};
 use crate::storage::btree::OVERFLOW_THRESHOLD;
-use crate::storage::page::{PAGE_SIZE_LEAF, PAGE_TYPE_LEAF};
+use crate::storage::page::{LEAF_HEADER_SIZE, PAGE_SIZE_LEAF, PAGE_TYPE_LEAF};
 use crate::storage::reconcile::driver::TreeIdent;
 
 use page_latch::{LatchMode, PageLatch, PageLatchExclusive, PageLatchShared};
@@ -481,7 +484,7 @@ impl<'pool> LatchedPinnedPage<'pool> {
         // SAFETY: this handle owns a live pin, so the frame slot cannot be
         // evicted. The exclusive page latch serializes delta-map access.
         let frame = unsafe { &*self.frame_ptr };
-        let mut cells = Vec::with_capacity(frame.deltas.len());
+        let mut leaf_bytes = LEAF_HEADER_SIZE;
         for (key, chain) in &frame.deltas {
             let Some(entry) = chain.iter().find(|entry| {
                 entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted)
@@ -491,20 +494,19 @@ impl<'pool> LatchedPinnedPage<'pool> {
             if entry.is_tombstone {
                 continue;
             }
-            let cell = match &entry.data {
+            let value_bytes = match &entry.data {
                 VersionData::Inline(bytes) if bytes.len() > OVERFLOW_THRESHOLD => {
-                    let total_length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-                    FoldedLeafCell::overflow(key.clone(), 0, total_length)
+                    CELL_OVERFLOW_REF_BYTES
                 }
-                VersionData::Inline(bytes) => FoldedLeafCell::inline(key.clone(), bytes.clone()),
-                VersionData::Overflow(oref) => FoldedLeafCell::overflow(
-                    key.clone(),
-                    oref.first_page(),
-                    u32::try_from(oref.total_length()).unwrap_or(u32::MAX),
-                ),
+                VersionData::Inline(bytes) => CELL_INLINE_LEN_BYTES + bytes.len(),
+                VersionData::Overflow(_) => CELL_OVERFLOW_REF_BYTES,
             };
-            cells.push(cell);
-            if predict_encoded_leaf_size(&cells, &RetainedChains::new()) > PAGE_SIZE_LEAF as usize {
+            leaf_bytes += SLOT_POINTER_BYTES
+                + CELL_KEY_LEN_BYTES
+                + key.len()
+                + CELL_VALUE_TYPE_BYTES
+                + value_bytes;
+            if leaf_bytes > PAGE_SIZE_LEAF as usize {
                 return Ok(true);
             }
         }

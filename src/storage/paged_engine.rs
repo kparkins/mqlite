@@ -125,15 +125,14 @@ mod write_order;
 #[path = "paged_engine/tests/write_visibility_epoch.rs"]
 mod write_visibility_epoch;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 #[cfg(any(test, feature = "test-hooks"))]
 use self::hidden_accessors::{LegacyCommitFailpoint, Us026PostRegisterFailpoint};
-#[cfg(test)]
-use std::sync::atomic::Ordering;
-
 use crate::options::BusyHandler;
 
 use bson::{Bson, Document};
@@ -144,6 +143,7 @@ use crate::journal::log_file::{
     CatalogCommitKind, CatalogCommitPage, CatalogCommitPayload, JournalPageSize, LogRecordDraft,
     PageId,
 };
+use crate::keys::encode_key;
 use crate::mvcc::transaction::WriteTxn;
 use crate::options::{
     DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
@@ -153,9 +153,11 @@ use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
+use crate::storage::root_snapshot::PublishedCatalog;
 use crate::storage::structural_page_batch::StructuralPageBatch;
+use crate::validation::validate_document;
 
-use self::doc_helpers::now_millis;
+use self::doc_helpers::{ensure_id, now_millis};
 use self::index_maint::{
     flip_pending_to_aborted_for, flip_pending_to_committed_for, install_pending_primary,
     install_pending_sec_index,
@@ -201,8 +203,20 @@ pub(crate) struct PagedEngine {
     pub(crate) busy_timeout: Duration,
     /// Durability mode chosen at open time.
     durability_mode: DurabilityMode,
-    /// Last interval-mode journal sync attempt. FullSync and None ignore it.
-    last_interval_sync: parking_lot::Mutex<Instant>,
+    /// Monotonic origin used by interval-mode sync deadline accounting.
+    interval_sync_origin: Instant,
+    /// Next monotonic millisecond deadline for interval-mode sync attempts.
+    next_interval_sync_ms: AtomicU64,
+}
+
+/// Internal result class for the batched insert-many fast path.
+pub(crate) enum InsertManyBatchError {
+    /// Staging failed before any journal reservation; caller may retry the
+    /// valid prefix or remaining batch without duplicating any durable writes.
+    Staging { index: usize, error: Error },
+    /// The commit envelope or namespace bootstrap failed; caller must surface
+    /// this error because durable state may have been reserved or written.
+    Commit(Error),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,6 +233,35 @@ struct IndexCatalogIdentity {
     unique: bool,
     sparse: bool,
     state: IndexState,
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duplicate_primary_key_error() -> Error {
+    Error::DuplicateKey {
+        detail: "document with _id already exists".to_owned(),
+    }
+}
+
+fn preflight_insert_many_primary_keys(
+    docs: &mut [Document],
+) -> std::result::Result<(), InsertManyBatchError> {
+    let mut keys = HashSet::with_capacity(docs.len());
+    for (index, doc) in docs.iter_mut().enumerate() {
+        if let Err(error) = validate_document(doc) {
+            return Err(InsertManyBatchError::Staging { index, error });
+        }
+        let id = ensure_id(doc);
+        if !keys.insert(encode_key(&id)) {
+            return Err(InsertManyBatchError::Staging {
+                index,
+                error: duplicate_primary_key_error(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// RAII guard that records the logical-frame-append duration sample and
@@ -242,8 +285,7 @@ impl LogicalTxnAppendPercentileRefresh {
 impl Drop for LogicalTxnAppendPercentileRefresh {
     fn drop(&mut self) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        crate::mvcc::metrics::record_logical_txn_append_duration_ms(elapsed_ms);
-        crate::mvcc::metrics::recompute_logical_txn_append_percentiles();
+        crate::mvcc::metrics::record_logical_txn_append_duration_ms_and_maybe_recompute(elapsed_ms);
     }
 }
 
@@ -292,13 +334,18 @@ impl PagedEngine {
             catalog_root_level,
             smo_classification_retry_cap,
         )?;
+        let next_interval_sync_ms = match &durability_mode {
+            DurabilityMode::Interval(interval) => duration_millis_saturating(*interval),
+            DurabilityMode::FullSync | DurabilityMode::None => u64::MAX,
+        };
         let engine = PagedEngine {
             shared,
             metadata: RwLock::new(()),
             metadata_state: Arc::new(md),
             busy_timeout,
             durability_mode,
-            last_interval_sync: parking_lot::Mutex::new(Instant::now()),
+            interval_sync_origin: Instant::now(),
+            next_interval_sync_ms: AtomicU64::new(next_interval_sync_ms),
         };
         engine.resume_building_indexes_after_open()?;
         Ok(engine)
@@ -324,12 +371,18 @@ impl PagedEngine {
     }
 
     fn wait_for_commit_durability(&self, end_lsn: u64) -> Result<()> {
-        let result = match self.durability_mode {
-            DurabilityMode::FullSync => self.shared.handle.wait_journal_durable(end_lsn),
-            DurabilityMode::Interval(_) | DurabilityMode::None => {
-                self.shared.handle.wait_journal_ready(end_lsn)
-            }
+        let start = Instant::now();
+        let (stage, result) = match self.durability_mode {
+            DurabilityMode::FullSync => (
+                crate::mvcc::metrics::CommitEnvelopeStage::JournalDurableWait,
+                self.shared.handle.wait_journal_durable(end_lsn),
+            ),
+            DurabilityMode::Interval(_) | DurabilityMode::None => (
+                crate::mvcc::metrics::CommitEnvelopeStage::JournalReadyWait,
+                self.shared.handle.wait_journal_ready(end_lsn),
+            ),
         };
+        crate::mvcc::metrics::record_commit_envelope_stage_duration(stage, start.elapsed());
         result.map_err(|error| self.poison_after_log_manager_failure(error))
     }
 
@@ -469,17 +522,33 @@ impl PagedEngine {
         let DurabilityMode::Interval(interval) = self.durability_mode else {
             return Ok(());
         };
-        {
-            let mut last_sync = self.last_interval_sync.lock();
-            if last_sync.elapsed() < interval {
-                return Ok(());
+        let interval_ms = duration_millis_saturating(interval);
+        if interval_ms > 0 {
+            let now_ms = duration_millis_saturating(self.interval_sync_origin.elapsed());
+            let mut next_due = self.next_interval_sync_ms.load(Ordering::Acquire);
+            loop {
+                if now_ms < next_due {
+                    return Ok(());
+                }
+                let next = now_ms.saturating_add(interval_ms);
+                match self.next_interval_sync_ms.compare_exchange(
+                    next_due,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => next_due = actual,
+                }
             }
-            *last_sync = Instant::now();
         }
-        self.shared
-            .handle
-            .sync_journal_ready_prefix()
-            .map_err(|error| self.poison_after_log_manager_failure(error))
+        let sync_start = Instant::now();
+        let result = self.shared.handle.sync_journal_ready_prefix();
+        crate::mvcc::metrics::record_commit_envelope_stage_duration(
+            crate::mvcc::metrics::CommitEnvelopeStage::IntervalSync,
+            sync_start.elapsed(),
+        );
+        result.map_err(|error| self.poison_after_log_manager_failure(error))
     }
 
     fn namespace_catalog_identity(
@@ -506,6 +575,29 @@ impl PagedEngine {
             ns_id: collection.id,
             indexes,
         }))
+    }
+
+    fn namespace_catalog_identity_from_published(
+        catalog: &PublishedCatalog,
+        ns: &str,
+    ) -> Option<NamespaceCatalogIdentity> {
+        let snapshot = catalog.get_by_name(ns)?;
+        let indexes = snapshot
+            .indexes
+            .iter()
+            .map(|index| IndexCatalogIdentity {
+                id: index.id,
+                name: index.name.clone(),
+                key_pattern: index.key_pattern.clone(),
+                unique: index.unique,
+                sparse: index.sparse,
+                state: index.state,
+            })
+            .collect();
+        Some(NamespaceCatalogIdentity {
+            ns_id: snapshot.id,
+            indexes,
+        })
     }
 
     /// Bootstrap a collection if it does not exist yet and return its
@@ -550,6 +642,14 @@ impl PagedEngine {
         F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
     {
         self.shared.check_engine_not_poisoned()?;
+        let published = self.shared.published.load_full();
+        if let Some(snapshot) = published.catalog.get_by_name(ns) {
+            let ns_id = snapshot.id;
+            drop(published);
+            return self.run_write_commit_envelope(ns, Some(ns_id), f);
+        }
+        drop(published);
+
         // Take a read guard to decide whether this write must bootstrap the
         // namespace before entering the ordinary commit envelope.
         let md_read = self
@@ -603,13 +703,34 @@ impl PagedEngine {
             .metadata
             .read()
             .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
+        let captured_epoch = self.shared.published.load_full();
         let (captured_ns_id, captured_catalog_gen, captured_catalog_identity) =
             if let Some(ns_id) = bootstrapped_ns_id {
-                let captured_identity = Self::namespace_catalog_identity(&self.metadata_state, ns)?;
-                let captured_gen = self.shared.published.load_full().catalog_generation;
-                (Some(ns_id), captured_gen, captured_identity)
+                let captured_identity = match Self::namespace_catalog_identity_from_published(
+                    &captured_epoch.catalog,
+                    ns,
+                ) {
+                    Some(identity) => Some(identity),
+                    None => Self::namespace_catalog_identity(&self.metadata_state, ns)?,
+                };
+                if captured_identity.is_none() {
+                    return Err(Error::WriteConflict {
+                        reason: WriteConflictReason::CatalogGenerationChanged,
+                    });
+                }
+                (
+                    Some(ns_id),
+                    captured_epoch.catalog_generation,
+                    captured_identity,
+                )
             } else {
-                let captured_identity = Self::namespace_catalog_identity(&self.metadata_state, ns)?;
+                let captured_identity = match Self::namespace_catalog_identity_from_published(
+                    &captured_epoch.catalog,
+                    ns,
+                ) {
+                    Some(identity) => Some(identity),
+                    None => Self::namespace_catalog_identity(&self.metadata_state, ns)?,
+                };
                 let captured_ns_id_opt = captured_identity.as_ref().map(|identity| identity.ns_id);
                 // §10.17.1 — published `catalog_generation` is the cheap
                 // dirty bit for catalog DDL. CRUD never advances it; only
@@ -618,9 +739,13 @@ impl PagedEngine {
                 // target namespace/index identity before deciding whether
                 // this writer is stale. Use `published.load_full()` directly
                 // because the §10.5 single-load gate is scoped to reads.
-                let captured_gen = self.shared.published.load_full().catalog_generation;
-                (captured_ns_id_opt, captured_gen, captured_identity)
+                (
+                    captured_ns_id_opt,
+                    captured_epoch.catalog_generation,
+                    captured_identity,
+                )
             };
+        drop(captured_epoch);
         // S2: create the writer visibility context held through S12.
         // COMMIT-ENVELOPE-RESIDUE: A (visibility setup fails before journal append).
         let vis = self.write_visibility_after_capture(ns, captured_ns_id)?;
@@ -670,10 +795,17 @@ impl PagedEngine {
                     // Write-path direct load (§10.5 single-load gate is
                     // read-path only); see the matching note at the S1
                     // capture above.
-                    let current_gen = self.shared.published.load_full().catalog_generation;
+                    let current_epoch = self.shared.published.load_full();
+                    let current_gen = current_epoch.catalog_generation;
+                    let current_identity = match Self::namespace_catalog_identity_from_published(
+                        &current_epoch.catalog,
+                        ns,
+                    ) {
+                        Some(identity) => Some(identity),
+                        None => Self::namespace_catalog_identity(&self.metadata_state, ns)?,
+                    };
                     if current_gen != captured_catalog_gen
-                        && Self::namespace_catalog_identity(&self.metadata_state, ns)?
-                            != captured_catalog_identity
+                        && current_identity != captured_catalog_identity
                     {
                         drop(txn);
                         return Err(Error::WriteConflict {
@@ -736,7 +868,7 @@ impl PagedEngine {
                 let sec_pages = match install_pending_sec_index(
                     &self.shared,
                     &self.metadata_state,
-                    sec_writes.to_vec(),
+                    sec_writes.into_vec(),
                     &vis,
                     commit_ts,
                     txn_id,
@@ -758,7 +890,7 @@ impl PagedEngine {
                 let primary_install = install_pending_primary(
                     &self.shared,
                     &self.metadata_state,
-                    primary_writes.to_vec(),
+                    primary_writes.into_vec(),
                     &vis,
                     commit_ts,
                     txn_id,
@@ -785,14 +917,23 @@ impl PagedEngine {
                 #[cfg(any(test, feature = "test-hooks"))]
                 self::hidden_accessors::before_log_reservation_if_installed(&self.shared);
 
+                let reserve_start = Instant::now();
                 let reserved = match self.shared.handle.reserve_log_record(draft) {
                     Ok(reserved) => reserved,
                     Err(e) => {
+                        crate::mvcc::metrics::record_commit_envelope_stage_duration(
+                            crate::mvcc::metrics::CommitEnvelopeStage::LogReserve,
+                            reserve_start.elapsed(),
+                        );
                         return Err(
                             self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
                         );
                     }
                 };
+                crate::mvcc::metrics::record_commit_envelope_stage_duration(
+                    crate::mvcc::metrics::CommitEnvelopeStage::LogReserve,
+                    reserve_start.elapsed(),
+                );
                 let commit_end_lsn = reserved.end_lsn();
 
                 // §4.6 deviation: US-006 installs Pending pages as
@@ -816,10 +957,21 @@ impl PagedEngine {
                 {
                     return Err(self.poison_after_reserved_log_failure(&reserved, e));
                 }
+                let write_ready_start = Instant::now();
                 let written_end_lsn = match reserved.write_and_mark() {
                     Ok(end_lsn) => end_lsn,
-                    Err(e) => return Err(self.poison_after_log_manager_failure(e)),
+                    Err(e) => {
+                        crate::mvcc::metrics::record_commit_envelope_stage_duration(
+                            crate::mvcc::metrics::CommitEnvelopeStage::LogWriteReady,
+                            write_ready_start.elapsed(),
+                        );
+                        return Err(self.poison_after_log_manager_failure(e));
+                    }
                 };
+                crate::mvcc::metrics::record_commit_envelope_stage_duration(
+                    crate::mvcc::metrics::CommitEnvelopeStage::LogWriteReady,
+                    write_ready_start.elapsed(),
+                );
                 debug_assert_eq!(written_end_lsn, commit_end_lsn);
                 crate::mvcc::metrics::record_logical_txn_append_bytes(logical_payload_len as u64);
                 crate::mvcc::metrics::record_journal_chain_commit_frame();
@@ -839,12 +991,19 @@ impl PagedEngine {
                 // S9: the log record is ready/durable before the
                 // Pending-to-Committed flip. The flip runs before publish so
                 // no reader can observe the new epoch with uncommitted heads.
-                flip_pending_to_committed_for(&self.shared, txn_id, commit_ts, &pending_pages)
-                    .map_err(|_| {
-                        self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
-                        )
-                    })?;
+                let pending_flip_start = Instant::now();
+                let pending_flip_result =
+                    flip_pending_to_committed_for(&self.shared, txn_id, commit_ts, &pending_pages)
+                        .map_err(|_| {
+                            self.engine_fatal(
+                                crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
+                            )
+                        });
+                crate::mvcc::metrics::record_commit_envelope_stage_duration(
+                    crate::mvcc::metrics::CommitEnvelopeStage::PendingFlip,
+                    pending_flip_start.elapsed(),
+                );
+                pending_flip_result?;
                 #[cfg(any(test, feature = "test-hooks"))]
                 {
                     self::hidden_accessors::us009_record_committed_flip(&self.shared);
@@ -866,6 +1025,7 @@ impl PagedEngine {
 
                 let shared = Arc::clone(&self.shared);
                 let metadata_state = Arc::clone(&self.metadata_state);
+                let publish_start = Instant::now();
                 let publish_result =
                     self.shared
                         .publish_sequencer
@@ -874,6 +1034,10 @@ impl PagedEngine {
                             self::hidden_accessors::us009_record_publish_ready(&shared);
                             rebuild_and_publish(&shared, &metadata_state, publish_ts, dirty, None)
                         });
+                crate::mvcc::metrics::record_commit_envelope_stage_duration(
+                    crate::mvcc::metrics::CommitEnvelopeStage::PublishReady,
+                    publish_start.elapsed(),
+                );
                 match publish_result {
                     Ok(()) => {}
                     Err(Error::EngineFatal { reason }) => {
@@ -952,6 +1116,52 @@ impl PagedEngine {
         self.run_write(ns, |shared, md, txn, vis| {
             doc_ops::stage_insert(shared, md, txn, vis, ns, doc)
         })
+    }
+
+    /// Insert all documents in one ordinary CRUD commit envelope.
+    ///
+    /// Staging failures are reported separately so the public `insert_many`
+    /// layer can preserve ordered/unordered bulk-write semantics without
+    /// retrying post-reservation failures.
+    pub(crate) fn insert_many_batch(
+        &self,
+        ns: &str,
+        mut docs: Vec<Document>,
+    ) -> std::result::Result<Vec<Bson>, InsertManyBatchError> {
+        self.shared
+            .check_engine_not_poisoned()
+            .map_err(InsertManyBatchError::Commit)?;
+        preflight_insert_many_primary_keys(&mut docs)?;
+
+        let body_started = Cell::new(false);
+        let body_completed = Cell::new(false);
+        let staging_error_index = Cell::new(None);
+        let result = self.run_write(ns, |shared, md, txn, vis| {
+            body_started.set(true);
+            let mut ids = Vec::with_capacity(docs.len());
+            for (index, doc) in docs.into_iter().enumerate() {
+                match doc_ops::stage_insert(shared, md, txn, vis, ns, doc) {
+                    Ok(id) => ids.push(id),
+                    Err(error) => {
+                        staging_error_index.set(Some(index));
+                        return Err(error);
+                    }
+                }
+            }
+            body_completed.set(true);
+            Ok(ids)
+        });
+
+        match result {
+            Ok(ids) => Ok(ids),
+            Err(error) if body_started.get() && !body_completed.get() => {
+                Err(InsertManyBatchError::Staging {
+                    index: staging_error_index.get().unwrap_or(0),
+                    error,
+                })
+            }
+            Err(error) => Err(InsertManyBatchError::Commit(error)),
+        }
     }
 
     pub(crate) fn find(

@@ -737,6 +737,45 @@ mod compat_tests {
     use tempfile::TempDir;
 
     #[test]
+    fn insert_many_success_inserts_all_documents() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("items");
+        let docs = vec![
+            doc! { "_id": 1_i32, "label": "doc0" },
+            doc! { "_id": 2_i32, "label": "doc1" },
+            doc! { "_id": 3_i32, "label": "doc2" },
+        ];
+        let res = col.insert_many(&docs).run().unwrap();
+        assert_eq!(res.inserted_ids.len(), 3);
+        assert!(res.errors.is_empty());
+        for id in 1_i32..=3_i32 {
+            assert!(col.find_one(doc! { "_id": id }).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn insert_many_duplicate_id_keeps_ordered_contract() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("items");
+        let docs = vec![
+            doc! { "_id": 1_i32, "label": "doc0" },
+            doc! { "_id": 1_i32, "label": "doc1" },
+            doc! { "_id": 2_i32, "label": "doc2" },
+        ];
+
+        let res = col.insert_many(&docs).ordered(true).run().unwrap();
+        assert_eq!(res.inserted_ids.len(), 1);
+        assert_eq!(res.errors.len(), 1);
+        assert_eq!(res.errors[0].index, 1);
+        assert!(col.find_one(doc! { "_id": 1_i32 }).unwrap().is_some());
+        assert!(col.find_one(doc! { "_id": 2_i32 }).unwrap().is_none());
+    }
+
+    #[test]
     fn insert_many_ordered_behavioral_contract() {
         let _tempdir = TempDir::new().expect("tempdir");
         let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
@@ -898,6 +937,7 @@ mod compat_tests {
             .unwrap();
         let scan_docs: Vec<Document> = col
             .find(doc! {})
+            .limit(0)
             .run()
             .unwrap()
             .collect::<crate::error::Result<_>>()
@@ -914,6 +954,34 @@ mod compat_tests {
 
         assert!(indexed_ids.contains(&63));
         assert_eq!(indexed_ids, scanned_ids);
+    }
+
+    #[test]
+    fn find_defaults_to_one_hundred_document_limit() {
+        let _tempdir = TempDir::new().expect("tempdir");
+        let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+        let db = client.database("test");
+        let col = db.collection::<Document>("docs");
+        for id in 0..120i32 {
+            col.insert_one(&doc! { "_id": id, "x": id }).unwrap();
+        }
+
+        let default_docs: Vec<Document> = col
+            .find(doc! {})
+            .run()
+            .unwrap()
+            .collect::<crate::error::Result<_>>()
+            .unwrap();
+        let unlimited_docs: Vec<Document> = col
+            .find(doc! {})
+            .limit(0)
+            .run()
+            .unwrap()
+            .collect::<crate::error::Result<_>>()
+            .unwrap();
+
+        assert_eq!(default_docs.len(), 100);
+        assert_eq!(unlimited_docs.len(), 120);
     }
 
     #[test]

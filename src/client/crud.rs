@@ -18,10 +18,18 @@ use crate::{
         FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
         InsertManyOptions, UpdateOptions,
     },
-    results::{DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
+    results::{BulkWriteError, DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
 };
 
 use super::{path::reject_symlink, ClientInner};
+
+fn bulk_write_error(index: usize, error: &Error) -> BulkWriteError {
+    BulkWriteError {
+        index,
+        code: error.code().unwrap_or(1),
+        message: error.to_string(),
+    }
+}
 
 impl ClientInner {
     pub(crate) fn insert_one<T: serde::Serialize>(
@@ -51,7 +59,7 @@ impl ClientInner {
         docs: &[T],
         opts: InsertManyOptions,
     ) -> Result<InsertManyResult> {
-        use crate::results::BulkWriteError;
+        use crate::storage::paged_engine::InsertManyBatchError;
         use std::collections::HashMap;
 
         #[cfg(feature = "tracing")]
@@ -61,40 +69,82 @@ impl ClientInner {
             doc_count = docs.len() as u64,
             "mqlite::insert"
         );
-        let mut inserted_ids: HashMap<usize, Bson> = HashMap::with_capacity(docs.len());
-        let mut errors: Vec<BulkWriteError> = Vec::with_capacity(docs.len());
+        if docs.is_empty() {
+            return Ok(InsertManyResult {
+                inserted_ids: HashMap::new(),
+                errors: Vec::new(),
+            });
+        }
 
-        for (i, doc) in docs.iter().enumerate() {
-            let bson_doc = match bson::to_document(doc).map_err(Error::BsonSerialization) {
-                Ok(d) => d,
-                Err(e) => {
-                    errors.push(BulkWriteError {
-                        index: i,
-                        code: e.code().unwrap_or(1),
-                        message: e.to_string(),
-                    });
-                    if opts.ordered {
-                        break;
-                    }
-                    continue;
+        let mut batch_docs = Vec::with_capacity(docs.len());
+        let mut errors = Vec::new();
+        let mut ordered_terminal_error = None;
+
+        for (index, doc) in docs.iter().enumerate() {
+            match bson::to_document(doc).map_err(Error::BsonSerialization) {
+                Ok(doc) => batch_docs.push((index, doc)),
+                Err(error) if opts.ordered => {
+                    ordered_terminal_error = Some(bulk_write_error(index, &error));
+                    break;
                 }
-            };
-            match self.engine.insert(name, bson_doc) {
-                Ok(id) => {
-                    inserted_ids.insert(i, id);
-                }
-                Err(e) => {
-                    errors.push(BulkWriteError {
-                        index: i,
-                        code: e.code().unwrap_or(1),
-                        message: e.to_string(),
-                    });
-                    if opts.ordered {
-                        break;
-                    }
-                }
+                Err(error) => errors.push(bulk_write_error(index, &error)),
             }
         }
+
+        let mut inserted_ids: HashMap<usize, Bson> = HashMap::with_capacity(batch_docs.len());
+        if opts.ordered {
+            let mut active_len = batch_docs.len();
+            loop {
+                if active_len == 0 {
+                    break;
+                }
+                let docs = batch_docs[..active_len]
+                    .iter()
+                    .map(|(_, doc)| doc.clone())
+                    .collect();
+                match self.engine.insert_many_batch(name, docs) {
+                    Ok(ids) => {
+                        for ((original_index, _), id) in batch_docs[..active_len].iter().zip(ids) {
+                            inserted_ids.insert(*original_index, id);
+                        }
+                        break;
+                    }
+                    Err(InsertManyBatchError::Staging { index, error }) => {
+                        let bounded_index = index.min(active_len.saturating_sub(1));
+                        ordered_terminal_error =
+                            Some(bulk_write_error(batch_docs[bounded_index].0, &error));
+                        active_len = bounded_index;
+                    }
+                    Err(InsertManyBatchError::Commit(error)) => return Err(error),
+                }
+            }
+            if let Some(error) = ordered_terminal_error {
+                errors.push(error);
+            }
+            return Ok(InsertManyResult {
+                inserted_ids,
+                errors,
+            });
+        }
+
+        while !batch_docs.is_empty() {
+            let docs = batch_docs.iter().map(|(_, doc)| doc.clone()).collect();
+            match self.engine.insert_many_batch(name, docs) {
+                Ok(ids) => {
+                    for ((original_index, _), id) in batch_docs.iter().zip(ids) {
+                        inserted_ids.insert(*original_index, id);
+                    }
+                    break;
+                }
+                Err(InsertManyBatchError::Staging { index, error }) => {
+                    let bounded_index = index.min(batch_docs.len().saturating_sub(1));
+                    let (original_index, _) = batch_docs.remove(bounded_index);
+                    errors.push(bulk_write_error(original_index, &error));
+                }
+                Err(InsertManyBatchError::Commit(error)) => return Err(error),
+            }
+        }
+        errors.sort_by_key(|error| error.index);
 
         Ok(InsertManyResult {
             inserted_ids,
