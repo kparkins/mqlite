@@ -46,7 +46,7 @@ pub(crate) mod shm;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -68,9 +68,9 @@ pub(crate) use self::recovery::ParsedLogicalFrames;
 #[cfg(any(test, feature = "test-hooks"))]
 use self::log_file::LogicalTxnFrame;
 use self::log_file::{
-    read_chain_commit_at_cursor, try_skip_logical_txn, write_page_frame_record,
-    CheckpointBatchPageRecord, JournalHeader, JournalOffset, JournalPageSize, Page0BoundaryRecord,
-    PageId, PositionedLogFile, JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
+    read_chain_commit_at_cursor, try_skip_logical_txn, CheckpointBatchPageRecord, JournalHeader,
+    JournalOffset, JournalPageSize, Page0BoundaryRecord, PageId, PositionedLogFile,
+    JOURNAL_HEADER_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -611,20 +611,6 @@ impl LogManager {
         self.sync_cv.notify_all();
     }
 
-    /// Reset reservation and ready frontiers after a cursor-based write that
-    /// has not been synced yet.
-    pub(crate) fn reset_ready_to_unsynced(&self, lsn: u64) {
-        let mut state = self.slots.lock();
-        state.slots.clear();
-        state.poisoned = None;
-        self.next_lsn.store(lsn, Ordering::Release);
-        self.ready_lsn.store(lsn, Ordering::Release);
-        let durable_lsn = self.durable_lsn.load(Ordering::Acquire).min(lsn);
-        self.durable_lsn.store(durable_lsn, Ordering::Release);
-        drop(state);
-        self.sync_cv.notify_all();
-    }
-
     /// Return the contiguous fully written byte frontier.
     pub(crate) fn ready_lsn(&self) -> u64 {
         self.ready_lsn.load(Ordering::Acquire)
@@ -979,22 +965,6 @@ impl JournalManager {
     // Writing (appending frames)
     // -----------------------------------------------------------------------
 
-    /// Append a non-commit journal frame for `page_number`.
-    ///
-    /// Call this for each modified page within a transaction, then call
-    /// [`commit`](Self::commit) when the transaction is complete.
-    ///
-    /// `page_data` must be exactly `page_size.bytes()` bytes.
-    pub(crate) fn append_non_commit(
-        &mut self,
-        page_number: u32,
-        page_size: JournalPageSize,
-        page_data: &[u8],
-    ) -> Result<u64> {
-        debug_assert_eq!(page_data.len(), page_size.bytes());
-        self.append_frame(page_number, 0, page_size, page_data, None)
-    }
-
     /// Return the batch id that the next checkpoint batch will receive.
     pub(crate) fn next_checkpoint_batch_id(&self) -> CheckpointBatchId {
         CheckpointBatchId(self.next_checkpoint_batch_id)
@@ -1280,248 +1250,6 @@ impl JournalManager {
         })
     }
 
-    /// Append a commit journal frame, completing the current transaction.
-    ///
-    /// `db_page_count` is the total number of database pages after this commit
-    /// (stored in the commit frame so recovery can update the main file header).
-    ///
-    /// After this call, the in-memory index is updated.  Returns `true`
-    /// if an emergency checkpoint should be triggered (the journal index
-    /// has reached the hot-threshold).
-    pub(crate) fn commit(
-        &mut self,
-        page_number: u32,
-        page_size: JournalPageSize,
-        page_data: &[u8],
-        db_page_count: u32,
-    ) -> Result<bool> {
-        debug_assert!(
-            db_page_count > 0,
-            "commit frame must have non-zero page count"
-        );
-        let offset = self.append_frame(page_number, db_page_count, page_size, page_data, None)?;
-        self.last_committed_db_page_count = Some(db_page_count);
-        self.legacy_pending_start_offset = None;
-        self.last_legacy_commit_end_offset = self.write_cursor;
-
-        // Update the in-memory index with the commit frame's page.
-        let emergency = self.index.insert(page_number, offset);
-
-        Ok(emergency)
-    }
-
-    /// Low-level frame append.  Returns the byte offset of the written frame.
-    fn append_frame(
-        &mut self,
-        page_number: u32,
-        db_page_count: u32,
-        page_size: JournalPageSize,
-        page_data: &[u8],
-        checkpoint_tag: Option<CheckpointFrameTag>,
-    ) -> Result<u64> {
-        if db_page_count == 0 && checkpoint_tag.is_none() && self.checkpoint_batch_active.is_some()
-        {
-            return Err(Error::Internal(
-                "ordinary page frame cannot be appended inside checkpoint batch".into(),
-            ));
-        }
-        self.log_manager.check_poisoned()?;
-        let frame_offset = self.write_cursor;
-        self.journal_file
-            .seek(SeekFrom::Start(frame_offset))
-            .map_err(Error::Io)?;
-
-        let frame_size = if checkpoint_tag.is_some() {
-            let record = CheckpointBatchPageRecord {
-                page_number,
-                salt1: self.salt1,
-                salt2: self.salt2,
-                page_size,
-            };
-            record
-                .write(&mut self.journal_file, page_data)
-                .map_err(Error::Io)?;
-            record.total_size()
-        } else {
-            write_page_frame_record(
-                &mut self.journal_file,
-                page_number,
-                db_page_count,
-                self.salt1,
-                self.salt2,
-                page_size,
-                page_data,
-            )
-            .map_err(Error::Io)?;
-            JOURNAL_FRAME_HEADER_SIZE + page_size.bytes()
-        };
-
-        self.write_cursor += frame_size as u64;
-        self.log_manager.reset_ready_to_unsynced(self.write_cursor);
-
-        if let Some(tag) = checkpoint_tag {
-            self.checkpoint_frame_tags.insert(frame_offset, tag);
-            return Ok(frame_offset);
-        }
-
-        // Update the in-memory index for non-commit frames too so reads
-        // through `JournalLayeredSource` see in-progress writes within the
-        // same process. Only the journal file is durable; the index lives
-        // in memory and is rebuilt on open.
-        if db_page_count == 0 {
-            if self.legacy_pending_start_offset.is_none() {
-                self.legacy_pending_start_offset = Some(frame_offset);
-            }
-            self.index.insert(page_number, frame_offset);
-        }
-
-        Ok(frame_offset)
-    }
-
-    // -----------------------------------------------------------------------
-    // Reading
-    // -----------------------------------------------------------------------
-
-    /// Look up `page_number` in the journal.
-    ///
-    /// Returns the page data if found, or `None` if the page should be read
-    /// from the main file.
-    ///
-    /// Uses the in-memory journal index for O(1) lookup.
-    pub(crate) fn read_page(&mut self, page_number: u32) -> Result<Option<Vec<u8>>> {
-        let frame_offset = match self.index.lookup(page_number) {
-            Some(off) => off,
-            None => return Ok(None),
-        };
-
-        // Read the frame header at the recorded offset.
-        self.journal_file
-            .seek(SeekFrom::Start(frame_offset))
-            .map_err(Error::Io)?;
-
-        let mut header_buf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
-        self.journal_file
-            .read_exact(&mut header_buf)
-            .map_err(Error::Io)?;
-
-        let page_size_u32 = u32::from_le_bytes(header_buf[16..20].try_into().expect("4 bytes"));
-        let page_size = JournalPageSize::from_u32(page_size_u32)?;
-
-        let mut page_data = vec![0u8; page_size.bytes()];
-        self.journal_file
-            .read_exact(&mut page_data)
-            .map_err(Error::Io)?;
-
-        Ok(Some(page_data))
-    }
-
-    /// Fallback: linear journal scan to find `page_number`.
-    ///
-    /// O(journal frames) per lookup.  Acceptable with aggressive checkpointing.
-    pub(crate) fn read_page_linear(&mut self, _page_number: u32) -> Result<Option<Vec<u8>>> {
-        self.journal_file
-            .seek(SeekFrom::Start(JOURNAL_HEADER_SIZE as u64))
-            .map_err(Error::Io)?;
-
-        let mut cursor = JOURNAL_HEADER_SIZE as u64;
-
-        loop {
-            self.journal_file
-                .seek(SeekFrom::Start(cursor))
-                .map_err(Error::Io)?;
-
-            // ChainCommit and logical frames carry no single page number.
-            if let Some((n, _commit_ts, _offset)) =
-                read_chain_commit_at_cursor(&mut self.journal_file, self.salt1, self.salt2)?
-            {
-                cursor += n;
-                continue;
-            }
-            if let Some((n, _frame)) =
-                try_skip_logical_txn(&mut self.journal_file, self.salt1, self.salt2)?
-            {
-                cursor += n;
-                continue;
-            }
-
-            break;
-        }
-
-        Ok(None)
-    }
-
-    // -----------------------------------------------------------------------
-    // Checkpoint
-    // -----------------------------------------------------------------------
-
-    /// Checkpoint all committed journal frames into the main file.
-    ///
-    /// After a successful checkpoint:
-    /// 1. The journal file is truncated to just the header.
-    /// 2. The in-memory journal index is cleared.
-    /// 3. The checkpoint sequence counter is incremented.
-    ///
-    /// `main_file` must be open for read/write.
-    pub(crate) fn checkpoint(
-        &mut self,
-        main_file: &mut File,
-        main_header: &mut FileHeader,
-    ) -> Result<()> {
-        #[cfg(feature = "tracing")]
-        let _chk_start = std::time::Instant::now();
-        #[cfg(feature = "tracing")]
-        let _journal_size_before = self.write_cursor;
-
-        // Collect all entries from the in-memory index.
-        let entries: Vec<(u32, u64)> = self.index.iter_entries().collect();
-
-        // For each indexed page, read the journal frame and write to main file.
-        for (page_number, frame_offset) in &entries {
-            // Read page_size from the frame header.
-            let header_offset = *frame_offset;
-            self.journal_file
-                .seek(SeekFrom::Start(header_offset))
-                .map_err(Error::Io)?;
-            let mut hbuf = [0u8; JOURNAL_FRAME_HEADER_SIZE];
-            self.journal_file.read_exact(&mut hbuf).map_err(Error::Io)?;
-            let page_size_u32 = u32::from_le_bytes(hbuf[16..20].try_into().expect("4 bytes"));
-            let page_size_bytes = JournalPageSize::from_u32(page_size_u32)?.bytes();
-
-            let mut page_data = vec![0u8; page_size_bytes];
-            self.journal_file
-                .read_exact(&mut page_data)
-                .map_err(Error::Io)?;
-
-            write_page_to_main(main_file, *page_number, page_size_bytes, &page_data)?;
-        }
-
-        // Update main file header with latest committed page count.
-        if let Some(db_page_count) = self.last_committed_db_page_count {
-            main_header.total_page_count = db_page_count;
-        }
-        main_file.flush().map_err(Error::Io)?;
-
-        // Reset journal to empty (truncate to just the header).
-        self.truncate_journal()?;
-
-        // Clear the in-memory index.
-        self.index.clear_index();
-
-        #[cfg(feature = "tracing")]
-        {
-            let duration_ms = _chk_start.elapsed().as_millis() as u64;
-            tracing::info!(
-                target: "mqlite",
-                pages_copied = entries.len() as u64,
-                duration_ms,
-                journal_size_before = _journal_size_before,
-                "mqlite::checkpoint"
-            );
-        }
-
-        Ok(())
-    }
-
     /// Copy a durable checkpoint batch into the main file after its page-0
     /// boundary has been appended.
     ///
@@ -1555,25 +1283,6 @@ impl JournalManager {
         main_file.sync_data().map_err(Error::Io)?;
         self.truncate_journal()?;
         self.index.clear_index();
-        Ok(())
-    }
-
-    /// Checkpoint all journal frames, then delete the journal file.
-    ///
-    /// Called on clean database close.  After this returns, only the main
-    /// `.mqlite` file remains.
-    pub(crate) fn close_and_cleanup(
-        mut self,
-        main_file: &mut File,
-        main_header: &mut FileHeader,
-    ) -> Result<()> {
-        // Checkpoint everything to main file.
-        self.checkpoint(main_file, main_header)?;
-
-        // Delete journal file.
-        drop(self.journal_file);
-        let _ = std::fs::remove_file(&self.journal_path);
-
         Ok(())
     }
 

@@ -375,45 +375,5 @@ pub fn fuzz_logical_txn_recover(body: &[u8]) -> std::result::Result<(), ()> {
         }
     }
     drop(client);
-
-    // AC#6 explicit: directly call `JournalManager::read_page_linear`
-    // for a span of page numbers post-recovery. The recovery scan
-    // above already exercised the linear walk during `Client::open`;
-    // this loop additionally drives the on-demand linear-scan path
-    // that `read_page_linear` takes for any page index. Any panic /
-    // UB / infinite loop in the frame-kind skip dispatch on the
-    // fuzzed body would surface here.
-    fuzz_drive_read_page_linear(&db_path);
     Ok(())
-}
-
-/// §9.2 / US-023 AC#6 — directly drive
-/// `JournalManager::read_page_linear` for a span of page numbers
-/// against the fuzzed journal body. Opens a fresh `JournalManager`
-/// off the same db_path, then invokes `read_page_linear` for pages
-/// 1..=16. Errors are swallowed; the contract under fuzz is "no
-/// panic / UB / infinite loop", not "succeeds".
-#[cfg(feature = "fuzz")]
-fn fuzz_drive_read_page_linear(db_path: &std::path::Path) {
-    use crate::journal::JournalManager;
-    use crate::storage::header::FileHeader;
-    use std::fs::OpenOptions;
-    use std::io::Read;
-
-    let Ok(mut main_file) = OpenOptions::new().read(true).write(true).open(db_path) else {
-        return;
-    };
-    let mut header_bytes = [0u8; crate::storage::header::HEADER_PAGE_SIZE];
-    if main_file.read_exact(&mut header_bytes).is_err() {
-        return;
-    }
-    let Ok(header) = FileHeader::from_bytes(&header_bytes) else {
-        return;
-    };
-    let Ok(mut mgr) = JournalManager::open_or_create(db_path, &header, &mut main_file) else {
-        return;
-    };
-    for page in 1u32..=16 {
-        let _ = mgr.read_page_linear(page);
-    }
 }

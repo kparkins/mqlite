@@ -594,30 +594,17 @@ mod tests {
     fn no_shm_file_created_in_any_phase() {
         let (dir, db_path, mut main_file) = make_db_file();
         main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
-        let mut header = make_header();
+        let header = make_header();
         let shm_sidecar = {
             let mut p = db_path.as_os_str().to_owned();
             p.push("-shm");
             PathBuf::from(p)
         };
 
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
+        let mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
         assert!(!shm_sidecar.exists(), "no -shm after open");
 
-        mgr.append_non_commit(1, JournalPageSize::Small4k, &make_page_4k(0x01))
-            .unwrap();
-        assert!(!shm_sidecar.exists(), "no -shm after append");
-
-        mgr.commit(2, JournalPageSize::Small4k, &make_page_4k(0x02), 5)
-            .unwrap();
-        assert!(!shm_sidecar.exists(), "no -shm after commit");
-
-        mgr.checkpoint(&mut main_file, &mut header).unwrap();
-        assert!(!shm_sidecar.exists(), "no -shm after checkpoint");
-
-        mgr.close_and_cleanup(&mut main_file, &mut header).unwrap();
-        assert!(!shm_sidecar.exists(), "no -shm after clean close");
-
+        drop(mgr);
         drop(main_file);
         drop(dir);
     }
@@ -717,12 +704,7 @@ mod tests {
             .write(true)
             .open(&db_path)
             .unwrap();
-        let mut mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
-
-        assert!(
-            mgr2.read_page_linear(99).unwrap().is_none(),
-            "read_page_linear on an unrelated page must return None"
-        );
+        let mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
 
         // §8.2 AC#2 — assert the LogicalTxn frame bytes survived the
         // reopen-via-recovery cycle by reading them back from the
@@ -874,77 +856,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Commit
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn commit_frame_marks_transaction_boundary() {
-        let (_dir, db_path, mut main_file) = make_db_file();
-        let header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let page_a = make_page_4k(0xAA);
-        let page_b = make_page_4k(0xBB);
-        mgr.append_non_commit(1, JournalPageSize::Small4k, &page_a)
-            .unwrap();
-        let emergency = mgr
-            .commit(2, JournalPageSize::Small4k, &page_b, 10)
-            .unwrap();
-        assert!(!emergency);
-        assert_eq!(mgr.last_committed_db_page_count, Some(10));
-    }
-
-    // -----------------------------------------------------------------------
-    // Checkpoint
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn checkpoint_writes_pages_to_main_file() {
-        let (_dir, db_path, mut main_file) = make_db_file();
-        // Pre-allocate main file large enough
-        main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
-
-        let mut header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-
-        let page_data = make_page_4k(0x42);
-        mgr.append_non_commit(2, JournalPageSize::Small4k, &page_data)
-            .unwrap();
-        mgr.commit(2, JournalPageSize::Small4k, &page_data, 5)
-            .unwrap();
-
-        mgr.checkpoint(&mut main_file, &mut header).unwrap();
-
-        // Verify: page 2 in main file at the uniform 32 KB slot offset.
-        let offset = 2u64 * PAGE_SIZE_LEAF as u64;
-        main_file.seek(SeekFrom::Start(offset)).unwrap();
-        let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
-        main_file.read_exact(&mut buf).unwrap();
-        assert_eq!(buf[0], 0x42);
-
-        // Journal should be reset.
-        assert_eq!(mgr.write_cursor, JOURNAL_HEADER_SIZE as u64);
-        assert_eq!(mgr.index.occupied_count(), 0);
-    }
-
-    #[test]
-    fn checkpoint_increments_sequence() {
-        let (_dir, db_path, mut main_file) = make_db_file();
-        main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
-        let mut header = make_header();
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        assert_eq!(mgr.checkpoint_seq, 0);
-
-        let page_data = make_page_4k(0x01);
-        mgr.commit(1, JournalPageSize::Small4k, &page_data, 2)
-            .unwrap();
-        mgr.checkpoint(&mut main_file, &mut header).unwrap();
-
-        assert_eq!(mgr.checkpoint_seq, 1);
-    }
-
-    // -----------------------------------------------------------------------
     // Recovery — crash simulation
     // -----------------------------------------------------------------------
 
@@ -1026,7 +937,7 @@ mod tests {
             .write(true)
             .open(&db_path)
             .unwrap();
-        let mut mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
+        let _mgr2 = JournalManager::open_or_create(&db_path, &header, &mut main_file2).unwrap();
 
         // Page 2 should not be copied into the main file.
         let mut buf = vec![0u8; PAGE_SIZE_INTERNAL as usize];
@@ -1035,11 +946,6 @@ mod tests {
             .unwrap();
         main_file2.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 0x00, "incomplete checkpoint page is discarded");
-
-        assert!(
-            mgr2.read_page_linear(2).unwrap().is_none(),
-            "incomplete checkpoint page must not remain readable from journal"
-        );
     }
 
     #[test]
@@ -1060,29 +966,6 @@ mod tests {
         // A fresh journal should have been created with the new salts.
         assert_eq!(mgr2.salt1, 0x1111_1111);
         assert_eq!(mgr2.salt2, 0x2222_2222);
-    }
-
-    // -----------------------------------------------------------------------
-    // Clean close
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn close_and_cleanup_removes_journal() {
-        let (dir, db_path, mut main_file) = make_db_file();
-        main_file.set_len(100 * PAGE_SIZE_INTERNAL as u64).unwrap();
-        let mut header = make_header();
-
-        let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
-        let page_data = make_page_4k(0xFF);
-        mgr.commit(1, JournalPageSize::Small4k, &page_data, 2)
-            .unwrap();
-
-        let jp = journal_path_for(&db_path);
-
-        mgr.close_and_cleanup(&mut main_file, &mut header).unwrap();
-
-        assert!(!jp.exists(), "journal must be deleted after clean close");
-        let _ = dir;
     }
 
     // -----------------------------------------------------------------------

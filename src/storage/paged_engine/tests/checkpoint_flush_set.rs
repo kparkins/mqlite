@@ -128,13 +128,5 @@ fn test_checkpoint_flush_set_tags_only_checkpoint_batch_frames() -> Result<()> {
         boundary.journal_offset() >= pending_start,
         "boundary is appended after the checkpoint-owned pending range"
     );
-    assert!(
-        journal.read_page_linear(10)?.is_none(),
-        "generic linear lookup must not expose checkpoint-owned frames"
-    );
-    assert!(
-        journal.read_page_linear(11)?.is_none(),
-        "future-dirty excluded page must not be tagged or flushed"
-    );
     Ok(())
 }
