@@ -196,6 +196,30 @@ pub(super) fn find(
     Ok((apply_find_opts(matched, opts), explain))
 }
 
+/// Return the first document that matches `filter`, short-circuiting after
+/// one match. Callers that only need a single result should prefer this over
+/// [`find`] to avoid decoding the entire collection.
+pub(super) fn find_first(
+    engine: &super::PagedEngine,
+    ns: &str,
+    filter: &Document,
+) -> Result<Option<Document>> {
+    let snap = engine.shared.load_published();
+    let ns_snap = match snap.catalog.get_by_name(ns) {
+        None => return Ok(None),
+        Some(n) => n,
+    };
+    let (_, pairs) = plan_and_collect_snapshot_pairs_limited(
+        &engine.shared,
+        ns_snap,
+        filter,
+        Arc::clone(&snap),
+        true,
+        Some(1),
+    )?;
+    Ok(pairs.into_iter().next().map(|(_, doc)| doc))
+}
+
 pub(super) fn update(
     engine: &super::PagedEngine,
     ns: &str,

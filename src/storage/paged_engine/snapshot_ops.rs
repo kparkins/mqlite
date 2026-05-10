@@ -291,6 +291,9 @@ pub(super) fn plan_and_collect_snapshot_pairs(
     )
 }
 
+/// Like [`plan_and_collect_snapshot_pairs`] but stops collecting after
+/// `match_limit` matches. On the collscan path this avoids decoding
+/// documents that cannot contribute to the result.
 pub(super) fn plan_and_collect_snapshot_pairs_limited(
     shared: &SharedState,
     ns_snap: &NamespaceSnapshot,

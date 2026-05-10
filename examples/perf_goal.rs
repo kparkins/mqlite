@@ -26,18 +26,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut single_multi: Vec<Measurement> = Vec::with_capacity(iter);
     let mut batch_multi: Vec<Measurement> = Vec::with_capacity(iter);
     let mut read: Vec<Measurement> = Vec::with_capacity(iter);
+    let mut read_find_one: Vec<Measurement> = Vec::with_capacity(iter);
     for _ in 0..iter {
         single_same.push(run_same_collection_write_benchmark(WriteMode::Single)?);
         batch_same.push(run_same_collection_write_benchmark(WriteMode::Batch)?);
         single_multi.push(run_multi_collection_write_benchmark(WriteMode::Single)?);
         batch_multi.push(run_multi_collection_write_benchmark(WriteMode::Batch)?);
         read.push(run_read_benchmark()?);
+        read_find_one.push(run_find_one_benchmark()?);
     }
     let single_same = median_by_units_per_second(single_same);
     let batch_same = median_by_units_per_second(batch_same);
     let single_multi = median_by_units_per_second(single_multi);
     let batch_multi = median_by_units_per_second(batch_multi);
     let read = median_by_units_per_second(read);
+    let read_find_one = median_by_units_per_second(read_find_one);
     println!(
         "{{\"iter\":{iter},\
          \"write_single_same_collection_4\":{{\"writers\":{},\"docs\":{},\
@@ -48,7 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          \"elapsed_secs\":{:.9},\"docs_per_second\":{:.6}}},\
          \"write_batch_multi_collection_8\":{{\"writers\":{},\"docs\":{},\
          \"elapsed_secs\":{:.9},\"docs_per_second\":{:.6}}},\
-         \"read_mixed\":{{\"ops\":{},\"elapsed_secs\":{:.9},\"ops_per_second\":{:.6}}}}}",
+         \"read_mixed\":{{\"ops\":{},\"elapsed_secs\":{:.9},\"ops_per_second\":{:.6}}},\
+         \"read_find_one\":{{\"ops\":{},\"elapsed_secs\":{:.9},\"ops_per_second\":{:.6}}}}}",
         single_same.workers,
         single_same.units,
         single_same.elapsed_secs,
@@ -67,7 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch_multi.units_per_second,
         read.units,
         read.elapsed_secs,
-        read.units_per_second
+        read.units_per_second,
+        read_find_one.units,
+        read_find_one.elapsed_secs,
+        read_find_one.units_per_second
     );
     Ok(())
 }
@@ -320,6 +327,40 @@ fn run_read_benchmark() -> Result<Measurement, Box<dyn std::error::Error>> {
 
     if checksum < 0 {
         return Err("read benchmark checksum underflowed".into());
+    }
+
+    Ok(measure(ops, start.elapsed(), 1))
+}
+
+/// Measures `find_one` throughput on the primary-key point-read path.
+///
+/// Uses `_id` as the filter so the planner always picks `PrimaryKeyLookup::Eq`
+/// (O(log n)). This is the canonical `find_one` use case and the path where
+/// the `match_limit=Some(1)` short-circuit removes the allocation overhead
+/// of the old `find → Vec → .next()` pattern.
+fn run_find_one_benchmark() -> Result<Measurement, Box<dyn std::error::Error>> {
+    let seed_docs = env_i32("MQLITE_PERF_READ_SEED_DOCS", DEFAULT_READ_SEED_DOCS).max(1);
+    let ops = env_usize("MQLITE_PERF_READ_OPS", DEFAULT_READ_OPS).max(1);
+    let dir = TempDir::new()?;
+    let client = open_interval_client(&dir)?;
+    let db = client.database("perf_goal");
+    db.create_collection("read_one_docs")?;
+    let collection = db.collection::<Document>("read_one_docs");
+    let payload = "x".repeat(PAYLOAD_BYTES);
+    let seed_docs_usize = seed_docs as usize;
+    let seed_batch = (0..seed_docs)
+        .map(|id| doc! { "_id": id, "payload": payload.as_str() })
+        .collect::<Vec<_>>();
+    collection.insert_many(&seed_batch).run()?;
+
+    // Point reads by _id: PrimaryKeyLookup::Eq path, O(log n).
+    let start = Instant::now();
+    for op in 0..ops {
+        let id = (op % seed_docs_usize) as i32;
+        let result = collection.find_one(doc! { "_id": id })?;
+        if result.is_none() {
+            return Err(format!("find_one returned no document for _id={id}").into());
+        }
     }
 
     Ok(measure(ops, start.elapsed(), 1))
