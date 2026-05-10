@@ -5,11 +5,26 @@ Embedded MongoDB-compatible document store for Rust.
 [![crates.io](https://img.shields.io/crates/v/mqlite)](https://crates.io/crates/mqlite)
 [![docs.rs](https://docs.rs/mqlite/badge.svg)](https://docs.rs/mqlite)
 
+## Capabilities
+
+- Single-file embedded store with crash-safe write-ahead journal.
+- MongoDB query and update operators with serde-typed or untyped
+  `Document` collections.
+- Snapshot reads via WiredTiger-style MVCC; multi-writer, multi-reader
+  per namespace.
+- B+ tree indexes (`create_index`, unique, sparse) with planner-driven
+  index selection.
+- Optional MongoDB wire-protocol shim for `mongosh` / `pymongo` interop
+  (behind the `wire` feature).
+
 ## Quick Start
+
+mqlite is pre-1.0 and not yet on crates.io; depend on git until the first
+tagged release.
 
 ```toml
 [dependencies]
-mqlite = "0.1"
+mqlite = { git = "https://github.com/kparkins/mqlite" }
 serde = { version = "1", features = ["derive"] }
 ```
 
@@ -68,15 +83,15 @@ Dropping the handle is non-blocking and leaves the journal on disk; the next ope
 
 ## Documentation
 
-- [API Reference (docs.rs)](https://docs.rs/mqlite)
-- [Architecture](ARCHITECTURE.md) — engine internals, lock order, MVCC read/write/reconcile paths
-- [Capabilities](CAPABILITIES.md) — feature surface and what is not supported
-- [Compatibility Matrix](docs/COMPATIBILITY.md) — operator- and command-level MongoDB compatibility
-- [Concurrency Model](docs/CONCURRENCY.md) — MWMR reads, per-namespace write lanes, cross-process locking
-- [Errors](docs/ERRORS.md) — `Error` variants and MongoDB error-code mapping
-- [File Management](docs/FILE-MANAGEMENT.md) — backup, checkpoint, crash recovery
+- [Compatibility Matrix](docs/COMPATIBILITY.md) — operator- and
+  command-level MongoDB compatibility
+- [Concurrency Model](docs/CONCURRENCY.md) — MWMR reads, per-namespace
+  write lanes, cross-process locking
+- [Errors](docs/ERRORS.md) — `Error` variants and MongoDB error-code
+  mapping
+- [File Management](docs/FILE-MANAGEMENT.md) — backup, checkpoint,
+  crash recovery
 - [Wire Protocol Security Advisory](docs/WIRE-SECURITY.md)
-- ADRs: [0001 MVCC](docs/adr/0001-mvcc.md), [0002 MWMR](docs/adr/0002-mwmr.md)
 
 ## Release policy
 

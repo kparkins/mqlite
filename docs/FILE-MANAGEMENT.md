@@ -203,15 +203,17 @@ fn report_db_size(path: &str) {
 
 ---
 
-## After a Crash: Automatic WAL Recovery
+## After a Crash: Automatic Journal Recovery
 
-If the process is killed or the host crashes while mqlite is open, the WAL
-file remains on disk. The next `Client::open()` automatically:
+If the process is killed or the host crashes while mqlite is open, the
+journal file remains on disk. The next `Client::open()` automatically:
 
-1. Detects the leftover WAL.
-2. Replays committed transactions from the WAL into memory.
-3. Discards any partially-written transaction at the tail.
-4. Resumes normal operation.
+1. Detects the leftover journal.
+2. Scans byte-LSN log records forward, accepting only complete
+   CRC-valid records and stopping at the first torn or invalid record.
+3. Truncates the journal to the valid end LSN.
+4. Replays accepted records by persisted `publish_seq` (skipping any whose
+   `end_lsn <= checkpoint_applied_lsn`) and resumes normal operation.
 
 No manual intervention is required.
 
@@ -222,17 +224,18 @@ let client = mqlite::Client::open("myapp.mqlite")?;
 ```
 
 > **Committed vs uncommitted at crash time:**
-> Transactions that were committed (i.e., the write operation returned `Ok`)
-> before the crash are replayed from the WAL and are fully durable.
-> Transactions that were in-flight at crash time (the operation had not
-> returned `Ok`) are discarded.
+> Transactions whose log record was fully written and (for `FullSync`) durable
+> before the crash are replayed and are fully durable. Transactions that
+> reserved a slot but failed before `mark_written` are not replayed; under
+> `Interval` or `None`, writes that finished `mark_written` but had not been
+> fsynced may not survive the crash.
 
 ---
 
 ## Read-Only Access After Failure
 
-If the main file is corrupt but the WAL is intact, or if you need to inspect
-a database without risking further damage, open it in read-only mode:
+If the main file is corrupt but the journal is intact, or if you need to
+inspect a database without risking further damage, open it in read-only mode:
 
 ```rust
 use mqlite::{Client, OpenOptions};
@@ -247,7 +250,8 @@ fn forensic_open(path: &str) -> mqlite::Result<mqlite::Database> {
 ```
 
 In read-only mode:
-- WAL replay is skipped (reads from the last checkpointed state in the main file).
+- Journal replay is skipped (reads from the last checkpointed state in the
+  main file).
 - No write operations are permitted.
 - No OS exclusive lock is acquired (multiple read-only opens can coexist).
 
@@ -260,10 +264,10 @@ read-only filesystem (e.g., a mounted backup volume or a CD-ROM image).
 
 **mqlite does not support network filesystems** (NFS, SMB/CIFS, SSHFS, etc.).
 
-The WAL protocol relies on:
+The journal protocol relies on:
 1. **Atomic file renames** (used during checkpoints).
 2. **Reliable `fcntl`/`LockFileEx` advisory locks** (used for writer exclusivity).
-3. **Durable `fsync` semantics** for the WAL file.
+3. **Durable `fsync` semantics** for the journal file.
 
 Network filesystems frequently fail to provide all three guarantees. The result
 is database corruption that may not be detected immediately.

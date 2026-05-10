@@ -200,11 +200,11 @@ handshake.
 
 | Driver | Status | Required connection options |
 |--------|--------|---------------------------|
-| mongosh 2.x | ✅ Supported | `directConnection=true` |
-| pymongo 4.x | ✅ Supported | `directConnection=True` |
-| Node.js driver 6.x | 🟡 Partial | `directConnection: true` (cursor batching tested; change streams unsupported) |
-| Motor (async pymongo) 3.x | 🟡 Partial | `directConnection=True` |
-| MongoDB Rust driver 3.x | 🟡 Partial | `directConnection=true` (mqlite's native API is sync; wrap in `tokio::task::spawn_blocking` when driving it from an async runtime) |
+| mongosh 2.x | ✅ Tested | `directConnection=true` (handshake + CRUD covered by `tests/wire_compat.rs` and `tests/mongosh_smoke.sh`) |
+| pymongo 4.x | ✅ Tested | `directConnection=True` (covered by `tests/wire_compat.rs` and `tests/pymongo_compat.py`; disable compression: `compressors=[]`) |
+| Node.js driver 6.x | 🔴 Untested | `directConnection: true` (expected to work for basic CRUD; change streams unsupported) |
+| Motor (async pymongo) 3.x | 🔴 Untested | `directConnection=True` (expected to work for basic CRUD) |
+| MongoDB Rust driver 3.x | 🔴 Untested | `directConnection=true` (mqlite's native API is sync; wrap in `tokio::task::spawn_blocking` when driving it from an async runtime) |
 | Java driver 5.x | 🔴 Untested | `directConnection=true` (expected to work for basic CRUD) |
 | Go driver 1.x | 🔴 Untested | `directConnection=true` (expected to work for basic CRUD) |
 

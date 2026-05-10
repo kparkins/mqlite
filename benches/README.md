@@ -120,6 +120,31 @@ cargo bench --bench same_collection_multiwriter -- --baseline current
 
 ---
 
+### Reader Memory Pressure
+
+```
+cargo bench --bench reader_memory_pressure -- --save-baseline current
+```
+
+Workload: a fixed-size hot set of documents is pre-seeded outside the timed
+region; each iteration reads the entire set while a background writer
+continuously inserts to force page eviction. Exercises read-path behavior under
+memory pressure. Durability: `Interval(100ms)`.
+
+---
+
+### Group-Commit LSN
+
+```
+cargo bench --bench group_commit_lsn -- --save-baseline current
+```
+
+Workload: multiple writers commit concurrently to measure LSN assignment and
+group-commit throughput. Captures serialization cost in the commit path.
+Durability: `Interval(100ms)`.
+
+---
+
 ### Reopen Latency
 
 ```
@@ -157,6 +182,10 @@ cargo bench --bench writers_diff_ns -- --baseline current --sample-size 10 --mea
 cargo bench --bench payload_sizes -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
 cargo bench --bench durability_modes -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
 cargo bench --bench index_build -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench read_epoch_root_neutral -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench same_collection_multiwriter -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench reader_memory_pressure -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench --bench group_commit_lsn -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
 cargo bench --bench reopen -- --baseline current --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 

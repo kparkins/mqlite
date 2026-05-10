@@ -273,7 +273,7 @@ match logs.insert_one(&doc! { "msg": "hello" }) {
 ### `Error::SymlinkRejected`
 
 The database path points to a symlink. mqlite refuses to follow symlinks to
-prevent symlink-based path traversal attacks (see WIRE-SECURITY.md §Threat 12).
+prevent symlink-based path traversal attacks (see [WIRE-SECURITY.md](WIRE-SECURITY.md)).
 
 **MongoDB error code:** 2 (BAD_VALUE)
 
@@ -474,6 +474,209 @@ file a bug report at https://github.com/kparkins/mqlite/issues with:
 
 ---
 
+### `Error::WriteConflict`
+
+A concurrent writer committed a conflicting change. mqlite is a
+first-committer-wins MVCC engine; the caller decides whether to retry against
+a fresh `ReadView`. Distinct from `WriterBusy`, which signals lane contention
+with no logical conflict.
+
+**Field:** `reason: WriteConflictReason` — discriminant explaining why the
+conflict was raised:
+- `StaleSnapshot` — the writer's `ReadView` predates a concurrent committed
+  head on the same key.
+- `UpgradeRace` — two readers on the same page-local latch requested upgrade;
+  one loses. Retry is immediate and does not require a new `ReadView`.
+- `SameKeyConflict { key_preview }` — two writers installed deltas on the
+  same primary key.
+- `CatalogGenerationChanged` — the captured catalog generation no longer
+  matches the published epoch when the writer revalidated.
+- `StructuralContention` — multi-leaf install could not acquire all required
+  exclusive page latches.
+- `UniqueConflict { key_prefix_preview }` — a unique-index install observed
+  another live entry whose prefix equals this writer's prefix.
+
+**Recovery:** open a new `ReadView` (or re-run the operation against the live
+client) and retry.
+
+---
+
+### `Error::InvalidConfig`
+
+A caller supplied an invalid engine configuration value (e.g. via `OpenOptions`).
+
+**MongoDB error code:** 2 (BAD_VALUE)
+
+**Fields:**
+- `field: &'static str` — configuration field that failed validation
+- `detail: String` — human-readable reason
+
+---
+
+### `Error::UnsupportedJournalFormat`
+
+The on-disk journal sidecar's magic bytes or format version do not match what
+this build supports. Typically means the database was created by an older or
+newer mqlite build.
+
+**Fields:**
+- `found: [u8; 4]` — magic bytes read from the journal
+- `expected: [u8; 4]` — magic bytes this build expects (`MQJL`)
+
+---
+
+### `Error::JournalFrameTooLarge`
+
+A logical-txn journal frame would exceed the hard byte cap. The encoder bails
+before any byte is appended so the journal stays well-formed.
+
+**Fields:**
+- `logical_frame_bytes: usize`
+- `max_bytes: usize`
+
+---
+
+### `Error::TimestampExhausted`
+
+The HLC logical counter saturated at `u32::MAX` for the current millisecond
+and the wall clock has not advanced past it. Only reachable under pathological
+load (more than `u32::MAX` commits in the same millisecond) or a stuck clock.
+
+---
+
+### `Error::RefcountOverflow`
+
+An overflow-page refcount would exceed `u32::MAX`. Indicates a pin leak
+(≥ 4 billion live `OverflowRef`s on one chain); investigate long-lived
+`ReadView`s or `OverflowRef` retention.
+
+---
+
+### `Error::ReadViewExpired`
+
+A `ReadView` was force-expired by the engine (e.g. during a `drop_collection`
+barrier). The caller must open a new `ReadView` to continue reading.
+
+---
+
+### `Error::StatePoisoned`
+
+A shared-state mutex was poisoned by a panicking thread.
+
+**Field:** `component: &'static str` — name of the poisoned component
+(e.g. `"history_store"`).
+
+---
+
+### `Error::CatalogParse`
+
+A catalog field could not be parsed from BSON.
+
+**Fields:**
+- `field: &'static str` — the BSON field name that failed to parse
+- `source: bson::de::Error` — underlying deserialization error (via `#[source]`)
+
+---
+
+### `Error::UpdateOperatorTypeMismatch`
+
+An update operator was applied to a field whose type does not match what the
+operator requires (e.g. `$inc` on a string field).
+
+**Fields:**
+- `operator: &'static str` (e.g. `"$inc"`)
+- `expected: &'static str`
+- `got: &'static str`
+
+---
+
+### `Error::Recovery`
+
+Open-time recovery found durable evidence that cannot be replayed safely.
+
+**Field:** `detail: String` — operator-facing recovery detail.
+
+---
+
+### `Error::RecoveryPoolExhausted`
+
+Reopen logical replay would exceed the configured buffer-pool size. Increase
+`max_pool_bytes` or perform a forced reconcile on the previous open before
+closing.
+
+---
+
+### `Error::PoolExhausted`
+
+A live CRUD or reader path could not find an evictable buffer-pool frame.
+Checkpoint frontier pressure is reported separately as
+`Error::CheckpointIncomplete`.
+
+**Field:** `reason: PoolExhaustedReason`:
+- `AllFramesPinned` — every frame in the target pool partition is pinned.
+- `DeltaBearingFrames` — every eviction candidate carries resident deltas
+  that cannot be dropped without first reconciling them.
+
+**Recovery:** close or expire long-lived readers/pins, wait for checkpoint
+relief, or increase `buffer_pool_size`.
+
+---
+
+### `Error::CheckpointIncomplete`
+
+A checkpoint cannot advance the durable frontier without losing
+checkpoint-visible resident state.
+
+**Fields:**
+- `first_blocking_page: u32` — first dirty leaf that blocked checkpoint
+  planning.
+- `reason: CheckpointIncompleteReason` — `FrameCoWRefused`,
+  `OverflowSpillNotWired`, `VisibleWinnerExceedsPageBudget`,
+  `TombstonePredecessorPressure`, `PoolExhausted(PoolExhaustedReason)`,
+  `HistoryDuplicateConflict`, `HistoryDuplicateCapExceeded`,
+  `ReachabilityRepairRequired`.
+
+**Recovery:** close or expire long readers/pins, enable overflow spill if
+blocking, raise pool or cap limits, then retry the checkpoint.
+
+---
+
+### `Error::BufferPoolEvictionBlocked`
+
+Internal-only eviction refusal for a delta-bearing frame. Not produced by
+public engine APIs; those still surface `Error::PoolExhausted` when every
+eviction candidate is blocked.
+
+**Fields:**
+- `page: u32`
+- `reason: &'static str`
+
+---
+
+### `Error::EngineFatal`
+
+The engine reached a post-durable state that requires reopening. The durable
+journal commit has already completed when this is raised; in-memory state
+cannot be repaired, so the engine is poisoned, refuses new operations, and
+must be reopened.
+
+**Field:** `reason: EngineFatalReason`:
+- `PostReservationLogWriteFailure` — log writer failed after reserving a
+  byte-LSN range and before marking the record written.
+- `PostDurablePublishFailure` — failure during the ordinary CRUD `mark_ready`
+  publish closure or its surrounding post-durable scope.
+- `PostDurablePendingFlipFailure` — failure flipping `VersionState::Pending`
+  to `Committed`.
+- `PostDurableDdlPublishFailure` — failure during a DDL publish closure
+  (create/drop index, drop namespace, create-index cleanup).
+- `CheckpointPostMutationFailure` — checkpoint failed after its mutation
+  phase began.
+
+**Recovery:** close the `Client` and reopen the database; recovery replays
+from the last durable checkpoint boundary.
+
+---
+
 ## Matching on `Error`
 
 `Error` is `#[non_exhaustive]`, so match arms should include a catch-all:
@@ -510,7 +713,7 @@ Drivers that inspect the `code` field of the error response will receive these v
 | Code | Constant | Variant |
 |------|----------|---------|
 | 1 | `INTERNAL_ERROR` | `Error::Internal` |
-| 2 | `BAD_VALUE` | `Error::SymlinkRejected` |
+| 2 | `BAD_VALUE` | `Error::SymlinkRejected`, `Error::InvalidConfig` |
 | 9 | `UNSUPPORTED_OPERATOR` | `Error::UnsupportedOperator` |
 | 26 | `NAMESPACE_NOT_FOUND` | `Error::CollectionNotFound` |
 | 43 | `CURSOR_NOT_FOUND` | `Error::CursorNotFound` |
@@ -519,6 +722,11 @@ Drivers that inspect the `code` field of the error response will receive these v
 | 121 | `DOCUMENT_VALIDATION_FAILURE` | `Error::DocumentValidationFailure` |
 | 10334 | `DOCUMENT_TOO_LARGE` | `Error::DocumentTooLarge` |
 | 11000 | `DUPLICATE_KEY` | `Error::DuplicateKey` |
+
+All other variants — including `WriteConflict`, `WriterBusy`, `Io`, BSON
+serialization errors, and the engine/recovery variants — return `None` from
+`Error::code()` and surface as `INTERNAL_ERROR` (1) when emitted via the wire
+protocol's generic conversion path.
 
 Use `error.code()` to retrieve the code from a Rust `Error` value:
 

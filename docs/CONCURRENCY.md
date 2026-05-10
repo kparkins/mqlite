@@ -2,10 +2,10 @@
 
 mqlite is **MWMR in-process**: reads are mutex-free (atomic snapshot load),
 and ordinary writer bodies can overlap while DDL waits behind a shared
-metadata read fence. Every read operation opens a `ReadView` that pins a
-point-in-time snapshot; concurrent writes do not disturb an in-progress read.
-The durable commit envelope is globally ordered so commit timestamps, journal
-append order, and published snapshots agree.
+metadata read fence. Every read operation opens a WiredTiger-style MVCC
+`ReadView` that pins a point-in-time snapshot; concurrent writes do not
+disturb an in-progress read. The byte-LSN log envelope is globally ordered
+so commit timestamps, log-append order, and published snapshots agree.
 
 ---
 
@@ -102,9 +102,17 @@ This prevents two separate **processes** from writing simultaneously.
 
 `drop_collection` is the one DDL operation that cannot proceed while any
 `ReadView` is live on the target collection. Under `metadata.write()` the
-engine calls `read_view_registry().force_expire_all()`, which poisons
-every open `ReadView` globally and waits for `pin_ops_in_flight == 0`
-before freeing the collection's B-tree pages (see `src/storage/paged_engine.rs`).
+engine first drains all in-flight writers on the target namespace through
+`NsWriterRegistry::close_and_drain_guard` (see
+`src/storage/paged_engine/writer_registry.rs:214`), then calls
+`read_view_registry().force_expire_all()`, which poisons every open
+`ReadView` globally and waits for `pin_ops_in_flight == 0` before freeing the
+collection's B-tree pages (see `src/storage/paged_engine.rs:1102`).
+
+Phase 5 US-004 retired the legacy F5 name-keyed drop tombstone. Durable
+monotonic namespace ids (Phase 1 §10.7) are now the resurrection barrier: a
+freshly-bootstrapped collection of a previously-dropped name receives a fresh
+`CollectionEntry.id`.
 
 Any caller that holds a `ReadView` across a `drop_collection` will receive
 `Error::ReadViewExpired` on its next read and must open a fresh view.
@@ -118,9 +126,12 @@ Subsequent reads on the dropped collection return zero rows.
 
 | Scenario | Likely Cause |
 |----------|-------------|
-| `WriterBusy` from another process | Another process has the file open for writing |
-| `WriterBusy` from another thread | Two threads writing without coordination |
-| Intermittent `WriterBusy` | Short bursts of write contention |
+| `WriterBusy` from another process | Another process holds the OS advisory writer lock |
+| `WriterBusy` on the target namespace | DDL is draining `NsWriterRegistry` for `drop_namespace`, `create_index`, etc. |
+| Intermittent `WriterBusy` | Short bursts of DDL contention against ordinary CRUD |
+
+Ordinary CRUD writers on different threads do not contend with each other —
+they share `metadata.read()` and overlap inside the engine.
 
 ### Configuring the Busy Timeout
 
@@ -240,12 +251,38 @@ writer.join().unwrap();
 # Ok::<(), mqlite::Error>(())
 ```
 
-### Pattern 2: Shared Database Handle with Mutex Coordination
+### Pattern 2: Shared Database Handle
 
-If you need writes to return results (e.g., the inserted `_id`), wrap the
-write operations in a `Mutex` at the application level. mqlite's internal
-writer mutex already serializes them, but this pattern lets you batch
-application-level logic atomically.
+`Client` is `Send + Sync` and cheap to clone (`Arc`-backed), so most callers
+just clone it across threads — concurrent CRUD writers overlap on
+per-namespace lanes and individual operations commit atomically on their
+own. No external coordination is needed for independent inserts/updates:
+
+```rust
+use mqlite::{Client, doc};
+use bson::Document;
+use std::thread;
+
+let client = Client::open("myapp.mqlite")?;
+let handles: Vec<_> = (0..4).map(|i| {
+    let client = client.clone();
+    thread::spawn(move || {
+        let col = client.database("mydb").collection::<Document>("items");
+        col.insert_one(&doc! { "worker": i, "ts": bson::DateTime::now() })
+    })
+}).collect();
+for h in handles {
+    h.join().unwrap()?;
+}
+# Ok::<(), mqlite::Error>(())
+```
+
+#### When an application-level `Mutex` is warranted
+
+Wrap an explicit `Mutex` only around a read-modify-write sequence that must
+not race with itself in the same process — for example, an in-process
+counter increment, where two threads reading the current value
+simultaneously would each write back the same successor:
 
 ```rust
 use mqlite::{Client, doc};
@@ -253,32 +290,41 @@ use bson::Document;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-// Client is already cheaply clonable (Arc-backed)
 let client = Client::open("myapp.mqlite")?;
+let counters = client.database("mydb").collection::<Document>("counters");
+counters.insert_one(&doc! { "name": "hits", "value": 0i64 })?; // bootstrap
 
-// For application-level atomic batches, add your own Mutex
-let write_lock = Arc::new(Mutex::new(()));
-
-let handles: Vec<_> = (0..4).map(|i| {
+let lock = Arc::new(Mutex::new(()));
+let handles: Vec<_> = (0..4).map(|_| {
     let client = client.clone();
-    let lock = Arc::clone(&write_lock);
-    thread::spawn(move || {
-        let col = client.database("mydb").collection::<Document>("items");
-        // Hold app mutex for the duration of the logical operation
+    let lock = Arc::clone(&lock);
+    thread::spawn(move || -> mqlite::Result<()> {
+        let counters =
+            client.database("mydb").collection::<Document>("counters");
         let _guard = lock.lock().unwrap();
-        col.insert_one(&doc! { "worker": i, "ts": bson::DateTime::now() })
+        let cur = counters
+            .find_one(doc! { "name": "hits" })?
+            .and_then(|d| d.get_i64("value").ok())
+            .unwrap_or(0);
+        counters.update_one(
+            doc! { "name": "hits" },
+            doc! { "$set": { "value": cur + 1 } },
+        )?;
+        Ok(())
     })
 }).collect();
-
 for h in handles {
     h.join().unwrap()?;
 }
 # Ok::<(), mqlite::Error>(())
 ```
 
-> **Tip:** For simple use cases, you can skip the application-level `Mutex`.
-> mqlite's internal writer mutex already ensures correctness — the only reason
-> to add your own is if you need to keep multiple operations logically atomic.
+> **Caveats:** the mutex only excludes other threads in the same process —
+> a second process or another `Client` opened against the same file can
+> still race. Each operation still commits independently, so concurrent
+> readers may observe one update without the next; the mutex prevents
+> racing reads of the same input state, not multi-step atomic visibility.
+> There is no rollback if a later step in the sequence fails.
 
 ### Pattern 3: Multiple Processes (Read-Heavy Workloads)
 
@@ -354,7 +400,8 @@ async fn get_user(client: Client, id: &str) -> mqlite::Result<Option<bson::Docum
 **Q: Can I open the same `.mqlite` file from multiple threads?**
 
 Yes. `Client` is `Clone`, `Send`, and `Sync`. Clone it and share across
-threads freely. The internal writer mutex serializes writes automatically.
+threads freely. Ordinary CRUD writers overlap; only DDL operations and the
+durable log envelope serialize across threads.
 
 **Q: Can I open the same `.mqlite` file from multiple processes?**
 
@@ -377,9 +424,11 @@ write is invisible to all readers until it commits under a single `commit_ts`.
 **Q: What happens if my writer panics mid-write?**
 
 `WriteTxn` rolls back via its `Drop` implementation, so in-progress staged
-changes are discarded. The WAL ensures the database file itself remains
-consistent — the in-progress write was never committed. The engine mutex is
-released normally.
+changes are discarded. The byte-LSN journal is the durable authority:
+recovery only replays complete CRC-valid records and stops at the first torn
+record, so a panic before `mark_written` is invisible after reopen. A panic
+after the LSN range is reserved but before `mark_written` poisons the live
+engine through `LogManager::poison_slot`.
 
 **Q: Is there a way to do multi-document transactions?**
 
