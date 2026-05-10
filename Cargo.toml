@@ -78,6 +78,9 @@ serial_test = "3"
 name = "wire_server"
 required-features = ["wire"]
 
+[[example]]
+name = "perf_axis"
+
 [[bin]]
 name = "mqlite_jepsen_adapter"
 path = "tests/jepsen/adapter.rs"
