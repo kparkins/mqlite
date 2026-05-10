@@ -175,10 +175,6 @@ fn post_step_8_checkpoint_batch_without_boundary_discards_batch() {
         header.last_checkpoint_ts,
         "post-step-8 recovery must leave the durable header frontier unchanged"
     );
-    assert!(
-        recovered.index().lookup(CHECKPOINT_PAGE).is_none(),
-        "discarded checkpoint batch must not be retained in the recovery index"
-    );
     assert_eq!(
         recovered.write_cursor(),
         JOURNAL_HEADER_SIZE as u64,
@@ -225,10 +221,6 @@ fn torn_non_commit_frame_before_intact_commit_boundary_discards_batch() {
         read_header(&mut reopen_file).last_checkpoint_ts,
         header.last_checkpoint_ts,
         "intact page-0 boundary after a torn non-commit frame must be ignored"
-    );
-    assert!(
-        recovered.index().lookup(CHECKPOINT_PAGE).is_none(),
-        "torn checkpoint batch must not be retained in the recovery index"
     );
     assert_eq!(
         recovered.write_cursor(),

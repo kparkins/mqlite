@@ -61,12 +61,9 @@ use crate::storage::page::PAGE_SIZE_LEAF;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::paged_engine::group_commit_observations;
 
-use self::shm::JournalIndex;
 
 pub(crate) use self::recovery::ParsedLogicalFrames;
 
-#[cfg(any(test, feature = "test-hooks"))]
-use self::log_file::LogicalTxnFrame;
 use self::log_file::{
     JournalHeader, JournalOffset, JournalPageSize, PageId, PositionedLogFile, JOURNAL_HEADER_SIZE,
 };
@@ -806,13 +803,6 @@ impl CheckpointFlushSet {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CheckpointFrameTag {
-    batch_id: CheckpointBatchId,
-    pool: CheckpointPoolKind,
-    page_id: PageId,
-}
-
 /// Manages the journal and its in-memory page-offset index for one database.
 ///
 /// Created via [`JournalManager::open_or_create`].  On clean shutdown call
@@ -823,9 +813,6 @@ pub(crate) struct JournalManager {
     pub(super) journal_path: PathBuf,
     /// Open handle to the journal file (positioned at the write cursor).
     pub(super) journal_file: File,
-    /// In-memory `page_number -> journal frame offset` index, rebuilt from
-    /// a journal scan on open and maintained in-place. Not persisted.
-    pub(super) index: JournalIndex,
     /// Salt 1 from the main file header (stored in every journal frame).
     pub(super) salt1: u32,
     /// Salt 2 from the main file header.
@@ -857,16 +844,10 @@ pub(crate) struct JournalManager {
     /// via [`take_parsed_logical_frames`](Self::take_parsed_logical_frames)
     /// for Pass 2 validation (§5.2).
     pub(crate) parsed_logical_frames: ParsedLogicalFrames,
-    /// Start offset for an uncommitted legacy page-frame range.
-    pub(super) legacy_pending_start_offset: Option<JournalOffset>,
-    /// End offset of the most recent committed legacy page-frame range.
-    pub(super) last_legacy_commit_end_offset: JournalOffset,
     /// Open checkpoint batch id/start, if step-8 flushing is active.
     pub(super) checkpoint_batch_active: Option<(CheckpointBatchId, JournalOffset)>,
     /// Next in-process checkpoint batch id.
     pub(super) next_checkpoint_batch_id: u64,
-    /// In-memory tags for checkpoint-owned pending page frames.
-    checkpoint_frame_tags: BTreeMap<JournalOffset, CheckpointFrameTag>,
 }
 
 impl JournalManager {
@@ -923,7 +904,6 @@ impl JournalManager {
         Ok(Self {
             journal_path,
             journal_file,
-            index: JournalIndex::new(),
             salt1,
             salt2,
             checkpoint_seq: 0,
@@ -936,11 +916,8 @@ impl JournalManager {
             recovered_max_commit_ts: None,
             recovered_max_publish_seq: None,
             parsed_logical_frames: ParsedLogicalFrames::default(),
-            legacy_pending_start_offset: None,
-            last_legacy_commit_end_offset: JOURNAL_HEADER_SIZE as u64,
             checkpoint_batch_active: None,
             next_checkpoint_batch_id: 1,
-            checkpoint_frame_tags: BTreeMap::new(),
         })
     }
 
@@ -1205,11 +1182,6 @@ impl JournalManager {
         (self.salt1, self.salt2)
     }
 
-    /// Return a reference to the in-memory journal index (for inspection in tests).
-    pub(crate) fn index(&self) -> &JournalIndex {
-        &self.index
-    }
-
     /// Highest `ChainCommit::commit_ts` observed during recovery, or `None`
     /// when the journal was freshly created or carried no ChainCommit
     /// frames. The MVCC backend uses this to floor the HLC oracle at
@@ -1301,10 +1273,7 @@ impl JournalManager {
 
         self.write_cursor = JOURNAL_HEADER_SIZE as u64;
         self.log_manager.reset_to(self.write_cursor);
-        self.legacy_pending_start_offset = None;
-        self.last_legacy_commit_end_offset = self.write_cursor;
         self.checkpoint_batch_active = None;
-        self.checkpoint_frame_tags.clear();
         Ok(())
     }
 }

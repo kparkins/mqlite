@@ -20,7 +20,6 @@ use super::log_file::{
     LOG_RECORD_MAGIC, LOG_RECORD_TOTAL_LEN_OFFSET, MAX_LOG_RECORD_BYTES,
     RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
 };
-use super::shm::JournalIndex;
 use super::write_page_to_main;
 use super::JournalManager;
 
@@ -156,7 +155,6 @@ impl JournalManager {
         Ok(Some(JournalManager {
             journal_path: journal_path.to_path_buf(),
             journal_file,
-            index: JournalIndex::new(),
             salt1,
             salt2,
             checkpoint_seq,
@@ -166,11 +164,8 @@ impl JournalManager {
             recovered_max_commit_ts: scan.recovered_max_commit_ts,
             recovered_max_publish_seq: scan.recovered_max_publish_seq,
             parsed_logical_frames: scan.parsed_logical,
-            legacy_pending_start_offset: None,
-            last_legacy_commit_end_offset: resume_lsn,
             checkpoint_batch_active: None,
             next_checkpoint_batch_id,
-            checkpoint_frame_tags: std::collections::BTreeMap::new(),
         }))
     }
 
