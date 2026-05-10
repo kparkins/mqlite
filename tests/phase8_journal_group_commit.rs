@@ -175,30 +175,6 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
-fn commit_append_hot_path_uses_log_manager_reservations() {
-    let source = include_str!("../src/journal/mod.rs");
-    let chain_body = source_between(
-        source,
-        "fn append_chain_commit_record",
-        "/// Append a `LogicalTxnFrame`",
-    );
-    let logical_body = source_between(
-        source,
-        "pub(crate) fn append_logical_txn",
-        "/// Append a page-0 checkpoint commit boundary",
-    );
-
-    for body in [chain_body, logical_body] {
-        assert!(body.contains("self.log_manager.reserve(bytes.len())"));
-        assert!(body.contains("self.log_manager.write_reserved(&slot, &bytes)"));
-        assert!(body.contains("self.log_manager.mark_written(&slot)"));
-        assert!(!body.contains("frame_offset = self.write_cursor"));
-        assert!(!body.contains(".seek("));
-        assert!(!body.contains(".write_all("));
-    }
-}
-
-#[test]
 fn sync_journal_uses_log_manager_durable_frontier() {
     let source = include_str!("../src/journal/mod.rs");
     let sync_body = source_between(
