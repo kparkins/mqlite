@@ -158,7 +158,6 @@ impl JournalManager {
             salt1,
             salt2,
             checkpoint_seq,
-            write_cursor: resume_lsn,
             log_manager: Arc::new(super::LogManager::new(log_manager_file, resume_lsn)),
             last_committed_db_page_count: scan.recovered_db_page_count,
             recovered_max_commit_ts: scan.recovered_max_commit_ts,

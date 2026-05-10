@@ -819,8 +819,6 @@ pub(crate) struct JournalManager {
     pub(super) salt2: u32,
     /// Checkpoint sequence counter from the journal file header.
     pub(super) checkpoint_seq: u32,
-    /// Byte offset of the next frame to write (append cursor).
-    pub(super) write_cursor: u64,
     /// Phase 8 byte-LSN reservation manager for ordinary commit-log appends.
     log_manager: Arc<LogManager>,
     /// Total database page count as of the last committed journal frame.
@@ -907,7 +905,6 @@ impl JournalManager {
             salt1,
             salt2,
             checkpoint_seq: 0,
-            write_cursor: JOURNAL_HEADER_SIZE as u64,
             log_manager: Arc::new(LogManager::new(
                 log_manager_file,
                 JOURNAL_HEADER_SIZE as u64,
@@ -1271,8 +1268,7 @@ impl JournalManager {
             .map_err(Error::Io)?;
         self.journal_file.flush().map_err(Error::Io)?;
 
-        self.write_cursor = JOURNAL_HEADER_SIZE as u64;
-        self.log_manager.reset_to(self.write_cursor);
+        self.log_manager.reset_to(JOURNAL_HEADER_SIZE as u64);
         self.checkpoint_batch_active = None;
         Ok(())
     }
