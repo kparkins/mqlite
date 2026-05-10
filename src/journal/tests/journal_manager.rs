@@ -138,48 +138,6 @@ mod tests {
         ))
     }
 
-    fn append_test_page0_boundary(
-        mgr: &mut JournalManager,
-        base_header: &FileHeader,
-        checkpoint_ts: crate::mvcc::timestamp::Ts,
-    ) -> BoundaryAppended {
-        let cursor = mgr.begin_checkpoint_batch().unwrap();
-        let mut staged_header = base_header.clone();
-        staged_header.last_checkpoint_ts = checkpoint_ts;
-        mgr.append_checkpoint_commit_boundary(&staged_header, cursor)
-            .unwrap()
-    }
-
-    fn append_test_checkpoint_batch(
-        mgr: &mut JournalManager,
-        base_header: &FileHeader,
-        pages: impl IntoIterator<Item = u32>,
-        fill: u8,
-        checkpoint_ts: crate::mvcc::timestamp::Ts,
-    ) -> BoundaryAppended {
-        let pages: Vec<u32> = pages.into_iter().collect();
-        let cursor = mgr.begin_checkpoint_batch().unwrap();
-        let batch_id = cursor.batch_id();
-        let page_data = make_page_4k(fill);
-        for page_number in &pages {
-            mgr.append_checkpoint_frame(
-                batch_id,
-                CheckpointPoolKind::Main,
-                *page_number,
-                JournalPageSize::Small4k,
-                &page_data,
-            )
-            .unwrap();
-        }
-        let mut staged_header = base_header.clone();
-        if let Some(max_page) = pages.iter().copied().max() {
-            staged_header.total_page_count = staged_header.total_page_count.max(max_page + 1);
-        }
-        staged_header.last_checkpoint_ts = checkpoint_ts;
-        mgr.append_checkpoint_commit_boundary(&staged_header, cursor)
-            .unwrap()
-    }
-
     // -----------------------------------------------------------------------
     // Phase 8 LogManager slot reservation
     // -----------------------------------------------------------------------

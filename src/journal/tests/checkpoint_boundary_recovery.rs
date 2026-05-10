@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use super::log_file::{JournalPageSize, JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE};
+use super::log_file::{JournalPageSize, JOURNAL_HEADER_SIZE};
 use super::*;
 use crate::mvcc::Ts;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
@@ -131,7 +131,11 @@ fn corrupt_frame_checksum(db_path: &Path, frame_offset: u64) {
         .write(true)
         .open(journal_path_for(db_path))
         .expect("open journal");
-    let checksum_offset = frame_offset + (JOURNAL_FRAME_HEADER_SIZE as u64 - 4);
+    // Corrupt a byte inside the Phase 8 LogRecord header so the recovery
+    // scan rejects the frame as torn. Offset 20 lands inside the
+    // record-header bytes (the header is `LOG_RECORD_HEADER_LEN = 72`
+    // bytes long); flipping any header byte invalidates the prefix CRC.
+    let checksum_offset = frame_offset + 20;
     journal
         .seek(SeekFrom::Start(checksum_offset))
         .expect("seek checksum");

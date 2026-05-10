@@ -10,17 +10,14 @@
 mod tests {
     use crate::error::Error;
     use crate::journal::log_file::{
-        ChainCommitFrame, CheckpointBatchPageRecord, JournalHeader, JournalPageSize,
-        Page0BoundaryRecord, FRAME_KIND_CHAIN_COMMIT, JOURNAL_FORMAT_VERSION,
-        JOURNAL_FRAME_HEADER_SIZE, JOURNAL_HEADER_SIZE,
-        RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
+        ChainCommitFrame, JournalHeader, FRAME_KIND_CHAIN_COMMIT, JOURNAL_FORMAT_VERSION,
+        JOURNAL_HEADER_SIZE, RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
     };
     use crate::journal::{journal_path_for, JournalManager};
     use crate::mvcc::timestamp::Ts;
     use crate::storage::header::FileHeader;
-    use crate::storage::page::PAGE_SIZE_INTERNAL;
     use std::fs::OpenOptions;
-    use std::io::{Cursor, Read, Seek, Write};
+    use std::io::{Read, Write};
 
     const TEST_SALT1: u32 = 0xDEAD_BEEF;
     const TEST_SALT2: u32 = 0xCAFE_BABE;
@@ -48,57 +45,6 @@ mod tests {
         let mut header = JournalHeader::new(TEST_SALT1, TEST_SALT2);
         header.format_version = format_version;
         header.to_bytes()
-    }
-
-    #[test]
-    fn test_a2_format_lock_byte_layout_matches_head() {
-        let page = vec![0xA2; PAGE_SIZE_INTERNAL as usize];
-        let record = CheckpointBatchPageRecord {
-            page_number: 37,
-            salt1: TEST_SALT1,
-            salt2: TEST_SALT2,
-            page_size: JournalPageSize::Small4k,
-        };
-
-        let mut bytes = Vec::new();
-        record.write(&mut bytes, &page).unwrap();
-
-        assert_eq!(
-            bytes.len(),
-            JOURNAL_FRAME_HEADER_SIZE + PAGE_SIZE_INTERNAL as usize
-        );
-        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 37);
-        assert_eq!(
-            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            0,
-            "checkpoint-batch page records are non-commit page frames"
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            TEST_SALT1
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            TEST_SALT2
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            PAGE_SIZE_INTERNAL
-        );
-
-        let mut prefix = [0u8; 20];
-        prefix.copy_from_slice(&bytes[..20]);
-        let expected_crc = CheckpointBatchPageRecord::compute_checksum(&prefix, &page);
-        assert_eq!(
-            u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-            expected_crc
-        );
-
-        let mut cursor = Cursor::new(bytes);
-        let decoded = CheckpointBatchPageRecord::read(&mut cursor, TEST_SALT1, TEST_SALT2)
-            .unwrap()
-            .expect("checkpoint-batch page record decodes");
-        assert_eq!(decoded, record);
     }
 
     #[test]
