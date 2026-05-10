@@ -627,7 +627,6 @@ impl LogManager {
     }
 
     /// Return the next byte-LSN reservation frontier.
-    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn next_lsn(&self) -> u64 {
         self.next_lsn.load(Ordering::Acquire)
     }
