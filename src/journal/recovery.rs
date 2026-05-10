@@ -953,7 +953,8 @@ impl JournalManager {
             );
         }
 
-        let mut manager = JournalManager {
+        let _ = durable_checkpoint_page_count;
+        let manager = JournalManager {
             journal_path: journal_path.to_path_buf(),
             journal_file,
             index,
@@ -972,9 +973,6 @@ impl JournalManager {
             next_checkpoint_batch_id: 1,
             checkpoint_frame_tags: std::collections::BTreeMap::new(),
         };
-        if let Some(expected_total_page_count) = durable_checkpoint_page_count {
-            manager.emergency_checkpoint_after_boundary(main_file, expected_total_page_count)?;
-        }
 
         Ok(Some(manager))
     }

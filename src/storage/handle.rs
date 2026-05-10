@@ -381,45 +381,6 @@ impl BufferPoolHandle {
         Ok(())
     }
 
-    /// Copy the post-boundary checkpoint batch into the main file.
-    ///
-    /// This Phase 7 primitive runs only after the page-0 boundary has become
-    /// durable. It fdatasyncs the main file before journal truncation and never
-    /// mutates allocator header state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Internal`] if no journal/main-file pair is attached, no
-    /// durable page-0 checkpoint boundary exists, or the boundary page count
-    /// differs from `expected_total_page_count`.
-    #[allow(
-        dead_code,
-        reason = "Phase 7 checkpoint recovery primitive is retained for checkpoint-only callers"
-    )]
-    pub(crate) fn emergency_checkpoint_after_boundary(
-        &self,
-        expected_total_page_count: u32,
-    ) -> Result<()> {
-        let Some(file_mutex) = self.journal_main_file.as_ref() else {
-            return Err(Error::Internal(
-                "post-boundary checkpoint requires an attached main file".into(),
-            ));
-        };
-        let Some(journal) = &self.journal else {
-            return Err(Error::Internal(
-                "post-boundary checkpoint requires an attached journal".into(),
-            ));
-        };
-        let mut file_guard = file_mutex
-            .lock()
-            .map_err(|_| Error::Internal("journal main-file mutex poisoned".into()))?;
-        let mut journal_guard = journal
-            .lock()
-            .map_err(|_| Error::Internal("journal mutex poisoned".into()))?;
-        journal_guard
-            .emergency_checkpoint_after_boundary(&mut file_guard, expected_total_page_count)
-    }
-
     /// Advance the page-lifetime checkpoint fence and drain newly eligible pages.
     pub(crate) fn advance_page_lifetime_checkpoint(&self) -> Result<usize> {
         self.allocator.advance_page_lifetime_checkpoint_fence();
