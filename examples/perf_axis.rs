@@ -13,6 +13,7 @@
 //! Default writer counts: same_ns_* = 4, multi_ns_* = 8.
 
 use std::env;
+use std::io::Write;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -97,7 +98,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         other => return Err(format!("unknown --axis: {other}").into()),
     }
-    Ok(())
+    // Throughput is already emitted inside the run_* helpers; the workload
+    // is what we measure, not the post-workload Client::drop checkpoint.
+    // Bypass the drop chain (which would flush a 60K-row checkpoint
+    // serially per invocation and dominate the runner's wall time) and
+    // exit immediately. The TempDir leak is bounded — the OS reclaims it
+    // when the runner finishes.
+    std::io::stdout().flush().ok();
+    std::process::exit(0);
 }
 
 fn run_same_ns(
