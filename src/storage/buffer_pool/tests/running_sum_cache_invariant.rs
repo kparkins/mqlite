@@ -1,6 +1,6 @@
 //! PR2 running-sum cache invariant proof.
 //!
-//! Three load-bearing tests:
+//! Four load-bearing tests:
 //!
 //! 1. **`stress_10k_mutations_keep_cache_consistent`** — runs 10 000
 //!    seeded random mutations on a single page through every
@@ -24,7 +24,12 @@
 //!    Committed satisfy) and the head's `key`/`data`/`stop_ts`/
 //!    `is_tombstone` are identical before and after.
 //!
-//! 3. **`replace_leaf_and_chains_recomputes_cache`** — exercises
+//! 3. **`phase_b_abort_swap_updates_cache`** — proves the same Phase B
+//!    install path subtracts bytes when Pending insert heads flip to
+//!    Aborted during pre-durable cleanup. This guards the non-debug
+//!    release path, where a stale cache would otherwise survive.
+//!
+//! 4. **`replace_leaf_and_chains_recomputes_cache`** — exercises
 //!    audit Finding A: the checkpoint dirty-leaf reconcile path
 //!    bypasses `with_all_chains` to swap both the page bytes and the
 //!    chain map atomically. PR2 wires a fresh recompute into that
@@ -400,6 +405,73 @@ fn phase_b_swap_preserves_cache() {
     );
     // And the cache still matches a fresh recompute.
     assert_cache_consistent(&pool, "phase_b_post_flip", 0);
+}
+
+#[test]
+fn phase_b_abort_swap_updates_cache() {
+    let pool = fresh_pool();
+
+    const TXN_ID: u64 = 0xAB0A7;
+    const N: usize = 8;
+    let pending_ts = 200u64;
+    for i in 0..N {
+        let key = key_for(i);
+        let chain = Arc::new(VecDeque::from([pending_entry(
+            pending_ts + i as u64,
+            TXN_ID,
+            &[i as u8, 0xAA],
+        )]));
+        pool.with_chain_under_latch(PAGE_ID, &key, LatchMode::Exclusive, |slot| {
+            *slot = Some(chain);
+        })
+        .unwrap();
+    }
+
+    let cached_before = pool
+        .live_delta_payload_bytes_for_test(PAGE_ID)
+        .expect("page must be resident");
+    assert!(
+        cached_before > 0,
+        "pending inserts must produce cache bytes"
+    );
+    assert_cache_consistent(&pool, "phase_b_abort_setup", 0);
+
+    let mut prepared: Vec<PreparedChainSwap> = Vec::with_capacity(N);
+    {
+        let mut excl = pool
+            .pin_for_write_sized(PAGE_ID, PageSize::Large32k)
+            .unwrap();
+        for i in 0..N {
+            let key = key_for(i);
+            let expected_old = excl
+                .snapshot_chain_arc(&key)
+                .expect("chain installed in setup");
+            let mut new_chain = expected_old.clone();
+            let new_inner = Arc::make_mut(&mut new_chain);
+            if let Some(head) = new_inner.front_mut() {
+                head.state = VersionState::Aborted;
+            }
+            prepared.push(PreparedChainSwap {
+                key,
+                new_chain,
+                expected_old,
+            });
+        }
+
+        let outcome = excl.try_swap_chains_if_unchanged(prepared).unwrap();
+        assert!(matches!(outcome, SwapOutcome::Success), "swap must succeed");
+    }
+
+    let cached_after = pool
+        .live_delta_payload_bytes_for_test(PAGE_ID)
+        .expect("page must still be resident");
+    assert_eq!(
+        cached_after, 0,
+        "Phase B Pending->Aborted flip must subtract pending bytes \
+         from live_delta_payload_bytes (before={cached_before}, \
+         after={cached_after})"
+    );
+    assert_cache_consistent(&pool, "phase_b_abort_post_flip", 0);
 }
 
 #[test]

@@ -260,11 +260,11 @@ pub use wire::WireProtocol;
 // ---------------------------------------------------------------------------
 // PR1 perf-counter readers (feature = "perf-counters" only)
 //
-// Exposed publicly so `examples/perf_axis` can print AC values at the
+// Exposed publicly so `benches/perf/perf_matrix.rs` can print AC values at the
 // end of a workload run. Production binaries that don't enable
 // `perf-counters` never compile this module and pay zero overhead.
 // ---------------------------------------------------------------------------
-/// PR1 perf-counter readers exposed for the `examples/perf_axis` AC harness.
+/// PR1 perf-counter readers exposed for the consolidated perf harness.
 ///
 /// Only compiled when the `perf-counters` cargo feature is enabled.
 /// Production binaries pay zero overhead and these symbols do not

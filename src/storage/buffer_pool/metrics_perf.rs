@@ -2,7 +2,7 @@
 //!
 //! All counter storage lives in [`super::chains`] (the AtomicU64
 //! statics) plus the shared-latch-wait histogram below. This module is
-//! the single read surface for [`examples/perf_axis`] and the AC
+//! the single read surface for `benches/perf/perf_matrix.rs` and the AC
 //! verification harness; production binaries that don't enable
 //! `perf-counters` never compile this file and pay zero overhead.
 //!

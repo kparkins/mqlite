@@ -228,7 +228,7 @@ The plan rev-4 estimate of 450 LOC ± 50% covers this honest 500–700 LOC range
 These are NOT blockers to the verdict but should be addressed during implementation:
 
 1. **Shard count `N=16` is a guess.** The plan defers a microbench inside PR4. Recommend committing the audit with `N=16` as a TUNABLE constant and noting the microbench-revisit obligation.
-2. **`tools/perf/sample_hot.py` and `examples/perf_axis.rs`** — PR4 needs a sample profile capture confirming `_pthread_mutex_firstfit_lock_slow on PrimaryHistoryProbe` drops by ≥50% (per AC). This is straightforward.
+2. **`benches/perf/sample_hot.py` and `benches/perf/perf_matrix.rs`** — PR4 needs a sample profile capture confirming `_pthread_mutex_firstfit_lock_slow on PrimaryHistoryProbe` drops by ≥50% (per AC). This is straightforward.
 3. **Cross-shard recovery ordering test** is required (per AC). Test strategy: create N spills covering keys that hash to different shards, force a process exit between commit_spill_txn and flush in a way that leaves one shard's write durable and another's not (using `test-hooks`). On recovery, assert the live engine reads back the durable shard's writes only and re-applies the lost ones from the journal tail (logical_replay_frontier path stays intact). Concrete failpoints to look at: `hidden_accessors::us026_fail_if_armed`.
 4. **Catalog page-id set in `paged_engine.rs:457-458`** — used by `check_recovery_replay_pool_bound`. Sharded variant must insert all N history roots; missing any one would let recovery's pool-bound check ignore that shard's pages. Easy to get wrong.
 5. **`HistoryStoreGuard` thread-local depth sentinel** at `history_store.rs:82-105` — the non-recursion sentinel must remain a SINGLE depth counter (not per-shard), because the protection is "any history-store entry, anywhere in the engine". Sharded variant: each shard's public method increments the same `HISTORY_STORE_DEPTH`. ✓ trivial.
@@ -240,7 +240,7 @@ These are NOT blockers to the verdict but should be addressed during implementat
 This audit's **PROCEED-when-justified** verdict is bounded above by current profile evidence (spike #6: history-store mutex is cold). Implementation is unblocked when **either** of the following triggers fires on a future post-PR2 profile run:
 
 ### Trigger A — Probe-path mutex appears in profile top-30
-On any post-PR2 `examples/perf_axis --axis same_ns_single --seconds 30 --writers 4` `sample` capture, post-processed via `tools/perf/sample_hot.py`:
+On any post-PR2 `target/release/perf_matrix --axis multi_writer_single_ns_single --writers 4` `sample` capture, post-processed via `benches/perf/sample_hot.py`:
 - **Symbol:** `_pthread_mutex_firstfit_lock_slow` (or its parking_lot equivalent if the codebase migrates) appearing on the call stack of `PrimaryHistoryProbe::probe_visible_version` (`snapshot_ops.rs:141-152`) **or** `SecondaryHistoryProbe::probe_visible_version` (`visibility.rs:104-116`).
 - **Threshold:** appears in the top-30 self-time entries of the `sample_hot.py` output for the run.
 - **Action:** unblock PR4 implementation; this audit is the cross-key precondition.

@@ -637,28 +637,32 @@ impl<'pool> LatchedPinnedPage<'pool> {
         // Second pass: install. We checked every entry first; this
         // loop cannot observe a conflict it did not see in pass one.
         //
-        // PR2 cache invariant: Pending(txn_id) -> Committed flips do
-        // NOT change a chain's `chain_live_head_bytes` contribution
-        // because the formula filters on `state != Aborted`, which
-        // both Pending and Committed satisfy, AND the head's `key`,
-        // `data`, `is_tombstone`, `stop_ts` fields are identical
-        // before and after the flip. The `debug_assert_eq!` below
-        // witnesses this invariant on every swap; release builds
-        // skip it.
-        #[cfg(debug_assertions)]
-        for swap in &prepared {
+        // PR2 cache invariant: commit flips are usually byte-neutral
+        // (`Pending` and `Committed` both count as live). Abort flips are
+        // not byte-neutral because `Aborted` heads are filtered out by
+        // `chain_live_head_bytes`. Keep the running sum in sync by
+        // applying the same per-key byte delta as `with_chain`.
+        let mut live_delta_payload_bytes = frame
+            .live_delta_payload_bytes
+            .load(Ordering::Acquire);
+        for swap in prepared {
             let before = chains::chain_live_head_bytes(&swap.key, &swap.expected_old);
             let after = chains::chain_live_head_bytes(&swap.key, &swap.new_chain);
-            debug_assert_eq!(
-                before, after,
-                "Phase B swap must preserve chain_live_head_bytes \
-                 (key={:?}, before={before}, after={after}) — flipping \
-                 Pending(txn_id) -> Committed must NOT change footprint",
-                swap.key
-            );
-        }
-        for swap in prepared {
+            live_delta_payload_bytes = live_delta_payload_bytes
+                .wrapping_add(after)
+                .wrapping_sub(before);
             frame.deltas.insert(swap.key, swap.new_chain);
+        }
+        frame
+            .live_delta_payload_bytes
+            .store(live_delta_payload_bytes, Ordering::Release);
+        #[cfg(debug_assertions)]
+        {
+            let fresh = chains::frame_live_delta_payload_bytes(&frame.deltas);
+            debug_assert_eq!(
+                live_delta_payload_bytes, fresh,
+                "Phase B swap must preserve live_delta_payload_bytes invariant"
+            );
         }
         Ok(SwapOutcome::Success)
     }

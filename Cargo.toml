@@ -25,7 +25,7 @@ loom-tests = []
 # Enables in-tree perf counters for the PR1 bounded-retry rate AC and the
 # PR1/PR2 read-coupling latency histograms. Off by default — production
 # builds pay zero overhead. Build with `--features perf-counters` to
-# capture the AC measurements via `examples/perf_axis`.
+# capture the AC measurements via `benches/perf/perf_matrix.rs`.
 perf-counters = ["dep:hdrhistogram"]
 
 [dependencies]
@@ -92,8 +92,9 @@ serde_json = "1"
 name = "wire_server"
 required-features = ["wire"]
 
-[[example]]
-name = "perf_axis"
+[[bin]]
+name = "perf_matrix"
+path = "benches/perf/perf_matrix.rs"
 
 [[bin]]
 name = "mqlite_jepsen_adapter"
@@ -130,14 +131,6 @@ debug = true
 opt-level = 3
 
 [[bench]]
-name = "writers_same_ns"
-harness = false
-
-[[bench]]
-name = "writers_diff_ns"
-harness = false
-
-[[bench]]
 name = "payload_sizes"
 harness = false
 
@@ -159,10 +152,6 @@ harness = false
 
 [[bench]]
 name = "reader_memory_pressure"
-harness = false
-
-[[bench]]
-name = "same_collection_multiwriter"
 harness = false
 
 [[bench]]

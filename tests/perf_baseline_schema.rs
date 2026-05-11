@@ -18,7 +18,6 @@ const REQUIRED_TOP_LEVEL: &[&str] = &[
     "hardware",
     "build_cmd",
     "axis_runs",
-    "duration_seconds",
     "rows",
 ];
 
@@ -32,6 +31,12 @@ const REQUIRED_ROW_FIELDS: &[&str] = &[
 ];
 
 const ALLOWED_AXES: &[&str] = &[
+    "single_writer_single_ns_single",
+    "single_writer_single_ns_batch",
+    "multi_writer_single_ns_single",
+    "multi_writer_single_ns_batch",
+    "multi_writer_multi_ns_single",
+    "multi_writer_multi_ns_batch",
     "same_ns_single",
     "same_ns_batch",
     "same_ns_partitioned",
@@ -59,15 +64,23 @@ fn baseline_sidecars_match_schema() {
     // one commit and the baseline data in a follow-up commit, so this test
     // must succeed in the interim. Once any sidecar exists it must conform.
     if sidecars.is_empty() {
-        eprintln!("note: no JSON sidecars in {BASELINE_DIR}/ yet — schema check is a no-op");
+        eprintln!(
+            "note: no JSON sidecars in {BASELINE_DIR}/ yet - \
+             schema check is a no-op"
+        );
         return;
     }
 
     for path in &sidecars {
-        let body =
-            fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let v: Value = serde_json::from_str(&body)
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let path_display = path.display();
+        let body = match fs::read_to_string(path) {
+            Ok(body) => body,
+            Err(error) => panic!("{path_display}: {error}"),
+        };
+        let v: Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
+            Err(error) => panic!("{path_display}: {error}"),
+        };
 
         let obj = v
             .as_object()
@@ -96,11 +109,7 @@ fn baseline_sidecars_match_schema() {
             "{}: axis_runs must be unsigned integer",
             path.display()
         );
-        assert!(
-            obj["duration_seconds"].is_u64(),
-            "{}: duration_seconds must be unsigned integer",
-            path.display()
-        );
+        assert_run_shape_fields(path, obj);
 
         let rows = obj["rows"]
             .as_array()
@@ -110,7 +119,7 @@ fn baseline_sidecars_match_schema() {
         for (i, row) in rows.iter().enumerate() {
             let row = row
                 .as_object()
-                .unwrap_or_else(|| panic!("{}: rows[{i}] must be object", path.display()));
+                .unwrap_or_else(|| panic!("{path_display}: rows[{i}] must be object"));
             for key in REQUIRED_ROW_FIELDS {
                 assert!(
                     row.contains_key(*key),
@@ -119,9 +128,9 @@ fn baseline_sidecars_match_schema() {
                 );
             }
 
-            let axis = row["axis"].as_str().unwrap_or_else(|| {
-                panic!("{}: rows[{i}].axis must be string", path.display())
-            });
+            let axis = row["axis"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{path_display}: axis string"));
             assert!(
                 ALLOWED_AXES.contains(&axis),
                 "{}: rows[{i}].axis = {axis:?} not in allowed set",
@@ -157,4 +166,20 @@ fn baseline_sidecars_match_schema() {
             );
         }
     }
+}
+
+fn assert_run_shape_fields(path: &Path, obj: &serde_json::Map<String, Value>) {
+    let has_duration = obj
+        .get("duration_seconds")
+        .is_some_and(|value| value.is_u64());
+    let has_fixed_docs = obj
+        .get("docs_per_writer")
+        .is_some_and(|value| value.is_u64())
+        && obj.get("batch_size").is_some_and(|value| value.is_u64());
+    assert!(
+        has_duration || has_fixed_docs,
+        "{}: sidecar must declare either duration_seconds or \
+         docs_per_writer + batch_size",
+        path.display()
+    );
 }

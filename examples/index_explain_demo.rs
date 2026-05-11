@@ -15,7 +15,7 @@ struct LogEntry {
 }
 
 fn main() -> mqlite::Result<()> {
-    let db_path = std::env::temp_dir().join("mqlite_index_test.mqlite");
+    let db_path = std::env::temp_dir().join("mqlite_index_explain_demo.mqlite");
     println!("Database: {}\n", db_path.display());
 
     let client = Client::open(&db_path)?;
@@ -92,7 +92,10 @@ fn main() -> mqlite::Result<()> {
     println!("  Matched: {}\n", matched.len());
 
     // --- Test 3: Range query with index ($gte on indexed field) ---
-    println!("=== Test 3: Find logs with level >= 'warn' (range on indexed `level`) ===");
+    println!(
+        "=== Test 3: Find logs with level >= 'warn' \
+         (range on indexed `level`) ==="
+    );
     let cursor = logs.find(doc! { "level": { "$gte": "warn" } }).run()?;
     let explain = cursor.explain()?;
     println!("  Plan: {}", explain.plan);
