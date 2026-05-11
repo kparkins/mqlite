@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Extract hot self-time frames from a macOS `sample` call graph.
 
-macOS `sample` format:
-    `    + NNN funcname (in mod) + offset [addr]` — depth 1 (1 space after +)
-    `    +   NNN funcname ...` — depth 2 (3 spaces)
-    `    +     NNN funcname ...` — depth 3 (5 spaces)
-    `    +         ! NNN funcname ...` — leaf at this depth (! = end of stack)
-    `    +         ! : NNN funcname ...` — additional leaf siblings under same parent
+macOS `sample` format (call-graph mode):
+    `    +         ! NNN funcname (in mod) + offset [addr]`
+    `    +         ! : NNN funcname ...`           (sibling leaf)
+    `    +         ! : | + ! NNN funcname ...`     (deeply nested leaf)
+    `    +         ! : | + NNN funcname ...`       (intermediate frame, NOT a leaf)
 
-A frame is a self-time frame if it's marked with `!`, OR if it has no children
-(next line at the same or shallower depth). The count on a `!` line IS the
-self-time for that frame.
+A line is a self-time leaf iff a `!` appears immediately before the
+count digits (i.e. the rightmost match of `! <digits> <symbol>`). The
+count on that `!` row is treated as the self-time at that frame.
+Intermediate inclusive-count rows (e.g. `+ : | + NNN funcname`) lack
+the `!` directly before the count and are skipped.
 
 Usage: sample_hot.py <pr1-sample.txt> [N]
 """
@@ -22,9 +23,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-# Match: `    + NNN ...` or `    +   NNN ...` or `    +         ! NNN ...`
-# The "spaces between + and digit" encodes depth (1 space = depth 1, 3 spaces = 2, etc.)
-LINE_RE = re.compile(r"^(\s*)\+(\s+)(?:!\s*)?(?::\s*)?(\d+)\s+(.+?)\s*$")
+# Match the rightmost `!  N  symbol` segment in a line. The trailing
+# context terminates the symbol at the binary path (`(in <bin>)`) or
+# end-of-line so `findall` returns one match per leaf row.
+LEAF_RE = re.compile(r"!\s+(\d+)\s+(\S.+?)(?:\s+\(in\s|\s*$)")
 
 SYNC_HINTS = (
     "lock",
@@ -39,11 +41,6 @@ SYNC_HINTS = (
     "Condvar",
     "spin_loop",
 )
-
-
-def is_leaf_marker(line: str) -> bool:
-    """Lines containing `+         ! NNN ...` are leaf frames."""
-    return "+ " in line and "! " in line and re.search(r"\+\s+!\s+", line) is not None
 
 
 def short_name(label: str) -> str:
@@ -77,13 +74,13 @@ def main():
             if line.startswith("Total number") or line.startswith("Binary Images"):
                 in_call_graph = False
                 continue
-            # We only care about leaf-marked lines (`!` after the `+`).
-            if not is_leaf_marker(line):
+            # We only care about leaf-marked lines: ones with a `!` directly
+            # before the count digits. Take the rightmost match in case the
+            # line has multiple `!` segments along the structural prefix.
+            matches = LEAF_RE.findall(line)
+            if not matches:
                 continue
-            m = LINE_RE.match(line)
-            if not m:
-                continue
-            _indent, _between, count_str, label = m.groups()
+            count_str, label = matches[-1]
             self_time[short_name(label)] += int(count_str)
 
     total = sum(self_time.values())
