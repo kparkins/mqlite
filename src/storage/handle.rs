@@ -44,7 +44,7 @@ use crate::journal::{
 };
 use crate::mvcc::read_view::ReadViewRegistry;
 use crate::storage::allocator::AllocatorHandle;
-use crate::storage::buffer_pool::{BufferPool, PageSize, PageSource, PinnedPage};
+use crate::storage::buffer_pool::{BufferPool, LatchMode, PageSize, PageSource, PinnedPage};
 use crate::storage::header::FileHeader;
 
 // ---------------------------------------------------------------------------
@@ -273,7 +273,14 @@ impl BufferPoolHandle {
         // and must not leak into the new occupant's MVCC bookkeeping —
         // they would trip the `chains_empty` guard at the next leaf
         // merge / split. Clear them now while the frame is fresh.
-        self.pool.clear_chains_on_page(page_no, size)?;
+        // Only the 32 KiB partition can carry chains; 4 KiB internal
+        // pages never get them, so the call is a no-op there.
+        if size == PageSize::Large32k {
+            self.pool
+                .with_all_chains_under_latch(page_no, LatchMode::Exclusive, |chains| {
+                    chains.clear()
+                })?;
+        }
 
         Ok(page_no)
     }

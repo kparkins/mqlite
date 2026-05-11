@@ -18,7 +18,7 @@ use crate::query::planner::{
 };
 use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::PageSize;
+use crate::storage::buffer_pool::{LatchMode, PageSize};
 use crate::storage::catalog::IndexState;
 use crate::storage::history_store::HistoryStore;
 use crate::storage::reconcile::driver::{
@@ -461,11 +461,11 @@ fn checkpoint_after_reconcile_plan(
             continue;
         }
         for page_id in tree.mutation_ready_pages() {
-            engine
-                .shared
-                .handle
-                .pool()
-                .clear_chains_on_page(*page_id, PageSize::Large32k)?;
+            engine.shared.handle.pool().with_all_chains_under_latch(
+                *page_id,
+                LatchMode::Exclusive,
+                |chains| chains.clear(),
+            )?;
         }
         engine
             .shared

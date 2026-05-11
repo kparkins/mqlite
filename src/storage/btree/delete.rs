@@ -185,7 +185,12 @@ impl<S: BTreePageStore> BTree<S> {
     fn move_all_leaf_chains(&mut self, from_page: u32, to_page: u32) -> Result<()> {
         // Phase 3 Section 10.6: merge drains every chain from the source leaf,
         // including delta-only chains, and keeps the existing transport shape.
-        for (key, chain) in self.store.take_all_chains(from_page)? {
+        let drained: Vec<_> =
+            self.store
+                .with_all_chains_under_latch(from_page, LatchMode::Exclusive, |c| {
+                    std::mem::take(c).into_iter().collect()
+                })?;
+        for (key, chain) in drained {
             self.store
                 .with_chain_under_latch(to_page, &key, LatchMode::Exclusive, |slot| {
                     *slot = Some(chain);
@@ -203,14 +208,29 @@ impl<S: BTreePageStore> BTree<S> {
         // Phase 3 Section 10.6: redistribution remains a separator-key
         // partition, so delta-only chains route by the same raw key bytes as
         // base-backed chains.
-        let mut chains = self.store.take_all_chains(left_page)?;
-        chains.extend(self.store.take_all_chains(right_page)?);
+        let mut chains: Vec<_> =
+            self.store
+                .with_all_chains_under_latch(left_page, LatchMode::Exclusive, |c| {
+                    std::mem::take(c).into_iter().collect()
+                })?;
+        chains.extend(
+            self.store
+                .with_all_chains_under_latch(right_page, LatchMode::Exclusive, |c| {
+                    std::mem::take(c).into_iter().collect::<Vec<_>>()
+                })?,
+        );
 
         for (key, chain) in chains {
             if key.as_slice() < separator_key {
-                self.store.put_chain(left_page, key, chain)?;
+                self.store
+                    .with_chain_under_latch(left_page, &key, LatchMode::Exclusive, |slot| {
+                        *slot = Some(chain);
+                    })?;
             } else {
-                self.store.put_chain(right_page, key, chain)?;
+                self.store
+                    .with_chain_under_latch(right_page, &key, LatchMode::Exclusive, |slot| {
+                        *slot = Some(chain);
+                    })?;
             }
         }
 

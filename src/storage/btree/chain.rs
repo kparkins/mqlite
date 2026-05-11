@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::storage::buffer_pool::PageSize;
+use crate::storage::buffer_pool::{LatchMode, PageSize};
 use crate::storage::page::OverflowPageHeader;
 
 use super::{BTreePageStore, CellValue, LeafNode};
@@ -18,7 +18,7 @@ pub(super) fn free_overflow_chain<S: BTreePageStore>(store: &mut S, first_page: 
         // remnants from a prior data-leaf life of this page number so
         // the T3.5 `chains_empty` guard inside `free_leaf` paths does
         // not trip. The frame may not be resident — that's a no-op.
-        store.clear_chains(cur)?;
+        store.with_all_chains_under_latch(cur, LatchMode::Exclusive, |chains| chains.clear())?;
         store.free_leaf(cur)?;
         cur = next;
     }

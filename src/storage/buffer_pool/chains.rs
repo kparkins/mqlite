@@ -14,19 +14,27 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::mvcc::version::VersionEntry;
 
-use super::{BufferPool, PageSize};
+use super::{BufferPool, LatchMode, PageSize};
 
 type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
 
 impl BufferPool {
     // -----------------------------------------------------------------------
-    // MVCC delta-chain helpers (T3.5)
+    // MVCC delta-chain helpers (T3.5 → PR0.5)
     //
-    // Chains are stored on the 32 KB partition's frames (leaf pages). The
-    // caller is responsible for having pinned the page (via `read_leaf` or
-    // `write_leaf_structural`) recently enough that the frame is still resident — the
-    // MVCC writer lane sequences these calls synchronously after a leaf
-    // read / write, so the frame has not yet been eligible for eviction.
+    // The four mutator helpers below (`take_chain`, `put_chain`,
+    // `clear_chains_on_page`, `drain_leaf_chains`) are now THIN WRAPPERS
+    // over the latch-aware `with_chain_under_latch` /
+    // `with_all_chains_under_latch` entry points. They previously went
+    // straight to the partition mutex without taking the per-page latch,
+    // which let concurrent CRUD writers race on the same `frame.deltas`
+    // map. Routing through the latch-aware entry points removes that
+    // race; the wrappers exist only to keep PR0.5 commit 2's diff
+    // surface tractable. PR0.5 commit 3 deletes them.
+    //
+    // The `chains_empty` reader at the bottom is unchanged — it is a
+    // read-only inspection used by structural-cleanup guards and does
+    // not need the latch.
     // -----------------------------------------------------------------------
 
     /// Remove and return the delta chain for `key` on leaf page `page`.
@@ -35,17 +43,14 @@ impl BufferPool {
         page: u32,
         key: &[u8],
     ) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
-        let mut guard = self
-            .inner_32k
-            .lock()
-            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-        let Some(&idx) = guard.page_map.get(&page) else {
-            return Ok(None);
-        };
-        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
-            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
-        })?;
-        Ok(frame.deltas.remove(key))
+        // Wrapper over the latch-aware path. Note the semantic change
+        // vs the legacy implementation: this path now ERRORS if the
+        // frame is not resident (because `pin_then_latch` cannot pin a
+        // missing page), where the legacy returned `Ok(None)`. No
+        // production caller relies on the silent-miss behaviour after
+        // PR0.5 commit 1's migration; the remaining test callers all
+        // pre-pin the page before calling.
+        self.with_chain_under_latch(page, key, LatchMode::Exclusive, |slot| slot.take())
     }
 
     /// Install a delta chain for `key` on leaf page `page`.
@@ -55,20 +60,9 @@ impl BufferPool {
         key: Vec<u8>,
         chain: Arc<VecDeque<VersionEntry>>,
     ) -> Result<()> {
-        let mut guard = self
-            .inner_32k
-            .lock()
-            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-        let idx = guard.page_map.get(&page).copied().ok_or_else(|| {
-            Error::Internal(format!(
-                "buffer pool put_chain: page {page} is not resident"
-            ))
-        })?;
-        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
-            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
-        })?;
-        frame.deltas.insert(key, chain);
-        Ok(())
+        self.with_chain_under_latch(page, &key, LatchMode::Exclusive, |slot| {
+            *slot = Some(chain);
+        })
     }
 
     /// Clear all delta chains attached to the resident frame for `page`
@@ -80,24 +74,14 @@ impl BufferPool {
     /// its previous data-leaf life. Clearing them keeps the T3.5
     /// `chains_empty` guard inside `free_leaf` consumers sound.
     ///
-    /// No-op when the page is not resident — there are no chains to
-    /// clear in that case.
+    /// `Small4k` pages never carry chains, so the call is a no-op
+    /// there. `Large32k` pages route through the latch-aware
+    /// `with_all_chains_under_latch`.
     pub(crate) fn clear_chains_on_page(&self, page: u32, size: PageSize) -> Result<()> {
-        let lock = match size {
-            PageSize::Small4k => &self.inner_4k,
-            PageSize::Large32k => &self.inner_32k,
-        };
-        let mut guard = lock
-            .lock()
-            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-        let Some(&idx) = guard.page_map.get(&page) else {
+        if size != PageSize::Large32k {
             return Ok(());
-        };
-        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
-            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
-        })?;
-        frame.deltas.clear();
-        Ok(())
+        }
+        self.with_all_chains_under_latch(page, LatchMode::Exclusive, |chains| chains.clear())
     }
 
     /// Drain and return every delta chain currently attached to the
@@ -109,17 +93,9 @@ impl BufferPool {
     /// onto the merged-into sibling so MVCC readers whose ReadView
     /// predates the delete still observe them.
     pub(crate) fn drain_leaf_chains(&self, page: u32) -> Result<VersionChainDrain> {
-        let mut guard = self
-            .inner_32k
-            .lock()
-            .map_err(|_| Error::Internal("buffer pool mutex poisoned".into()))?;
-        let Some(&idx) = guard.page_map.get(&page) else {
-            return Ok(Vec::new());
-        };
-        let frame = guard.frames[idx].as_mut().ok_or_else(|| {
-            Error::Internal("page_map invariant: frame must exist at mapped slot".into())
-        })?;
-        Ok(std::mem::take(&mut frame.deltas).into_iter().collect())
+        self.with_all_chains_under_latch(page, LatchMode::Exclusive, |chains| {
+            std::mem::take(chains).into_iter().collect()
+        })
     }
 
     /// True if no delta chains are attached to leaf page `page` (including

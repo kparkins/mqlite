@@ -14,7 +14,7 @@ use crate::journal::ParsedLogicalFrames;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::PageSize;
+use crate::storage::buffer_pool::{LatchMode, PageSize};
 use crate::storage::catalog::{Catalog, CollectionEntry, IndexEntry};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
@@ -259,40 +259,33 @@ fn replay_chain_op(
     );
     let leaf_page = tree.find_leaf(delta.key)?;
     let _pin = shared.handle.fetch_page(leaf_page, PageSize::Large32k)?;
-    let mut chain_arc = shared
-        .handle
-        .pool()
-        .take_chain(leaf_page, delta.key)?
-        .unwrap_or_default();
-    {
-        let recovered_txn_id = u64::from(delta.op_ordinal);
-        let chain_mut = Arc::make_mut(&mut chain_arc);
-        if chain_mut.front().is_some_and(|entry| {
-            entry.start_ts == delta.commit_ts && entry.txn_id == recovered_txn_id
-        }) {
-            shared
-                .handle
-                .pool()
-                .put_chain(leaf_page, delta.key.to_vec(), chain_arc)?;
-            shared.mark_leaf_dirty(ident, leaf_page, dirty_reason);
-            return Ok(());
-        }
-        if let Some(prev_head) = chain_mut.front_mut() {
-            prev_head.stop_ts = delta.commit_ts;
-        }
-        chain_mut.push_front(VersionEntry {
-            start_ts: delta.commit_ts,
-            stop_ts: Ts::MAX,
-            txn_id: recovered_txn_id,
-            state: VersionState::Committed,
-            data: VersionData::Inline(delta.data),
-            is_tombstone: delta.is_tombstone,
-        });
-    }
-    shared
-        .handle
-        .pool()
-        .put_chain(leaf_page, delta.key.to_vec(), chain_arc)?;
+    let recovered_txn_id = u64::from(delta.op_ordinal);
+    shared.handle.pool().with_chain_under_latch(
+        leaf_page,
+        delta.key,
+        LatchMode::Exclusive,
+        |slot| {
+            let mut chain_arc = slot.take().unwrap_or_default();
+            let chain_mut = Arc::make_mut(&mut chain_arc);
+            let already_replayed = chain_mut.front().is_some_and(|entry| {
+                entry.start_ts == delta.commit_ts && entry.txn_id == recovered_txn_id
+            });
+            if !already_replayed {
+                if let Some(prev_head) = chain_mut.front_mut() {
+                    prev_head.stop_ts = delta.commit_ts;
+                }
+                chain_mut.push_front(VersionEntry {
+                    start_ts: delta.commit_ts,
+                    stop_ts: Ts::MAX,
+                    txn_id: recovered_txn_id,
+                    state: VersionState::Committed,
+                    data: VersionData::Inline(delta.data),
+                    is_tombstone: delta.is_tombstone,
+                });
+            }
+            *slot = Some(chain_arc);
+        },
+    )?;
     shared.mark_leaf_dirty(ident, leaf_page, dirty_reason);
     Ok(())
 }

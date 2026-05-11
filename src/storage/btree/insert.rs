@@ -216,7 +216,11 @@ impl<S: BTreePageStore> BTree<S> {
 
         // Drain-and-partition window: split routing must move every resident
         // delta chain atomically with the leaf-page split.
-        let all_chains = self.store.take_all_chains(left_page)?;
+        let all_chains: Vec<_> =
+            self.store
+                .with_all_chains_under_latch(left_page, LatchMode::Exclusive, |chains| {
+                    std::mem::take(chains).into_iter().collect()
+                })?;
         let (left_chains, right_chains): (Vec<_>, Vec<_>) = all_chains
             .into_iter()
             .partition(|(key, _)| key.as_slice() < promoted_key.as_slice());

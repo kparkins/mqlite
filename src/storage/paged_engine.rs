@@ -1602,7 +1602,7 @@ impl PagedEngine {
         );
         let mut pages = tree.collect_pages_by_size()?;
         pages.sort_by_key(|(page_id, _)| *page_id);
-        let latches = pages
+        let mut latches = pages
             .iter()
             .map(|(page_id, size)| {
                 self.shared
@@ -1612,12 +1612,16 @@ impl PagedEngine {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut store = self.shared.new_structural_store(batch);
-        for (page_id, size) in pages {
+        // The latches above are exclusive — operate directly on the
+        // already-latched pages instead of routing through the legacy
+        // (non-latch-aware) `store.clear_chains`, which would deadlock
+        // when it tried to re-acquire the same per-page latch.
+        for ((page_id, size), latch) in pages.iter().zip(latches.iter_mut()) {
             match size {
-                PageSize::Small4k => store.free_internal(page_id)?,
+                PageSize::Small4k => store.free_internal(*page_id)?,
                 PageSize::Large32k => {
-                    store.clear_chains(page_id)?;
-                    store.free_leaf(page_id)?;
+                    latch.with_all_chains(|chains| chains.clear())?;
+                    store.free_leaf(*page_id)?;
                 }
             }
         }
