@@ -22,6 +22,11 @@ test-hooks = []
 # Enables loom-based concurrency stress tests. Run with:
 #   RUSTFLAGS="--cfg loom" cargo test --release --features loom-tests --test loom_common
 loom-tests = []
+# Enables in-tree perf counters for the PR1 bounded-retry rate AC and the
+# PR1/PR2 read-coupling latency histograms. Off by default — production
+# builds pay zero overhead. Build with `--features perf-counters` to
+# capture the AC measurements via `examples/perf_axis`.
+perf-counters = ["dep:hdrhistogram"]
 
 [dependencies]
 arc-swap = "1"
@@ -66,6 +71,14 @@ optional = true
 [dependencies.tempfile]
 version = "3"
 optional = true
+
+# Optional: perf-counters feature uses hdrhistogram to record p50/p99
+# of reader-thread `pin_then_latch` shared-acquire latency for the PR1
+# read-coupling AC. Off by default; release builds pay zero overhead.
+[dependencies.hdrhistogram]
+version = "7"
+optional = true
+default-features = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

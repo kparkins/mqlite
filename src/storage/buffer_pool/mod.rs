@@ -41,7 +41,14 @@
 // The reconciliation path snapshots `ReadViewRegistry::oldest_required_ts()`
 // (position 5) BEFORE acquiring a partition mutex or page latch.
 
-mod chains;
+pub(crate) mod chains;
+#[cfg(feature = "perf-counters")]
+mod metrics_perf;
+#[cfg(feature = "perf-counters")]
+pub use metrics_perf::{
+    flip_retry_exhausted_count, flip_retry_rate, reset_flip_counters,
+    reset_shared_latch_wait_hist, shared_latch_wait_p50_ns, shared_latch_wait_p99_ns,
+};
 // `PageLatch` is consumed by higher-level write, reconciliation, and test
 // paths. Some primitive APIs still look unused to the lib-only dead-code lint
 // despite being exercised by buffer-pool and integration coverage.
@@ -550,52 +557,76 @@ impl<'pool> LatchedPinnedPage<'pool> {
         Ok(false)
     }
 
-    /// Flip every pending entry for `txn_id` on this page.
-    pub(crate) fn flip_pending_for_txn(
-        &mut self,
-        txn_id: u64,
-        commit_ts: Option<Ts>,
-    ) -> Result<usize> {
-        self.require_exclusive("flip_pending_for_txn")?;
-        // SAFETY: this handle owns a live pin, so the frame slot cannot be
-        // evicted. The exclusive page latch serializes delta-map mutation.
-        let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
-        let mut flipped = 0usize;
-        for chain_arc in frame.deltas.values_mut() {
-            let chain = Arc::make_mut(chain_arc);
-            for idx in 0..chain.len() {
-                let pending_start_ts = match chain.get(idx) {
-                    Some(entry)
-                        if matches!(
-                            entry.state,
-                            VersionState::Pending { txn_id: pending } if pending == txn_id
-                        ) =>
-                    {
-                        entry.start_ts
-                    }
-                    _ => continue,
-                };
+    /// Return the keys on this page whose chain has a `Pending(txn_id)`
+    /// entry. Drives PR1's selective-CoW Phase A: only chains in the
+    /// returned set get `Arc::make_mut` + flip work, instead of the
+    /// legacy "iterate every chain on the frame" pattern.
+    ///
+    /// Works under either shared or exclusive latch: the caller decides
+    /// which mode is appropriate. Phase A uses `Shared`; legacy
+    /// callers that already hold `Exclusive` can also use this method.
+    pub(crate) fn pending_keys_for_txn(&self, txn_id: u64) -> Vec<Vec<u8>> {
+        // SAFETY: this handle owns a live pin, so the frame slot cannot
+        // be evicted. The page latch (shared or exclusive) prevents
+        // concurrent writers from mutating `frame.deltas` while we walk
+        // it to identify pending keys.
+        let frame = unsafe { &*self.frame_ptr };
+        frame
+            .deltas
+            .iter()
+            .filter_map(|(key, chain)| {
+                let has_pending = chain.iter().any(|entry| {
+                    matches!(entry.state, VersionState::Pending { txn_id: id } if id == txn_id)
+                });
+                has_pending.then(|| key.clone())
+            })
+            .collect()
+    }
 
-                let mut restore_after_abort = false;
-                if let Some(entry) = chain.get_mut(idx) {
-                    match commit_ts {
-                        Some(ts) => {
-                            entry.start_ts = ts;
-                            entry.state = VersionState::Committed;
-                        }
-                        None => {
-                            entry.state = VersionState::Aborted;
-                            restore_after_abort = true;
-                        }
-                    }
-                    flipped += 1;
-                }
-                if restore_after_abort {
-                    restore_previous_head_after_abort(chain, idx, pending_start_ts);
-                }
+    /// Clone the `Arc` for the chain at `key`, if any. Reader-friendly
+    /// snapshot used by PR1's Phase A: the caller drops the latch after
+    /// collecting these snapshots, then operates on local clones
+    /// without holding the page locked.
+    pub(crate) fn snapshot_chain_arc(&self, key: &[u8]) -> Option<Arc<VecDeque<VersionEntry>>> {
+        // SAFETY: this handle owns a live pin and the page latch (shared
+        // or exclusive); both keep `frame.deltas` stable for the
+        // duration of the lookup.
+        let frame = unsafe { &*self.frame_ptr };
+        frame.deltas.get(key).cloned()
+    }
+
+    /// Phase B of PR1's selective-CoW algorithm: for each prepared
+    /// `(key, new_arc, expected_old_arc)`, verify that
+    /// `Arc::ptr_eq(frame.deltas[key], expected_old_arc)` still holds,
+    /// then atomically install the new chains.
+    ///
+    /// Returns [`SwapOutcome::Success`] when ALL prepared entries
+    /// matched and were installed. Returns [`SwapOutcome::Conflict`]
+    /// when ANY entry's expected-old `Arc` no longer matches the
+    /// resident chain — in that case NO frame mutation has happened
+    /// and the caller should retry Phase A. The verify-all-then-install
+    /// two-pass shape is what makes the swap atomic per page.
+    pub(crate) fn try_swap_chains_if_unchanged(
+        &mut self,
+        prepared: Vec<PreparedChainSwap>,
+    ) -> Result<SwapOutcome> {
+        self.require_exclusive("try_swap_chains_if_unchanged")?;
+        // SAFETY: pin keeps the frame resident; exclusive latch
+        // serializes delta-map mutation.
+        let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
+        // First pass: verify ALL expected-old chains still match.
+        for swap in &prepared {
+            match frame.deltas.get(swap.key.as_slice()) {
+                Some(current) if Arc::ptr_eq(current, &swap.expected_old) => {}
+                _ => return Ok(SwapOutcome::Conflict),
             }
         }
-        Ok(flipped)
+        // Second pass: install. We checked every entry first; this
+        // loop cannot observe a conflict it did not see in pass one.
+        for swap in prepared {
+            frame.deltas.insert(swap.key, swap.new_chain);
+        }
+        Ok(SwapOutcome::Success)
     }
 
     fn require_exclusive(&self, operation: &str) -> Result<()> {
@@ -606,6 +637,81 @@ impl<'pool> LatchedPinnedPage<'pool> {
             "LatchedPinnedPage::{operation} requires an exclusive page latch"
         )))
     }
+}
+
+/// PR1 Phase B input: a chain swap prepared during Phase A.
+///
+/// `expected_old` is the `Arc` clone snapshotted from the frame in
+/// Phase A; `new_chain` is the locally-CoW'd flipped chain. Phase B
+/// installs `new_chain` only when the resident chain at `key` is
+/// still `Arc::ptr_eq` to `expected_old` — proof that no other
+/// committer / aborter raced between phases.
+#[derive(Clone)]
+pub(crate) struct PreparedChainSwap {
+    pub(crate) key: Vec<u8>,
+    pub(crate) new_chain: Arc<VecDeque<VersionEntry>>,
+    pub(crate) expected_old: Arc<VecDeque<VersionEntry>>,
+}
+
+/// PR1 Phase B outcome.
+///
+/// `Conflict` is recoverable — the caller's bounded retry loop in
+/// `flip_pending_to_committed_for` re-runs Phase A and tries again.
+/// `Success` means every prepared chain was installed atomically.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SwapOutcome {
+    Success,
+    Conflict,
+}
+
+/// Flip every `Pending(txn_id)` entry in `chain` to `Committed`
+/// (when `commit_ts` is `Some`) or `Aborted` (when `None`). Returns
+/// the number of entries flipped.
+///
+/// Extracted from the legacy `LatchedPinnedPage::flip_pending_for_txn`
+/// body so PR1's selective-CoW Phase A can call it on a locally-cloned
+/// chain (off-frame, no latch held during the closure body).
+///
+/// On abort, restores the previous live head's `stop_ts` to `Ts::MAX`
+/// via `restore_previous_head_after_abort` — preserves the same
+/// pre-PR1 semantics.
+pub(crate) fn flip_pending_in_chain(
+    chain: &mut VecDeque<VersionEntry>,
+    txn_id: u64,
+    commit_ts: Option<Ts>,
+) -> usize {
+    let mut flipped = 0usize;
+    for idx in 0..chain.len() {
+        let pending_start_ts = match chain.get(idx) {
+            Some(entry)
+                if matches!(
+                    entry.state,
+                    VersionState::Pending { txn_id: pending } if pending == txn_id
+                ) =>
+            {
+                entry.start_ts
+            }
+            _ => continue,
+        };
+        let mut restore_after_abort = false;
+        if let Some(entry) = chain.get_mut(idx) {
+            match commit_ts {
+                Some(ts) => {
+                    entry.start_ts = ts;
+                    entry.state = VersionState::Committed;
+                }
+                None => {
+                    entry.state = VersionState::Aborted;
+                    restore_after_abort = true;
+                }
+            }
+            flipped += 1;
+        }
+        if restore_after_abort {
+            restore_previous_head_after_abort(chain, idx, pending_start_ts);
+        }
+    }
+    flipped
 }
 
 fn restore_previous_head_after_abort(
@@ -1292,7 +1398,16 @@ impl BufferPool {
         // mutability through `parking_lot::RwLock`.
         let latch_ref: &PageLatch = unsafe { &(*frame_ptr).latch };
         let hold = match mode {
-            LatchMode::Shared => LatchHold::Shared(latch_ref.lock_shared()),
+            LatchMode::Shared => {
+                #[cfg(feature = "perf-counters")]
+                let acquire_start = std::time::Instant::now();
+                let h = LatchHold::Shared(latch_ref.lock_shared());
+                #[cfg(feature = "perf-counters")]
+                metrics_perf::record_shared_latch_wait_ns(
+                    acquire_start.elapsed().as_nanos() as u64,
+                );
+                h
+            }
             LatchMode::Exclusive => LatchHold::Exclusive(latch_ref.lock_exclusive()),
         };
 

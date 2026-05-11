@@ -75,6 +75,9 @@ mod checkpoint_boundary_replay;
 #[path = "paged_engine/tests/checkpoint_dirty_leaf_reconcile.rs"]
 mod checkpoint_dirty_leaf_reconcile;
 #[cfg(test)]
+#[path = "paged_engine/tests/flip_committed_concurrent_observers.rs"]
+mod flip_committed_concurrent_observers;
+#[cfg(test)]
 #[path = "paged_engine/tests/checkpoint_flush_set.rs"]
 mod checkpoint_flush_set;
 #[cfg(test)]

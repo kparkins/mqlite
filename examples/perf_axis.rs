@@ -96,8 +96,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             coll.insert_many(&seed).run()?;
             run_read_find_one(&client, dur)?
         }
+        "read_find_one_under_writers" => {
+            // PR1 read-coupling AC scenario: 4 writers + 1 reader on
+            // same_ns_single. Reader-thread `pin_then_latch` shared-acquire
+            // latency is sampled into the buffer-pool histogram (see
+            // `src/storage/buffer_pool/metrics_perf.rs`); reader and writer
+            // throughput are reported separately.
+            let writers = writers_override.unwrap_or(DEFAULT_SAME_NS_WRITERS);
+            run_read_find_one_under_writers(&client, dur, writers)?
+        }
         other => return Err(format!("unknown --axis: {other}").into()),
     }
+    #[cfg(feature = "perf-counters")]
+    print_perf_counters();
     // Throughput is already emitted inside the run_* helpers; the workload
     // is what we measure, not the post-workload Client::drop checkpoint.
     // Bypass the drop chain (which would flush a 60K-row checkpoint
@@ -277,4 +288,121 @@ fn run_read_find_one(client: &Client, dur: Duration) -> Result<(), Box<dyn std::
         count as f64 / elapsed
     );
     Ok(())
+}
+
+/// PR1 read-coupling AC scenario: 4 writers + 1 reader on same_ns
+/// `same_ns_single` workload. Reader-thread `pin_then_latch` shared
+/// latency is sampled into the buffer-pool histogram (when built with
+/// `--features perf-counters`); reader and writer throughput are
+/// reported on separate JSON lines.
+fn run_read_find_one_under_writers(
+    client: &Client,
+    dur: Duration,
+    writers: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = client.database("perf_axis");
+    db.create_collection("same_ns")?;
+
+    // Seed the namespace with a small set of documents so the reader's
+    // `find_one` always touches a leaf path that exists.
+    let payload_seed = "x".repeat(PAYLOAD_BYTES);
+    let seed: Vec<Document> = (0..SEED_DOCS)
+        .map(|id| doc! { "_id": id, "payload": payload_seed.as_str() })
+        .collect();
+    db.collection::<Document>("same_ns")
+        .insert_many(&seed)
+        .run()?;
+
+    // Reset the perf-counter histogram before the workload window so
+    // the recorded p50/p99 reflect only this scenario's samples.
+    #[cfg(feature = "perf-counters")]
+    {
+        mqlite::perf_counters::reset_shared_latch_wait_hist();
+        mqlite::perf_counters::reset_flip_counters();
+    }
+
+    let payload = Arc::new("x".repeat(PAYLOAD_BYTES));
+    let id_offset = Arc::new(std::sync::atomic::AtomicI64::new(SEED_DOCS as i64));
+    let stop_at = Instant::now() + dur;
+    let barrier = Arc::new(Barrier::new(writers + 1));
+
+    let mut writer_handles = Vec::with_capacity(writers);
+    for _ in 0..writers {
+        let c = client.clone();
+        let payload = Arc::clone(&payload);
+        let id_offset = Arc::clone(&id_offset);
+        let barrier = Arc::clone(&barrier);
+        writer_handles.push(thread::spawn(move || -> Result<u64, String> {
+            let coll = c.database("perf_axis").collection::<Document>("same_ns");
+            barrier.wait();
+            let mut count = 0u64;
+            while Instant::now() < stop_at {
+                let id = id_offset.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                coll.insert_one(&doc! { "_id": id, "payload": payload.as_str() })
+                    .map_err(|e| e.to_string())?;
+                count += 1;
+            }
+            Ok(count)
+        }));
+    }
+
+    // Reader thread (single, on this same client). Its
+    // `pin_then_latch(_, _, Shared)` calls inside `find_one` are what
+    // the histogram in `metrics_perf::record_shared_latch_wait_ns`
+    // samples.
+    let reader = {
+        let c = client.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || -> Result<u64, String> {
+            let coll = c.database("perf_axis").collection::<Document>("same_ns");
+            barrier.wait();
+            let mut count = 0u64;
+            let mut id = 0i32;
+            while Instant::now() < stop_at {
+                let _ = coll
+                    .find_one(doc! { "_id": id })
+                    .map_err(|e| e.to_string())?;
+                id = (id + 1) % SEED_DOCS;
+                count += 1;
+            }
+            Ok(count)
+        })
+    };
+
+    let start = Instant::now();
+    let mut writer_total = 0u64;
+    for h in writer_handles {
+        writer_total += h.join().unwrap().map_err(|s| s.to_string())?;
+    }
+    let reader_total = reader.join().unwrap().map_err(|s| s.to_string())?;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    println!(
+        "{{\"axis\":\"read_find_one_under_writers\",\"writers\":{},\"writer_docs\":{},\"reader_ops\":{},\"elapsed_secs\":{:.6},\"writer_docs_per_second\":{:.2},\"reader_ops_per_second\":{:.2}}}",
+        writers,
+        writer_total,
+        reader_total,
+        elapsed,
+        writer_total as f64 / elapsed,
+        reader_total as f64 / elapsed,
+    );
+    Ok(())
+}
+
+/// Emit the PR1 perf-counter values when built with
+/// `--features perf-counters`. Called from `main` after every axis
+/// completes so the AC harness can scrape:
+///   - flip_retry_rate (must be < 0.01 over a 30 s same_ns_single run)
+///   - flip_retry_exhausted_count (must be == 0 — engine poison gate)
+///   - shared_latch_wait_p50_ns / p99_ns (read-coupling AC)
+#[cfg(feature = "perf-counters")]
+fn print_perf_counters() {
+    use mqlite::perf_counters as pc;
+    println!(
+        "{{\"perf_counters\":{{\"flip_retry_rate\":{:.6},\"flip_retry_exhausted\":{},\"shared_latch_wait_p50_ns\":{},\"shared_latch_wait_p99_ns\":{}}}}}",
+        pc::flip_retry_rate(),
+        pc::flip_retry_exhausted_count(),
+        pc::shared_latch_wait_p50_ns(),
+        pc::shared_latch_wait_p99_ns(),
+    );
 }

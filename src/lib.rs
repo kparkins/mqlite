@@ -258,6 +258,26 @@ pub use bson::{doc, Bson, DateTime, Document, ObjectId};
 pub use wire::WireProtocol;
 
 // ---------------------------------------------------------------------------
+// PR1 perf-counter readers (feature = "perf-counters" only)
+//
+// Exposed publicly so `examples/perf_axis` can print AC values at the
+// end of a workload run. Production binaries that don't enable
+// `perf-counters` never compile this module and pay zero overhead.
+// ---------------------------------------------------------------------------
+/// PR1 perf-counter readers exposed for the `examples/perf_axis` AC harness.
+///
+/// Only compiled when the `perf-counters` cargo feature is enabled.
+/// Production binaries pay zero overhead and these symbols do not
+/// exist.
+#[cfg(feature = "perf-counters")]
+pub mod perf_counters {
+    pub use crate::storage::buffer_pool::{
+        flip_retry_exhausted_count, flip_retry_rate, reset_flip_counters,
+        reset_shared_latch_wait_hist, shared_latch_wait_p50_ns, shared_latch_wait_p99_ns,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Fuzz helpers (feature = "fuzz" only — never enable in production)
 // ---------------------------------------------------------------------------
 

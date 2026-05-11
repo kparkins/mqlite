@@ -619,6 +619,37 @@ pub(super) fn install_pending_primary(
 }
 
 /// Flip pending entries installed by `txn_id` to Committed.
+///
+/// **Post-durable contract** (per `.omc/plans/mwmr-page-latch.md` rev 4
+/// PR1 §critical ordering invariant): this function runs AFTER
+/// `wait_for_commit_durability` at `paged_engine.rs:975`. The txn is
+/// already durably committed in the WAL when control reaches here.
+/// Any error returned MUST be mapped by the caller to
+/// `EngineFatal { PostDurablePendingFlipFailure }` via the existing
+/// `.map_err(|_| self.engine_fatal(...))?` at `paged_engine.rs:993-998`.
+/// **Do not abort a durably-committed txn from here.**
+///
+/// Algorithm (PR1):
+///   1. Pin each page resident across the phase transition (outer
+///      `pool.pin()` survives the latch drop between Phase A and Phase B,
+///      so eviction cannot remove the frame mid-flip).
+///   2. Phase A under SHARED latch: identify the keys with `Pending(txn_id)`
+///      via `LatchedPinnedPage::pending_keys_for_txn`, snapshot their
+///      `Arc`s via `snapshot_chain_arc`, and locally `Arc::make_mut` +
+///      flip each clone (selective CoW — the legacy whole-frame
+///      iteration over `frame.deltas.values_mut()` is gone).
+///   3. Phase B under EXCLUSIVE latch: verify every prepared
+///      `expected_old` is still `Arc::ptr_eq` to the resident chain via
+///      `try_swap_chains_if_unchanged`, and atomically install all new
+///      `Arc`s. If any one mismatches, retry Phase A with fresh
+///      snapshots up to `MAX_FLIP_RETRIES` attempts.
+///   4. On exhaustion, return `Err(Error::Internal(...))`. The caller
+///      maps to `EngineFatal { PostDurablePendingFlipFailure }`.
+///
+/// Recovery is unchanged: `recovery_apply.rs:283-290` installs
+/// `VersionState::Committed` directly from durable WAL frames; the flip
+/// is a live-write-path concept that does not exist in recovery. The
+/// end-state guarantee (durable commit becomes visible) is preserved.
 pub(super) fn flip_pending_to_committed_for(
     shared: &SharedState,
     txn_id: u64,
@@ -629,19 +660,130 @@ pub(super) fn flip_pending_to_committed_for(
     page_ids.sort_unstable();
     page_ids.dedup();
     for page_id in page_ids {
-        let mut page = shared.handle.pool().pin_for_write(page_id)?;
-        page.flip_pending_for_txn(txn_id, Some(commit_ts))?;
+        flip_pending_one_page(shared, page_id, txn_id, Some(commit_ts))?;
     }
     Ok(())
 }
 
 /// Flip all resident pending entries for `txn_id` to Aborted.
+///
+/// Same Phase A/B + bounded retry shape as
+/// [`flip_pending_to_committed_for`], but the abort path is **NOT**
+/// under the post-durable contract — abort runs on commit-path
+/// failure paths before durability, so an `Err` here can be surfaced
+/// to the caller as a normal failure (not an `EngineFatal`). Only the
+/// per-page algorithm switched.
 pub(super) fn flip_pending_to_aborted_for(shared: &SharedState, txn_id: u64) -> Result<()> {
     for page_id in shared.handle.pool().pages_with_pending_txn(txn_id)? {
-        let mut page = shared.handle.pool().pin_for_write(page_id)?;
-        page.flip_pending_for_txn(txn_id, None)?;
+        flip_pending_one_page(shared, page_id, txn_id, None)?;
     }
     Ok(())
+}
+
+/// Maximum bounded-retry attempts per page before declaring conflict
+/// exhaustion. Conflict requires another writer to commit / abort on
+/// the same key between Phase A and Phase B, which is bounded by the
+/// per-txn pending key set; 3 attempts is comfortably above the
+/// expected steady-state retry count and below the engine-poison
+/// threshold.
+const MAX_FLIP_RETRIES: u32 = 3;
+
+/// Per-page Phase A/B + bounded-retry driver shared by the commit and
+/// abort flip paths. See [`flip_pending_to_committed_for`] for the
+/// post-durable contract details.
+fn flip_pending_one_page(
+    shared: &SharedState,
+    page_id: u32,
+    txn_id: u64,
+    commit_ts: Option<crate::mvcc::Ts>,
+) -> Result<()> {
+    use crate::storage::buffer_pool::{
+        flip_pending_in_chain, PageSize, PreparedChainSwap, SwapOutcome,
+    };
+
+    // Outer pin: keeps the frame resident across the Phase A → Phase B
+    // latch transition. The inner `pin_for_read_sized` /
+    // `pin_for_write_sized` calls bump pin_count further; this outer
+    // pin guarantees that even if the inner pins drop first the frame
+    // does not become evictable in between.
+    let _outer_pin = shared.handle.pool().pin(page_id, PageSize::Large32k)?;
+
+    #[cfg(feature = "perf-counters")]
+    crate::storage::buffer_pool::chains::FLIP_TXN_TOTAL
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    for _attempt in 0..MAX_FLIP_RETRIES {
+        // Phase A under shared latch — identify pending keys, snapshot
+        // their Arcs, locally CoW + flip on the clones. Drop the
+        // shared latch before Phase B so concurrent readers can run.
+        let prepared: Vec<PreparedChainSwap> = {
+            let shared_latch = shared
+                .handle
+                .pool()
+                .pin_for_read_sized(page_id, PageSize::Large32k)?;
+            let pending_keys = shared_latch.pending_keys_for_txn(txn_id);
+            let mut prepared = Vec::with_capacity(pending_keys.len());
+            for key in pending_keys {
+                let Some(expected_old) = shared_latch.snapshot_chain_arc(&key) else {
+                    // Cannot happen while we hold the shared latch on
+                    // this frame, but tolerate it defensively.
+                    continue;
+                };
+                let mut new = expected_old.clone();
+                let new_chain_mut = std::sync::Arc::make_mut(&mut new);
+                flip_pending_in_chain(new_chain_mut, txn_id, commit_ts);
+                prepared.push(PreparedChainSwap {
+                    key,
+                    new_chain: new,
+                    expected_old,
+                });
+            }
+            prepared
+        };
+
+        // Empty prepared set means the frame had no pending entries
+        // for this txn — `pages_with_pending_txn` drift on the abort
+        // path can produce this; treat as success.
+        if prepared.is_empty() {
+            return Ok(());
+        }
+
+        // Phase B under exclusive latch — atomic two-pass swap.
+        // `_outer_pin` keeps the frame resident across this block.
+        let outcome = {
+            let mut excl_latch = shared
+                .handle
+                .pool()
+                .pin_for_write_sized(page_id, PageSize::Large32k)?;
+            excl_latch.try_swap_chains_if_unchanged(prepared)?
+        };
+
+        match outcome {
+            SwapOutcome::Success => return Ok(()),
+            SwapOutcome::Conflict => {
+                #[cfg(feature = "perf-counters")]
+                crate::storage::buffer_pool::chains::FLIP_RETRY_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Loop and retry Phase A with fresh snapshots.
+            }
+        }
+    }
+
+    // MAX_FLIP_RETRIES reached without converging. Bump the
+    // exhaustion counter for the AC harness, then return the local
+    // Internal error. The caller in paged_engine.rs:993-998 maps it to
+    // EngineFatal { PostDurablePendingFlipFailure } via the existing
+    // .map_err(|_| self.engine_fatal(...)) at the same line. We do
+    // NOT change that mapper. Engine poison is the correct outcome
+    // because the txn is already durably committed (commit path) or
+    // already on the abort path; retrying forever is worse than
+    // poisoning the in-memory engine.
+    #[cfg(feature = "perf-counters")]
+    crate::storage::buffer_pool::chains::FLIP_RETRY_EXHAUSTED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Err(Error::Internal(format!(
+        "flip_pending_one_page: bounded retry exhausted on page {page_id} after {MAX_FLIP_RETRIES} attempts (txn_id={txn_id})"
+    )))
 }
 
 /// Fold visible secondary delta heads into base pages during checkpoint.

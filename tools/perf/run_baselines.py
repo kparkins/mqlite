@@ -93,10 +93,23 @@ def run_axis_once(axis: str, writers: int, seconds: int) -> float:
     # PR1/PR2/PR4 measurements MUST share the identical perf_axis
     # lifecycle for the compounding-delta math to be apples-to-apples.
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    line = proc.stdout.strip().splitlines()[-1]
-    record = json.loads(line)
+    # `perf_axis` emits one JSON record per axis on stdout. Under
+    # `--features perf-counters` it also tail-prints a
+    # `{"perf_counters": ...}` line; pick the record that carries the
+    # throughput field we want instead of blindly taking the last line.
     field = DPS_FIELD_READ if axis == "read_find_one" else DPS_FIELD_DEFAULT
-    return float(record[field])
+    if axis == "read_find_one_under_writers":
+        field = "reader_ops_per_second"
+    for line in reversed(proc.stdout.strip().splitlines()):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if field in record:
+            return float(record[field])
+    raise RuntimeError(
+        f"no JSON record with field {field!r} on stdout for {axis}@{writers}"
+    )
 
 
 def collect_axis(axis: str, writers: int, runs: int, seconds: int) -> RunResult:
