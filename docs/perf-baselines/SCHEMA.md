@@ -5,7 +5,8 @@
 comparisons and automation that consume performance sidecars.
 
 The current producer is `benches/perf/run_baselines.py`, which shells out to
-the `perf_matrix` binary and writes one JSON object.
+the `perf_matrix` binary and writes one JSON object. See
+[PERFORMANCE.md](../PERFORMANCE.md) for the benchmark workflow.
 
 ## Top-Level Object
 

@@ -79,21 +79,21 @@ fn main() -> mqlite::Result<()> {
 
 ## Feature Flags
 
-| Flag | Description |
-|------|-------------|
-| `wire` | MongoDB wire protocol shim; connect with `mongosh` or `pymongo` (requires `directConnection=true`) |
-| `tracing` | Structured observability via the [`tracing`](https://docs.rs/tracing) crate |
-| `test-hooks` | Internal crash-cut and state probes for the integration test suite |
-| `fuzz` | Internal fuzz-target support |
-| `loom-tests` | Internal loom concurrency test support |
-| `perf-counters` | Internal performance-counter instrumentation for selected benches |
+- `wire` - MongoDB wire protocol shim for local tool interop.
+- `tracing` - structured observability via the `tracing` crate.
+- `test-hooks` - internal crash-cut and state probes for the integration test
+  suite.
+- `fuzz` - internal fuzz-target support.
+- `loom-tests` - internal loom concurrency test support.
+- `perf-counters` - internal performance-counter instrumentation for selected
+  benches.
 
 ## Files on Disk
 
 | File | When present | Meaning |
 |------|-------------|---------|
 | `myapp.mqlite` | Always | Main database file |
-| `myapp.mqlite-journal` | During write activity | Append-only write journal; safe to leave and replayed on next open |
+| `myapp.mqlite-journal` | During writes | Append-only journal; replayed on next open |
 
 A "single-file database" means a single file after a successful checkpoint.
 `Client::close()` runs the checkpoint and returns any error. Dropping the last
@@ -111,8 +111,10 @@ on disk and the next `Client::open` recovers it automatically.
   mapping
 - [File Management](docs/FILE-MANAGEMENT.md) - backup, checkpoint,
   crash recovery
-- [Verification Guide](docs/VERIFICATION.md) - tests, Jepsen, benchmarks,
-  and perf-baseline sidecars
+- [Performance Guide](docs/PERFORMANCE.md) - benchmark axes, baseline
+  sidecars, profiling, and result reporting
+- [Verification Guide](docs/VERIFICATION.md) - tests, Jepsen, and
+  correctness gates
 - [Wire Protocol Security Advisory](docs/WIRE-SECURITY.md)
 
 ## Verification
