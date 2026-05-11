@@ -691,6 +691,7 @@ dependencies = [
  "proptest",
  "regex",
  "serde",
+ "serde_json",
  "serial_test",
  "smallvec",
  "tempfile",

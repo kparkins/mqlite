@@ -73,6 +73,7 @@ tempfile = "3"
 loom = "0.7"
 proptest = "1"
 serial_test = "3"
+serde_json = "1"
 
 [[example]]
 name = "wire_server"
