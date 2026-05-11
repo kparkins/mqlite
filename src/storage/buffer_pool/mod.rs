@@ -465,20 +465,6 @@ impl<'pool> LatchedPinnedPage<'pool> {
         Ok(false)
     }
 
-    /// Install `chain` for `key`.
-    pub(crate) fn put_chain(
-        &mut self,
-        key: Vec<u8>,
-        chain: Arc<VecDeque<VersionEntry>>,
-    ) -> Result<()> {
-        self.require_exclusive("put_chain")?;
-        // SAFETY: this handle owns a live pin, so the frame slot cannot be
-        // evicted. The exclusive page latch serializes delta-map mutation.
-        let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
-        frame.deltas.insert(key, chain);
-        Ok(())
-    }
-
     /// Read-modify-write the chain slot for `key` while holding this
     /// page's exclusive latch.
     ///

@@ -67,8 +67,10 @@ fn load_and_unpin(pool: &BufferPool, page: u32) {
 }
 
 fn install_chain(pool: &BufferPool, page: u32, key: &[u8], entry: VersionEntry) {
-    pool.put_chain(page, key.to_vec(), Arc::new(VecDeque::from([entry])))
-        .unwrap();
+    pool.with_chain_under_latch(page, key, LatchMode::Exclusive, |slot| {
+        *slot = Some(Arc::new(VecDeque::from([entry])));
+    })
+    .unwrap();
 }
 
 fn install_two_delta_bearing_frames(pool: &BufferPool) {
@@ -203,9 +205,9 @@ mod tracing_tests {
             pool.occupancy_snapshot().unwrap();
             pool.occupancy_snapshot().unwrap();
 
-            pool.clear_chains_on_page(PAGE_A, PageSize::Large32k)
+            pool.with_all_chains_under_latch(PAGE_A, LatchMode::Exclusive, |c| c.clear())
                 .unwrap();
-            pool.clear_chains_on_page(PAGE_B, PageSize::Large32k)
+            pool.with_all_chains_under_latch(PAGE_B, LatchMode::Exclusive, |c| c.clear())
                 .unwrap();
             pool.occupancy_snapshot().unwrap();
 

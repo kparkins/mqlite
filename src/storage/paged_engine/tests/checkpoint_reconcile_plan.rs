@@ -10,7 +10,7 @@ use crate::keys::encode_key;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, LatchMode};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::reconcile::driver::{DirtyReason, TreeIdent, TreeKind};
@@ -97,13 +97,16 @@ fn test_checkpoint_reconcile_plan_detects_visible_notinstallable_before_mutation
         .map_err(|_| Error::Internal("mock io pages mutex poisoned".into()))?
         .len();
 
-    engine.shared.handle.pool().put_chain(
+    engine.shared.handle.pool().with_chain_under_latch(
         leaf,
-        key.clone(),
-        Arc::new(VecDeque::from([committed_inline(
-            checkpoint_ts,
-            vec![0xA5; LARGE_INLINE_BYTES],
-        )])),
+        &key,
+        LatchMode::Exclusive,
+        |slot| {
+            *slot = Some(Arc::new(VecDeque::from([committed_inline(
+                checkpoint_ts,
+                vec![0xA5; LARGE_INLINE_BYTES],
+            )])));
+        },
     )?;
     engine.shared.dirty_leaves.clear();
     mark_primary_dirty(&engine, ident.clone(), leaf);
@@ -137,14 +140,18 @@ fn test_checkpoint_reconcile_plan_detects_visible_notinstallable_before_mutation
     let future_ts = future_checkpoint_ts
         .successor()
         .expect("test timestamp can advance");
-    future_engine.shared.handle.pool().put_chain(
+    let future_chain = Arc::new(VecDeque::from([committed_inline(
+        future_ts,
+        bson::to_vec(&doc! { "_id": 2, "value": "future-only" })
+            .map_err(Error::BsonSerialization)?,
+    )]));
+    future_engine.shared.handle.pool().with_chain_under_latch(
         future_leaf,
-        future_key.clone(),
-        Arc::new(VecDeque::from([committed_inline(
-            future_ts,
-            bson::to_vec(&doc! { "_id": 2, "value": "future-only" })
-                .map_err(Error::BsonSerialization)?,
-        )])),
+        &future_key,
+        LatchMode::Exclusive,
+        |slot| {
+            *slot = Some(future_chain);
+        },
     )?;
     future_engine.shared.dirty_leaves.clear();
     mark_primary_dirty(&future_engine, future_ident.clone(), future_leaf);
@@ -152,18 +159,19 @@ fn test_checkpoint_reconcile_plan_detects_visible_notinstallable_before_mutation
     future_engine.checkpoint()?;
 
     assert_dirty_leaf(&future_engine, &future_ident, future_leaf);
-    let chain = future_engine
-        .shared
-        .handle
-        .pool()
-        .take_chain(future_leaf, &future_key)?
-        .expect("future-only residue remains resident");
-    assert_eq!(chain.len(), 1);
-    future_engine
-        .shared
-        .handle
-        .pool()
-        .put_chain(future_leaf, future_key, chain)?;
+    future_engine.shared.handle.pool().with_chain_under_latch(
+        future_leaf,
+        &future_key,
+        LatchMode::Exclusive,
+        |slot| -> Result<()> {
+            let chain = slot
+                .as_ref()
+                .ok_or_else(|| Error::Internal("future-only residue missing".into()))?;
+            assert_eq!(chain.len(), 1);
+            // Slot left as-is — inspection only.
+            Ok(())
+        },
+    )??;
     Ok(())
 }
 

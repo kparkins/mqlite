@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
+use crate::storage::buffer_pool::LatchMode;
 
 use super::node::LeafNode;
 use super::{BTree, BTreePageStore, MemPageStore};
@@ -60,7 +61,11 @@ fn tree_with_pre_split_chains(
 
     let left_page = tree.root_page;
     for (raw_key, chain) in chains {
-        tree.store.put_chain(left_page, key(raw_key), chain)?;
+        let encoded = key(raw_key);
+        tree.store
+            .with_chain_under_latch(left_page, &encoded, LatchMode::Exclusive, |slot| {
+                *slot = Some(chain);
+            })?;
     }
 
     for n in BASE_KEYS_TO_FORCE_SPLIT {
@@ -86,13 +91,20 @@ fn assert_chain_routed(
     is_tombstone: bool,
 ) -> Result<()> {
     let encoded_key = key(raw_key);
+    let other_chain = tree
+        .store
+        .with_chain_under_latch(other_page, &encoded_key, LatchMode::Exclusive, |slot| {
+            slot.take()
+        })?;
     assert!(
-        tree.store.take_chain(other_page, &encoded_key)?.is_none(),
+        other_chain.is_none(),
         "key {raw_key} should not be routed to the other split sibling"
     );
     let chain = tree
         .store
-        .take_chain(expected_page, &encoded_key)?
+        .with_chain_under_latch(expected_page, &encoded_key, LatchMode::Exclusive, |slot| {
+            slot.take()
+        })?
         .expect("chain should be routed to the expected split sibling");
     assert_eq!(chain.len(), 1);
     assert_eq!(chain[0].is_tombstone, is_tombstone);

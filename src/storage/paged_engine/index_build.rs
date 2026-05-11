@@ -642,9 +642,11 @@ impl PagedEngine {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut store = self.shared.new_structural_store(batch);
-        // The latches above are exclusive; operate directly on the
-        // already-latched pages to avoid the legacy non-latch-aware
-        // `store.clear_chains` re-acquiring the same latch.
+        // The latches above are exclusive — operate directly on the
+        // already-latched pages via `LatchedPinnedPage::with_all_chains`
+        // instead of routing through `store.with_all_chains_under_latch`,
+        // which would deadlock when it tried to re-acquire the same
+        // per-page latch via its internal `pin_then_latch`.
         for ((page_id, size), latch) in pages.iter().zip(latches.iter_mut()) {
             match size {
                 PageSize::Small4k => store.free_internal(*page_id)?,

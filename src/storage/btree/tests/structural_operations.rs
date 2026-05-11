@@ -534,6 +534,7 @@ fn invariants_after_delete_and_merge() {
 use crate::mvcc::timestamp::Ts;
 use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
+use crate::storage::buffer_pool::LatchMode;
 use crate::storage::header::FileHeader;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -588,8 +589,12 @@ fn t3_5_split_migrates_chains_for_moving_cells_primary() {
     let leaf_page = tree.root_page;
     // Attach a unique chain to every key.
     for i in 0u64..4 {
+        let k = key(i);
+        let chain = chain_with(&[i as u8]);
         tree.store
-            .put_chain(leaf_page, key(i), chain_with(&[i as u8]))
+            .with_chain_under_latch(leaf_page, &k, LatchMode::Exclusive, |slot| {
+                *slot = Some(chain);
+            })
             .unwrap();
     }
 
@@ -602,13 +607,21 @@ fn t3_5_split_migrates_chains_for_moving_cells_primary() {
     // Every original key's chain must still be reachable, on whichever
     // leaf the key now lives on, byte-identical to what we inserted.
     for i in 0u64..4 {
-        let home = leaf_of(&tree, &key(i));
-        let chain = tree.store.take_chain(home, &key(i)).unwrap();
-        let chain = chain.expect("chain survived the split");
+        let k = key(i);
+        let home = leaf_of(&tree, &k);
+        let chain = tree
+            .store
+            .with_chain_under_latch(home, &k, LatchMode::Exclusive, |slot| slot.take())
+            .unwrap()
+            .expect("chain survived the split");
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].txn_id, i);
         // Put it back for subsequent checks / cleanup.
-        tree.store.put_chain(home, key(i), chain).unwrap();
+        tree.store
+            .with_chain_under_latch(home, &k, LatchMode::Exclusive, |slot| {
+                *slot = Some(chain);
+            })
+            .unwrap();
     }
 }
 
@@ -633,8 +646,12 @@ fn t3_5_split_migrates_chains_for_moving_cells_secondary() {
     }
     let leaf_page = tree.root_page;
     for i in 0u64..4 {
+        let k = sec_key(0x5A, i);
+        let chain = chain_with(&[i as u8]);
         tree.store
-            .put_chain(leaf_page, sec_key(0x5A, i), chain_with(&[i as u8]))
+            .with_chain_under_latch(leaf_page, &k, LatchMode::Exclusive, |slot| {
+                *slot = Some(chain);
+            })
             .unwrap();
     }
 
@@ -646,10 +663,17 @@ fn t3_5_split_migrates_chains_for_moving_cells_secondary() {
     for i in 0u64..4 {
         let k = sec_key(0x5A, i);
         let home = leaf_of(&tree, &k);
-        let chain = tree.store.take_chain(home, &k).unwrap();
-        let chain = chain.expect("chain survived the split (sec-index)");
+        let chain = tree
+            .store
+            .with_chain_under_latch(home, &k, LatchMode::Exclusive, |slot| slot.take())
+            .unwrap()
+            .expect("chain survived the split (sec-index)");
         assert_eq!(chain[0].txn_id, i);
-        tree.store.put_chain(home, k, chain).unwrap();
+        tree.store
+            .with_chain_under_latch(home, &k, LatchMode::Exclusive, |slot| {
+                *slot = Some(chain);
+            })
+            .unwrap();
     }
 }
 
@@ -710,8 +734,16 @@ fn t3_5_merge_preserves_overflow_refcount_invariant() {
 
     let home_a = leaf_of(&tree, &key(0));
     let home_b = leaf_of(&tree, &key(5));
-    tree.store.put_chain(home_a, key(0), chain_a).unwrap();
-    tree.store.put_chain(home_b, key(5), chain_b).unwrap();
+    tree.store
+        .with_chain_under_latch(home_a, &key(0), LatchMode::Exclusive, |slot| {
+            *slot = Some(chain_a);
+        })
+        .unwrap();
+    tree.store
+        .with_chain_under_latch(home_b, &key(5), LatchMode::Exclusive, |slot| {
+            *slot = Some(chain_b);
+        })
+        .unwrap();
 
     // Delete one key to force a leaf underflow that takes the merge path
     // (both siblings hold MIN or fewer cells after the split, so
@@ -729,12 +761,12 @@ fn t3_5_merge_preserves_overflow_refcount_invariant() {
     let home_b = leaf_of(&tree, &key(5));
     let a = tree
         .store
-        .take_chain(home_a, &key(0))
+        .with_chain_under_latch(home_a, &key(0), LatchMode::Exclusive, |slot| slot.take())
         .unwrap()
         .expect("chain A survived merge");
     let b = tree
         .store
-        .take_chain(home_b, &key(5))
+        .with_chain_under_latch(home_b, &key(5), LatchMode::Exclusive, |slot| slot.take())
         .unwrap()
         .expect("chain B survived merge");
 
@@ -770,7 +802,9 @@ fn t3_5_merge_into_left_migrates_orphan_chain() {
     // stale readers still descend to the correct frame after the root
     // collapses.
     tree.store
-        .put_chain(victim_leaf, b"orphan-key".to_vec(), chain_with(&[0xEE]))
+        .with_chain_under_latch(victim_leaf, b"orphan-key", LatchMode::Exclusive, |slot| {
+            *slot = Some(chain_with(&[0xEE]));
+        })
         .unwrap();
 
     assert!(tree.delete(&key(5)).unwrap());
@@ -782,7 +816,9 @@ fn t3_5_merge_into_left_migrates_orphan_chain() {
 
     let orphan = tree
         .store
-        .take_chain(tree.root_page, b"orphan-key")
+        .with_chain_under_latch(tree.root_page, b"orphan-key", LatchMode::Exclusive, |slot| {
+            slot.take()
+        })
         .unwrap()
         .expect("orphan chain survived merge-into-left");
     assert_eq!(orphan[0].txn_id, 0xEE);
@@ -806,7 +842,9 @@ fn t3_5_merge_into_right_migrates_orphan_chain() {
     let victim_leaf = tree.leftmost_leaf().unwrap();
 
     tree.store
-        .put_chain(victim_leaf, b"orphan-key".to_vec(), chain_with(&[0xFF]))
+        .with_chain_under_latch(victim_leaf, b"orphan-key", LatchMode::Exclusive, |slot| {
+            *slot = Some(chain_with(&[0xFF]));
+        })
         .unwrap();
 
     assert!(tree.delete(&key(0)).unwrap());
@@ -818,7 +856,9 @@ fn t3_5_merge_into_right_migrates_orphan_chain() {
 
     let orphan = tree
         .store
-        .take_chain(tree.root_page, b"orphan-key")
+        .with_chain_under_latch(tree.root_page, b"orphan-key", LatchMode::Exclusive, |slot| {
+            slot.take()
+        })
         .unwrap()
         .expect("orphan chain survived merge-into-right");
     assert_eq!(orphan[0].txn_id, 0xFF);

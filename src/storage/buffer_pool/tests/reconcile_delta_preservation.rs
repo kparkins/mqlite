@@ -60,7 +60,10 @@ fn tombstone_entry(start_ts: Ts, stop_ts: Ts) -> VersionEntry {
 }
 
 fn install_chain(pool: &BufferPool, page: u32, key: &[u8], chain: VecDeque<VersionEntry>) {
-    pool.put_chain(page, key.to_vec(), Arc::new(chain)).unwrap();
+    pool.with_chain_under_latch(page, key, LatchMode::Exclusive, |slot| {
+        *slot = Some(Arc::new(chain));
+    })
+    .unwrap();
 }
 
 #[test]

@@ -9,7 +9,7 @@ use crate::keys::{encode_compound_key, encode_key};
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, LatchMode};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::root_snapshot::{NamespaceSnapshot, PublishedIndex};
@@ -92,7 +92,9 @@ fn install_primary_delta(
     let mut chain = VecDeque::new();
     chain.push_back(committed_inline(ts, bytes, false));
     tree.store
-        .put_chain(leaf, key, Arc::new(chain))
+        .with_chain_under_latch(leaf, &key, LatchMode::Exclusive, |slot| {
+            *slot = Some(Arc::new(chain));
+        })
         .expect("install primary delta chain");
 }
 
@@ -122,7 +124,9 @@ fn install_secondary_delta(
     let mut chain = VecDeque::new();
     chain.push_back(entry);
     tree.store
-        .put_chain(leaf, key, Arc::new(chain))
+        .with_chain_under_latch(leaf, &key, LatchMode::Exclusive, |slot| {
+            *slot = Some(Arc::new(chain));
+        })
         .expect("install secondary delta chain");
 }
 

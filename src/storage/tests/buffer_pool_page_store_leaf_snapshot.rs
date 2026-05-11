@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::*;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::{BTreePageStore, LeafPageImage};
-use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, LatchMode, PageSize};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::test_support::{ArcIo, MockIo};
@@ -95,10 +95,14 @@ fn point_leaf_read_snapshots_only_requested_chain() {
         .write_leaf_structural(page, &data)
         .expect("write leaf page");
     store
-        .put_chain(page, b"target".to_vec(), chain(b"target"))
+        .with_chain_under_latch(page, b"target", LatchMode::Exclusive, |slot| {
+            *slot = Some(chain(b"target"));
+        })
         .expect("install target chain");
     store
-        .put_chain(page, b"other".to_vec(), chain(b"other"))
+        .with_chain_under_latch(page, b"other", LatchMode::Exclusive, |slot| {
+            *slot = Some(chain(b"other"));
+        })
         .expect("install other chain");
 
     let (_, full_snapshot) = store.read_leaf(page).expect("full leaf read");

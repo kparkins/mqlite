@@ -66,8 +66,10 @@ fn expired_entry() -> VersionEntry {
 }
 
 fn install_chain(pool: &BufferPool, page: u32, entry: VersionEntry) {
-    pool.put_chain(page, DELTA_KEY.to_vec(), Arc::new(VecDeque::from([entry])))
-        .unwrap();
+    pool.with_chain_under_latch(page, DELTA_KEY, LatchMode::Exclusive, |slot| {
+        *slot = Some(Arc::new(VecDeque::from([entry])));
+    })
+    .unwrap();
 }
 
 fn two_frame_pool() -> (BufferPool, Arc<ReadViewRegistry>, AllocatorHandle) {
@@ -155,11 +157,9 @@ fn test_evict_blocked_for_tombstone_head_until_ort_passes() {
     assert!(result.is_err(), "live tombstone head must block eviction");
     assert_cached(&pool, DELTA_PAGE);
 
-    pool.put_chain(
-        DELTA_PAGE,
-        DELTA_KEY.to_vec(),
-        Arc::new(VecDeque::from([expired_entry()])),
-    )
+    pool.with_chain_under_latch(DELTA_PAGE, DELTA_KEY, LatchMode::Exclusive, |slot| {
+        *slot = Some(Arc::new(VecDeque::from([expired_entry()])));
+    })
     .unwrap();
 
     drop(

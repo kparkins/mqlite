@@ -286,50 +286,13 @@ impl BTreePageStore for BufferPoolPageStore {
     }
 
     // -----------------------------------------------------------------------
-    // MVCC delta-chain accessors (T3.5)
+    // MVCC delta-chain accessors (T3.5 → PR0.5)
     //
-    // Delegate to the buffer pool's chain helpers, which operate on the
-    // `Frame::deltas` map for the 32 KB leaf partition.
+    // Read-only `chains_empty` plus the latch-aware mutator surface.
     // -----------------------------------------------------------------------
-
-    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
-        self.handle.pool().take_chain(page, key)
-    }
-
-    fn put_chain(
-        &mut self,
-        page: u32,
-        key: Vec<u8>,
-        chain: Arc<VecDeque<VersionEntry>>,
-    ) -> Result<()> {
-        self.handle.pool().put_chain(page, key, chain)
-    }
 
     fn chains_empty(&self, page: u32) -> Result<bool> {
         self.handle.pool().chains_empty(page)
-    }
-
-    fn clear_chains(&mut self, page: u32) -> Result<()> {
-        // Overflow pages live on the main 32 KB leaf pool (same
-        // partition as data leaves). History-routed stores never
-        // attach version chains to their pages, so the call is a
-        // no-op there.
-        if self.is_history {
-            return Ok(());
-        }
-        self.handle
-            .pool()
-            .clear_chains_on_page(page, PageSize::Large32k)
-    }
-
-    fn take_all_chains(
-        &mut self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        if self.is_history {
-            return Ok(Vec::new());
-        }
-        self.handle.pool().drain_leaf_chains(page)
     }
 
     fn with_chain_under_latch<R, F>(

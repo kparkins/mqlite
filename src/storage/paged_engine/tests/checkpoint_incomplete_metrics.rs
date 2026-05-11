@@ -13,7 +13,7 @@ use crate::mvcc::metrics::{
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, LatchMode};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::reconcile::driver::{
@@ -85,13 +85,16 @@ fn install_oversized_checkpoint_visible_leaf(engine: &PagedEngine) -> Result<(Tr
     let ident = primary_ident(engine);
     let (key, leaf) = primary_leaf_for_id(engine, &Bson::Int32(1))?;
     let checkpoint_ts = engine.shared.load_published().visible_ts;
-    engine.shared.handle.pool().put_chain(
+    engine.shared.handle.pool().with_chain_under_latch(
         leaf,
-        key,
-        Arc::new(VecDeque::from([committed_inline(
-            checkpoint_ts,
-            vec![0xA5; LARGE_INLINE_BYTES],
-        )])),
+        &key,
+        LatchMode::Exclusive,
+        |slot| {
+            *slot = Some(Arc::new(VecDeque::from([committed_inline(
+                checkpoint_ts,
+                vec![0xA5; LARGE_INLINE_BYTES],
+            )])));
+        },
     )?;
     engine.shared.dirty_leaves.clear();
     engine

@@ -106,8 +106,10 @@ fn chain(payload: &[u8]) -> Arc<VecDeque<VersionEntry>> {
 #[test]
 fn replace_leaf_and_chains_swaps_base_and_retained_chains() {
     let pool = pool_with_leaf(PAGE_ID);
-    pool.put_chain(PAGE_ID, OLD_KEY.to_vec(), chain(b"old"))
-        .unwrap();
+    pool.with_chain_under_latch(PAGE_ID, OLD_KEY, LatchMode::Exclusive, |slot| {
+        *slot = Some(chain(b"old"));
+    })
+    .unwrap();
 
     let mut retained = BTreeMap::new();
     retained.insert(RETAINED_KEY.to_vec(), chain(b"retained"));

@@ -501,7 +501,9 @@ pub(super) fn install_pending_sec_index(
                 "missing US-010 secondary latch for page {leaf_page}"
             ))
         })?;
-        page.put_chain(write.key, chain_arc)?;
+        page.with_chain(&write.key, |slot| {
+            *slot = Some(chain_arc);
+        })?;
         shared.mark_leaf_dirty(ident, leaf_page, DirtyReason::SecondaryWrite);
         installed_pages.push(leaf_page);
     }
@@ -599,7 +601,9 @@ pub(super) fn install_pending_primary(
                 is_tombstone,
             });
         }
-        page.put_chain(write.key, chain_arc)?;
+        page.with_chain(&write.key, |slot| {
+            *slot = Some(chain_arc);
+        })?;
         structural_tree_change |= page.live_delta_payload_exceeds_leaf_budget()?;
         shared.mark_leaf_dirty(
             TreeIdent {

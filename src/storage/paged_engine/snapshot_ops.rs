@@ -18,7 +18,7 @@ use crate::query::planner::{
 };
 use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{LatchMode, PageSize};
+use crate::storage::buffer_pool::LatchMode;
 use crate::storage::catalog::IndexState;
 use crate::storage::history_store::HistoryStore;
 use crate::storage::reconcile::driver::{

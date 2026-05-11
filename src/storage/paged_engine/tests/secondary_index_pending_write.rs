@@ -14,7 +14,7 @@ use crate::mvcc::{
 use crate::options::{FindOptions, IndexOptions};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, LatchMode};
 use crate::storage::catalog::{IndexEntry, IndexState};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
@@ -132,18 +132,19 @@ fn take_chain(
         None => None,
     };
     let leaf = tree.find_leaf(key)?;
-    let chain = engine
-        .shared
-        .handle
-        .pool()
-        .take_chain(leaf, key)?
-        .ok_or_else(|| Error::Internal("delta chain missing".into()))?;
-    let entries: Vec<VersionEntry> = chain.iter().cloned().collect();
-    engine
-        .shared
-        .handle
-        .pool()
-        .put_chain(leaf, key.to_vec(), chain)?;
+    let entries = engine.shared.handle.pool().with_chain_under_latch(
+        leaf,
+        key,
+        LatchMode::Exclusive,
+        |slot| {
+            let chain = slot
+                .as_ref()
+                .ok_or_else(|| Error::Internal("delta chain missing".into()))?;
+            let entries: Vec<VersionEntry> = chain.iter().cloned().collect();
+            // Slot stays as-is — we only inspect the chain.
+            Ok::<_, Error>(entries)
+        },
+    )??;
     Ok((base, entries))
 }
 

@@ -111,38 +111,8 @@ impl BTreePageStore for MemPageStore {
         Ok(())
     }
 
-    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
-        Ok(self.leaf_chains.get_mut(&page).and_then(|m| m.remove(key)))
-    }
-
-    fn put_chain(
-        &mut self,
-        page: u32,
-        key: Vec<u8>,
-        chain: Arc<VecDeque<VersionEntry>>,
-    ) -> Result<()> {
-        self.leaf_chains.entry(page).or_default().insert(key, chain);
-        Ok(())
-    }
-
     fn chains_empty(&self, page: u32) -> Result<bool> {
         Ok(self.leaf_chains.get(&page).map_or(true, |m| m.is_empty()))
-    }
-
-    fn clear_chains(&mut self, page: u32) -> Result<()> {
-        self.leaf_chains.remove(&page);
-        Ok(())
-    }
-
-    fn take_all_chains(
-        &mut self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        Ok(self
-            .leaf_chains
-            .remove(&page)
-            .map(|m| m.into_iter().collect())
-            .unwrap_or_default())
     }
 
     fn with_chain_under_latch<R, F>(

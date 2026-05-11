@@ -21,7 +21,7 @@ use crate::mvcc::{VersionEntry, VersionState};
 use crate::options::OpenOptions as DbOpenOptions;
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, LatchMode};
 use crate::storage::catalog::CollectionEntry;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
@@ -74,21 +74,15 @@ fn primary_chain_for_key(
         coll.data_root_level,
     );
     let leaf = tree.find_leaf(key).expect("find leaf");
-    let chain = engine
-        .shared
-        .handle
-        .pool()
-        .take_chain(leaf, key)
-        .expect("take chain")
-        .expect("chain exists");
-    let entries: Vec<VersionEntry> = chain.iter().cloned().collect();
     engine
         .shared
         .handle
         .pool()
-        .put_chain(leaf, key.to_vec(), chain)
-        .expect("restore chain");
-    entries
+        .with_chain_under_latch(leaf, key, LatchMode::Exclusive, |slot| {
+            let chain = slot.as_ref().expect("chain exists");
+            chain.iter().cloned().collect::<Vec<_>>()
+        })
+        .expect("inspect chain under latch")
 }
 
 fn parsed_frame(ops: Vec<LogicalOp>) -> ParsedLogicalFrames {

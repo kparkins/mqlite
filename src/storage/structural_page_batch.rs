@@ -504,32 +504,8 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
     // bytes carrying a replacement — that is worse, not better, for
     // correctness. See the module docstring.
 
-    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>> {
-        self.base.take_chain(page, key)
-    }
-
-    fn put_chain(
-        &mut self,
-        page: u32,
-        key: Vec<u8>,
-        chain: Arc<VecDeque<VersionEntry>>,
-    ) -> Result<()> {
-        self.base.put_chain(page, key, chain)
-    }
-
     fn chains_empty(&self, page: u32) -> Result<bool> {
         self.base.chains_empty(page)
-    }
-
-    fn clear_chains(&mut self, page: u32) -> Result<()> {
-        self.base.clear_chains(page)
-    }
-
-    fn take_all_chains(
-        &mut self,
-        page: u32,
-    ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
-        self.base.take_all_chains(page)
     }
 
     fn with_chain_under_latch<R, F>(

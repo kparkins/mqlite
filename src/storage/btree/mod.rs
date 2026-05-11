@@ -34,8 +34,6 @@ use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::buffer_pool::{LatchMode, PageSize};
 
-type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
-
 /// Reader-path history fallthrough.
 ///
 /// Bound to a specific durable tree identity at the call site — the BTree
@@ -293,67 +291,26 @@ pub(crate) trait BTreePageStore {
     fn free_leaf(&mut self, page: u32) -> Result<()>;
 
     // -----------------------------------------------------------------------
-    // MVCC version-chain accessors (T3.5)
+    // MVCC version-chain accessors (T3.5 → PR0.5)
     //
     // Leaf frames own per-key MVCC version chains. Split / merge operations
     // migrate these chains alongside the cells that own them; the `free_leaf`
     // call sites in the merge path are guarded by `chains_empty` to fail
     // loudly if migration is ever skipped.
+    //
+    // PR0.5 unifies every mutation behind `with_chain_under_latch` /
+    // `with_all_chains_under_latch`. Both pin the leaf and acquire the
+    // per-page latch before invoking the caller's closure, so concurrent
+    // CRUD writers serialize on `frame.deltas` instead of racing through
+    // the buffer-pool partition mutex. PR1's selective CoW and PR2's
+    // running-sum cache hang off this single choke point.
     // -----------------------------------------------------------------------
 
-    /// Remove and return the version chain for `key` on leaf `page`.
-    #[allow(dead_code)]
-    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<Arc<VecDeque<VersionEntry>>>>;
-
-    /// Install a delta chain for `key` on leaf `page`. Overwrites any
-    /// existing chain for that key.
-    fn put_chain(
-        &mut self,
-        page: u32,
-        key: Vec<u8>,
-        chain: Arc<VecDeque<VersionEntry>>,
-    ) -> Result<()>;
-
-    /// True iff no delta chains are attached to leaf `page`.
+    /// True iff no delta chains are attached to leaf `page`. Read-only
+    /// inspector used by structural-cleanup guards (e.g. the
+    /// `free_leaf`-path `chains_empty` check). Implementations may use a
+    /// shared latch or no latch at all; mutation is forbidden.
     fn chains_empty(&self, page: u32) -> Result<bool>;
-
-    /// Clear ALL delta chains attached to leaf `page`.
-    ///
-    /// Used by the overflow-chain free path: overflow pages are allocated
-    /// from the same 32 KB leaf pool as data leaves, so a page that was
-    /// previously a data leaf may carry stale `deltas` entries
-    /// when reborn as an overflow page. Clearing those entries before
-    /// `free_leaf` keeps the T3.5 guard sound.
-    ///
-    /// No-op if the frame is not currently resident — there are no
-    /// chains to clear in that case.
-    fn clear_chains(&mut self, page: u32) -> Result<()>;
-
-    /// Remove and return every delta chain currently attached to leaf
-    /// `page`. Used by the leaf-merge path to migrate the residual chains
-    /// for keys whose cells were already removed earlier in the same txn
-    /// (e.g. by `delete_from_leaf`) onto the merged-into sibling — those
-    /// tombstone-eligible chains must remain visible to MVCC readers
-    /// whose ReadView predates the delete commit.
-    ///
-    /// Returns an empty vector if the frame is not resident.
-    fn take_all_chains(&mut self, page: u32) -> Result<VersionChainDrain>;
-
-    // -----------------------------------------------------------------------
-    // Latch-aware chain-mutator API (PR0.5 unification)
-    //
-    // The four methods above (`take_chain`, `put_chain`, `clear_chains`,
-    // `take_all_chains`) acquire the buffer-pool partition mutex but do
-    // NOT take the per-page latch — concurrent CRUD writers could mutate
-    // the same `frame.deltas` map without serialization. The two methods
-    // below replace them with a single canonical entry point per access
-    // pattern (single-key vs all-chains), each of which acquires the page
-    // latch via `pin_then_latch` before invoking the caller's closure.
-    //
-    // After PR0.5 commit 3 these are the ONLY chain mutators on the
-    // trait surface; the four above are deleted. PR1's selective CoW
-    // and PR2's running-sum cache hang off this single choke point.
-    // -----------------------------------------------------------------------
 
     /// Pin leaf `page` under `mode`, run `f` against the chain slot for
     /// `key`, and release the pin+latch.

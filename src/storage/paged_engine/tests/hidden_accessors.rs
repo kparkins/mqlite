@@ -1026,7 +1026,9 @@ impl PagedEngine {
             data: VersionData::Inline(data),
             is_tombstone: false,
         });
-        page.put_chain(key, chain)?;
+        page.with_chain(&key, |slot| {
+            *slot = Some(chain);
+        })?;
         self.shared.mark_leaf_dirty(
             TreeIdent {
                 collection_id: coll.id,

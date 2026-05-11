@@ -10,7 +10,7 @@ use crate::keys::encode_key;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
-use crate::storage::buffer_pool::{default_sizes, BufferPool};
+use crate::storage::buffer_pool::{default_sizes, BufferPool, LatchMode};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;
 use crate::storage::reconcile::driver::reconcile_tree_dirty_set;
@@ -108,12 +108,12 @@ fn checkpoint_reconciles_dirty_primary_leaf_then_flushes() -> Result<()> {
     );
     drop(pages);
     assert!(engine.find_one(NS, &doc! { "_id": 1 })?.is_some());
-    assert!(engine
+    let residue = engine
         .shared
         .handle
         .pool()
-        .take_chain(leaf, &key)?
-        .is_none());
+        .with_chain_under_latch(leaf, &key, LatchMode::Exclusive, |slot| slot.take())?;
+    assert!(residue.is_none());
     Ok(())
 }
 
@@ -136,10 +136,16 @@ fn checkpoint_keeps_not_installable_leaf_dirty_and_reports_stats() -> Result<()>
     let (key, leaf) = primary_leaf_for_id(&engine, &Bson::Int32(7))?;
     let checkpoint_ts = engine.shared.load_published().visible_ts;
     let oversized = vec![0xA5; LARGE_INLINE_BYTES];
-    engine.shared.handle.pool().put_chain(
+    engine.shared.handle.pool().with_chain_under_latch(
         leaf,
-        key.clone(),
-        Arc::new(VecDeque::from([committed_inline(checkpoint_ts, oversized)])),
+        &key,
+        LatchMode::Exclusive,
+        |slot| {
+            *slot = Some(Arc::new(VecDeque::from([committed_inline(
+                checkpoint_ts,
+                oversized,
+            )])));
+        },
     )?;
     engine.shared.dirty_leaves.clear();
     engine
@@ -175,13 +181,16 @@ fn checkpoint_keeps_not_installable_leaf_dirty_and_reports_stats() -> Result<()>
     assert!(matches!(err, Error::CheckpointIncomplete { .. }));
 
     assert_dirty_leaf(&engine, &ident, leaf);
-    let chain = engine
-        .shared
-        .handle
-        .pool()
-        .take_chain(leaf, &key)?
-        .expect("non-installable chain must remain attached");
-    assert_eq!(chain.len(), 1);
-    engine.shared.handle.pool().put_chain(leaf, key, chain)?;
+    engine.shared.handle.pool().with_chain_under_latch(
+        leaf,
+        &key,
+        LatchMode::Exclusive,
+        |slot| {
+            let chain = slot
+                .as_ref()
+                .expect("non-installable chain must remain attached");
+            assert_eq!(chain.len(), 1);
+        },
+    )?;
     Ok(())
 }

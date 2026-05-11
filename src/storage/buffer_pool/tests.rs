@@ -738,7 +738,10 @@ mod reconcile {
     }
 
     fn install_chain(pool: &BufferPool, page: u32, key: &[u8], chain: VecDeque<VersionEntry>) {
-        pool.put_chain(page, key.to_vec(), Arc::new(chain)).unwrap();
+        pool.with_chain_under_latch(page, key, LatchMode::Exclusive, |slot| {
+            *slot = Some(Arc::new(chain));
+        })
+        .unwrap();
     }
 
     fn entry_inline(start: Ts, stop: Ts, txn: u64, payload: &[u8]) -> VersionEntry {

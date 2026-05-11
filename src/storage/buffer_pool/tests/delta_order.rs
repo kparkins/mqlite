@@ -43,8 +43,10 @@ fn test_delta_map_iterates_in_key_order() {
     drop(pool.pin(page_number, PageSize::Large32k).unwrap());
 
     for key in [b"m".as_slice(), b"a".as_slice(), b"k".as_slice()] {
-        pool.put_chain(page_number, key.to_vec(), chain(key[0]))
-            .unwrap();
+        pool.with_chain_under_latch(page_number, key, LatchMode::Exclusive, |slot| {
+            *slot = Some(chain(key[0]));
+        })
+        .unwrap();
     }
 
     let guard = pool.inner_32k.lock().unwrap();

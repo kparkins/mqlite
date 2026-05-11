@@ -10,6 +10,7 @@ use crate::keys::encode_key;
 use crate::mvcc::transaction::Ns;
 use crate::mvcc::{PrimaryOp, PrimaryWrite, ReadView, Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::{BTree, BTreePageStore, MemPageStore};
+use crate::storage::buffer_pool::LatchMode;
 
 const NS_ID: i64 = 1;
 const TXN_ID: u64 = 7;
@@ -68,7 +69,10 @@ fn install_chain(tree: &mut BTree<MemPageStore>, doc: &Document) -> Result<()> {
     let key = encode_key(id);
     let leaf = tree.find_leaf(&key)?;
     let chain = VecDeque::from([live_entry(doc)?]);
-    tree.store.put_chain(leaf, key, Arc::new(chain))
+    tree.store
+        .with_chain_under_latch(leaf, &key, LatchMode::Exclusive, |slot| {
+            *slot = Some(Arc::new(chain));
+        })
 }
 
 fn pending_insert(ns: &str, doc: &Document) -> Result<PrimaryWrite> {

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::mvcc::{ReadView, Ts, VersionData, VersionEntry, VersionState};
+use crate::storage::buffer_pool::LatchMode;
 
 use super::{BTree, BTreePageStore, HistoryProbe, MemPageStore};
 
@@ -35,7 +36,10 @@ fn install_chain(
     for entry in entries {
         chain.push_back(entry);
     }
-    tree.store.put_chain(leaf, key.to_vec(), Arc::new(chain))
+    tree.store
+        .with_chain_under_latch(leaf, key, LatchMode::Exclusive, |slot| {
+            *slot = Some(Arc::new(chain));
+        })
 }
 
 struct RecordingHistoryProbe {

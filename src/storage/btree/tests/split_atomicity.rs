@@ -25,7 +25,6 @@ const UNWATCHED_PAGE: u32 = u32::MAX;
 const ENTRY_MARKER: u8 = 0xA5;
 
 type ChainArc = Arc<VecDeque<VersionEntry>>;
-type ChainDrain = Vec<(Vec<u8>, ChainArc)>;
 type InternalPageBytes = [u8; PAGE_SIZE_INTERNAL as usize];
 type InternalPage = Box<[u8; PAGE_SIZE_INTERNAL as usize]>;
 type LeafPageBytes = [u8; PAGE_SIZE_LEAF as usize];
@@ -193,26 +192,8 @@ impl BTreePageStore for ObservedStore {
         self.with_store_mut(|store| store.free_leaf(page))
     }
 
-    fn take_chain(&mut self, page: u32, key: &[u8]) -> Result<Option<ChainArc>> {
-        self.with_store_mut(|store| store.take_chain(page, key))
-    }
-
-    fn put_chain(&mut self, page: u32, key: Vec<u8>, chain: ChainArc) -> Result<()> {
-        self.with_store_mut(|store| store.put_chain(page, key, chain))
-    }
-
     fn chains_empty(&self, page: u32) -> Result<bool> {
         self.with_store(|store| store.chains_empty(page))
-    }
-
-    fn clear_chains(&mut self, page: u32) -> Result<()> {
-        self.with_store_mut(|store| store.clear_chains(page))
-    }
-
-    fn take_all_chains(&mut self, page: u32) -> Result<ChainDrain> {
-        let chains = self.with_store_mut(|store| store.take_all_chains(page))?;
-        self.split_window.after_chain_drain(page);
-        Ok(chains)
     }
 
     fn with_chain_under_latch<R, F>(
@@ -309,7 +290,9 @@ fn run_split_atomicity_case(distribution: ChainDistribution) -> Result<()> {
     let watched_keys = encoded_keys(distribution);
     for watched_key in &watched_keys {
         tree.store
-            .put_chain(left_page, watched_key.clone(), chain())?;
+            .with_chain_under_latch(left_page, watched_key, LatchMode::Exclusive, |slot| {
+                *slot = Some(chain());
+            })?;
     }
 
     let namespace_lane = Arc::new(Mutex::new(()));
