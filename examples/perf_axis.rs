@@ -113,8 +113,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is what we measure, not the post-workload Client::drop checkpoint.
     // Bypass the drop chain (which would flush a 60K-row checkpoint
     // serially per invocation and dominate the runner's wall time) and
-    // exit immediately. The TempDir leak is bounded — the OS reclaims it
-    // when the runner finishes.
+    // exit immediately. We bypass Client::drop AND TempDir::drop via
+    // `std::process::exit`, so manually reclaim the tempdir first;
+    // otherwise multi-day perf sessions accumulate hundreds of leaked
+    // .tmp* dirs (PR2 matrix run hit 100% disk on this — 473 leaks /
+    // 54 GB across the PR0/PR1/PR2 sessions).
+    let _ = std::fs::remove_dir_all(dir.path());
     std::io::stdout().flush().ok();
     std::process::exit(0);
 }
