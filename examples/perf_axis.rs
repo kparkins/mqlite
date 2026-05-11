@@ -395,14 +395,21 @@ fn run_read_find_one_under_writers(
 ///   - flip_retry_rate (must be < 0.01 over a 30 s same_ns_single run)
 ///   - flip_retry_exhausted_count (must be == 0 — engine poison gate)
 ///   - shared_latch_wait_p50_ns / p99_ns (read-coupling AC)
+///   - install_phase_b_mean_hold_ns (PR2 macro: per-write install
+///     critical section, with_chain + live_delta_check; AC: post-PR2
+///     mean <= 0.70 × post-PR1 mean)
+///   - live_delta_check_mean_hold_ns (PR2 micro: just the scanner
+///     call, replaced by O(1) cache load; AC: post-PR2 mean <= 50 ns)
 #[cfg(feature = "perf-counters")]
 fn print_perf_counters() {
     use mqlite::perf_counters as pc;
     println!(
-        "{{\"perf_counters\":{{\"flip_retry_rate\":{:.6},\"flip_retry_exhausted\":{},\"shared_latch_wait_p50_ns\":{},\"shared_latch_wait_p99_ns\":{}}}}}",
+        "{{\"perf_counters\":{{\"flip_retry_rate\":{:.6},\"flip_retry_exhausted\":{},\"shared_latch_wait_p50_ns\":{},\"shared_latch_wait_p99_ns\":{},\"install_phase_b_mean_hold_ns\":{},\"live_delta_check_mean_hold_ns\":{}}}}}",
         pc::flip_retry_rate(),
         pc::flip_retry_exhausted_count(),
         pc::shared_latch_wait_p50_ns(),
         pc::shared_latch_wait_p99_ns(),
+        pc::install_phase_b_mean_hold_ns(),
+        pc::live_delta_check_mean_hold_ns(),
     );
 }

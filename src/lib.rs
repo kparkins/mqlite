@@ -272,8 +272,9 @@ pub use wire::WireProtocol;
 #[cfg(feature = "perf-counters")]
 pub mod perf_counters {
     pub use crate::storage::buffer_pool::{
-        flip_retry_exhausted_count, flip_retry_rate, reset_flip_counters,
-        reset_shared_latch_wait_hist, shared_latch_wait_p50_ns, shared_latch_wait_p99_ns,
+        flip_retry_exhausted_count, flip_retry_rate, install_phase_b_mean_hold_ns,
+        live_delta_check_mean_hold_ns, reset_flip_counters, reset_shared_latch_wait_hist,
+        shared_latch_wait_p50_ns, shared_latch_wait_p99_ns,
     };
 }
 

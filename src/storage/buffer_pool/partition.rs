@@ -93,6 +93,29 @@ pub(super) struct Frame {
     /// without a matching chain. Both cases are legal; see Phase 3 §10.4 for
     /// the decision table.
     pub(super) deltas: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
+    /// PR2 running-sum cache: total `chain_live_head_bytes` over every
+    /// chain in `deltas`. Maintained by every chain mutator that goes
+    /// through `LatchedPinnedPage::with_chain` /
+    /// `LatchedPinnedPage::with_all_chains` /
+    /// `BufferPool::replace_leaf_and_chains` /
+    /// `Partition::reconcile_frame_at`. Read by
+    /// `LatchedPinnedPage::live_delta_payload_exceeds_leaf_budget`,
+    /// which adds `LEAF_HEADER_SIZE` and compares to `PAGE_SIZE_LEAF`.
+    ///
+    /// **Lifecycle invariant:** every fresh `Frame` is constructed
+    /// with `deltas: BTreeMap::new()` and this counter at 0. The
+    /// invariant `cached == frame_live_delta_payload_bytes(&deltas)`
+    /// holds across every mutator return — see
+    /// `tests/running_sum_cache_invariant.rs` for the 10k-mutation
+    /// stress proof.
+    ///
+    /// **Memory ordering:** writers update via `Acquire` load + arithmetic
+    /// + `Release` store under the page-local exclusive latch (which
+    /// already serializes mutator vs reader). The Acquire/Release pair
+    /// is defense-in-depth: it makes the cache safe to read under a
+    /// shared latch without a correctness migration if a future PR
+    /// chooses to relax the read.
+    pub(super) live_delta_payload_bytes: AtomicU64,
     /// Phase 5 §10.18 page-local latch. Acquired AFTER the partition mutex
     /// is released by `BufferPool::pin_for_read`/`pin_for_write` and held
     /// for the lifetime of the wrapping `LatchedPinnedPage`. The latch is
@@ -349,6 +372,8 @@ impl Partition {
             dirty_lsn: Frame::clean_dirty_lsn(),
             ref_bit: true,
             deltas: BTreeMap::new(),
+            // PR2 lifecycle invariant: empty `deltas` ↔ cache = 0.
+            live_delta_payload_bytes: AtomicU64::new(0),
             latch: PageLatch::new(),
         });
         self.page_map.insert(page_number, idx);
@@ -413,6 +438,8 @@ impl Partition {
             dirty_lsn: Frame::clean_dirty_lsn(),
             ref_bit: true,
             deltas: BTreeMap::new(),
+            // PR2 lifecycle invariant: empty `deltas` ↔ cache = 0.
+            live_delta_payload_bytes: AtomicU64::new(0),
             latch: PageLatch::new(),
         });
         self.page_map.insert(page_number, idx);
@@ -423,19 +450,35 @@ impl Partition {
     /// Prune the frame at slot `idx`'s version chains against horizon `ort`.
     /// Returns the number of `VersionEntry` objects dropped. No-op if the
     /// slot is empty.
+    ///
+    /// PR2 cache invariant: this is the only `frame.deltas` mutator that
+    /// bypasses the page-local exclusive latch (it runs under the
+    /// partition mutex during eviction-prep). The running-sum cache is
+    /// recomputed inline during the same retain pass so the function
+    /// remains self-correcting — even though every current caller
+    /// (`pin_page_reconciling`) immediately replaces the frame, a
+    /// future caller that retains the frame would see a correct cache.
     fn reconcile_frame_at(&mut self, idx: usize, ort: Ts) -> usize {
         let Some(frame) = self.frames[idx].as_mut() else {
             return 0;
         };
         let mut dropped = 0usize;
-        frame.deltas.retain(|_, chain_arc| {
+        let mut new_payload_bytes = 0u64;
+        frame.deltas.retain(|key, chain_arc| {
             let before = chain_arc.len();
             let chain_mut = Arc::make_mut(chain_arc);
             chain_mut.retain(|e| e.stop_ts == Ts::MAX || e.stop_ts > ort);
             let after = chain_arc.len();
             dropped += before - after;
-            !chain_arc.is_empty()
+            let keep = !chain_arc.is_empty();
+            if keep {
+                new_payload_bytes += super::chains::chain_live_head_bytes(key, chain_arc);
+            }
+            keep
         });
+        frame
+            .live_delta_payload_bytes
+            .store(new_payload_bytes, Ordering::Release);
         dropped
     }
 

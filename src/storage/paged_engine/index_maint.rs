@@ -601,10 +601,27 @@ pub(super) fn install_pending_primary(
                 is_tombstone,
             });
         }
+        // PR2 install critical section: time the with_chain install +
+        // the live_delta_payload_exceeds_leaf_budget check together,
+        // because both run under the same exclusive page latch and
+        // both are the bytes PR2 attacks (with_chain gained the
+        // running-sum delta update; the scanner became an O(1) cache
+        // load). Counts each per-write iteration once.
+        #[cfg(feature = "perf-counters")]
+        let _install_start = std::time::Instant::now();
         page.with_chain(&write.key, |slot| {
             *slot = Some(chain_arc);
         })?;
         structural_tree_change |= page.live_delta_payload_exceeds_leaf_budget()?;
+        #[cfg(feature = "perf-counters")]
+        {
+            use std::sync::atomic::Ordering;
+            let elapsed_ns = _install_start.elapsed().as_nanos() as u64;
+            crate::storage::buffer_pool::chains::INSTALL_HOLD_NS_TOTAL
+                .fetch_add(elapsed_ns, Ordering::Relaxed);
+            crate::storage::buffer_pool::chains::INSTALL_WRITES
+                .fetch_add(1, Ordering::Relaxed);
+        }
         shared.mark_leaf_dirty(
             TreeIdent {
                 collection_id: write.ns_id,

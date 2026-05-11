@@ -1,0 +1,31 @@
+{
+  "date": "2026-05-10",
+  "branch": "perf/p2-running-sum-cache",
+  "hardware": "Model Name: MacBook Pro; Model Identifier: Mac15,7; Chip: Apple M3 Pro; Total Number of Cores: 12 (6 Performance and 6 Efficiency); Memory: 36 GB",
+  "build_cmd": "cargo build --release --example perf_axis",
+  "axis_runs": 11,
+  "duration_seconds": 15,
+  "rows": [
+    {
+      "axis": "same_ns_single",
+      "writers": 4,
+      "median_dps": 8200.38,
+      "min_dps": 7772.43,
+      "max_dps": 8448.63,
+      "envelope": 0.0825,
+      "raw_dps": [
+        8343.92,
+        8448.63,
+        8183.88,
+        8335.78,
+        8267.88,
+        8110.86,
+        7772.43,
+        8338.52,
+        7891.76,
+        8200.38,
+        8092.14
+      ]
+    }
+  ]
+}

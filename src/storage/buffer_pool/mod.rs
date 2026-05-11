@@ -46,8 +46,9 @@ pub(crate) mod chains;
 mod metrics_perf;
 #[cfg(feature = "perf-counters")]
 pub use metrics_perf::{
-    flip_retry_exhausted_count, flip_retry_rate, reset_flip_counters,
-    reset_shared_latch_wait_hist, shared_latch_wait_p50_ns, shared_latch_wait_p99_ns,
+    flip_retry_exhausted_count, flip_retry_rate, install_phase_b_mean_hold_ns,
+    live_delta_check_mean_hold_ns, reset_flip_counters, reset_shared_latch_wait_hist,
+    shared_latch_wait_p50_ns, shared_latch_wait_p99_ns,
 };
 // `PageLatch` is consumed by higher-level write, reconciliation, and test
 // paths. Some primitive APIs still look unused to the lib-only dead-code lint
@@ -73,14 +74,9 @@ use crate::error::{Error, PoolExhaustedReason, Result};
 use crate::journal::log_file::PageId;
 use crate::mvcc::metrics;
 use crate::mvcc::read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
-use crate::mvcc::version::{VersionData, VersionEntry, VersionState};
+use crate::mvcc::version::{VersionEntry, VersionState};
 use crate::mvcc::{ExpectedHead, Ts};
 use crate::storage::allocator::AllocatorHandle;
-use crate::storage::btree::reconcile::{
-    CELL_INLINE_LEN_BYTES, CELL_KEY_LEN_BYTES, CELL_OVERFLOW_REF_BYTES, CELL_VALUE_TYPE_BYTES,
-    SLOT_POINTER_BYTES,
-};
-use crate::storage::btree::OVERFLOW_THRESHOLD;
 use crate::storage::page::{LEAF_HEADER_SIZE, PAGE_SIZE_LEAF, PAGE_TYPE_LEAF};
 use crate::storage::reconcile::driver::TreeIdent;
 
@@ -497,10 +493,29 @@ impl<'pool> LatchedPinnedPage<'pool> {
         // evicted. The exclusive page latch serializes delta-map mutation.
         let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
         let mut slot = frame.deltas.remove(key);
+        // PR2 cache: snapshot the chain's live-head contribution
+        // BEFORE the closure runs so we can compute the per-key delta
+        // post-mutation. `before` is 0 when the chain didn't exist.
+        let before = slot
+            .as_ref()
+            .map(|chain| chains::chain_live_head_bytes(key, chain))
+            .unwrap_or(0);
         let result = f(&mut slot);
+        let after = slot
+            .as_ref()
+            .map(|chain| chains::chain_live_head_bytes(key, chain))
+            .unwrap_or(0);
         if let Some(chain) = slot {
             frame.deltas.insert(key.to_vec(), chain);
         }
+        // PR2 cache: signed delta accumulation via wrapping arithmetic.
+        // The cache value is non-negative in absolute terms over the
+        // frame's lifetime (it tracks bytes that exist on the frame),
+        // but per-mutation deltas can be negative when a chain
+        // shrinks via tombstone or removal.
+        let cur = frame.live_delta_payload_bytes.load(Ordering::Acquire);
+        let next = cur.wrapping_add(after).wrapping_sub(before);
+        frame.live_delta_payload_bytes.store(next, Ordering::Release);
         Ok(result)
     }
 
@@ -519,42 +534,40 @@ impl<'pool> LatchedPinnedPage<'pool> {
         // SAFETY: this handle owns a live pin, so the frame slot cannot be
         // evicted. The exclusive page latch serializes delta-map mutation.
         let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
-        Ok(f(&mut frame.deltas))
+        let result = f(&mut frame.deltas);
+        // PR2 cache: arbitrary mutation through the closure forces a
+        // full recompute. Used only by leaf-merge migration / overflow
+        // repurpose paths — both rare events.
+        let total = chains::frame_live_delta_payload_bytes(&frame.deltas);
+        frame.live_delta_payload_bytes.store(total, Ordering::Release);
+        Ok(result)
     }
 
     /// Return true when live resident deltas no longer fit one folded leaf.
+    ///
+    /// PR2: the legacy whole-frame scanner that walked every chain and
+    /// summed `chain_live_head_bytes` inline is gone — this is now an
+    /// O(1) read of the running-sum cache maintained by `with_chain` /
+    /// `with_all_chains` / `replace_leaf_and_chains` /
+    /// `reconcile_frame_at`. Single canonical path per Principle 3.
     pub(crate) fn live_delta_payload_exceeds_leaf_budget(&self) -> Result<bool> {
         self.require_exclusive("live_delta_payload_exceeds_leaf_budget")?;
+        #[cfg(feature = "perf-counters")]
+        let _start = std::time::Instant::now();
         // SAFETY: this handle owns a live pin, so the frame slot cannot be
-        // evicted. The exclusive page latch serializes delta-map access.
+        // evicted. The exclusive page latch serializes delta-map mutation;
+        // the Acquire-load pairs with the Release-store in every cache
+        // updater (defense-in-depth — the latch already serializes us).
         let frame = unsafe { &*self.frame_ptr };
-        let mut leaf_bytes = LEAF_HEADER_SIZE;
-        for (key, chain) in &frame.deltas {
-            let Some(entry) = chain.iter().find(|entry| {
-                entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted)
-            }) else {
-                continue;
-            };
-            if entry.is_tombstone {
-                continue;
-            }
-            let value_bytes = match &entry.data {
-                VersionData::Inline(bytes) if bytes.len() > OVERFLOW_THRESHOLD => {
-                    CELL_OVERFLOW_REF_BYTES
-                }
-                VersionData::Inline(bytes) => CELL_INLINE_LEN_BYTES + bytes.len(),
-                VersionData::Overflow(_) => CELL_OVERFLOW_REF_BYTES,
-            };
-            leaf_bytes += SLOT_POINTER_BYTES
-                + CELL_KEY_LEN_BYTES
-                + key.len()
-                + CELL_VALUE_TYPE_BYTES
-                + value_bytes;
-            if leaf_bytes > PAGE_SIZE_LEAF as usize {
-                return Ok(true);
-            }
+        let cached = frame.live_delta_payload_bytes.load(Ordering::Acquire);
+        let result = LEAF_HEADER_SIZE as u64 + cached > PAGE_SIZE_LEAF as u64;
+        #[cfg(feature = "perf-counters")]
+        {
+            let elapsed_ns = _start.elapsed().as_nanos() as u64;
+            chains::LIVE_DELTA_CHECK_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
+            chains::LIVE_DELTA_CHECK_CALLS.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(false)
+        Ok(result)
     }
 
     /// Return the keys on this page whose chain has a `Pending(txn_id)`
@@ -623,6 +636,27 @@ impl<'pool> LatchedPinnedPage<'pool> {
         }
         // Second pass: install. We checked every entry first; this
         // loop cannot observe a conflict it did not see in pass one.
+        //
+        // PR2 cache invariant: Pending(txn_id) -> Committed flips do
+        // NOT change a chain's `chain_live_head_bytes` contribution
+        // because the formula filters on `state != Aborted`, which
+        // both Pending and Committed satisfy, AND the head's `key`,
+        // `data`, `is_tombstone`, `stop_ts` fields are identical
+        // before and after the flip. The `debug_assert_eq!` below
+        // witnesses this invariant on every swap; release builds
+        // skip it.
+        #[cfg(debug_assertions)]
+        for swap in &prepared {
+            let before = chains::chain_live_head_bytes(&swap.key, &swap.expected_old);
+            let after = chains::chain_live_head_bytes(&swap.key, &swap.new_chain);
+            debug_assert_eq!(
+                before, after,
+                "Phase B swap must preserve chain_live_head_bytes \
+                 (key={:?}, before={before}, after={after}) — flipping \
+                 Pending(txn_id) -> Committed must NOT change footprint",
+                swap.key
+            );
+        }
         for swap in prepared {
             frame.deltas.insert(swap.key, swap.new_chain);
         }
@@ -1136,6 +1170,13 @@ impl BufferPool {
         }
         frame.data.store(Arc::new(new_base));
         frame.deltas = retained_chains;
+        // PR2 cache: full recompute since the entire `deltas` map was
+        // replaced. This is the checkpoint dirty-leaf reconcile path
+        // (audit Finding A); it bypasses `with_all_chains` because it
+        // also has to publish the new leaf-image bytes atomically with
+        // the chain swap, so we maintain the cache inline here.
+        let total = chains::frame_live_delta_payload_bytes(&frame.deltas);
+        frame.live_delta_payload_bytes.store(total, Ordering::Release);
         frame.mark_unflushable_if_clean();
 
         Ok(())

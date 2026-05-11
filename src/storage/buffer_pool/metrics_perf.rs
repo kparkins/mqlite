@@ -17,7 +17,10 @@ use std::sync::atomic::Ordering;
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;
 
-use super::chains::{FLIP_RETRY_EXHAUSTED, FLIP_RETRY_TOTAL, FLIP_TXN_TOTAL};
+use super::chains::{
+    FLIP_RETRY_EXHAUSTED, FLIP_RETRY_TOTAL, FLIP_TXN_TOTAL, INSTALL_HOLD_NS_TOTAL, INSTALL_WRITES,
+    LIVE_DELTA_CHECK_CALLS, LIVE_DELTA_CHECK_NS_TOTAL,
+};
 
 /// Reader-thread `pin_then_latch` shared-acquire latency in
 /// nanoseconds, sampled by [`record_shared_latch_wait_ns`]. Drives
@@ -73,10 +76,16 @@ pub fn reset_shared_latch_wait_hist() {
 }
 
 /// Reset the flip-retry counters (for repeatable measurement runs).
+/// Also clears the PR2 install / live-delta-check counters so a fresh
+/// reading reflects only the next workload.
 pub fn reset_flip_counters() {
     FLIP_TXN_TOTAL.store(0, Ordering::Relaxed);
     FLIP_RETRY_TOTAL.store(0, Ordering::Relaxed);
     FLIP_RETRY_EXHAUSTED.store(0, Ordering::Relaxed);
+    INSTALL_HOLD_NS_TOTAL.store(0, Ordering::Relaxed);
+    INSTALL_WRITES.store(0, Ordering::Relaxed);
+    LIVE_DELTA_CHECK_NS_TOTAL.store(0, Ordering::Relaxed);
+    LIVE_DELTA_CHECK_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// Bounded-retry rate over the workload window.
@@ -121,4 +130,48 @@ pub fn shared_latch_wait_p99_ns() -> u64 {
         }
         h.value_at_percentile(99.0)
     })
+}
+
+/// Mean per-write install critical-section hold time in nanoseconds.
+///
+/// Times the exclusive page-latch hold across the with_chain install
+/// AND the live_delta_payload_exceeds_leaf_budget check at
+/// `index_maint.rs:565-617`. PR2 structural verdict: post-PR2 mean
+/// must be `<= 0.70 ×` post-PR1 mean.
+///
+/// Note: this is the per-WRITE install critical section, NOT PR1's
+/// FLIP-path Phase B (which lives in
+/// `LatchedPinnedPage::try_swap_chains_if_unchanged`). The naming
+/// keeps the `phase_b` token used by the rev-4 plan but adds an
+/// `install_` prefix to disambiguate.
+///
+/// Returns 0 when no install writes have happened (avoids division
+/// by zero and distinguishes "no work" from "instant work").
+pub fn install_phase_b_mean_hold_ns() -> u64 {
+    let writes = INSTALL_WRITES.load(Ordering::Relaxed);
+    if writes == 0 {
+        return 0;
+    }
+    let total = INSTALL_HOLD_NS_TOTAL.load(Ordering::Relaxed);
+    total / writes
+}
+
+/// Mean wall-clock hold time of a single
+/// `live_delta_payload_exceeds_leaf_budget` call in nanoseconds.
+///
+/// Pre-PR2 this was an O(N) walk of `frame.deltas`; post-PR2 it is
+/// an O(1) Acquire load on the running-sum cache. The "Amdahl
+/// falsification" micro-metric: if the scanner truly dominated the
+/// per-write critical section, this number drops to single-digit
+/// nanoseconds in PR2; if not, the bottleneck is somewhere else and
+/// the cache replacement was wrong.
+///
+/// Returns 0 when no checks have happened.
+pub fn live_delta_check_mean_hold_ns() -> u64 {
+    let calls = LIVE_DELTA_CHECK_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        return 0;
+    }
+    let total = LIVE_DELTA_CHECK_NS_TOTAL.load(Ordering::Relaxed);
+    total / calls
 }
