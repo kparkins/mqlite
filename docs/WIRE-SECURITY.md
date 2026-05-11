@@ -6,6 +6,9 @@
 > MongoDB wire protocol. This advisory describes the security posture of that
 > listener and the steps required to use it safely.
 
+The embedded Rust API is the primary mqlite integration surface. The wire
+listener is an optional local interop layer for tools and tests.
+
 ## Summary
 
 **mqlite has no authentication, no authorization, and no TLS.**
@@ -19,8 +22,9 @@ Anyone who can reach the TCP port has full read/write access to the database.
 The wire protocol server accepts all connections without requiring credentials.
 There is no username/password, no API key, and no certificate-based identity.
 
-This is intentional. mqlite targets local-only use cases (test
-doubles, embedded tools, local development) and has no authentication layer.
+This is intentional. The wire listener targets local-only use cases such as
+test doubles, embedded tools, and local development. It has no authentication
+layer.
 
 ### Localhost-Only Default
 
@@ -40,7 +44,7 @@ Network-adjacent attackers cannot reach the port.
 ### Why `0.0.0.0` is Dangerous
 
 Binding to `0.0.0.0` (all interfaces) makes the database reachable from any
-network interface on the host — including external NICs, VPNs, Docker bridge
+network interface on the host, including external NICs, VPNs, Docker bridge
 networks, etc.
 
 **Do not bind to `0.0.0.0` unless:**
@@ -50,14 +54,14 @@ networks, etc.
 mqlite logs a warning when `0.0.0.0` is detected:
 
 ```
-mqlite WARNING: wire protocol server bound to 0.0.0.0:27017 — accessible from
+mqlite WARNING: wire protocol server bound to 0.0.0.0:27017 - accessible from
 all network interfaces. mqlite has no authentication. Use 127.0.0.1 for
 local-only access.
 ```
 
 ### No TLS
 
-mqlite transmits all data — including document contents — in plaintext.
+mqlite transmits all data, including document contents, in plaintext.
 
 Do not use the wire feature to serve sensitive data over untrusted networks.
 Even on a trusted LAN, plaintext transmission is inadvisable for sensitive
@@ -102,15 +106,15 @@ Using mqlite with the wire feature in CI is safe when:
 | Threat | Mitigation |
 |--------|------------|
 | Local process reads database file | File permissions `0600` (owner only) |
-| Local process connects to wire port | None — localhost binding only recommended |
+| Local process connects to wire port | None - localhost binding only recommended |
 | Network attacker connects to wire port | Firewall / localhost binding |
 | Symlink attack on database file | `SymlinkRejected` error prevents open |
-| Credential theft | N/A — no credentials exist |
-| Data in transit (plaintext) | No mitigation — avoid untrusted networks |
+| Credential theft | N/A - no credentials exist |
+| Data in transit (plaintext) | No mitigation - avoid untrusted networks |
 
 ## Reporting Security Issues
 
 Please report security vulnerabilities by opening a GitHub Security Advisory
-on the [mqlite repository](https://github.com/kyleparkinson/mqlite/security).
+on the [mqlite repository](https://github.com/kparkins/mqlite/security).
 
 Do not disclose security issues in public GitHub issues.

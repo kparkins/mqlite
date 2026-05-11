@@ -8,12 +8,12 @@ How to safely copy, back up, monitor, and recover mqlite database files.
 
 mqlite is advertised as a **single-file database**. The fine print:
 
-> A mqlite database is a single file **after a clean close**.
+> A mqlite database is a single file after a successful checkpoint.
 > During normal operation, one additional file may be present.
 
 ```
-myapp.mqlite          ← Main database file (always present)
-myapp.mqlite-journal  ← Write journal (present during write activity)
+myapp.mqlite          Main database file (always present)
+myapp.mqlite-journal  Write journal (present during write activity)
 ```
 
 | File | When present | Role |
@@ -21,25 +21,26 @@ myapp.mqlite-journal  ← Write journal (present during write activity)
 | `myapp.mqlite` | Always | Persistent B-tree pages. The "real" database. |
 | `myapp.mqlite-journal` | After any write, until checkpointed | Uncommitted and unmerged write pages. |
 
-The page-offset lookup index used by readers lives **only in memory** — it is
+The page-offset lookup index used by readers lives **only in memory** - it is
 rebuilt from a journal scan on every open. There is no on-disk sidecar for it.
 
 **During normal operation** the two files form a single logical unit. Never
-copy or move them individually — always treat the `.mqlite` and `-journal`
+copy or move them individually - always treat the `.mqlite` and `-journal`
 files as a group.
 
 ---
 
 ## Clean Close
 
-`Client::close()` performs a **blocking checkpoint + flush**:
+`Client::close()` performs a **blocking checkpoint + flush** and returns any
+error to the caller:
 
 1. All committed journal pages are merged into `myapp.mqlite`.
 2. The journal file is removed.
 3. The OS advisory lock is released.
 
-After `close()` returns, `myapp.mqlite` is the sole file on disk and can be
-copied safely.
+After `close()` returns `Ok(())`, `myapp.mqlite` is the sole file on disk and
+can be copied safely.
 
 ```rust
 use mqlite::Client;
@@ -49,17 +50,18 @@ fn write_and_close() -> mqlite::Result<()> {
     let col = client.database("myapp").collection::<mqlite::Document>("events");
     col.insert_one(&mqlite::doc! { "type": "shutdown" })?;
 
-    // Blocking flush + checkpoint. After this line, myapp.mqlite is the sole file.
+    // Blocking flush + checkpoint. After Ok, myapp.mqlite is the sole file.
     client.close()?;
     Ok(())
 }
 ```
 
-> **`Drop` vs `close()`:** Dropping a `Client` handle is non-blocking. It
-> releases the OS lock but does **not** checkpoint the journal. The journal
-> file remains on disk. This is safe — the next `open()` replays the journal
-> automatically — but it means `Drop` does not produce a single-file state.
-> Call `close()` explicitly when you need one.
+> **`Drop` vs `close()`:** Dropping the last `Client` handle currently attempts
+> the same checkpoint path, but `Drop` cannot report checkpoint errors. If the
+> process exits, crashes, or the checkpoint cannot complete, the journal file
+> may remain on disk. This is safe because the next `open()` recovers the
+> journal automatically. Call `close()` explicitly when you need a reported
+> single-file handoff.
 
 ---
 
@@ -93,8 +95,8 @@ fn cold_backup(src: &str, dst: &str) -> mqlite::Result<()> {
 ```
 
 **Important:** Verify that `src-journal` does **not** exist after `close()`.
-If it does, a crash occurred between the checkpoint and the file removal —
-open and close the database again before copying.
+If it does, a crash or checkpoint failure left recovery work behind. Open and
+close the database again before copying.
 
 ```rust
 use std::path::Path;
@@ -121,8 +123,8 @@ fn checkpoint_backup(client: &Client, src: &str, dst: &str) -> mqlite::Result<()
     client.checkpoint()?;
 
     // Safe to copy IF no concurrent writers are active.
-    // For single-process apps (the common case), this is always true here
-    // because checkpoint holds the writer lock while it runs.
+    // For single-process apps using one shared Client, checkpoint drains
+    // writers before it publishes the checkpointed state.
     fs::copy(src, dst)?;
     println!("Checkpoint backup written to {dst}");
     Ok(())
@@ -130,11 +132,10 @@ fn checkpoint_backup(client: &Client, src: &str, dst: &str) -> mqlite::Result<()
 ```
 
 **When is this safe?**
-- ✅ Single-process apps: `checkpoint()` serializes with all writers in the
-  same process, so the copy happens when no writes are in flight.
-- ⚠️ Multi-process setups: A second process could start writing between
-  `checkpoint()` and the `fs::copy`. In this case the copy may include a
-  partial journal. Use a hot backup (see below) or a cold backup instead.
+- Single-process apps: `checkpoint()` serializes with writers admitted through
+  the same engine, so the copy happens after those writes are drained.
+- Multi-process setups: a second process could start writing between
+  `checkpoint()` and the `fs::copy`. Use a hot backup or a cold backup instead.
 
 ---
 
@@ -147,7 +148,7 @@ is running**.
 use mqlite::Client;
 
 fn hot_backup(client: &Client, dst: &str) -> mqlite::Result<()> {
-    // Acquires the writer lock, checkpoints, then copies the file.
+    // Uses the existing database lock fd, checkpoints, then copies the file.
     // Writers are briefly paused during the copy; readers continue unaffected.
     client.backup(dst)?;
     println!("Hot backup written to {dst}");
@@ -156,8 +157,8 @@ fn hot_backup(client: &Client, dst: &str) -> mqlite::Result<()> {
 ```
 
 Implementation notes:
-- Acquires the in-process writer lock before copying, so the backup sees a
-  fully consistent committed state.
+- Drains in-process writers before copying, so the backup sees a fully
+  consistent committed state for this client.
 - Checkpoints all dirty pages to the main file before copying.
 - Reads through the existing lock file descriptor to avoid releasing the
   OS advisory lock (POSIX footgun prevention).
@@ -190,11 +191,13 @@ fn report_db_size(path: &str) {
 ```
 
 **Journal size behaviour:**
-- The journal grows with each write and shrinks (to zero) after a checkpoint.
-- Auto-checkpoint triggers when the journal reaches `journal_auto_checkpoint`
-  pages (default: 1,000 pages ≈ 4 MB) or `journal_max_size` bytes (default: 100 MB).
-- A large journal does not affect read correctness but does slow reads (the
-  reader must scan the journal for page versions).
+- The journal grows with writes and shrinks to an empty or removed state after
+  a checkpoint.
+- `Client::checkpoint()`, `Database::checkpoint()`, `backup()`, `close()`, and
+  the last-handle drop path can checkpoint the journal. Do not rely on a
+  background checkpoint thread.
+- A large journal does not affect read correctness but can slow open-time
+  recovery because the journal scan has more records to validate.
 
 **Main file size behaviour:**
 - The main file **never shrinks automatically**. Deleted documents
@@ -218,7 +221,7 @@ journal file remains on disk. The next `Client::open()` automatically:
 No manual intervention is required.
 
 ```rust
-// After a crash, just open normally — recovery is automatic.
+// After a crash, just open normally. Recovery is automatic.
 let client = mqlite::Client::open("myapp.mqlite")?;
 // All committed data is available.
 ```
@@ -250,13 +253,15 @@ fn forensic_open(path: &str) -> mqlite::Result<mqlite::Database> {
 ```
 
 In read-only mode:
-- Journal replay is skipped (reads from the last checkpointed state in the
-  main file).
-- No write operations are permitted.
-- No OS exclusive lock is acquired (multiple read-only opens can coexist).
+- No write operations are permitted after open.
+- No OS exclusive writer lock is acquired, so multiple read-only opens can
+  coexist.
+- The current open path still validates and recovers an existing journal before
+  it exposes the database. Use a clean checkpointed file when opening from a
+  read-only filesystem or immutable backup volume.
 
-This is useful for forensic inspection or for opening a database on a
-read-only filesystem (e.g., a mounted backup volume or a CD-ROM image).
+This is useful for forensic inspection when the file can be opened and any
+required recovery can run.
 
 ---
 
@@ -294,7 +299,7 @@ client_a.database("mydb").collection::<mqlite::Document>("log")
     .insert_one(&mqlite::doc! { "msg": "hello" })?;
 // client_a holds the exclusive write lock while inserting.
 
-// Process B (reader) — can open concurrently:
+// Process B (reader) - can open concurrently:
 let client_b = mqlite::Client::open_with_options(
     "shared.mqlite",
     mqlite::OpenOptions::new().read_only(true),

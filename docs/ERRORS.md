@@ -58,20 +58,17 @@ match Client::open("myapp.mqlite") {
 
 Another writer is holding the exclusive write lock on the database file.
 
-**The single-writer model:** mqlite enforces one writer at a time via two
-cooperating locks:
+**The cross-process writer lock:** mqlite uses an OS advisory lock to prevent
+two writer processes from owning the same file at once. Inside one process,
+ordinary CRUD writers share the engine and can overlap; DDL uses namespace
+drain barriers when it must exclude writers on a target collection.
 
-1. **OS advisory lock** (`fcntl`/`LockFileEx`) — prevents two *processes* from
-   writing simultaneously to the same `.mqlite` file.
-2. **In-process `Mutex`** — prevents two *threads within the same process* from
-   writing simultaneously (POSIX advisory locks are per-process, not per-thread).
-
-`WriterBusy` is returned when either lock cannot be acquired within the configured
-busy timeout.
+`WriterBusy` is returned when an advisory file lock or namespace drain barrier
+cannot be acquired within the configured busy timeout.
 
 **Common causes:**
 - Another process has the database open for writing (check with `lsof myapp.mqlite`)
-- Two threads in the same process are both trying to write without coordination
+- DDL is draining the namespace while another thread tries to write it
 - The busy timeout is too short for your workload
 
 **Recovery options:**
@@ -80,7 +77,7 @@ busy timeout.
 use mqlite::{Client, OpenOptions};
 use std::time::Duration;
 
-// ── Option 1: set a busy timeout ────────────────────────────────────────────
+// Option 1: set a busy timeout.
 // Block until the lock is available or the timeout expires.
 // Use this when you expect brief contention (e.g., background checkpoint).
 let client = Client::open_with_options(
@@ -88,7 +85,7 @@ let client = Client::open_with_options(
     OpenOptions::new().busy_timeout(Duration::from_secs(5)),
 )?;
 
-// ── Option 2: custom busy handler ────────────────────────────────────────────
+// Option 2: custom busy handler.
 // Called repeatedly while contended. Return true to retry, false to give up.
 // `attempts` counts how many times the handler has been called so far.
 let client = Client::open_with_options(
@@ -99,14 +96,14 @@ let client = Client::open_with_options(
     }),
 )?;
 
-// ── Option 3: immediate failure ───────────────────────────────────────────────
+// Option 3: immediate failure.
 // Use Duration::ZERO to fail immediately on contention (SQLite-style BUSY).
 let client = Client::open_with_options(
     "myapp.mqlite",
     OpenOptions::new().busy_timeout(Duration::ZERO),
 )?;
 
-// ── Option 4: open read-only ──────────────────────────────────────────────────
+// Option 4: open read-only.
 // Readers never block writers. Multiple read-only opens are allowed concurrently.
 let client = Client::open_with_options(
     "myapp.mqlite",

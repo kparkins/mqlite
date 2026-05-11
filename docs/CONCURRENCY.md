@@ -1,11 +1,13 @@
 # mqlite Concurrency Guide
 
-mqlite is **MWMR in-process**: reads are mutex-free (atomic snapshot load),
-and ordinary writer bodies can overlap while DDL waits behind a shared
-metadata read fence. Every read operation opens a WiredTiger-style MVCC
-`ReadView` that pins a point-in-time snapshot; concurrent writes do not
-disturb an in-progress read. The byte-LSN log envelope is globally ordered
-so commit timestamps, log-append order, and published snapshots agree.
+mqlite is **MWMR in-process** for normal CRUD: reads do not take the metadata
+write lock, and ordinary writer bodies can overlap while DDL waits behind a
+shared metadata read fence. A read still performs small coordination steps when
+it opens a `ReadView` and checks the published frontier; the claim is not
+"lock-free end to end." Every read operation pins a point-in-time MVCC
+snapshot, so concurrent writes do not disturb an in-progress read. The
+byte-LSN log envelope is globally ordered so commit timestamps, log-append
+order, and published snapshots agree.
 
 ---
 
@@ -41,11 +43,11 @@ let users = db.collection::<bson::Document>("users");
 // Insert initial data
 users.insert_one(&doc! { "_id": 1, "status": "active" })?;
 
-// Thread A: long-running read (holds snapshot at T₁)
+// Thread A: long-running read (holds snapshot at T1)
 let client_a = client.clone();
 let reader = thread::spawn(move || {
     let users_a = client_a.database("mydb").collection::<bson::Document>("users");
-    // This read sees "active" — the snapshot when the read started
+    // This read sees "active" from the snapshot when the read started.
     users_a.find_one(doc! { "_id": 1 })
 });
 
@@ -55,7 +57,7 @@ users.update_one(
     doc! { "$set": { "status": "inactive" } },
 )?;
 
-// Thread A's read result: still "active" (snapshot at T₁)
+// Thread A's read result: still "active" (snapshot at T1)
 let result = reader.join().unwrap()?;
 println!("{:?}", result.unwrap().get("status")); // "active"
 
@@ -74,9 +76,16 @@ new `ReadView`s.
 
 **Lock acquisition on the write path** (see `src/storage/paged_engine.rs`):
 
-1. `PagedEngine::metadata: RwLock<()>` — shared read guard held across the private write body, resident Pending install, durable LSN log envelope, and ordered publish. This blocks DDL while allowing ordinary CRUD writers to overlap.
-2. Page latches — protect resident per-leaf version chains and structural mutation windows.
-3. `LogManager` plus `PublishSequencer` — reserve disjoint byte-LSN ranges, advance `ready_lsn` only over written contiguous records, advance `durable_lsn` after high-water group commit sync, and publish slots in persisted `publish_seq` order.
+1. `PagedEngine::metadata: RwLock<()>` - a shared read guard is held across
+   the private write body, resident Pending install, durable LSN log envelope,
+   and ordered publish. This blocks DDL while allowing ordinary CRUD writers
+   to overlap.
+2. Page latches - protect resident per-leaf version chains and structural
+   mutation windows.
+3. `LogManager` plus `PublishSequencer` - reserve disjoint byte-LSN ranges,
+   advance `ready_lsn` only over written contiguous records, advance
+   `durable_lsn` after high-water group commit sync, and publish slots in
+   persisted `publish_seq` order.
 
 **Reads take none of the above locks.** A read loads `shared.published:
 ArcSwap<PublishedSnapshot>` atomically, opens B-trees at the snapshot's
@@ -109,10 +118,9 @@ engine first drains all in-flight writers on the target namespace through
 `ReadView` globally and waits for `pin_ops_in_flight == 0` before freeing the
 collection's B-tree pages (see `src/storage/paged_engine.rs:1102`).
 
-Phase 5 US-004 retired the legacy F5 name-keyed drop tombstone. Durable
-monotonic namespace ids (Phase 1 §10.7) are now the resurrection barrier: a
-freshly-bootstrapped collection of a previously-dropped name receives a fresh
-`CollectionEntry.id`.
+Durable monotonic namespace ids are the resurrection barrier: a freshly
+bootstrapped collection of a previously dropped name receives a fresh
+`CollectionEntry.id`, so old versions cannot reattach to the new collection.
 
 Any caller that holds a `ReadView` across a `drop_collection` will receive
 `Error::ReadViewExpired` on its next read and must open a fresh view.
@@ -127,11 +135,13 @@ Subsequent reads on the dropped collection return zero rows.
 | Scenario | Likely Cause |
 |----------|-------------|
 | `WriterBusy` from another process | Another process holds the OS advisory writer lock |
-| `WriterBusy` on the target namespace | DDL is draining `NsWriterRegistry` for `drop_namespace`, `create_index`, etc. |
+| `WriterBusy` on the target namespace | DDL is draining the target collection |
 | Intermittent `WriterBusy` | Short bursts of DDL contention against ordinary CRUD |
 
-Ordinary CRUD writers on different threads do not contend with each other —
-they share `metadata.read()` and overlap inside the engine.
+Ordinary CRUD writers on different threads do not queue behind a single global
+writer mutex. They share `metadata.read()` and overlap inside the engine. They
+can still return `WriteConflict` if they race on the same key, lose a page-latch
+upgrade race, or encounter structural contention.
 
 ### Configuring the Busy Timeout
 
@@ -186,7 +196,7 @@ let client = Client::open_with_options(
 # Ok::<(), mqlite::Error>(())
 ```
 
-The busy handler and `busy_timeout` are mutually exclusive — if both are set,
+The busy handler and `busy_timeout` are mutually exclusive; if both are set,
 the busy handler takes precedence.
 
 ---
@@ -254,7 +264,7 @@ writer.join().unwrap();
 ### Pattern 2: Shared Database Handle
 
 `Client` is `Send + Sync` and cheap to clone (`Arc`-backed), so most callers
-just clone it across threads — concurrent CRUD writers overlap on
+just clone it across threads; concurrent CRUD writers overlap on
 per-namespace lanes and individual operations commit atomically on their
 own. No external coordination is needed for independent inserts/updates:
 
@@ -280,7 +290,7 @@ for h in handles {
 #### When an application-level `Mutex` is warranted
 
 Wrap an explicit `Mutex` only around a read-modify-write sequence that must
-not race with itself in the same process — for example, an in-process
+not race with itself in the same process, for example, an in-process
 counter increment, where two threads reading the current value
 simultaneously would each write back the same successor:
 
@@ -319,7 +329,7 @@ for h in handles {
 # Ok::<(), mqlite::Error>(())
 ```
 
-> **Caveats:** the mutex only excludes other threads in the same process —
+> **Caveats:** the mutex only excludes other threads in the same process;
 > a second process or another `Client` opened against the same file can
 > still race. Each operation still commits independently, so concurrent
 > readers may observe one update without the next; the mutex prevents
@@ -406,15 +416,15 @@ durable log envelope serialize across threads.
 **Q: Can I open the same `.mqlite` file from multiple processes?**
 
 Yes, but only one process can be the writer. Open additional processes with
-`read_only(true)`. If a second process opens for writing, the first write will
-succeed, and subsequent writes from either process will race — the OS advisory
-lock ensures only one wins at a time, with the loser receiving `WriterBusy`.
+`read_only(true)`. If a second process opens for writing while a writer already
+holds the file, open waits up to `busy_timeout` and then returns
+`Error::WriterBusy`.
 
 **Q: Do I need to manually checkpoint the journal?**
 
-No. mqlite auto-checkpoints the journal after every `journal_auto_checkpoint` pages
-(default: 1000 pages). On clean close, a full checkpoint is performed and the
-journal file is removed.
+Call `checkpoint()` or `close()` when you need a reported single-file state.
+The last `Client` drop path also attempts a checkpoint, but it cannot report
+errors. Do not rely on a background checkpoint thread.
 
 **Q: Can readers see partial writes?**
 
@@ -439,10 +449,10 @@ Multi-document transaction support is out of scope for v1.
 
 ## Quick Reference
 
-| Want to… | Use |
+| Want to... | Use |
 |----------|-----|
 | Share database across threads | `client.clone()` (it's already `Arc`-backed) |
-| Serialize writes | mqlite does this automatically |
+| Serialize a multi-step application sequence | Wrap that sequence in an application mutex |
 | Read without blocking writes | `read_only(true)` or just `find_one` |
 | Wait for writer lock | `busy_timeout(Duration::from_secs(N))` |
 | Custom retry logic | `busy_handler(|attempts| ...)` |
