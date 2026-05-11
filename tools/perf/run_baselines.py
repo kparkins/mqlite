@@ -81,6 +81,17 @@ def run_axis_once(axis: str, writers: int, seconds: int) -> float:
     ]
     if axis != "read_find_one":
         cmd += ["--writers", str(writers)]
+    # NOTE: process wall-time IS the workload window because
+    # `examples/perf_axis::main` ends with `std::process::exit(0)` to
+    # bypass `Client::drop`. The original behaviour ran a per-invocation
+    # checkpoint that pushed wall-time to ~45-60s for a 15s workload and
+    # made median-of-11 across 11 (axis,writers) rows infeasible (~13h
+    # projected). Throughput inside the workload is unaffected — the
+    # `docs_per_second` print happens before main returns and is the
+    # only number we read here. DO NOT remove the bypass without
+    # re-baselining ALL downstream PRs that compare against this matrix:
+    # PR1/PR2/PR4 measurements MUST share the identical perf_axis
+    # lifecycle for the compounding-delta math to be apples-to-apples.
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     line = proc.stdout.strip().splitlines()[-1]
     record = json.loads(line)
