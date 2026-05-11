@@ -2,6 +2,7 @@
 //! node split with key promotion to the parent.
 
 use crate::error::{Error, Result};
+use crate::storage::buffer_pool::LatchMode;
 use crate::storage::page::{
     overflow_page_checksum, OverflowPageHeader, OVERFLOW_HEADER_SIZE, PAGE_SIZE_LEAF,
     PAGE_TYPE_OVERFLOW,
@@ -220,10 +221,16 @@ impl<S: BTreePageStore> BTree<S> {
             .into_iter()
             .partition(|(key, _)| key.as_slice() < promoted_key.as_slice());
         for (key, chain) in left_chains {
-            self.store.put_chain(left_page, key, chain)?;
+            self.store
+                .with_chain_under_latch(left_page, &key, LatchMode::Exclusive, |slot| {
+                    *slot = Some(chain);
+                })?;
         }
         for (key, chain) in right_chains {
-            self.store.put_chain(right_page, key, chain)?;
+            self.store
+                .with_chain_under_latch(right_page, &key, LatchMode::Exclusive, |slot| {
+                    *slot = Some(chain);
+                })?;
         }
 
         let right_node = LeafNode {

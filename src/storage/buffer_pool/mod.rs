@@ -77,7 +77,8 @@ use crate::storage::btree::OVERFLOW_THRESHOLD;
 use crate::storage::page::{LEAF_HEADER_SIZE, PAGE_SIZE_LEAF, PAGE_TYPE_LEAF};
 use crate::storage::reconcile::driver::TreeIdent;
 
-use page_latch::{LatchMode, PageLatch, PageLatchExclusive, PageLatchShared};
+use page_latch::{PageLatch, PageLatchExclusive, PageLatchShared};
+pub(crate) use page_latch::LatchMode;
 use partition::{Frame, Partition};
 
 /// Default warning threshold for delta-bearing frame density.
@@ -476,6 +477,56 @@ impl<'pool> LatchedPinnedPage<'pool> {
         let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
         frame.deltas.insert(key, chain);
         Ok(())
+    }
+
+    /// Read-modify-write the chain slot for `key` while holding this
+    /// page's exclusive latch.
+    ///
+    /// The closure receives `&mut Option<Arc<...>>` — `None` when the
+    /// frame currently has no chain for `key`. The closure may take,
+    /// replace, or leave the slot. After it returns, the slot is written
+    /// back into the frame's `deltas` map (insert if `Some`, leave
+    /// removed if `None`).
+    ///
+    /// This is the canonical chain mutator surface that PR0.5 unifies on
+    /// top of. The `pub(super)` `take_chain_locked` / `put_chain_locked`
+    /// helpers in `chains.rs` exist only to back the legacy
+    /// non-latch-aware free functions on `BufferPool`; once those are
+    /// deleted in this PR's commit 3 every chain mutation flows through
+    /// this method (or the all-chains variant).
+    pub(crate) fn with_chain<R>(
+        &mut self,
+        key: &[u8],
+        f: impl FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R,
+    ) -> Result<R> {
+        self.require_exclusive("with_chain")?;
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The exclusive page latch serializes delta-map mutation.
+        let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
+        let mut slot = frame.deltas.remove(key);
+        let result = f(&mut slot);
+        if let Some(chain) = slot {
+            frame.deltas.insert(key.to_vec(), chain);
+        }
+        Ok(result)
+    }
+
+    /// Read-modify-write the entire `deltas` map for this page while
+    /// holding the exclusive latch.
+    ///
+    /// Used by the leaf-merge migration path to drain all chains and by
+    /// the overflow-page repurpose path to clear inherited chains. The
+    /// closure can mutate the map however it likes (insert / remove /
+    /// drain).
+    pub(crate) fn with_all_chains<R>(
+        &mut self,
+        f: impl FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R,
+    ) -> Result<R> {
+        self.require_exclusive("with_all_chains")?;
+        // SAFETY: this handle owns a live pin, so the frame slot cannot be
+        // evicted. The exclusive page latch serializes delta-map mutation.
+        let frame = unsafe { &mut *self.frame_ptr.cast_mut() };
+        Ok(f(&mut frame.deltas))
     }
 
     /// Return true when live resident deltas no longer fit one folded leaf.
@@ -1129,6 +1180,45 @@ impl BufferPool {
         size: PageSize,
     ) -> Result<LatchedPinnedPage<'_>> {
         self.pin_then_latch(page_id, size, LatchMode::Exclusive)
+    }
+
+    /// Pin a leaf page in exclusive latch mode, run `f` against its
+    /// chain slot for `key`, and release the pin+latch.
+    ///
+    /// Canonical chain-slot mutator. Every production callsite that
+    /// today reaches into `chains::take_chain` / `put_chain` should
+    /// migrate to this entry point so per-page latch invariants hold.
+    /// `mode` must be [`LatchMode::Exclusive`] — shared callers should
+    /// use `pin_for_read_sized` + the snapshot APIs on
+    /// [`LatchedPinnedPage`] instead. The mode parameter is preserved
+    /// to mirror the trait signature on [`BTreePageStore`] but is
+    /// validated runtime-side via `require_exclusive` inside
+    /// [`LatchedPinnedPage::with_chain`].
+    pub(crate) fn with_chain_under_latch<R>(
+        &self,
+        page: u32,
+        key: &[u8],
+        mode: LatchMode,
+        f: impl FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R,
+    ) -> Result<R> {
+        let mut latched = self.pin_then_latch(page, PageSize::Large32k, mode)?;
+        latched.with_chain(key, f)
+    }
+
+    /// Pin a leaf page in exclusive latch mode, run `f` against its
+    /// entire chain map, and release the pin+latch.
+    ///
+    /// Companion to [`Self::with_chain_under_latch`] for callers that
+    /// must drain or clear every chain on the page (leaf merge,
+    /// overflow-page repurpose).
+    pub(crate) fn with_all_chains_under_latch<R>(
+        &self,
+        page: u32,
+        mode: LatchMode,
+        f: impl FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R,
+    ) -> Result<R> {
+        let mut latched = self.pin_then_latch(page, PageSize::Large32k, mode)?;
+        latched.with_all_chains(f)
     }
 
     /// Pin `page_id` and acquire its page-local latch in **shared** mode.

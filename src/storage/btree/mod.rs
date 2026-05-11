@@ -25,14 +25,14 @@
 //! `root_level` and updates `root_page`; callers must persist the new root page number
 //! (e.g. into the catalog or file header) if durability is required.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
-use crate::storage::buffer_pool::PageSize;
+use crate::storage::buffer_pool::{LatchMode, PageSize};
 
 type VersionChainDrain = Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>;
 
@@ -338,6 +338,50 @@ pub(crate) trait BTreePageStore {
     ///
     /// Returns an empty vector if the frame is not resident.
     fn take_all_chains(&mut self, page: u32) -> Result<VersionChainDrain>;
+
+    // -----------------------------------------------------------------------
+    // Latch-aware chain-mutator API (PR0.5 unification)
+    //
+    // The four methods above (`take_chain`, `put_chain`, `clear_chains`,
+    // `take_all_chains`) acquire the buffer-pool partition mutex but do
+    // NOT take the per-page latch — concurrent CRUD writers could mutate
+    // the same `frame.deltas` map without serialization. The two methods
+    // below replace them with a single canonical entry point per access
+    // pattern (single-key vs all-chains), each of which acquires the page
+    // latch via `pin_then_latch` before invoking the caller's closure.
+    //
+    // After PR0.5 commit 3 these are the ONLY chain mutators on the
+    // trait surface; the four above are deleted. PR1's selective CoW
+    // and PR2's running-sum cache hang off this single choke point.
+    // -----------------------------------------------------------------------
+
+    /// Pin leaf `page` under `mode`, run `f` against the chain slot for
+    /// `key`, and release the pin+latch.
+    ///
+    /// The closure receives `&mut Option<Arc<...>>` — `None` when the
+    /// frame currently has no chain for `key`. After it returns, the
+    /// slot is written back to the frame's `deltas` map: `Some` is
+    /// inserted, `None` leaves the slot absent.
+    ///
+    /// `mode` must be [`LatchMode::Exclusive`] for chain mutation;
+    /// shared callers should use `pin_shared_for_read` and the snapshot
+    /// helpers on `LatchedPinnedPage` instead.
+    fn with_chain_under_latch<R, F>(
+        &mut self,
+        page: u32,
+        key: &[u8],
+        mode: LatchMode,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R;
+
+    /// Pin leaf `page` under `mode`, run `f` against the entire chain
+    /// map, and release the pin+latch. Used by leaf-merge migration
+    /// (drain) and overflow-page repurpose (clear).
+    fn with_all_chains_under_latch<R, F>(&mut self, page: u32, mode: LatchMode, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R;
 }
 
 #[cfg(test)]

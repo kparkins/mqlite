@@ -27,14 +27,14 @@
 //! instances (e.g. one per collection namespace) can each hold their own
 //! `BufferPoolPageStore` pointing to the same shared handle.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::btree::{BTreePageStore, LeafPageImage};
-use crate::storage::buffer_pool::{LatchedPinnedPage, PageSize, PinnedPage};
+use crate::storage::buffer_pool::{LatchMode, LatchedPinnedPage, PageSize, PinnedPage};
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
@@ -330,6 +330,41 @@ impl BTreePageStore for BufferPoolPageStore {
             return Ok(Vec::new());
         }
         self.handle.pool().drain_leaf_chains(page)
+    }
+
+    fn with_chain_under_latch<R, F>(
+        &mut self,
+        page: u32,
+        key: &[u8],
+        mode: LatchMode,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R,
+    {
+        // History-routed stores never attach version chains to their
+        // pages — match the legacy `clear_chains` no-op behaviour by
+        // running `f` against an empty slot.
+        if self.is_history {
+            let mut slot: Option<Arc<VecDeque<VersionEntry>>> = None;
+            return Ok(f(&mut slot));
+        }
+        self.handle
+            .pool()
+            .with_chain_under_latch(page, key, mode, f)
+    }
+
+    fn with_all_chains_under_latch<R, F>(&mut self, page: u32, mode: LatchMode, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R,
+    {
+        if self.is_history {
+            let mut empty: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>> = BTreeMap::new();
+            return Ok(f(&mut empty));
+        }
+        self.handle
+            .pool()
+            .with_all_chains_under_latch(page, mode, f)
     }
 }
 

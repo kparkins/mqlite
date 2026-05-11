@@ -2,6 +2,7 @@
 //! redistribution or merge, and parent separator maintenance.
 
 use crate::error::{Error, Result};
+use crate::storage::buffer_pool::LatchMode;
 use crate::storage::page::{LEAF_HEADER_SIZE, PAGE_SIZE_LEAF};
 
 use super::chain::free_overflow_chain;
@@ -185,7 +186,10 @@ impl<S: BTreePageStore> BTree<S> {
         // Phase 3 Section 10.6: merge drains every chain from the source leaf,
         // including delta-only chains, and keeps the existing transport shape.
         for (key, chain) in self.store.take_all_chains(from_page)? {
-            self.store.put_chain(to_page, key, chain)?;
+            self.store
+                .with_chain_under_latch(to_page, &key, LatchMode::Exclusive, |slot| {
+                    *slot = Some(chain);
+                })?;
         }
         Ok(())
     }

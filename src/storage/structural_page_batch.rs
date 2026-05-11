@@ -36,12 +36,13 @@
 //! restores catalog-root fields on pre-durable abort. Allocator/lifetime
 //! mutation is owned by [`AllocatorLifetimeBatch`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
+use crate::storage::buffer_pool::LatchMode;
 use crate::storage::btree::{
     empty_internal_page_bytes, empty_leaf_page_bytes, BTreePageStore, LeafPageImage,
 };
@@ -529,6 +530,26 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
         page: u32,
     ) -> Result<Vec<(Vec<u8>, Arc<VecDeque<VersionEntry>>)>> {
         self.base.take_all_chains(page)
+    }
+
+    fn with_chain_under_latch<R, F>(
+        &mut self,
+        page: u32,
+        key: &[u8],
+        mode: LatchMode,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R,
+    {
+        self.base.with_chain_under_latch(page, key, mode, f)
+    }
+
+    fn with_all_chains_under_latch<R, F>(&mut self, page: u32, mode: LatchMode, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R,
+    {
+        self.base.with_all_chains_under_latch(page, mode, f)
     }
 }
 

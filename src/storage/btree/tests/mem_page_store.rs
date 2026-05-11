@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
-use crate::storage::buffer_pool::PageSize;
+use crate::storage::buffer_pool::{LatchMode, PageSize};
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
 use super::{BTreePageStore, LeafPageImage};
@@ -143,5 +143,40 @@ impl BTreePageStore for MemPageStore {
             .remove(&page)
             .map(|m| m.into_iter().collect())
             .unwrap_or_default())
+    }
+
+    fn with_chain_under_latch<R, F>(
+        &mut self,
+        page: u32,
+        key: &[u8],
+        _mode: LatchMode,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R,
+    {
+        // In-memory test store has no buffer-pool latches; the closure
+        // operates directly on the page's chain map. Mode is preserved
+        // for trait shape but ignored.
+        let chains = self.leaf_chains.entry(page).or_default();
+        let mut slot = chains.remove(key);
+        let result = f(&mut slot);
+        if let Some(chain) = slot {
+            chains.insert(key.to_vec(), chain);
+        }
+        Ok(result)
+    }
+
+    fn with_all_chains_under_latch<R, F>(
+        &mut self,
+        page: u32,
+        _mode: LatchMode,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R,
+    {
+        let chains = self.leaf_chains.entry(page).or_default();
+        Ok(f(chains))
     }
 }

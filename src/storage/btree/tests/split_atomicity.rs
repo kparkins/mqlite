@@ -1,6 +1,6 @@
 //! Phase 3 US-017 split atomicity regression test.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::mvcc::{ChainSnapshot, Ts, VersionData, VersionEntry, VersionState};
-use crate::storage::buffer_pool::PageSize;
+use crate::storage::buffer_pool::{LatchMode, PageSize};
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
 use super::{BTree, BTreePageStore, LeafPageImage, MemPageStore};
@@ -213,6 +213,33 @@ impl BTreePageStore for ObservedStore {
         let chains = self.with_store_mut(|store| store.take_all_chains(page))?;
         self.split_window.after_chain_drain(page);
         Ok(chains)
+    }
+
+    fn with_chain_under_latch<R, F>(
+        &mut self,
+        page: u32,
+        key: &[u8],
+        mode: LatchMode,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut Option<ChainArc>) -> R,
+    {
+        self.with_store_mut(|store| store.with_chain_under_latch(page, key, mode, f))
+    }
+
+    fn with_all_chains_under_latch<R, F>(
+        &mut self,
+        page: u32,
+        mode: LatchMode,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&mut BTreeMap<Vec<u8>, ChainArc>) -> R,
+    {
+        let result = self.with_store_mut(|store| store.with_all_chains_under_latch(page, mode, f));
+        self.split_window.after_chain_drain(page);
+        result
     }
 }
 
