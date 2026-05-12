@@ -322,7 +322,7 @@ fn test_concurrent_smos_on_shared_ancestor_serialize() {
     __us010_reset_probe();
 
     let left = client.clone();
-    let right = client.clone();
+    let right = client;
     let t1 = thread::spawn(move || set_pad(&left, 11, OVERFLOW_PAD_BYTES));
     let t2 = thread::spawn(move || set_pad(&right, 12, OVERFLOW_PAD_BYTES));
 
@@ -343,7 +343,7 @@ fn test_root_neutral_concurrent_with_smo_on_unrelated_subtree() {
     __us010_reset_probe();
 
     let root_neutral = client.clone();
-    let smo = client.clone();
+    let smo = client;
     let t1 = thread::spawn(move || set_pad(&root_neutral, 13, 16));
     let t2 = thread::spawn(move || set_pad(&smo, 14, OVERFLOW_PAD_BYTES));
 
@@ -427,7 +427,7 @@ fn test_reconcile_vs_writer_same_page_writer_waits() {
     wait_ready(&reconcile_ready, "reconcile latch");
 
     let (done_tx, done_rx) = mpsc::channel();
-    let writer = client.clone();
+    let writer = client;
     let started = Instant::now();
     let writer_handle = thread::spawn(move || {
         let result = set_us028_pad(&writer, id);
@@ -456,7 +456,7 @@ fn test_reconcile_vs_writer_disjoint_page_both_progress() {
     wait_ready(&reconcile_ready, "reconcile latch");
 
     let (done_tx, done_rx) = mpsc::channel();
-    let writer = client.clone();
+    let writer = client;
     let writer_handle = thread::spawn(move || {
         let result = set_us028_pad(&writer, writer_id);
         done_tx.send(result).expect("send writer result");
@@ -476,8 +476,7 @@ fn test_writer_latch_held_reconcile_waits() {
     let (writer_ready, writer_release, writer_handle) = spawn_writer_latch(client.clone(), id);
     wait_ready(&writer_ready, "writer latch");
 
-    let (reconcile_ready, reconcile_release, reconcile_handle) =
-        spawn_reconcile_latch(client.clone(), id);
+    let (reconcile_ready, reconcile_release, reconcile_handle) = spawn_reconcile_latch(client, id);
     assert_not_ready(&reconcile_ready, "same-page reconcile latch");
 
     release_and_join(writer_release, writer_handle, "writer latch");
@@ -551,7 +550,7 @@ fn test_smo_blocked_by_in_progress_reader() {
     wait_ready(&reader_ready, "reader latch");
 
     let (done_tx, done_rx) = mpsc::channel();
-    let writer = client.clone();
+    let writer = client;
     let started = Instant::now();
     let writer_handle = thread::spawn(move || {
         let result = set_us028_pad(&writer, id);

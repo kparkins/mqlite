@@ -1,15 +1,15 @@
 //! Cross-platform file format compatibility tool.
 //!
 //! Validates that the `.mqlite` file format is byte-identical across CPU
-//! architectures (x86_64 ↔ aarch64). This binary writes 100 BSON documents
+//! architectures (x86_64 <-> aarch64). This binary writes 100 BSON documents
 //! with deterministic content into a minimal `.mqlite`-structured file, then
 //! reads and verifies them.
 //!
 //! The test exercises the two areas most likely to produce cross-platform
 //! byte-order problems:
 //!
-//! 1. **File header** — all multi-byte numeric fields must be little-endian.
-//! 2. **BSON payloads** — the BSON specification mandates little-endian
+//! 1. **File header** - all multi-byte numeric fields must be little-endian.
+//! 2. **BSON payloads** - the BSON specification mandates little-endian
 //!    throughout, so this acts as a regression guard on BSON encoding.
 //!
 //! # File layout
@@ -17,16 +17,16 @@
 //! ```text
 //! Offset 0        : File header page (4 096 bytes, .mqlite format)
 //! Offset 4 096    : Document count (4 bytes, u32 LE)
-//! Offset 4 100    : Document 0 — length (4 bytes, u32 LE) + BSON bytes
-//!                 : Document 1 — length (4 bytes, u32 LE) + BSON bytes
-//!                 : …
+//! Offset 4 100    : Document 0 - length (4 bytes, u32 LE) + BSON bytes
+//!                 : Document 1 - length (4 bytes, u32 LE) + BSON bytes
+//!                 : ...
 //! ```
 //!
 //! # Usage
 //!
 //! ```text
-//! format_compat write <path>   — write 100 known documents to <path>
-//! format_compat read  <path>   — open <path> and verify the 100 documents
+//! format_compat write <path>   - write 100 known documents to <path>
+//! format_compat read  <path>   - open <path> and verify the 100 documents
 //! ```
 //!
 //! Both commands exit with code 0 on success, non-zero on any failure.
@@ -37,8 +37,8 @@
 //! `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64), passing a
 //! binary artifact between them. Both directions are tested:
 //!
-//! - x86_64 writes  → aarch64 reads
-//! - aarch64 writes → x86_64 reads
+//! - x86_64 writes  -> aarch64 reads
+//! - aarch64 writes -> x86_64 reads
 
 use bson::{doc, Document};
 use crc32c::crc32c;
@@ -51,7 +51,7 @@ use std::{
 };
 
 // ---------------------------------------------------------------------------
-// File format constants — must stay in sync with storage/header.rs
+// File format constants - must stay in sync with storage/header.rs
 // ---------------------------------------------------------------------------
 
 /// `.mqlite` magic bytes (ASCII "MQLT").
@@ -72,7 +72,7 @@ const HEADER_SIZE: usize = PAGE_SIZE_INTERNAL as usize;
 /// Checksum algorithm code for CRC32C.
 const CHECKSUM_ALGO_CRC32C: u32 = 1;
 
-/// Number of bytes covered by the header checksum (bytes 0–63).
+/// Number of bytes covered by the header checksum (bytes 0-63).
 const HEADER_CHECKSUM_RANGE: usize = 64;
 
 /// Byte offset of the header checksum field.
@@ -85,7 +85,7 @@ const HEADER_CHECKSUM_OFFSET: usize = 64;
 /// Number of documents written/verified.
 const NUM_DOCS: u32 = 100;
 
-/// Fixed creation timestamp — keeps written bytes reproducible across runs.
+/// Fixed creation timestamp - keeps written bytes reproducible across runs.
 const FIXED_CREATED_AT: u64 = 1_700_000_000_000;
 
 /// Fixed WAL salt 1 used in the compat header.
@@ -133,19 +133,19 @@ fn write_header(file: &mut File) -> io::Result<()> {
     buf[8..12].copy_from_slice(&PAGE_SIZE_INTERNAL.to_le_bytes());
     buf[12..16].copy_from_slice(&PAGE_SIZE_LEAF.to_le_bytes());
     buf[16..24].copy_from_slice(&FIXED_CREATED_AT.to_le_bytes());
-    // Offsets 24..36: last_checkpoint_ts (Ts-LE, 12 B) — left zero for this
+    // Offsets 24..36: last_checkpoint_ts (Ts-LE, 12 B) - left zero for this
     // static test fixture.
-    // Offsets 36–59: zero (catalog root, free lists, page counts)
+    // Offsets 36-59: zero (catalog root, free lists, page counts)
     buf[60..64].copy_from_slice(&CHECKSUM_ALGO_CRC32C.to_le_bytes());
-    // Offset 64–67: CRC32C of bytes 0–63
+    // Offset 64-67: CRC32C of bytes 0-63
     let checksum = crc32c(&buf[..HEADER_CHECKSUM_RANGE]);
     buf[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_OFFSET + 4]
         .copy_from_slice(&checksum.to_le_bytes());
-    // Offset 68–71: WAL salt 1
+    // Offset 68-71: WAL salt 1
     buf[68..72].copy_from_slice(&FIXED_SALT1.to_le_bytes());
-    // Offset 72–75: WAL salt 2
+    // Offset 72-75: WAL salt 2
     buf[72..76].copy_from_slice(&FIXED_SALT2.to_le_bytes());
-    // Offsets 76–4095: zero (catalog root backup, reserved, padding)
+    // Offsets 76-4095: zero (catalog root backup, reserved, padding)
 
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&buf)?;
@@ -202,7 +202,7 @@ fn verify_header(file: &mut File) -> Result<(), String> {
         ));
     }
 
-    // CRC32C over bytes 0–63
+    // CRC32C over bytes 0-63
     let computed_crc = crc32c(&buf[..HEADER_CHECKSUM_RANGE]);
     let stored_crc = u32::from_le_bytes([buf[64], buf[65], buf[66], buf[67]]);
     if computed_crc != stored_crc {
@@ -238,7 +238,7 @@ fn verify_header(file: &mut File) -> Result<(), String> {
 /// Layout (starting at byte 4096):
 /// ```text
 /// [doc_count: u32 LE]
-/// [doc_len: u32 LE][bson_bytes…]  ×  doc_count
+/// [doc_len: u32 LE][bson_bytes...]  x  doc_count
 /// ```
 fn write_docs(file: &mut File) -> io::Result<()> {
     file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
@@ -316,7 +316,7 @@ fn cmd_write(path: &Path) -> Result<(), String> {
     write_header(&mut file).map_err(|e| format!("write_header: {e}"))?;
     write_docs(&mut file).map_err(|e| format!("write_docs: {e}"))?;
 
-    println!("✓ Wrote {NUM_DOCS} documents to {path:?}");
+    println!("Wrote {NUM_DOCS} documents to {path:?}");
     Ok(())
 }
 
@@ -327,7 +327,7 @@ fn cmd_read(path: &Path) -> Result<(), String> {
     verify_header(&mut file)?;
     verify_docs(&mut file)?;
 
-    println!("✓ Verified {NUM_DOCS} documents in {path:?}");
+    println!("Verified {NUM_DOCS} documents in {path:?}");
     Ok(())
 }
 

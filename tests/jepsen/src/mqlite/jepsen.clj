@@ -56,6 +56,8 @@
 (def batch-prefix-ok-count 2)
 (def batch-prefix-error-index 2)
 (def namespace-b-offset 1000000)
+(def namespace-final-a -1)
+(def namespace-final-b (dec namespace-b-offset))
 (def secondary-key-count 8)
 (def secondary-doc-count 64)
 (def secondary-final-rounds 4)
@@ -1255,9 +1257,16 @@
                                       {:f :namespace-add
                                        :value [:b (+ namespace-b-offset id)]})
                                     (range))]))
-        final-gen (gen/clients
-                    [{:f :namespace-read :value :a}
-                     {:f :namespace-read :value :b}])]
+        final-gen (gen/phases
+                    (gen/clients
+                      (gen/until-ok {:f :namespace-add
+                                     :value [:a namespace-final-a]}))
+                    (gen/clients
+                      (gen/until-ok {:f :namespace-add
+                                     :value [:b namespace-final-b]}))
+                    (gen/clients
+                      [{:f :namespace-read :value :a}
+                       {:f :namespace-read :value :b}]))]
     {:checker (checker/compose {:namespace-isolation
                                 (->NamespaceIsolationChecker)})
      :generator (recovering-generator opts client-gen final-gen)}))

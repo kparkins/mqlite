@@ -59,6 +59,7 @@ use tempfile::TempDir;
 const OP_MSG: i32 = 2013;
 const OP_QUERY: i32 = 2004;
 const OP_REPLY: i32 = 1;
+const BSON_ROUNDTRIP_DOUBLE: f64 = 3.125;
 
 // ---------------------------------------------------------------------------
 // Test helper: spin up a wire server on a random port
@@ -1439,7 +1440,7 @@ fn bson_roundtrip_native_write_wire_read() {
         "str": "hello",
         "int32": 42i32,
         "int64": 9999999i64,
-        "double": 3.14_f64,
+        "double": BSON_ROUNDTRIP_DOUBLE,
         "bool": true,
         "null_field": Bson::Null,
         "array": [1i32, 2i32, 3i32],
@@ -1485,7 +1486,7 @@ fn bson_roundtrip_native_write_wire_read() {
         "Int64 preserved"
     );
     assert!(
-        (returned_doc.get_f64("double").unwrap() - 3.14).abs() < 1e-9,
+        (returned_doc.get_f64("double").unwrap() - BSON_ROUNDTRIP_DOUBLE).abs() < 1e-9,
         "Double preserved"
     );
     assert!(returned_doc.get_bool("bool").unwrap(), "Bool preserved");

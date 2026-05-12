@@ -42,20 +42,16 @@ use crate::error::{Error, Result};
 
 #[inline]
 fn read_le_i32(buf: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes(
-        buf[off..off + 4]
-            .try_into()
-            .expect("caller verified buf.len() >= off + 4"),
-    )
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&buf[off..off + 4]);
+    i32::from_le_bytes(bytes)
 }
 
 #[inline]
 fn read_le_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(
-        buf[off..off + 4]
-            .try_into()
-            .expect("caller verified buf.len() >= off + 4"),
-    )
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&buf[off..off + 4]);
+    u32::from_le_bytes(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +107,8 @@ impl MsgHeader {
 
     /// Parse a 16-byte header from `buf`.
     ///
+    /// # Errors
+    ///
     /// Returns `Err(InvalidWireMessage)` if the slice is shorter than 16 bytes.
     pub fn parse(buf: &[u8]) -> Result<MsgHeader> {
         if buf.len() < Self::SIZE {
@@ -131,6 +129,7 @@ impl MsgHeader {
     }
 
     /// Serialise the header to 16 bytes (little-endian).
+    #[must_use]
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut out = [0u8; Self::SIZE];
         out[0..4].copy_from_slice(&self.message_length.to_le_bytes());
@@ -305,6 +304,7 @@ impl OpMsg {
     /// Return the Kind-0 body document, if one is present.
     ///
     /// Every well-formed OP_MSG has exactly one Kind-0 section.
+    #[must_use]
     pub fn body(&self) -> Option<&Document> {
         self.sections.iter().find_map(|s| match s {
             Section::Body(doc) => Some(doc),
@@ -318,6 +318,10 @@ impl OpMsg {
     ///
     /// `request_id` should be a fresh ID for this response.
     /// `response_to` should be the `request_id` of the incoming request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `body` cannot be encoded as BSON.
     pub fn build_response(request_id: i32, response_to: i32, body: &Document) -> Result<Vec<u8>> {
         // Serialise the BSON document.
         let bson_bytes = bson::to_vec(body)?;

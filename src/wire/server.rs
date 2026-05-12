@@ -116,7 +116,7 @@ impl Default for ServerState {
         ServerState {
             start_time: std::time::Instant::now(),
             next_connection_id: Arc::new(AtomicI32::new(1)),
-            db_path: Some(db_path.clone()),
+            db_path: Some(db_path),
             topology_process_id: ObjectId::new(),
             database: Arc::clone(&client.inner),
             cancel: CancellationToken::new(),
@@ -239,10 +239,16 @@ impl WireProtocol {
         }
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("tokio runtime creation should not fail");
+            {
+                Ok(rt) => rt,
+                Err(error) => {
+                    let _ = bind_tx.send(Err(format!("tokio runtime creation failed: {error}")));
+                    return;
+                }
+            };
 
             rt.block_on(async move {
                 // Attempt to bind; report outcome to the caller.
@@ -360,7 +366,7 @@ async fn handle_connection(mut stream: TcpStream, state: ServerState) {
         let request_id = header.request_id;
 
         // Guard against oversized messages.
-        if declared_len < MsgHeader::SIZE || declared_len > MAX_MESSAGE_SIZE {
+        if !(MsgHeader::SIZE..=MAX_MESSAGE_SIZE).contains(&declared_len) {
             break;
         }
 

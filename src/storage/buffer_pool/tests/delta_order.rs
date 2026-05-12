@@ -2,19 +2,7 @@ use super::*;
 use std::collections::VecDeque;
 
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
-
-struct ZeroIo;
-
-impl PageSource for ZeroIo {
-    fn read_page(&self, _page_number: u32, _size: PageSize, buf: &mut [u8]) -> Result<()> {
-        buf.fill(0);
-        Ok(())
-    }
-
-    fn write_page(&self, _page_number: u32, _size: PageSize, _buf: &[u8]) -> Result<()> {
-        Ok(())
-    }
-}
+use crate::storage::test_support::ZeroIo;
 
 fn entry(payload: u8) -> VersionEntry {
     VersionEntry {

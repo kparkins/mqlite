@@ -101,6 +101,18 @@ A "single-file database" means a single file after a successful checkpoint.
 process exits, crashes, or cannot finish that checkpoint, the journal may remain
 on disk and the next `Client::open` recovers it automatically.
 
+## Durability
+
+The default durability mode is `DurabilityMode::Interval(50ms)`. Commits wait
+until their journal records are ready, then mqlite syncs the ready journal
+prefix on a 50ms interval. This is the fast default: process crashes can
+recover accepted journal bytes, while an OS crash or power loss can lose
+commits since the last successful interval sync.
+
+Use `DurabilityMode::FullSync` when every returned commit must wait for an
+fsync boundary. Use `DurabilityMode::None` only for unsafe throughput ceilings
+or ephemeral data; it makes no explicit sync durability guarantee.
+
 ## Documentation
 
 - [Compatibility Matrix](docs/COMPATIBILITY.md) - operator- and
@@ -111,6 +123,8 @@ on disk and the next `Client::open` recovers it automatically.
   mapping
 - [File Management](docs/FILE-MANAGEMENT.md) - backup, checkpoint,
   crash recovery
+- [Journal Auto-Checkpoint Plan](docs/JOURNAL-AUTO-CHECKPOINT-PLAN.md) -
+  plan for wiring page-count checkpoint triggers
 - [Performance Guide](docs/PERFORMANCE.md) - benchmark axes, baseline
   sidecars, profiling, and result reporting
 - [Verification Guide](docs/VERIFICATION.md) - tests, Jepsen, and

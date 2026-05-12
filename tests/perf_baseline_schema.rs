@@ -23,6 +23,7 @@ const REQUIRED_TOP_LEVEL: &[&str] = &[
 
 const REQUIRED_ROW_FIELDS: &[&str] = &[
     "axis",
+    "durability",
     "writers",
     "median_dps",
     "min_dps",
@@ -45,8 +46,10 @@ const ALLOWED_AXES: &[&str] = &[
     "read_find_one",
 ];
 
+const ALLOWED_DURABILITIES: &[&str] = &["full-sync", "interval-50ms", "none"];
+
 #[test]
-fn baseline_sidecars_match_schema() {
+fn baseline_sidecars_match_schema() -> Result<(), String> {
     let dir = Path::new(BASELINE_DIR);
     assert!(
         dir.is_dir(),
@@ -54,7 +57,7 @@ fn baseline_sidecars_match_schema() {
     );
 
     let mut sidecars: Vec<_> = fs::read_dir(dir)
-        .expect("read perf-baselines dir")
+        .map_err(|error| format!("{BASELINE_DIR}: {error}"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|s| s == "json").unwrap_or(false))
         .collect();
@@ -68,23 +71,18 @@ fn baseline_sidecars_match_schema() {
             "note: no JSON sidecars in {BASELINE_DIR}/ yet - \
              schema check is a no-op"
         );
-        return;
+        return Ok(());
     }
 
     for path in &sidecars {
-        let path_display = path.display();
-        let body = match fs::read_to_string(path) {
-            Ok(body) => body,
-            Err(error) => panic!("{path_display}: {error}"),
-        };
-        let v: Value = match serde_json::from_str(&body) {
-            Ok(value) => value,
-            Err(error) => panic!("{path_display}: {error}"),
-        };
+        let path_display = path.display().to_string();
+        let body = fs::read_to_string(path).map_err(|error| format!("{path_display}: {error}"))?;
+        let v: Value =
+            serde_json::from_str(&body).map_err(|error| format!("{path_display}: {error}"))?;
 
         let obj = v
             .as_object()
-            .unwrap_or_else(|| panic!("{}: top-level must be object", path.display()));
+            .ok_or_else(|| format!("{path_display}: top-level must be object"))?;
 
         for key in REQUIRED_TOP_LEVEL {
             assert!(
@@ -113,13 +111,13 @@ fn baseline_sidecars_match_schema() {
 
         let rows = obj["rows"]
             .as_array()
-            .unwrap_or_else(|| panic!("{}: rows must be array", path.display()));
+            .ok_or_else(|| format!("{path_display}: rows must be array"))?;
         assert!(!rows.is_empty(), "{}: rows array is empty", path.display());
 
         for (i, row) in rows.iter().enumerate() {
             let row = row
                 .as_object()
-                .unwrap_or_else(|| panic!("{path_display}: rows[{i}] must be object"));
+                .ok_or_else(|| format!("{path_display}: rows[{i}] must be object"))?;
             for key in REQUIRED_ROW_FIELDS {
                 assert!(
                     row.contains_key(*key),
@@ -130,10 +128,19 @@ fn baseline_sidecars_match_schema() {
 
             let axis = row["axis"]
                 .as_str()
-                .unwrap_or_else(|| panic!("{path_display}: axis string"));
+                .ok_or_else(|| format!("{path_display}: rows[{i}].axis must be string"))?;
             assert!(
                 ALLOWED_AXES.contains(&axis),
                 "{}: rows[{i}].axis = {axis:?} not in allowed set",
+                path.display()
+            );
+
+            let durability = row["durability"]
+                .as_str()
+                .ok_or_else(|| format!("{path_display}: rows[{i}].durability must be string"))?;
+            assert!(
+                ALLOWED_DURABILITIES.contains(&durability),
+                "{}: rows[{i}].durability = {durability:?} not in allowed set",
                 path.display()
             );
 
@@ -150,10 +157,10 @@ fn baseline_sidecars_match_schema() {
                 );
             }
 
-            let median = row["median_dps"].as_f64().unwrap();
-            let min = row["min_dps"].as_f64().unwrap();
-            let max = row["max_dps"].as_f64().unwrap();
-            let envelope = row["envelope"].as_f64().unwrap();
+            let median = row_number(row, "median_dps", &path_display, i)?;
+            let min = row_number(row, "min_dps", &path_display, i)?;
+            let max = row_number(row, "max_dps", &path_display, i)?;
+            let envelope = row_number(row, "envelope", &path_display, i)?;
             assert!(
                 min <= median && median <= max,
                 "{}: rows[{i}] min/median/max ordering broken: {min}/{median}/{max}",
@@ -166,6 +173,8 @@ fn baseline_sidecars_match_schema() {
             );
         }
     }
+
+    Ok(())
 }
 
 fn assert_run_shape_fields(path: &Path, obj: &serde_json::Map<String, Value>) {
@@ -182,4 +191,15 @@ fn assert_run_shape_fields(path: &Path, obj: &serde_json::Map<String, Value>) {
          docs_per_writer + batch_size",
         path.display()
     );
+}
+
+fn row_number(
+    row: &serde_json::Map<String, Value>,
+    field: &str,
+    path_display: &str,
+    row_index: usize,
+) -> Result<f64, String> {
+    row.get(field)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("{path_display}: rows[{row_index}].{field} must be number"))
 }

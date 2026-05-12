@@ -208,11 +208,10 @@ fn read_journal_log_records(
         let mut header = [0u8; LOG_RECORD_HEADER_LEN];
         file.read_exact(&mut header)
             .map_err(crate::error::Error::Io)?;
-        let total_len = u32::from_le_bytes(
-            header[LOG_RECORD_TOTAL_LEN_OFFSET..LOG_RECORD_TOTAL_LEN_OFFSET + 4]
-                .try_into()
-                .expect("4 bytes"),
-        ) as usize;
+        let mut total_len_bytes = [0u8; 4];
+        total_len_bytes
+            .copy_from_slice(&header[LOG_RECORD_TOTAL_LEN_OFFSET..LOG_RECORD_TOTAL_LEN_OFFSET + 4]);
+        let total_len = u32::from_le_bytes(total_len_bytes) as usize;
         if !(LOG_RECORD_HEADER_LEN..=MAX_LOG_RECORD_BYTES).contains(&total_len) {
             break;
         }

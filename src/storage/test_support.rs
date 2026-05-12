@@ -5,10 +5,9 @@
 //! identical `MockIo` + `ArcIo` pair; this module is the single source of
 //! truth.
 //!
-//! Buffer-pool stress tests that need read/write counters
-//! (`buffer_pool::tests`) and the allocator unit tests
-//! (`allocator_tests`) intentionally keep their own variants — their
-//! shapes are not interchangeable with this fixture.
+//! Buffer-pool stress tests that need read/write counters (`buffer_pool::tests`)
+//! and the allocator unit tests (`allocator_tests`) intentionally keep their own
+//! variants; their shapes are not interchangeable with these fixtures.
 #![cfg(test)]
 
 use std::collections::HashMap;
@@ -16,6 +15,22 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::error::{Error, Result};
 use crate::storage::buffer_pool::{PageSize, PageSource};
+
+/// Stateless `PageSource` for tests that only need zero-filled page reads and
+/// no-op writes.
+pub(crate) struct ZeroIo;
+
+impl PageSource for ZeroIo {
+    fn read_page(&self, _page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
+        assert_eq!(buf.len(), size.bytes());
+        buf.fill(0);
+        Ok(())
+    }
+
+    fn write_page(&self, _page_number: u32, _size: PageSize, _buf: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// In-memory page store backing `BufferPool` in unit tests.
 #[derive(Default)]

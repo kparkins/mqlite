@@ -72,10 +72,10 @@ run_test() {
     output=$(mongosh "$URI" --quiet --eval "$script" 2>&1)
 
     if echo "$output" | grep -qF "$expected"; then
-        echo "  ✓ $name"
+        echo "  PASS $name"
         ((PASS_COUNT++))
     else
-        echo "  ✗ $name"
+        echo "  FAIL $name"
         echo "    Expected to find: $expected"
         echo "    Got: $output"
         ((FAIL_COUNT++))
@@ -88,10 +88,10 @@ run_test_no_error() {
 
     local output
     if output=$(mongosh "$URI" --quiet --eval "$script" 2>&1); then
-        echo "  ✓ $name"
+        echo "  PASS $name"
         ((PASS_COUNT++))
     else
-        echo "  ✗ $name (error)"
+        echo "  FAIL $name (error)"
         echo "    Output: $output"
         ((FAIL_COUNT++))
     fi
@@ -151,8 +151,8 @@ run_test "buildInfo" \
     "db.adminCommand({buildInfo:1})" \
     '"version"'
 
-# 10. Unsupported command → CommandNotFound (code 59)
-run_test "aggregate → CommandNotFound" \
+# 10. Unsupported command returns CommandNotFound (code 59)
+run_test "aggregate returns CommandNotFound" \
     'try { db.getSiblingDB("smoke_test").smoke_coll.aggregate([]).toArray(); print("NO_ERROR") } catch(e) { print("code:" + e.code) }' \
     'code:59'
 
@@ -168,7 +168,7 @@ echo ""
 echo "================================================================"
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 if [[ $FAIL_COUNT -eq 0 ]]; then
-    echo "All smoke tests passed ✓"
+    echo "All smoke tests passed"
 else
     echo "FAILED: $FAIL_COUNT test(s) failed"
 fi

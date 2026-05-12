@@ -5,7 +5,7 @@
 //! consults this module behind `cfg(any(test, feature = "test-hooks"))`.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use super::smo_latch::WriteShape;
 
@@ -29,21 +29,38 @@ static EVENTS: Mutex<Vec<Us010ProbeEvent>> = Mutex::new(Vec::new());
 static CLASSIFICATION_OVERRIDES: Mutex<VecDeque<WriteShape>> = Mutex::new(VecDeque::new());
 static FORCE_REVALIDATION_FAILURES: Mutex<u32> = Mutex::new(0);
 
-#[doc(hidden)]
-pub fn reset() {
-    EVENTS.lock().expect("US-010 events mutex poisoned").clear();
-    CLASSIFICATION_OVERRIDES
-        .lock()
-        .expect("US-010 overrides mutex poisoned")
-        .clear();
-    *FORCE_REVALIDATION_FAILURES
-        .lock()
-        .expect("US-010 revalidation mutex poisoned") = 0;
+fn events() -> MutexGuard<'static, Vec<Us010ProbeEvent>> {
+    match EVENTS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn classification_overrides() -> MutexGuard<'static, VecDeque<WriteShape>> {
+    match CLASSIFICATION_OVERRIDES.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn revalidation_failures() -> MutexGuard<'static, u32> {
+    match FORCE_REVALIDATION_FAILURES.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[doc(hidden)]
+pub fn reset() {
+    events().clear();
+    classification_overrides().clear();
+    *revalidation_failures() = 0;
+}
+
+#[doc(hidden)]
+#[must_use]
 pub fn drain_events() -> Vec<Us010ProbeEvent> {
-    std::mem::take(&mut *EVENTS.lock().expect("US-010 events mutex poisoned"))
+    std::mem::take(&mut *events())
 }
 
 #[doc(hidden)]
@@ -59,69 +76,50 @@ pub fn push_classification_override_names(shapes: &[&str]) {
         "OverflowChange" => WriteShape::OverflowChange,
         other => panic!("unsupported US-010 WriteShape override: {other}"),
     });
-    CLASSIFICATION_OVERRIDES
-        .lock()
-        .expect("US-010 overrides mutex poisoned")
-        .extend(mapped);
+    classification_overrides().extend(mapped);
 }
 
 #[doc(hidden)]
 pub fn force_revalidation_failures(count: u32) {
-    *FORCE_REVALIDATION_FAILURES
-        .lock()
-        .expect("US-010 revalidation mutex poisoned") = count;
+    *revalidation_failures() = count;
 }
 
 pub(super) fn record_exclusive_acquire(page_id: u32) {
-    EVENTS
-        .lock()
-        .expect("US-010 events mutex poisoned")
-        .push(Us010ProbeEvent {
-            kind: "exclusive_acquire",
-            page_id: Some(page_id),
-            phase: None,
-            shape: None,
-            attempt: None,
-        });
+    events().push(Us010ProbeEvent {
+        kind: "exclusive_acquire",
+        page_id: Some(page_id),
+        phase: None,
+        shape: None,
+        attempt: None,
+    });
 }
 
 pub(super) fn record_classification(phase: &'static str, shape: &WriteShape) {
-    EVENTS
-        .lock()
-        .expect("US-010 events mutex poisoned")
-        .push(Us010ProbeEvent {
-            kind: "classification",
-            page_id: None,
-            phase: Some(phase),
-            shape: Some(format!("{shape:?}")),
-            attempt: None,
-        });
+    events().push(Us010ProbeEvent {
+        kind: "classification",
+        page_id: None,
+        phase: Some(phase),
+        shape: Some(format!("{shape:?}")),
+        attempt: None,
+    });
 }
 
 pub(super) fn record_reclassification(attempt: u32) {
-    EVENTS
-        .lock()
-        .expect("US-010 events mutex poisoned")
-        .push(Us010ProbeEvent {
-            kind: "reclassification",
-            page_id: None,
-            phase: None,
-            shape: None,
-            attempt: Some(attempt),
-        });
+    events().push(Us010ProbeEvent {
+        kind: "reclassification",
+        page_id: None,
+        phase: None,
+        shape: None,
+        attempt: Some(attempt),
+    });
 }
 
 pub(super) fn override_classification(_phase: &'static str) -> Option<WriteShape> {
-    CLASSIFICATION_OVERRIDES
-        .lock()
-        .expect("US-010 overrides mutex poisoned")
-        .pop_front()
+    classification_overrides().pop_front()
 }
 
 pub(super) fn force_revalidation_failure_once() -> bool {
-    let mut remaining = FORCE_REVALIDATION_FAILURES
-        .lock()
-        .expect("US-010 revalidation mutex poisoned");
+    let mut remaining = revalidation_failures();
     if *remaining == 0 {
         return false;
     }

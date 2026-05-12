@@ -116,7 +116,6 @@ fn begin_checks_page_lifetime_queue() {
     assert_eq!(alloc.page_lifetime_queue().depth(), 1);
 }
 
-
 #[test]
 fn drop_drops_pending_and_decrefs() {
     let handle = fresh_handle();
@@ -131,7 +130,6 @@ fn drop_drops_pending_and_decrefs() {
     assert_eq!(alloc.overflow_refcount(88), 0);
     assert_eq!(alloc.page_lifetime_queue().depth(), 1);
 }
-
 
 // -----------------------------------------------------------------------
 // Sec-index staging (phase 5)
@@ -184,7 +182,6 @@ fn staged_sec_index_delete_then_insert_preserves_order() {
     }
 }
 
-
 #[test]
 fn drop_discards_pending_sec_index() {
     // Abort path: staged sec-index writes must NOT reach any durable
@@ -210,19 +207,13 @@ fn drop_discards_pending_sec_index() {
 fn stage_primary_insert_accumulates() {
     let mut t = WriteTxn::new(1);
     t.stage_primary_insert(
-        777,
-        "ns.a".to_string(),
-        9,
-        0,
+        PrimaryTarget::new(777, "ns.a".to_string(), 9, 0),
         b"k1".to_vec(),
         b"v1".to_vec(),
         None,
     );
     t.stage_primary_update(
-        777,
-        "ns.a".to_string(),
-        9,
-        0,
+        PrimaryTarget::new(777, "ns.a".to_string(), 9, 0),
         b"k2".to_vec(),
         b"v2".to_vec(),
         None,
@@ -253,8 +244,6 @@ fn stage_primary_insert_accumulates() {
 // -----------------------------------------------------------------------
 // Phase 2 §3.7 / §6.2 — emit_logical_txn_frame (US-010)
 // -----------------------------------------------------------------------
-
-
 
 /// §3.7 / US-021 r3 codex blocker — direct encode/decode proof
 /// that the LogicalTxnFrame format-encoding pipeline carries the

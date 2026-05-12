@@ -155,13 +155,4 @@ mod tests {
         assert!(matches!(err, Error::UnsupportedJournalFormat { .. }));
         assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), before_len);
     }
-
-    // Three legacy header-format tests deleted —
-    // `test_checkpoint_boundary_does_not_claim_crud_chaincommit_coverage`,
-    // `test_checkpoint_codecs_survive_legacy_grep_gate`, and
-    // `page0_boundary_record_roundtrips_staged_header` — exercised the
-    // 24-byte `Page0BoundaryRecord` codec that the unified `LogManager`
-    // reservation stream replaced. The legacy boundary record is no longer
-    // written; coverage moved to the `CheckpointBoundaryPayload` round-trip
-    // tests in `log_file_codec.rs`.
 }

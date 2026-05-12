@@ -137,12 +137,7 @@ impl BTreePageStore for MemPageStore {
         Ok(result)
     }
 
-    fn with_all_chains_under_latch<R, F>(
-        &mut self,
-        page: u32,
-        _mode: LatchMode,
-        f: F,
-    ) -> Result<R>
+    fn with_all_chains_under_latch<R, F>(&mut self, page: u32, _mode: LatchMode, f: F) -> Result<R>
     where
         F: FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R,
     {

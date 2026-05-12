@@ -108,11 +108,12 @@ fn checkpoint_reconciles_dirty_primary_leaf_then_flushes() -> Result<()> {
     );
     drop(pages);
     assert!(engine.find_one(NS, &doc! { "_id": 1 })?.is_some());
-    let residue = engine
-        .shared
-        .handle
-        .pool()
-        .with_chain_under_latch(leaf, &key, LatchMode::Exclusive, |slot| slot.take())?;
+    let residue = engine.shared.handle.pool().with_chain_under_latch(
+        leaf,
+        &key,
+        LatchMode::Exclusive,
+        |slot| slot.take(),
+    )?;
     assert!(residue.is_none());
     Ok(())
 }

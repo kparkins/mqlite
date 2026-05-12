@@ -133,9 +133,10 @@ pub(crate) static LIVE_DELTA_CHECK_CALLS: std::sync::atomic::AtomicU64 =
 ///   - inline payload > OVERFLOW_THRESHOLD:  CELL_OVERFLOW_REF_BYTES
 ///   - overflow:                              CELL_OVERFLOW_REF_BYTES
 pub(crate) fn chain_live_head_bytes(key: &[u8], chain: &VecDeque<VersionEntry>) -> u64 {
-    let Some(entry) = chain.iter().find(|entry| {
-        entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted)
-    }) else {
+    let Some(entry) = chain
+        .iter()
+        .find(|entry| entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted))
+    else {
         return 0;
     };
     if entry.is_tombstone {

@@ -1,4 +1,4 @@
-//! Same workload under FullSync and Interval(100ms) durability modes.
+//! Same workload under FullSync, Interval(50ms), and None durability modes.
 //!
 //! Fixed writer shape: 1 writer, 1 namespace, ~256B payload.
 //! This isolates the fsync cost from all other variables.
@@ -49,9 +49,10 @@ fn bench_durability_modes(c: &mut Criterion) {
     let cases: &[(&str, DurabilityMode)] = &[
         ("FullSync", DurabilityMode::FullSync),
         (
-            "Interval(100ms)",
-            DurabilityMode::Interval(Duration::from_millis(100)),
+            "Interval(50ms)",
+            DurabilityMode::Interval(Duration::from_millis(50)),
         ),
+        ("None", DurabilityMode::None),
     ];
 
     for (label, mode) in cases {

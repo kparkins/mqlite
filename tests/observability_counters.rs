@@ -183,7 +183,7 @@ fn lane_wait_ns_total_rises_with_same_namespace_writers() {
 
     reset_lane_wait_ns();
     let first_ticket = client.__us036_admit_writer(ns_id, 1_000).unwrap();
-    let c1 = client.clone();
+    let c1 = client;
     let waiting = thread::spawn(move || {
         c1.__us036_admit_writer(ns_id, 1_000)
             .expect("second writer admitted after first releases")

@@ -33,7 +33,6 @@ fn journal_header_checksum_failure_rejected() {
     assert!(JournalHeader::from_bytes(&bytes).is_err());
 }
 
-
 #[test]
 fn journal_page_size_roundtrip() {
     assert_eq!(
@@ -208,7 +207,6 @@ fn chain_commit_cursor_reader_advances_past_valid_frame() {
     assert_eq!(ts, expected_ts, "commit_ts must be carried out of the scan");
     assert_eq!(offset, 13, "start offset must be carried out of the scan");
 }
-
 
 #[test]
 fn chain_commit_cursor_reader_rewinds_on_salt_mismatch() {
@@ -1347,7 +1345,6 @@ fn try_skip_logical_txn_advances_on_valid_frame() {
     assert_eq!(decoded, frame, "helper carries out the decoded frame");
 }
 
-
 #[test]
 fn try_skip_logical_txn_rewinds_on_checksum_mismatch() {
     let frame = sample_mixed_ops_logical_frame();
@@ -1372,16 +1369,13 @@ fn try_skip_logical_txn_rewinds_on_salt_mismatch() {
     assert_eq!(cursor.position(), 0, "cursor restored on salt mismatch");
 }
 
-
 // ---------------------------------------------------------------------------
 // Phase 6 US-009: unsupported legacy-shaped byte negatives
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Page-0 checkpoint boundary codec
 // ---------------------------------------------------------------------------
-
 
 // ===========================================================================
 // US-022 §9.1 — Property tests

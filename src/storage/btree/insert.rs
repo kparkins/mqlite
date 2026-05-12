@@ -16,11 +16,10 @@ use super::{BTree, BTreePageStore, CellValue, OVERFLOW_PAGE_DATA, OVERFLOW_THRES
 // ---------------------------------------------------------------------------
 
 pub(super) fn write_overflow_chain<S: BTreePageStore>(store: &mut S, data: &[u8]) -> Result<u32> {
-    let chunks: Vec<&[u8]> = data.chunks(OVERFLOW_PAGE_DATA).collect();
-    let n = chunks.len();
-    if n == 0 {
+    if data.is_empty() {
         return Err(Error::Internal("write_overflow_chain: empty data".into()));
     }
+    let n = ((data.len() - 1) / OVERFLOW_PAGE_DATA) + 1;
 
     // Allocate all pages first.
     let mut pages = Vec::with_capacity(n);
@@ -29,8 +28,7 @@ pub(super) fn write_overflow_chain<S: BTreePageStore>(store: &mut S, data: &[u8]
     }
 
     // Write each page from last to first so we have next pointers.
-    for i in (0..n).rev() {
-        let chunk = chunks[i];
+    for (i, chunk) in data.chunks(OVERFLOW_PAGE_DATA).enumerate().rev() {
         let next = if i + 1 < n { pages[i + 1] } else { 0 };
 
         let mut buf = [0u8; PAGE_SIZE_LEAF as usize];

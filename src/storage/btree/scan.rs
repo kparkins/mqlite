@@ -18,7 +18,7 @@ use super::{BTree, BTreePageStore, CellValue, HistoryProbe, LeafPageImage};
 // Overflow read helper
 // ---------------------------------------------------------------------------
 
-pub(super) fn read_overflow_chain<S: BTreePageStore>(
+pub(crate) fn read_overflow_chain<S: BTreePageStore>(
     store: &S,
     first_page: u32,
     total_length: u32,
@@ -341,10 +341,8 @@ impl<S: BTreePageStore> BTree<S> {
                         let Some((key, entry)) = next else {
                             break;
                         };
-                        if !entry.is_tombstone {
-                            if !visit(key.to_vec(), resolve_entry(entry)?)? {
-                                return Ok(());
-                            }
+                        if !entry.is_tombstone && !visit(key.to_vec(), resolve_entry(entry)?)? {
+                            return Ok(());
                         }
                     }
                     MergeSource::Both => {
@@ -355,10 +353,8 @@ impl<S: BTreePageStore> BTree<S> {
                         let Some((_, entry)) = next else {
                             break;
                         };
-                        if !entry.is_tombstone {
-                            if !visit(cell.key.clone(), resolve_entry(entry)?)? {
-                                return Ok(());
-                            }
+                        if !entry.is_tombstone && !visit(cell.key.clone(), resolve_entry(entry)?)? {
+                            return Ok(());
                         }
                     }
                 }

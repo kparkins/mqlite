@@ -6,7 +6,7 @@
 //! cloning chain snapshots, before row iteration or BSON decode begins.
 
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -42,36 +42,39 @@ pub struct Us016RangeScanPauseGuard;
 static LATCH_SAMPLES: Mutex<Vec<Us016ReadLatchSample>> = Mutex::new(Vec::new());
 static RANGE_SCAN_PAUSE: Mutex<Option<RangeScanPauseHook>> = Mutex::new(None);
 
+fn latch_samples() -> MutexGuard<'static, Vec<Us016ReadLatchSample>> {
+    match LATCH_SAMPLES.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn range_scan_pause() -> MutexGuard<'static, Option<RangeScanPauseHook>> {
+    match RANGE_SCAN_PAUSE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 #[doc(hidden)]
 pub fn reset() {
-    LATCH_SAMPLES
-        .lock()
-        .expect("US-016 latch samples mutex poisoned")
-        .clear();
-    RANGE_SCAN_PAUSE
-        .lock()
-        .expect("US-016 range-scan pause mutex poisoned")
-        .take();
+    latch_samples().clear();
+    range_scan_pause().take();
 }
 
 #[doc(hidden)]
+#[must_use]
 pub fn drain_latch_samples() -> Vec<Us016ReadLatchSample> {
-    std::mem::take(
-        &mut *LATCH_SAMPLES
-            .lock()
-            .expect("US-016 latch samples mutex poisoned"),
-    )
+    std::mem::take(&mut *latch_samples())
 }
 
 #[doc(hidden)]
+#[must_use]
 pub fn install_range_scan_iteration_pause(
     ready: Sender<()>,
     release: Receiver<()>,
 ) -> Us016RangeScanPauseGuard {
-    *RANGE_SCAN_PAUSE
-        .lock()
-        .expect("US-016 range-scan pause mutex poisoned") =
-        Some(RangeScanPauseHook { ready, release });
+    *range_scan_pause() = Some(RangeScanPauseHook { ready, release });
     Us016RangeScanPauseGuard
 }
 
@@ -84,14 +87,11 @@ pub(crate) fn begin_leaf_hold(page_id: u32, level: u8) -> Us016LeafHoldStart {
 }
 
 pub(crate) fn finish_leaf_hold(start: Us016LeafHoldStart) {
-    LATCH_SAMPLES
-        .lock()
-        .expect("US-016 latch samples mutex poisoned")
-        .push(Us016ReadLatchSample {
-            page_id: start.page_id,
-            level: start.level,
-            hold_duration: start.started_at.elapsed(),
-        });
+    latch_samples().push(Us016ReadLatchSample {
+        page_id: start.page_id,
+        level: start.level,
+        hold_duration: start.started_at.elapsed(),
+    });
 }
 
 pub(super) fn pause_before_iteration() -> Result<()> {
@@ -113,9 +113,6 @@ pub(super) fn pause_before_iteration() -> Result<()> {
 
 impl Drop for Us016RangeScanPauseGuard {
     fn drop(&mut self) {
-        RANGE_SCAN_PAUSE
-            .lock()
-            .expect("US-016 range-scan pause mutex poisoned")
-            .take();
+        range_scan_pause().take();
     }
 }

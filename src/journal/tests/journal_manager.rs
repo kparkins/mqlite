@@ -513,16 +513,6 @@ mod tests {
         drop(dir);
     }
 
-    // -----------------------------------------------------------------------
-    // Append and read back
-    // -----------------------------------------------------------------------
-
-    // `append_and_read_4k`, `append_and_read_32k`, and `latest_write_wins`
-    // deleted — exercised the legacy 24-byte `append_non_commit`/`read_page`
-    // index-lookup path. Production CRUD now reserves through `LogManager`
-    // and replay happens via the unified record stream; per-page lookup by
-    // page number is no longer a journal-level concern.
-
     #[test]
     fn logical_txn_encode_rejects_oversize_inline_fields() {
         use crate::error::Error;
@@ -592,7 +582,6 @@ mod tests {
     // Recovery — crash simulation
     // -----------------------------------------------------------------------
 
-
     #[test]
     fn recovery_discards_checkpoint_batch_without_boundary() {
         let (_dir, db_path, mut main_file) = make_db_file();
@@ -652,24 +641,8 @@ mod tests {
         assert_eq!(mgr2.salt2, 0x2222_2222);
     }
 
-    // -----------------------------------------------------------------------
-    // Linear scan fallback
-    // -----------------------------------------------------------------------
-
-    // `linear_scan_ignores_untagged_page_frames` deleted — tested the
-    // legacy `read_page_linear` skip-on-untagged path that the unified
-    // record stream removes.
-
-    // -----------------------------------------------------------------------
-    // Rollback (truncate_to)
-    // -----------------------------------------------------------------------
-
-    // Three legacy `truncate_to` tests deleted — they exercised the
-    // 24-byte page-frame index and `read_page` lookup path that the unified
-    // `LogManager` reservation stream replaces.
-
     #[test]
-    fn truncate_to_full_drops_all_non_header_frames_placeholder() {
+    fn truncate_to_full_drops_all_non_header_frames() {
         let (dir, db_path, mut main_file) = make_db_file();
         let header = make_header();
         let mut mgr = JournalManager::open_or_create(&db_path, &header, &mut main_file).unwrap();
@@ -679,10 +652,6 @@ mod tests {
         drop(main_file);
         drop(dir);
     }
-
-    // `JournalLayeredSource` tests deleted alongside the type itself — the
-    // journal-as-page-overlay reader model is gone now that buffer-pool LSN
-    // pinning prevents cache misses from observing pre-checkpoint pages.
 
     #[test]
     fn truncate_to_rejects_out_of_range_cursor() {
@@ -714,7 +683,6 @@ mod tests {
         drop(main_file);
         drop(dir);
     }
-
 
     // -----------------------------------------------------------------------
     // Phase 2 US-012 / US-013 — ParsedLogicalFrames + take accessor
@@ -776,32 +744,10 @@ mod tests {
         drop(dir);
     }
 
-
     // -----------------------------------------------------------------------
     // Phase 2 US-014 — HLC floor isolation (§3.10) and orphan sweep (§3.8(b))
     // -----------------------------------------------------------------------
 
-
-    // `test_clean_page0_checkpoint_boundary_cut` deleted — exercised the
-    // legacy LogicalTxnFrame + ChainCommit + Page0BoundaryRecord recovery
-    // pipeline. Equivalent behaviour is covered by the Phase 8 CrudCommit +
-    // CheckpointBoundary recovery tests.
-
-    // `test_page0_checkpoint_boundary_frontier_monotonicity_clean_pair`
-    // deleted — exercised the legacy LogicalTxnFrame + ChainCommit +
-    // Page0BoundaryRecord pipeline whose intermixed scan no longer maps onto
-    // the unified LogManager record stream. Phase 8 recovery handles
-    // boundary-driven cull through the CrudCommit + CheckpointBoundary path.
-
-
-    // `read_page_linear_ignores_page0_checkpoint_boundary` deleted — tested
-    // the legacy `index.clear_index()` + `read_page_linear` lookup path that
-    // the unified record stream removes (no per-page index lives on the
-    // journal-side after PR1).
-
-    // `truncate_to_does_not_index_page0_checkpoint_boundary` deleted —
-    // exercised the legacy `read_page` index lookup path that the unified
-    // `LogManager` stream no longer maintains.
     #[test]
     fn truncate_to_resets_log_manager_frontier_to_cursor() {
         let (dir, db_path, mut main_file) = make_db_file();
@@ -813,9 +759,6 @@ mod tests {
         drop(main_file);
         drop(dir);
     }
-
-
-
 
     const PASS2_LIVE_NS_ID: i64 = 1;
     const PASS2_ABSENT_NS_ID: i64 = 999;
@@ -842,14 +785,12 @@ mod tests {
         }
     }
 
-
     /// Test-only mutex — Pass 1 metric counters are crate-globals and
     /// other tests in this module also touch them.
     fn orphan_metrics_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
-
 }
 
 #[cfg(all(test, unix))]

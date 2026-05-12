@@ -42,11 +42,11 @@ use std::sync::Arc;
 use crate::error::Result;
 use crate::mvcc::read_view::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
-use crate::storage::buffer_pool::LatchMode;
 use crate::storage::btree::{
     empty_internal_page_bytes, empty_leaf_page_bytes, BTreePageStore, LeafPageImage,
 };
 use crate::storage::btree_store::BufferPoolPageStore;
+use crate::storage::buffer_pool::LatchMode;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
 use crate::storage::header::FileHeader;

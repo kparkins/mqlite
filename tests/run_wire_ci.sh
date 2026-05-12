@@ -79,7 +79,7 @@ echo ""
 echo "Step 1: Installing pymongo 4.x..."
 pip install 'pymongo>=4,<5' --quiet
 PYMONGO_VERSION=$(python3 -c "import pymongo; print(pymongo.version)" 2>/dev/null || echo "unknown")
-echo "pymongo ${PYMONGO_VERSION} installed ✓"
+echo "pymongo ${PYMONGO_VERSION} installed"
 echo ""
 
 # ── Build wire server ────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ if ! cargo build --features wire --example wire_server 2>&1; then
     echo "ERROR: cargo build failed"
     exit 2
 fi
-echo "Build complete ✓"
+echo "Build complete"
 echo ""
 
 # ── Start wire server ────────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ if [[ $ready -ne 1 ]]; then
     exit 2
 fi
 
-echo "Server ready ✓"
+echo "Server ready"
 echo ""
 
 # ── Run pymongo test suite ───────────────────────────────────────────────────
@@ -163,7 +163,7 @@ fi
 if $TIMEOUT_CMD python3 "$SCRIPT_DIR/pymongo_compat.py" --port "$MQLITE_PORT"; then
     echo ""
     echo "================================================================"
-    echo "Wire protocol integration tests: PASSED ✓"
+    echo "Wire protocol integration tests: PASSED"
     echo "================================================================"
     exit 0
 else

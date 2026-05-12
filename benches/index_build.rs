@@ -40,7 +40,7 @@ fn metadata() -> String {
     format!(
         "doc_count={DOC_COUNT} payload_class={PAYLOAD_CLASS} actual_bytes={PAYLOAD_BYTES} \
          index_spec=\"{INDEX_SPEC}\" durability={} {}",
-        common::INTERVAL_100MS_LABEL,
+        common::INTERVAL_50MS_LABEL,
         common::host_metadata()
     )
 }
@@ -61,7 +61,7 @@ fn bench_index_build(c: &mut Criterion) {
     // Seed the collection once outside the Criterion timing loop.
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("bench.mqlite");
-    let client = common::open_client(&path, common::interval_100ms());
+    let client = common::open_client(&path, common::interval_50ms());
     let col = client.database("bench").collection::<Document>("big_col");
 
     let payload = "x".repeat(PAYLOAD_BYTES);

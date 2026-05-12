@@ -28,7 +28,7 @@
 //! # DurabilityMode variants
 //!
 //! - `DurabilityMode::FullSync`             — fdatasync after every commit
-//! - `DurabilityMode::Interval(Duration)`   — flush every N ms (default 100 ms)
+//! - `DurabilityMode::Interval(Duration)`   — flush every N ms (default 50 ms)
 //! - `DurabilityMode::None`                 — no explicit flush
 
 use std::path::Path;
@@ -49,7 +49,7 @@ fn fullsync_opts() -> OpenOptions {
 }
 
 fn interval_opts() -> OpenOptions {
-    OpenOptions::new().durability(DurabilityMode::Interval(Duration::from_millis(100)))
+    OpenOptions::new().durability(DurabilityMode::Interval(Duration::from_millis(50)))
 }
 
 fn nosync_opts() -> OpenOptions {

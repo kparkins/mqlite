@@ -42,7 +42,7 @@ fn metadata(writer_count: usize) -> String {
     format!(
         "writers={writer_count} ns=1 payload=~256B bytes={PAYLOAD_BYTES} \
          durability={} {}",
-        common::INTERVAL_100MS_LABEL,
+        common::INTERVAL_50MS_LABEL,
         common::host_metadata()
     )
 }

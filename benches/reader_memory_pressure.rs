@@ -280,7 +280,7 @@ fn run_workload(config: &Config) -> Result<Metrics, Box<dyn std::error::Error>> 
 
 fn open_client(dir: &TempDir) -> mqlite::Result<Client> {
     let path = dir.path().join("reader-memory-pressure.mqlite");
-    let opts = OpenOptions::new().durability(DurabilityMode::Interval(Duration::from_millis(100)));
+    let opts = OpenOptions::new().durability(DurabilityMode::Interval(Duration::from_millis(50)));
     Client::open_with_options(&path, opts)
 }
 
@@ -436,7 +436,7 @@ fn write_artifact(
          writes_per_writer={}\n\
          hot_docs={}\n\
          payload_bytes={}\n\
-         durability=Interval(100ms)\n\
+         durability=Interval(50ms)\n\
          elapsed_ms={}\n\
          successful_reads={}\n\
          successful_writes={}\n\

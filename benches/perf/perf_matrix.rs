@@ -34,7 +34,7 @@ const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_READ_SEED_DOCS: usize = 20_000;
 const DEFAULT_READ_OPS: usize = 100_000;
 const PAYLOAD_BYTES: usize = 256;
-const DURABILITY_INTERVAL_MS: u64 = 100;
+const DURABILITY_INTERVAL_MS: u64 = 50;
 const KEY_BAND_WIDTH: i64 = 1_000_000_000;
 const AXIS_REQUIRED_MSG: &str = "--axis required; use --list-axes to inspect choices";
 
@@ -61,6 +61,45 @@ enum Operation {
     InsertMany,
     ReadFindOne,
 }
+
+#[derive(Clone, Copy)]
+enum WriteOperation {
+    InsertOne,
+    InsertMany,
+}
+
+#[derive(Clone, Copy)]
+enum DurabilityProfile {
+    FullSync,
+    Interval50Ms,
+    None,
+}
+
+impl DurabilityProfile {
+    fn label(self) -> &'static str {
+        match self {
+            DurabilityProfile::FullSync => "full-sync",
+            DurabilityProfile::Interval50Ms => "interval-50ms",
+            DurabilityProfile::None => "none",
+        }
+    }
+
+    fn mode(self) -> DurabilityMode {
+        match self {
+            DurabilityProfile::FullSync => DurabilityMode::FullSync,
+            DurabilityProfile::Interval50Ms => {
+                DurabilityMode::Interval(Duration::from_millis(DURABILITY_INTERVAL_MS))
+            }
+            DurabilityProfile::None => DurabilityMode::None,
+        }
+    }
+}
+
+const DURABILITY_PROFILES: &[DurabilityProfile] = &[
+    DurabilityProfile::FullSync,
+    DurabilityProfile::Interval50Ms,
+    DurabilityProfile::None,
+];
 
 const AXES: &[AxisSpec] = &[
     AxisSpec {
@@ -109,6 +148,8 @@ const AXES: &[AxisSpec] = &[
 
 struct Config {
     axis: AxisSpec,
+    durability: DurabilityProfile,
+    exit_after_measurement: bool,
     writers: usize,
     docs_per_writer: usize,
     batch_size: usize,
@@ -161,6 +202,12 @@ fn main() -> BenchResult<()> {
             }
             return Ok(());
         }
+        ParseResult::ListDurability => {
+            for profile in DURABILITY_PROFILES {
+                println!("{}", profile.label());
+            }
+            return Ok(());
+        }
         ParseResult::Run(config) => config,
     };
 
@@ -168,7 +215,7 @@ fn main() -> BenchResult<()> {
     reset_perf_counters();
 
     let dir = TempWorkDir::new()?;
-    let client = open_interval_client(&dir)?;
+    let client = open_db(&dir, config.durability)?;
     let measurement = match config.axis.operation {
         Operation::ReadFindOne => run_read_axis(&client, &config)?,
         _ => run_write_axis(&client, &config)?,
@@ -179,11 +226,19 @@ fn main() -> BenchResult<()> {
     print_perf_counters();
 
     std::io::stdout().flush().ok();
+    if config.exit_after_measurement {
+        // The baseline driver measures public operations only. Avoid charging
+        // every subprocess for an unreported drop-time checkpoint.
+        std::mem::forget(client);
+        drop(dir);
+        process::exit(0);
+    }
     Ok(())
 }
 
 enum ParseResult {
     ListAxes,
+    ListDurability,
     Run(Config),
 }
 
@@ -194,12 +249,21 @@ fn parse_args() -> BenchResult<ParseResult> {
     let mut batch_size = DEFAULT_BATCH_SIZE;
     let mut read_seed_docs = DEFAULT_READ_SEED_DOCS;
     let mut read_ops = DEFAULT_READ_OPS;
+    let mut durability = DurabilityProfile::Interval50Ms;
+    let mut exit_after_measurement = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--list-axes" => return Ok(ParseResult::ListAxes),
+            "--list-durability" => return Ok(ParseResult::ListDurability),
+            "--exit-after-measurement" => {
+                exit_after_measurement = true;
+            }
             "--axis" => axis_name = args.next(),
+            "--durability" => {
+                durability = parse_durability(args.next())?;
+            }
             "--writers" => {
                 writers_override = Some(parse_positive_usize(&arg, args.next())?);
             }
@@ -229,6 +293,8 @@ fn parse_args() -> BenchResult<ParseResult> {
 
     Ok(ParseResult::Run(Config {
         axis,
+        durability,
+        exit_after_measurement,
         writers,
         docs_per_writer,
         batch_size,
@@ -247,6 +313,16 @@ fn parse_positive_usize(flag: &str, value: Option<String>) -> BenchResult<usize>
     Ok(parsed)
 }
 
+fn parse_durability(value: Option<String>) -> BenchResult<DurabilityProfile> {
+    let value = value.ok_or("--durability requires value")?;
+    match value.as_str() {
+        "full-sync" | "fullsync" | "FullSync" => Ok(DurabilityProfile::FullSync),
+        "interval-50ms" | "Interval(50ms)" => Ok(DurabilityProfile::Interval50Ms),
+        "none" | "None" => Ok(DurabilityProfile::None),
+        other => Err(format!("unknown --durability: {other}").into()),
+    }
+}
+
 fn validate_writer_count(axis: AxisSpec, writers: usize) -> BenchResult<()> {
     let single_writer_axis = axis.name.starts_with("single_writer_");
     if single_writer_axis && writers != 1 {
@@ -261,17 +337,20 @@ fn validate_writer_count(axis: AxisSpec, writers: usize) -> BenchResult<()> {
     Ok(())
 }
 
-fn open_interval_client(dir: &TempWorkDir) -> BenchResult<Client> {
+fn open_db(dir: &TempWorkDir, durability: DurabilityProfile) -> BenchResult<Client> {
     let path = dir.path().join("perf-matrix.mqlite");
     let opts = OpenOptions::new()
-        .durability(DurabilityMode::Interval(Duration::from_millis(
-            DURABILITY_INTERVAL_MS,
-        )))
+        .durability(durability.mode())
         .busy_timeout(Duration::from_secs(30));
     Ok(Client::open_with_options(&path, opts)?)
 }
 
 fn run_write_axis(client: &Client, config: &Config) -> BenchResult<Measurement> {
+    let write_operation = match config.axis.operation {
+        Operation::InsertOne => WriteOperation::InsertOne,
+        Operation::InsertMany => WriteOperation::InsertMany,
+        Operation::ReadFindOne => return Err("read axis passed to write runner".into()),
+    };
     let plans = build_write_plans(client, config)?;
     let ready_barrier = Arc::new(Barrier::new(config.writers + 1));
     let start_barrier = Arc::new(Barrier::new(config.writers + 1));
@@ -281,7 +360,7 @@ fn run_write_axis(client: &Client, config: &Config) -> BenchResult<Measurement> 
         let worker = client.clone();
         let ready = Arc::clone(&ready_barrier);
         let start = Arc::clone(&start_barrier);
-        let operation = config.axis.operation;
+        let operation = write_operation;
         let batch_size = config.batch_size;
 
         handles.push(thread::spawn(move || -> Result<usize, String> {
@@ -291,12 +370,12 @@ fn run_write_axis(client: &Client, config: &Config) -> BenchResult<Measurement> 
             ready.wait();
             start.wait();
             match operation {
-                Operation::InsertOne => {
+                WriteOperation::InsertOne => {
                     for doc in &plan.docs {
                         collection.insert_one(doc).map_err(|err| err.to_string())?;
                     }
                 }
-                Operation::InsertMany => {
+                WriteOperation::InsertMany => {
                     for batch in plan.docs.chunks(batch_size) {
                         collection
                             .insert_many(batch)
@@ -304,7 +383,6 @@ fn run_write_axis(client: &Client, config: &Config) -> BenchResult<Measurement> 
                             .map_err(|err| err.to_string())?;
                     }
                 }
-                Operation::ReadFindOne => unreachable!("read axis"),
             }
             Ok(plan.docs.len())
         }));
@@ -409,13 +487,14 @@ fn print_measurement(config: &Config, measurement: &Measurement) {
         Operation::ReadFindOne => {
             println!(
                 "{{\"axis\":\"{}\",\"writers\":1,\"ops\":{},\"elapsed_secs\":{:.6},\
-                 \"ops_per_second\":{:.2},\"seed_docs\":{},\
+                 \"ops_per_second\":{:.2},\"seed_docs\":{},\"durability\":\"{}\",\
                  \"timed_scope\":\"operation_only\"}}",
                 config.axis.name,
                 measurement.units,
                 elapsed_secs,
                 throughput,
-                config.read_seed_docs
+                config.read_seed_docs,
+                config.durability.label()
             );
         }
         Operation::InsertOne | Operation::InsertMany => {
@@ -423,6 +502,7 @@ fn print_measurement(config: &Config, measurement: &Measurement) {
                 "{{\"axis\":\"{}\",\"writers\":{},\"namespaces\":{},\"docs\":{},\
                  \"docs_per_writer\":{},\"batch_size\":{},\"payload_bytes\":{},\
                  \"elapsed_secs\":{:.6},\"docs_per_second\":{:.2},\
+                 \"durability\":\"{}\",\
                  \"timed_scope\":\"operation_only\"}}",
                 config.axis.name,
                 config.writers,
@@ -432,7 +512,8 @@ fn print_measurement(config: &Config, measurement: &Measurement) {
                 config.batch_size,
                 PAYLOAD_BYTES,
                 elapsed_secs,
-                throughput
+                throughput,
+                config.durability.label()
             );
         }
     }

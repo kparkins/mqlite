@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::mvcc::metrics;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
+use crate::storage::test_support::ZeroIo;
 
 const PAGE_A: u32 = 201;
 const PAGE_B: u32 = 202;
@@ -17,20 +18,6 @@ const KEY_C: &[u8] = b"delta-c";
 const LARGE_PAGE_BYTES: usize = 32 * 1024;
 const POOL_BYTES: usize = LARGE_PAGE_BYTES * 4;
 const EPSILON: f64 = 0.000_001;
-
-struct ZeroIo;
-
-impl PageSource for ZeroIo {
-    fn read_page(&self, _page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
-        assert_eq!(buf.len(), size.bytes());
-        buf.fill(0);
-        Ok(())
-    }
-
-    fn write_page(&self, _page_number: u32, _size: PageSize, _buf: &[u8]) -> Result<()> {
-        Ok(())
-    }
-}
 
 fn ts(physical_ms: u64) -> Ts {
     Ts {

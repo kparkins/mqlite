@@ -475,7 +475,7 @@ impl<S: BTreePageStore> BTree<S> {
     /// by page id before acquiring latches.
     pub(crate) fn collect_pages_by_size(&mut self) -> Result<Vec<(u32, PageSize)>> {
         let mut pages = Vec::new();
-        collect_subtree_pages(&mut self.store, self.root_page, self.root_level, &mut pages)?;
+        collect_subtree_pages(&self.store, self.root_page, self.root_level, &mut pages)?;
         Ok(pages)
     }
 }
@@ -507,6 +507,7 @@ fn encoded_leaf_cell_size(key_len: usize, value_len: usize) -> usize {
 mod delete;
 mod insert;
 mod scan;
+pub(crate) use scan::read_overflow_chain;
 
 // ---------------------------------------------------------------------------
 // Tests

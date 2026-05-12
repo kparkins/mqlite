@@ -347,7 +347,13 @@ fn classify_delta_install(
                 txn_id: head.txn_id,
             }) == expected =>
         {
-            Ok(false)
+            if matches!(head.state, crate::mvcc::VersionState::Committed) && !head.is_tombstone {
+                Ok(false)
+            } else {
+                Err(Error::WriteConflict {
+                    reason: WriteConflictReason::StaleSnapshot,
+                })
+            }
         }
         Some(_) => Err(Error::WriteConflict {
             reason: WriteConflictReason::StaleSnapshot,
@@ -619,8 +625,7 @@ pub(super) fn install_pending_primary(
             let elapsed_ns = _install_start.elapsed().as_nanos() as u64;
             crate::storage::buffer_pool::chains::INSTALL_HOLD_NS_TOTAL
                 .fetch_add(elapsed_ns, Ordering::Relaxed);
-            crate::storage::buffer_pool::chains::INSTALL_WRITES
-                .fetch_add(1, Ordering::Relaxed);
+            crate::storage::buffer_pool::chains::INSTALL_WRITES.fetch_add(1, Ordering::Relaxed);
         }
         shared.mark_leaf_dirty(
             TreeIdent {

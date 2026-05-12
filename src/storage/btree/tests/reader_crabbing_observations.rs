@@ -4,7 +4,7 @@
 //! feature = "test-hooks"))`; integration tests drain the events to prove
 //! readers acquire a child shared latch before releasing the parent.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// One reader-crabbing event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,38 +24,40 @@ pub struct Us025CrabbingEvent {
 
 static EVENTS: Mutex<Vec<Us025CrabbingEvent>> = Mutex::new(Vec::new());
 
-#[doc(hidden)]
-pub fn reset() {
-    EVENTS.lock().expect("US-025 events mutex poisoned").clear();
+fn events() -> MutexGuard<'static, Vec<Us025CrabbingEvent>> {
+    match EVENTS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[doc(hidden)]
+pub fn reset() {
+    events().clear();
+}
+
+#[doc(hidden)]
+#[must_use]
 pub fn drain_events() -> Vec<Us025CrabbingEvent> {
-    std::mem::take(&mut *EVENTS.lock().expect("US-025 events mutex poisoned"))
+    std::mem::take(&mut *events())
 }
 
 pub(super) fn record_shared_acquire(page_id: u32, level: u8) {
-    EVENTS
-        .lock()
-        .expect("US-025 events mutex poisoned")
-        .push(Us025CrabbingEvent {
-            kind: "shared_acquire",
-            parent_page: None,
-            child_page: None,
-            page_id: Some(page_id),
-            level: Some(level),
-        });
+    events().push(Us025CrabbingEvent {
+        kind: "shared_acquire",
+        parent_page: None,
+        child_page: None,
+        page_id: Some(page_id),
+        level: Some(level),
+    });
 }
 
 pub(super) fn record_parent_release_after_child(parent_page: u32, child_page: u32) {
-    EVENTS
-        .lock()
-        .expect("US-025 events mutex poisoned")
-        .push(Us025CrabbingEvent {
-            kind: "parent_release_after_child",
-            parent_page: Some(parent_page),
-            child_page: Some(child_page),
-            page_id: None,
-            level: None,
-        });
+    events().push(Us025CrabbingEvent {
+        kind: "parent_release_after_child",
+        parent_page: Some(parent_page),
+        child_page: Some(child_page),
+        page_id: None,
+        level: None,
+    });
 }

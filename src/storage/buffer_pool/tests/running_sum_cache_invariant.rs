@@ -58,6 +58,27 @@ const STRESS_ITERATIONS: usize = 10_000;
 const STRESS_KEY_POOL: usize = 64;
 const REPLACE_LEAF_EVERY_N: usize = 250;
 
+#[derive(Clone, Copy)]
+enum StressAction {
+    InsertOrReplace,
+    Take,
+    MutateInPlace,
+    NoOpInspect,
+    DrainAll,
+}
+
+impl StressAction {
+    fn label(self) -> &'static str {
+        match self {
+            StressAction::InsertOrReplace => "insert_or_replace",
+            StressAction::Take => "take",
+            StressAction::MutateInPlace => "mutate_in_place",
+            StressAction::NoOpInspect => "no_op_inspect",
+            StressAction::DrainAll => "drain_all",
+        }
+    }
+}
+
 #[derive(Default)]
 struct MockIo {
     pages: StdMutex<BTreeMap<u32, Vec<u8>>>,
@@ -168,7 +189,9 @@ fn random_chain(rng: &mut XorShift, ts_seed: u64) -> Arc<VecDeque<VersionEntry>>
     for d in 0..depth {
         let ts = ts_seed + d as u64;
         let payload_len = rng.next_in(40) + 1;
-        let payload: Vec<u8> = (0..payload_len).map(|_| (rng.next_u64() & 0xFF) as u8).collect();
+        let payload: Vec<u8> = (0..payload_len)
+            .map(|_| (rng.next_u64() & 0xFF) as u8)
+            .collect();
         let pick = rng.next_in(5);
         let entry = match pick {
             0 => pending_entry(ts, 12345, &payload),
@@ -226,15 +249,15 @@ fn stress_10k_mutations_keep_cache_consistent() {
         // separately exercised below.
         let roll = rng.next_in(100);
         let action = match roll {
-            0..=39 => "insert_or_replace",
-            40..=59 => "take",
-            60..=84 => "mutate_in_place",
-            85..=94 => "no_op_inspect",
-            _ => "drain_all",
+            0..=39 => StressAction::InsertOrReplace,
+            40..=59 => StressAction::Take,
+            60..=84 => StressAction::MutateInPlace,
+            85..=94 => StressAction::NoOpInspect,
+            _ => StressAction::DrainAll,
         };
 
         match action {
-            "insert_or_replace" => {
+            StressAction::InsertOrReplace => {
                 let chain = random_chain(&mut rng, ts_counter);
                 ts_counter += 10;
                 pool.with_chain_under_latch(PAGE_ID, &key, LatchMode::Exclusive, |slot| {
@@ -242,13 +265,13 @@ fn stress_10k_mutations_keep_cache_consistent() {
                 })
                 .unwrap();
             }
-            "take" => {
+            StressAction::Take => {
                 pool.with_chain_under_latch(PAGE_ID, &key, LatchMode::Exclusive, |slot| {
                     let _ = slot.take();
                 })
                 .unwrap();
             }
-            "mutate_in_place" => {
+            StressAction::MutateInPlace => {
                 let new_payload_len = rng.next_in(40) + 1;
                 let new_payload: Vec<u8> = (0..new_payload_len)
                     .map(|_| (rng.next_u64() & 0xFF) as u8)
@@ -281,30 +304,29 @@ fn stress_10k_mutations_keep_cache_consistent() {
                 })
                 .unwrap();
             }
-            "no_op_inspect" => {
+            StressAction::NoOpInspect => {
                 pool.with_chain_under_latch(PAGE_ID, &key, LatchMode::Exclusive, |_slot| {})
                     .unwrap();
             }
-            "drain_all" => {
+            StressAction::DrainAll => {
                 pool.with_all_chains_under_latch(PAGE_ID, LatchMode::Exclusive, |chains| {
                     if rng.coin(1, 4) {
                         chains.clear();
                     } else {
                         // Partial drain: remove every-other key.
-                        let keep: Vec<Vec<u8>> = chains.keys().cloned().collect();
-                        for (i, k) in keep.into_iter().enumerate() {
-                            if i % 2 == 0 {
-                                chains.remove(&k);
-                            }
-                        }
+                        let mut i = 0usize;
+                        chains.retain(|_, _| {
+                            let keep = i % 2 != 0;
+                            i += 1;
+                            keep
+                        });
                     }
                 })
                 .unwrap();
             }
-            _ => unreachable!(),
         }
 
-        assert_cache_consistent(&pool, action, iter);
+        assert_cache_consistent(&pool, action.label(), iter);
 
         // Periodically run a `replace_leaf_and_chains` to exercise
         // audit Finding A's recompute path.
@@ -505,7 +527,11 @@ fn replace_leaf_and_chains_recomputes_cache() {
     );
     new_chains.insert(
         key_for(1),
-        Arc::new(VecDeque::from([pending_entry(501, 1234, b"pending-payload")])),
+        Arc::new(VecDeque::from([pending_entry(
+            501,
+            1234,
+            b"pending-payload",
+        )])),
     );
     new_chains.insert(
         key_for(2),

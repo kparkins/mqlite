@@ -1,12 +1,12 @@
-//! # mqlite — Embedded MongoDB-compatible document store
+//! # mqlite - Embedded MongoDB-compatible document store
 //!
 //! mqlite is a lightweight, embedded document database with MongoDB query semantics.
 //! It is designed for:
 //!
-//! - **Embedded apps** — local storage without a server
-//! - **Test doubles** — replace MongoDB containers with an in-memory database
-//! - **mongosh interop** — inspect mqlite files with familiar MongoDB tooling (via `wire` feature)
-//! - **Edge/IoT** — constrained environments, single-file databases, crash recovery
+//! - **Embedded apps** - local storage without a server
+//! - **Test doubles** - replace MongoDB containers with an in-memory database
+//! - **mongosh interop** - inspect mqlite files with familiar MongoDB tooling (via `wire` feature)
+//! - **Edge/IoT** - constrained environments, single-file databases, crash recovery
 //!
 //! # Quick Start
 //!
@@ -57,33 +57,33 @@
 //!
 //! | Type | `Send` | `Sync` | Notes |
 //! |------|--------|--------|-------|
-//! | [`Client`] | ✅ | ✅ | Clone and share across threads freely |
-//! | [`Database`] | ✅ | ✅ | Lightweight handle, same inner state as `Client` |
-//! | [`Collection<T>`] | ✅ | ✅ | Same shared state as `Client`/`Database` |
-//! | [`Cursor<T>`] | ✅ | ❌ | Move to another thread; use `Mutex` for concurrent access |
-//! | [`Error`] | ✅ | ✅ | — |
+//! | [`Client`] | yes | yes | Clone and share across threads freely |
+//! | [`Database`] | yes | yes | Lightweight handle, same inner state as `Client` |
+//! | [`Collection<T>`] | yes | yes | Same shared state as `Client`/`Database` |
+//! | [`Cursor<T>`] | yes | no | Move to another thread; use `Mutex` for concurrent access |
+//! | [`Error`] | yes | yes | - |
 //!
 //! `Client`, `Database`, and `Collection<T>` can be cloned and sent to other threads without
 //! any additional synchronization. The storage engine coordinates concurrent
 //! writes through MVCC publication, page latches, and DDL admission fences.
 //!
-//! `Cursor<T>` is `Send` but not `Sync` — matching the MongoDB Rust driver contract.
+//! `Cursor<T>` is `Send` but not `Sync` - matching the MongoDB Rust driver contract.
 //! Use `Mutex<Cursor<T>>` if you need to drive a cursor from multiple threads simultaneously.
 //!
 //! # File Lifecycle
 //!
 //! ```text
 //! Client::open("myapp.mqlite")
-//!   ├─ Creates myapp.mqlite            (main database file)
-//!   └─ Creates myapp.mqlite-journal    (write-ahead journal; accumulates writes)
+//!   +- Creates myapp.mqlite            (main database file)
+//!   +- Creates myapp.mqlite-journal    (write-ahead journal; accumulates writes)
 //!
 //! Client::close(self)             (blocking flush + checkpoint)
-//!   └─ myapp.mqlite-journal is checkpointed into myapp.mqlite and removed
-//!      → "single file" state
+//!   +- myapp.mqlite-journal is checkpointed into myapp.mqlite and removed
+//!      -> "single file" state
 //!
 //! drop(client)                    (non-blocking)
-//!   └─ myapp.mqlite-journal remains on disk
-//!      → Replayed automatically on next Client::open
+//!   +- myapp.mqlite-journal remains on disk
+//!      -> Replayed automatically on next Client::open
 //! ```
 //!
 //! The `close()` method is the recommended shutdown path when you need a guaranteed-clean
@@ -93,7 +93,7 @@
 //!
 //! - **File permissions**: new `.mqlite` files are created with mode `0600` (Unix)
 //! - **Symlink prevention**: [`Error::SymlinkRejected`] is returned if the path is a symlink
-//! - **Wire protocol**: no authentication — bind to `127.0.0.1` only;
+//! - **Wire protocol**: no authentication - bind to `127.0.0.1` only;
 //!   see the [Wire Protocol Security Advisory](https://github.com/kyleparkinson/mqlite/blob/master/docs/WIRE-SECURITY.md)
 
 #![cfg_attr(
@@ -115,9 +115,9 @@
 
 /// BSON re-exports for ergonomic use without a direct `bson` dependency.
 pub mod bson;
-/// Client entry point: `Client::open(path)` → `client.database(name)` → `db.collection::<T>(name)`.
+/// Client entry point: `Client::open(path)` -> `client.database(name)` -> `db.collection::<T>(name)`.
 ///
-/// The `Client`, `Database`, and `Collection<T>` handles all live in this module —
+/// The `Client`, `Database`, and `Collection<T>` handles all live in this module -
 /// they share the same `Arc<ClientInner>` and form a single ownership hierarchy.
 pub mod client;
 /// Lazy cursor for iterating query results.
@@ -152,7 +152,7 @@ mod validation;
 pub mod wire;
 
 // ---------------------------------------------------------------------------
-// Public re-exports — `use mqlite::*` or `use mqlite::Database;` etc.
+// Public re-exports - `use mqlite::*` or `use mqlite::Database;` etc.
 // ---------------------------------------------------------------------------
 
 // Core entry points

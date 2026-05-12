@@ -364,10 +364,13 @@ impl SharedState {
     /// stored reason (§10.19.0 C-2 / US-036).
     pub(crate) fn poison_engine(&self, reason: EngineFatalReason) {
         let mut guard = self.engine_poisoned.lock();
-        if guard.is_none() {
-            *guard = Some(reason);
-        }
-        let reason = guard.clone().expect("engine poison reason recorded");
+        let reason = match &*guard {
+            Some(existing) => existing.clone(),
+            None => {
+                *guard = Some(reason.clone());
+                reason
+            }
+        };
         drop(guard);
         self.checkpoint_admission.poison(reason);
     }

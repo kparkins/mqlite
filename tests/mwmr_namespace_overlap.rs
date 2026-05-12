@@ -497,7 +497,7 @@ fn test_long_reader_plus_many_writers_sees_stable_snapshot() {
     let coll = client.database(US019_DB).collection::<Document>(US019_COLL);
     let cursor = coll.find(doc! {}).sort(doc! { "_id": 1 }).run().unwrap();
 
-    let writer_client = client.clone();
+    let writer_client = client;
     let writer = thread::spawn(move || {
         let coll = writer_client
             .database(US019_DB)
@@ -536,7 +536,7 @@ fn test_reader_does_not_block_writers() {
 
     wait_us016_ready(&scan_ready_rx, "US-019 range scan pause");
 
-    let writer_client = client.clone();
+    let writer_client = client;
     let started = Instant::now();
     let writer = thread::spawn(move || {
         let coll = writer_client
@@ -761,7 +761,7 @@ fn test_long_range_scan_does_not_block_concurrent_writer() {
     wait_us016_ready(&scan_ready_rx, "long range scan pause");
 
     let (done_tx, done_rx) = mpsc::channel();
-    let writer_client = client.clone();
+    let writer_client = client;
     let started = Instant::now();
     let writer = thread::spawn(move || {
         let coll = writer_client

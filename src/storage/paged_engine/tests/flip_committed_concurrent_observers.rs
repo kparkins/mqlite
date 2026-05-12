@@ -142,8 +142,9 @@ fn flip_pending_to_committed_only_touches_pending_chains() -> Result<()> {
     };
     let pending_before: Vec<Arc<VecDeque<VersionEntry>>> =
         (0..PENDING_KEYS).map(|i| snap(&pending_key(i))).collect();
-    let background_before: Vec<Arc<VecDeque<VersionEntry>>> =
-        (0..BACKGROUND_KEYS).map(|i| snap(&background_key(i))).collect();
+    let background_before: Vec<Arc<VecDeque<VersionEntry>>> = (0..BACKGROUND_KEYS)
+        .map(|i| snap(&background_key(i)))
+        .collect();
 
     // Run the flip.
     let flip_commit_ts = Ts {
@@ -155,8 +156,9 @@ fn flip_pending_to_committed_only_touches_pending_chains() -> Result<()> {
     // Snapshot every chain Arc AFTER the flip.
     let pending_after: Vec<Arc<VecDeque<VersionEntry>>> =
         (0..PENDING_KEYS).map(|i| snap(&pending_key(i))).collect();
-    let background_after: Vec<Arc<VecDeque<VersionEntry>>> =
-        (0..BACKGROUND_KEYS).map(|i| snap(&background_key(i))).collect();
+    let background_after: Vec<Arc<VecDeque<VersionEntry>>> = (0..BACKGROUND_KEYS)
+        .map(|i| snap(&background_key(i)))
+        .collect();
 
     // Selective-CoW assertion: pending chains MUST have a new Arc
     // (the Phase B swap installed the locally CoW'd flipped chain),

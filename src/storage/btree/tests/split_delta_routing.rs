@@ -91,11 +91,12 @@ fn assert_chain_routed(
     is_tombstone: bool,
 ) -> Result<()> {
     let encoded_key = key(raw_key);
-    let other_chain = tree
-        .store
-        .with_chain_under_latch(other_page, &encoded_key, LatchMode::Exclusive, |slot| {
-            slot.take()
-        })?;
+    let other_chain = tree.store.with_chain_under_latch(
+        other_page,
+        &encoded_key,
+        LatchMode::Exclusive,
+        |slot| slot.take(),
+    )?;
     assert!(
         other_chain.is_none(),
         "key {raw_key} should not be routed to the other split sibling"

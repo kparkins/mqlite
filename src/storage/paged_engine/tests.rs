@@ -132,9 +132,11 @@ fn find_with_sort_and_limit() {
     for i in [3i32, 1, 2] {
         e.insert("test.c", doc! { "v": i }).unwrap();
     }
-    let mut opts = FindOptions::default();
-    opts.sort = Some(doc! { "v": 1 });
-    opts.limit = Some(2);
+    let opts = FindOptions {
+        sort: Some(doc! { "v": 1 }),
+        limit: Some(2),
+        ..Default::default()
+    };
     let (results, _) = e.find("test.c", &doc! {}, &opts).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].get_i32("v").unwrap(), 1);
@@ -202,6 +204,118 @@ fn find_one_and_delete_returns_doc() {
         .unwrap();
     assert!(d.is_some());
     assert_eq!(e.count("test.c", &doc! {}).unwrap(), 0);
+}
+
+#[test]
+fn find_one_and_update_conflicts_when_selected_snapshot_is_behind_pending_head() {
+    use super::hidden_accessors::install_publish_pause;
+    use crate::mvcc::VersionState;
+    use crate::options::ReturnDocument;
+    use std::sync::Barrier;
+
+    const NS: &str = "test.find_one_and_update_claim";
+    const SPIN_LIMIT: usize = 10_000;
+
+    let (engine_raw, _io) = buffered_engine();
+    let engine = Arc::new(engine_raw);
+    engine
+        .insert(NS, doc! { "_id": 0i32, "claimed": false, "worker": -1i32 })
+        .unwrap();
+
+    let coll = engine
+        .metadata_state
+        .catalog_lock()
+        .get_collection(NS)
+        .unwrap()
+        .expect("collection exists");
+    let key = encode_key(&Bson::Int32(0));
+    let tree = BTree::open(
+        BufferPoolPageStore::new(Arc::clone(&engine.shared.handle)),
+        coll.data_root_page,
+        coll.data_root_level,
+    );
+    let leaf = tree.find_leaf(&key).expect("target leaf exists");
+
+    let gate = Arc::new(Barrier::new(2));
+    let _guard = install_publish_pause(&engine.shared, Arc::clone(&gate));
+
+    let first_engine = Arc::clone(&engine);
+    let first = std::thread::spawn(move || {
+        let opts = FindOneAndUpdateOptions {
+            return_document: ReturnDocument::After,
+            upsert: false,
+            sort: Some(doc! { "_id": 1 }),
+        };
+        first_engine
+            .find_one_and_update(
+                NS,
+                &doc! { "claimed": false },
+                &doc! { "$set": { "claimed": true, "worker": 1i32 } },
+                &opts,
+            )
+            .expect("first claim should commit")
+    });
+
+    let mut saw_pending = false;
+    for _ in 0..SPIN_LIMIT {
+        let entries = engine
+            .shared
+            .handle
+            .pool()
+            .us009_chain_entries(leaf, &key)
+            .expect("read primary chain");
+        if entries
+            .first()
+            .is_some_and(|entry| matches!(entry.state, VersionState::Pending { .. }))
+        {
+            saw_pending = true;
+            break;
+        }
+        if first.is_finished() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    if !saw_pending {
+        if !first.is_finished() {
+            gate.wait();
+        }
+        let _ = first.join().expect("first writer thread panicked");
+        panic!("first writer must pause with a resident Pending primary head");
+    }
+
+    let opts = FindOneAndUpdateOptions {
+        return_document: ReturnDocument::After,
+        upsert: false,
+        sort: Some(doc! { "_id": 1 }),
+    };
+    let second = engine.find_one_and_update(
+        NS,
+        &doc! { "claimed": false },
+        &doc! { "$set": { "claimed": true, "worker": 2i32 } },
+        &opts,
+    );
+
+    gate.wait();
+    let claimed = first.join().expect("first writer thread panicked");
+
+    assert!(
+        matches!(
+            second,
+            Err(Error::WriteConflict {
+                reason: WriteConflictReason::StaleSnapshot
+            })
+        ),
+        "second writer must not pair its stale selected document with the \
+         foreign Pending head"
+    );
+
+    assert_eq!(
+        claimed.and_then(|doc| doc.get_i32("worker").ok()),
+        Some(1),
+        "first writer owns the only successful claim"
+    );
 }
 
 // -----------------------------------------------------------------------

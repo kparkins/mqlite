@@ -27,7 +27,9 @@ The sidecar must also declare either:
 - `docs_per_writer` and `batch_size`.
 
 `run_baselines.py` currently emits fixed-count runs with `docs_per_writer` and
-`batch_size`.
+`batch_size`. It also emits `teardown_policy` to record whether child
+`perf_matrix` processes skipped final drop-time checkpoint work after printing
+their operation-only metric.
 
 ## Row Object
 
@@ -36,6 +38,7 @@ Every `rows[]` entry requires:
 | Field | Type | Meaning |
 |---|---|---|
 | `axis` | string | Axis name from the allowed set below. |
+| `durability` | string | Durability label from the allowed set below. |
 | `writers` | unsigned integer | Writer count for the axis. |
 | `median_dps` | number | Median documents or operations per second. |
 | `min_dps` | number | Minimum run throughput. |
@@ -43,6 +46,7 @@ Every `rows[]` entry requires:
 | `envelope` | number | `(max - min) / median`; must be non-negative. |
 
 `min_dps <= median_dps <= max_dps` must hold.
+Rows are identified by `(axis, writers, durability)`.
 
 ## Allowed Axes
 
@@ -62,6 +66,15 @@ Every `rows[]` entry requires:
 The first seven names are emitted by the current `perf_matrix` default matrix.
 The remaining names are retained so older or targeted sidecars can still round
 trip through the schema test.
+
+## Allowed Durability Labels
+
+- `full-sync`
+- `interval-50ms`
+- `none`
+
+The default sidecar runner emits every allowed durability for every default
+axis. Targeted runs may restrict the set with `--durability`.
 
 ## Empty Directory Behavior
 

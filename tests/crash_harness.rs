@@ -92,6 +92,7 @@ pub struct RecoveryReport {
 ///
 /// The journal path is `<db_path>-journal`, matching the convention in
 /// `src/journal/mod.rs:journal_path_for`.
+#[must_use]
 pub fn journal_path(db_path: &Path) -> std::path::PathBuf {
     let mut s = db_path.as_os_str().to_owned();
     s.push("-journal");
@@ -99,6 +100,7 @@ pub fn journal_path(db_path: &Path) -> std::path::PathBuf {
 }
 
 /// Return FullSync open options for crash/recovery integration tests.
+#[must_use]
 pub fn fullsync_options() -> DbOpenOptions {
     DbOpenOptions::new().durability(DurabilityMode::FullSync)
 }

@@ -109,12 +109,12 @@ pub(super) struct Frame {
     /// `tests/running_sum_cache_invariant.rs` for the 10k-mutation
     /// stress proof.
     ///
-    /// **Memory ordering:** writers update via `Acquire` load + arithmetic
-    /// + `Release` store under the page-local exclusive latch (which
-    /// already serializes mutator vs reader). The Acquire/Release pair
-    /// is defense-in-depth: it makes the cache safe to read under a
-    /// shared latch without a correctness migration if a future PR
-    /// chooses to relax the read.
+    /// Memory ordering: writers update via `Acquire` load + arithmetic +
+    /// `Release` store under the page-local exclusive latch, which already
+    /// serializes mutator vs reader. The Acquire/Release pair is
+    /// defense-in-depth: it makes the cache safe to read under a shared
+    /// latch without a correctness migration if a future PR chooses to relax
+    /// the read.
     pub(super) live_delta_payload_bytes: AtomicU64,
     /// Phase 5 §10.18 page-local latch. Acquired AFTER the partition mutex
     /// is released by `BufferPool::pin_for_read`/`pin_for_write` and held

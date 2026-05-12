@@ -11,8 +11,10 @@ Use `perf_matrix` for write-throughput and point-read baselines:
 ```bash
 cargo build --release --bin perf_matrix
 target/release/perf_matrix --list-axes
+target/release/perf_matrix --list-durability
 target/release/perf_matrix \
     --axis multi_writer_single_ns_single \
+    --durability interval-50ms \
     --writers 4 \
     --docs-per-writer 20000 \
     --batch-size 100
@@ -34,6 +36,9 @@ timed window starts after database setup, namespace creation, thread creation,
 and synthetic document generation. The JSON output includes
 `"timed_scope":"operation_only"` for this contract.
 
+The sidecar driver runs `perf_matrix` with `--exit-after-measurement` so final
+drop-time checkpoint work does not delay operation-only throughput collection.
+
 Run the median sidecar driver from the same folder:
 
 ```bash
@@ -43,6 +48,10 @@ benches/perf/run_baselines.py \
     --docs-per-writer 20000 \
     --batch-size 100
 ```
+
+The sidecar driver runs all durability labels by default:
+`full-sync`, `interval-50ms`, and `none`. Use repeated `--durability` flags for
+targeted rows.
 
 Quick smoke:
 

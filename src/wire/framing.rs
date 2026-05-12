@@ -69,6 +69,10 @@ pub async fn read_message(stream: &mut TcpStream) -> Result<OpMsg> {
 }
 
 /// Write a pre-serialised OP_MSG response to `stream`.
+///
+/// # Errors
+///
+/// Returns an I/O error if the socket write fails.
 pub async fn write_message(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     stream.write_all(bytes).await?;
     Ok(())

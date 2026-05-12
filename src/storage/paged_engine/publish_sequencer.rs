@@ -434,10 +434,11 @@ impl PublishSequencer {
             // Take the slot out so the closure (which can re-enter the
             // sequencer through `published_frontier` loads) doesn't
             // borrow `g`.
-            let slot = g
-                .pending
-                .remove(&next)
-                .expect("first_entry was Some immediately above");
+            let Some(slot) = g.pending.remove(&next) else {
+                return Err(Error::Internal(
+                    "publish slot vanished during sequencer advance".into(),
+                ));
+            };
             match slot.state {
                 PublishSlotState::Pending => {
                     // Re-insert and stop: writer hasn't transitioned yet.

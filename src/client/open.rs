@@ -34,7 +34,7 @@ impl Client {
     /// Open a database file. Creates the file if it does not exist.
     ///
     /// Automatically replays the journal on recovery. Uses sensible defaults
-    /// (64MB buffer pool, 100ms durability interval, 5s busy timeout).
+    /// (64MB buffer pool, 50ms durability interval, 5s busy timeout).
     ///
     /// # Errors
     ///
@@ -211,7 +211,7 @@ impl Client {
             opts.busy_timeout,
             opts.busy_handler.clone(),
             opts.smo_classification_retry_cap,
-            opts.durability.clone(),
+            opts.durability,
         )?);
         let inner = Arc::new(ClientInner::new(Some(path.clone()), file_lock, engine));
         #[cfg(feature = "tracing")]

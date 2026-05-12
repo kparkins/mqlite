@@ -55,7 +55,7 @@ pub fn append_logical_replay_frames(
         .write(true)
         .open(db_path)?;
     let header = read_main_header(db_path)?;
-    let mut journal = JournalManager::open_or_create(db_path, &header, &mut main_file)?;
+    let journal = JournalManager::open_or_create(db_path, &header, &mut main_file)?;
     let (salt1, salt2) = journal.salts();
     let publish_seq_base = journal.recovered_max_publish_seq().unwrap_or(0);
     for (idx, frame) in frames.iter().enumerate() {

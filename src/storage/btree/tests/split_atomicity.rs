@@ -209,12 +209,7 @@ impl BTreePageStore for ObservedStore {
         self.with_store_mut(|store| store.with_chain_under_latch(page, key, mode, f))
     }
 
-    fn with_all_chains_under_latch<R, F>(
-        &mut self,
-        page: u32,
-        mode: LatchMode,
-        f: F,
-    ) -> Result<R>
+    fn with_all_chains_under_latch<R, F>(&mut self, page: u32, mode: LatchMode, f: F) -> Result<R>
     where
         F: FnOnce(&mut BTreeMap<Vec<u8>, ChainArc>) -> R,
     {
@@ -289,10 +284,14 @@ fn run_split_atomicity_case(distribution: ChainDistribution) -> Result<()> {
     split_window.watch_page(left_page);
     let watched_keys = encoded_keys(distribution);
     for watched_key in &watched_keys {
-        tree.store
-            .with_chain_under_latch(left_page, watched_key, LatchMode::Exclusive, |slot| {
+        tree.store.with_chain_under_latch(
+            left_page,
+            watched_key,
+            LatchMode::Exclusive,
+            |slot| {
                 *slot = Some(chain());
-            })?;
+            },
+        )?;
     }
 
     let namespace_lane = Arc::new(Mutex::new(()));

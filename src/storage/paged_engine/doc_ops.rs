@@ -6,14 +6,15 @@ use std::sync::Arc;
 
 use bson::{Bson, Document};
 
-use crate::error::{Error, Result};
-use crate::mvcc::transaction::{ExpectedHead, Ns};
+use crate::error::{Error, Result, WriteConflictReason};
+use crate::mvcc::transaction::{ExpectedHead, Ns, PrimaryTarget};
+use crate::mvcc::{VersionData, VersionEntry, VersionState};
 use crate::options::{
     FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
     ReturnDocument, UpdateOptions,
 };
 use crate::results::{DeleteResult, UpdateResult};
-use crate::storage::btree::BTree;
+use crate::storage::btree::{read_overflow_chain, BTree};
 use crate::update::{apply_update, is_operator_update, upsert_base_from_filter};
 use crate::validation::validate_document;
 
@@ -46,10 +47,33 @@ fn unsorted_materialization_limit(opts: &FindOptions) -> Option<usize> {
     )
 }
 
-fn expected_head_for_key(
+fn selected_version_stale() -> Error {
+    Error::WriteConflict {
+        reason: WriteConflictReason::StaleSnapshot,
+    }
+}
+
+fn expected_head_from_entry(entry: &VersionEntry) -> ExpectedHead {
+    ExpectedHead {
+        commit_ts: entry.start_ts,
+        txn_id: entry.txn_id,
+    }
+}
+
+fn version_entry_bytes(store: &BufferPoolPageStore, entry: &VersionEntry) -> Result<Vec<u8>> {
+    match &entry.data {
+        VersionData::Inline(bytes) => Ok(bytes.clone()),
+        VersionData::Overflow(overflow) => {
+            read_overflow_chain(store, overflow.first_page(), overflow.total_length() as u32)
+        }
+    }
+}
+
+fn expected_head_for_selected_doc(
     shared: &SharedState,
     ns_snap: &NamespaceSnapshot,
     key: &[u8],
+    selected: &Document,
 ) -> Result<Option<ExpectedHead>> {
     let tree = BTree::open(
         BufferPoolPageStore::new(Arc::clone(&shared.handle)),
@@ -58,7 +82,23 @@ fn expected_head_for_key(
     );
     let leaf_page = tree.find_leaf(key)?;
     let page = shared.handle.pool().pin_for_read(leaf_page)?;
-    Ok(page.expected_head(key))
+    let Some(head) = page.live_head(key) else {
+        return Ok(None);
+    };
+    drop(page);
+
+    if !matches!(head.state, VersionState::Committed) || head.is_tombstone {
+        return Err(selected_version_stale());
+    }
+
+    let store = BufferPoolPageStore::new(Arc::clone(&shared.handle));
+    let live_bytes = version_entry_bytes(&store, &head)?;
+    let live_doc: Document = bson::from_slice(&live_bytes).map_err(Error::BsonDeserialization)?;
+    if &live_doc != selected {
+        return Err(selected_version_stale());
+    }
+
+    Ok(Some(expected_head_from_entry(&head)))
 }
 
 fn attach_expected_heads(
@@ -69,7 +109,7 @@ fn attach_expected_heads(
     pairs
         .into_iter()
         .map(|(key, doc)| {
-            let expected_head = expected_head_for_key(shared, ns_snap, &key)?;
+            let expected_head = expected_head_for_selected_doc(shared, ns_snap, &key, &doc)?;
             Ok((key, doc, expected_head))
         })
         .collect()
@@ -117,10 +157,12 @@ pub(super) fn stage_insert(
         ns,
     )?;
     txn.stage_primary_insert(
-        entry.id,
-        ns_arc,
-        entry.data_root_page,
-        entry.data_root_level,
+        PrimaryTarget::new(
+            entry.id,
+            ns_arc,
+            entry.data_root_page,
+            entry.data_root_level,
+        ),
         key,
         bson_bytes,
         None,
@@ -152,10 +194,12 @@ fn stage_insert_snapshot(
         ns,
     )?;
     txn.stage_primary_insert(
-        ns_snap.id,
-        ns,
-        ns_snap.data_root_page,
-        ns_snap.data_root_level,
+        PrimaryTarget::new(
+            ns_snap.id,
+            ns,
+            ns_snap.data_root_page,
+            ns_snap.data_root_level,
+        ),
         key,
         bson_bytes,
         None,
@@ -281,10 +325,12 @@ pub(super) fn update(
                 )?;
                 if let Some(entry) = md.catalog_lock().get_collection(ns)? {
                     txn.stage_primary_update(
-                        entry.id,
-                        ns_arc.clone(),
-                        entry.data_root_page,
-                        entry.data_root_level,
+                        PrimaryTarget::new(
+                            entry.id,
+                            ns_arc.clone(),
+                            entry.data_root_page,
+                            entry.data_root_level,
+                        ),
                         key,
                         new_bytes,
                         expected_head,
@@ -413,10 +459,12 @@ pub(super) fn find_one_and_update(
         maintain_secondary_on_update(shared, md, ns, &before, &doc, &before_id, &new_id, vis, txn)?;
         if let Some(entry) = md.catalog_lock().get_collection(ns)? {
             txn.stage_primary_update(
-                entry.id,
-                ns_arc.clone(),
-                entry.data_root_page,
-                entry.data_root_level,
+                PrimaryTarget::new(
+                    entry.id,
+                    ns_arc.clone(),
+                    entry.data_root_page,
+                    entry.data_root_level,
+                ),
                 key,
                 new_bytes,
                 expected_head,
@@ -532,10 +580,12 @@ pub(super) fn find_one_and_replace(
         )?;
         if let Some(entry) = md.catalog_lock().get_collection(ns)? {
             txn.stage_primary_update(
-                entry.id,
-                ns_arc.clone(),
-                entry.data_root_page,
-                entry.data_root_level,
+                PrimaryTarget::new(
+                    entry.id,
+                    ns_arc.clone(),
+                    entry.data_root_page,
+                    entry.data_root_level,
+                ),
                 old_key,
                 new_bytes,
                 expected_head,

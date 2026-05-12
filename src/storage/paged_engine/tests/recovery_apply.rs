@@ -142,7 +142,7 @@ fn append_bad_overflow_replay_frame(db_path: &Path) {
         .open(db_path)
         .expect("open main file");
     let header = read_main_header(db_path);
-    let mut mgr =
+    let mgr =
         JournalManager::open_or_create(db_path, &header, &mut main_file).expect("open journal");
     let (salt1, salt2) = mgr.salts();
     let publish_seq = mgr.recovered_max_publish_seq().unwrap_or(0) + 1;

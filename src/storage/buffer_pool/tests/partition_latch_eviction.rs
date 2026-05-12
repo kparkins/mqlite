@@ -8,7 +8,7 @@
 use super::*;
 
 #[cfg(not(loom))]
-use crate::storage::buffer_pool::{PageSize, PageSource};
+use crate::storage::test_support::ZeroIo;
 
 #[cfg(not(loom))]
 const PAGE_A: u32 = 301;
@@ -18,22 +18,6 @@ const PAGE_B: u32 = 302;
 const LARGE_PAGE_BYTES: usize = 32 * 1024;
 #[cfg(not(loom))]
 const TEST_CAPACITY: usize = 2;
-
-#[cfg(not(loom))]
-struct ZeroIo;
-
-#[cfg(not(loom))]
-impl PageSource for ZeroIo {
-    fn read_page(&self, _page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
-        assert_eq!(buf.len(), size.bytes());
-        buf.fill(0);
-        Ok(())
-    }
-
-    fn write_page(&self, _page_number: u32, _size: PageSize, _buf: &[u8]) -> Result<()> {
-        Ok(())
-    }
-}
 
 #[cfg(not(loom))]
 fn resident_partition() -> Partition {

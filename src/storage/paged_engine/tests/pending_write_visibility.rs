@@ -166,13 +166,14 @@ fn test_writer_read_sees_own_pending_before_publish() -> Result<()> {
     // assertion BEFORE releasing the gate; once the writer publishes,
     // §10.19 C-1 advances the live frontier and the foreign-Pending
     // visibility predicate flips (US-037).
-    if observed.is_err() {
-        gate.wait();
-        writer.join().expect("writer thread panicked");
-        observed?;
-        unreachable!("observed was Err; we returned above via ?");
-    }
-    let observed = observed.expect("observed is Ok");
+    let observed = match observed {
+        Ok(observed) => observed,
+        Err(error) => {
+            gate.wait();
+            writer.join().expect("writer thread panicked");
+            return Err(error);
+        }
+    };
     assert_eq!(
         observed.snapshot.chain_len(&key),
         1,

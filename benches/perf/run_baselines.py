@@ -5,6 +5,8 @@ Default plan:
     - 1 warm-up run (discarded) + N=11 measurement runs per (axis, writers).
     - Fixed documents per writer; synthetic document generation is outside
       the measured window.
+    - Child perf_matrix processes exit after printing their operation-only
+      measurement so final drop-time checkpoints are not charged to the run.
     - Reject (axis, writers) groups whose envelope (max-min)/median > 0.05.
 
 Usage:
@@ -31,6 +33,9 @@ PERF_BIN = "target/release/perf_matrix"
 DPS_FIELD_DEFAULT = "docs_per_second"
 DPS_FIELD_READ = "ops_per_second"
 
+# Canonical durability labels accepted by perf_matrix.
+DEFAULT_DURABILITIES: list[str] = ["full-sync", "interval-50ms", "none"]
+
 # Canonical run matrix (axis, writers).
 DEFAULT_MATRIX: list[tuple[str, int]] = [
     ("single_writer_single_ns_single", 1),
@@ -46,6 +51,7 @@ DEFAULT_MATRIX: list[tuple[str, int]] = [
 @dataclass
 class RunResult:
     axis: str
+    durability: str
     writers: int
     raw_dps: list[float]
 
@@ -59,6 +65,7 @@ class RunResult:
     def to_row(self) -> dict:
         return {
             "axis": self.axis,
+            "durability": self.durability,
             "writers": self.writers,
             "median_dps": round(self.median(), 2),
             "min_dps": round(min(self.raw_dps), 2),
@@ -70,6 +77,7 @@ class RunResult:
 
 def run_axis_once(
     axis: str,
+    durability: str,
     writers: int,
     docs_per_writer: int,
     batch_size: int,
@@ -80,6 +88,9 @@ def run_axis_once(
         PERF_BIN,
         "--axis",
         axis,
+        "--durability",
+        durability,
+        "--exit-after-measurement",
         "--docs-per-writer",
         str(docs_per_writer),
         "--batch-size",
@@ -113,6 +124,7 @@ def run_axis_once(
 
 def collect_axis(
     axis: str,
+    durability: str,
     writers: int,
     runs: int,
     docs_per_writer: int,
@@ -121,18 +133,39 @@ def collect_axis(
     read_seed_docs: int,
 ) -> RunResult:
     print(
-        f"[run] axis={axis} writers={writers} runs={runs} "
+        f"[run] axis={axis} durability={durability} writers={writers} runs={runs} "
         f"docs_per_writer={docs_per_writer} batch_size={batch_size}",
         flush=True,
     )
     # Discard warm-up.
-    _ = run_axis_once(axis, writers, docs_per_writer, batch_size, read_ops, read_seed_docs)
+    _ = run_axis_once(
+        axis,
+        durability,
+        writers,
+        docs_per_writer,
+        batch_size,
+        read_ops,
+        read_seed_docs,
+    )
     dps_values: list[float] = []
     for i in range(runs):
-        dps = run_axis_once(axis, writers, docs_per_writer, batch_size, read_ops, read_seed_docs)
+        dps = run_axis_once(
+            axis,
+            durability,
+            writers,
+            docs_per_writer,
+            batch_size,
+            read_ops,
+            read_seed_docs,
+        )
         dps_values.append(dps)
         print(f"  run {i + 1}/{runs}: {dps:.2f}", flush=True)
-    return RunResult(axis=axis, writers=writers, raw_dps=dps_values)
+    return RunResult(
+        axis=axis,
+        durability=durability,
+        writers=writers,
+        raw_dps=dps_values,
+    )
 
 
 def hardware_string() -> str:
@@ -177,6 +210,12 @@ def main(argv: Iterable[str]) -> int:
         "May be passed multiple times.",
     )
     p.add_argument(
+        "--durability",
+        action="append",
+        choices=DEFAULT_DURABILITIES,
+        help="Restrict durability mode. May be passed multiple times.",
+    )
+    p.add_argument(
         "--quick",
         action="store_true",
         help="3 runs with reduced fixed counts (smoke).",
@@ -203,29 +242,33 @@ def main(argv: Iterable[str]) -> int:
                 return _fail(f"--axis must be of form axis@writers, got {spec!r}")
             wanted.append((axis, int(w)))
         matrix = wanted
+    durabilities = args.durability or DEFAULT_DURABILITIES
 
     started = time.time()
     rows: list[dict] = []
     rejected: list[str] = []
     for axis, writers in matrix:
-        result = collect_axis(
-            axis,
-            writers,
-            runs,
-            docs_per_writer,
-            args.batch_size,
-            read_ops,
-            read_seed_docs,
-        )
-        env = result.envelope()
-        row = result.to_row()
-        if env > 0.05:
-            print(
-                f"  WARN: envelope {env:.4f} > 0.05 for {axis}@{writers}; record kept",
-                flush=True,
+        for durability in durabilities:
+            result = collect_axis(
+                axis,
+                durability,
+                writers,
+                runs,
+                docs_per_writer,
+                args.batch_size,
+                read_ops,
+                read_seed_docs,
             )
-            rejected.append(f"{axis}@{writers}={env:.4f}")
-        rows.append(row)
+            env = result.envelope()
+            row = result.to_row()
+            if env > 0.05:
+                print(
+                    f"  WARN: envelope {env:.4f} > 0.05 for "
+                    f"{axis}@{writers}/{durability}; record kept",
+                    flush=True,
+                )
+                rejected.append(f"{axis}@{writers}/{durability}={env:.4f}")
+            rows.append(row)
 
     sidecar = {
         "date": time.strftime("%Y-%m-%d"),
@@ -233,6 +276,8 @@ def main(argv: Iterable[str]) -> int:
         "hardware": hardware_string(),
         "build_cmd": "cargo build --release --bin perf_matrix",
         "matrix_version": "perf_matrix_v1",
+        "teardown_policy": "exit_after_operation_measurement",
+        "durabilities": durabilities,
         "axis_runs": runs,
         "docs_per_writer": docs_per_writer,
         "batch_size": args.batch_size,

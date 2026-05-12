@@ -400,7 +400,7 @@ fn test_close_and_drain_cannot_be_starved_by_new_admits() -> Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let hammer_stop = Arc::clone(&stop);
-    let hammer_registry = registry.clone();
+    let hammer_registry = registry;
     let hammer = thread::spawn(move || -> u64 {
         let mut admits_after_close = 0_u64;
         while !hammer_stop.load(Ordering::Acquire) {
@@ -449,7 +449,7 @@ fn test_ddl_drain_completes_after_poisoned_successor_drops_ticket() -> Result<()
     });
     thread::sleep(SHORT_SLEEP);
 
-    let drain_registry = registry.clone();
+    let drain_registry = registry;
     let drain = thread::spawn(move || drain_registry.close_and_drain(TEST_NS_ID, DRAIN_TIMEOUT_MS));
     thread::sleep(SHORT_SLEEP);
 

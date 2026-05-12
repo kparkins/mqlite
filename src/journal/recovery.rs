@@ -129,9 +129,7 @@ impl JournalManager {
             checkpoint_seq = checkpoint_seq.wrapping_add(1);
             let mut header = super::log_file::JournalHeader::new(salt1, salt2);
             header.checkpoint_seq = checkpoint_seq;
-            journal_file
-                .seek(SeekFrom::Start(0))
-                .map_err(Error::Io)?;
+            journal_file.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
             journal_file
                 .write_all(&header.to_bytes())
                 .map_err(Error::Io)?;
@@ -274,10 +272,10 @@ impl JournalManager {
                     )
                 })?;
                 if !known_batch_ids.contains(&frame.batch_id) {
-                    orphan_truncate_lsn = Some(
-                        orphan_truncate_lsn
-                            .map_or(record.record.start_lsn, |prev| prev.min(record.record.start_lsn)),
-                    );
+                    orphan_truncate_lsn =
+                        Some(orphan_truncate_lsn.map_or(record.record.start_lsn, |prev| {
+                            prev.min(record.record.start_lsn)
+                        }));
                     continue;
                 }
                 pending_pages_by_batch
@@ -302,9 +300,8 @@ impl JournalManager {
         let mut recovered_max_commit_ts = (main_header.last_checkpoint_ts != Ts::default())
             .then_some(main_header.last_checkpoint_ts);
         if let Some(boundary_ts) = highest_boundary_ts {
-            recovered_max_commit_ts = Some(
-                recovered_max_commit_ts.map_or(boundary_ts, |prev| prev.max(boundary_ts)),
-            );
+            recovered_max_commit_ts =
+                Some(recovered_max_commit_ts.map_or(boundary_ts, |prev| prev.max(boundary_ts)));
         }
         let mut recovered_max_publish_seq = None;
         let mut applied_catalog_commit = false;

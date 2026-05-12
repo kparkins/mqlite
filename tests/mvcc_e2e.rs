@@ -350,7 +350,7 @@ fn overflow_pages_stable_under_mixed_load() {
     }
     // ReadView churn.
     let s_churn = Arc::clone(&stop);
-    let churn_client = client.clone();
+    let churn_client = client;
     handles.push(thread::spawn(move || {
         let reg = churn_client
             .__read_view_registry()

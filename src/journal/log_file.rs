@@ -440,9 +440,7 @@ impl LogRecordPayload {
             }
             LogRecordKind::CatalogCommit => Ok(Self::CatalogCommit(payload.to_vec())),
             LogRecordKind::CheckpointBoundary => Ok(Self::CheckpointBoundary(payload.to_vec())),
-            LogRecordKind::CheckpointPageFrame => {
-                Ok(Self::CheckpointPageFrame(payload.to_vec()))
-            }
+            LogRecordKind::CheckpointPageFrame => Ok(Self::CheckpointPageFrame(payload.to_vec())),
         }
     }
 }
@@ -1189,9 +1187,7 @@ impl CheckpointPageFramePayload {
             ));
         }
         if buf[0..4] != CHECKPOINT_PAGE_FRAME_PAYLOAD_MAGIC {
-            return Err(invalid_log_record(
-                "Phase 8 CheckpointPageFrame bad magic",
-            ));
+            return Err(invalid_log_record("Phase 8 CheckpointPageFrame bad magic"));
         }
         let version = read_u16(buf, 4);
         if version != CHECKPOINT_PAGE_FRAME_PAYLOAD_VERSION {

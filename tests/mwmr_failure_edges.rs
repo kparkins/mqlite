@@ -459,7 +459,7 @@ fn test_expected_head_mismatch_yields_stale_snapshot() {
     });
     hook_a.wait_until_entered().expect("writer A entered body");
 
-    let client_b = client.clone();
+    let client_b = client;
     let writer_b = thread::spawn(move || {
         client_b
             .database("db")

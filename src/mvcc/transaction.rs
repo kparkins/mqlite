@@ -81,7 +81,7 @@ impl From<&str> for Ns {
 
 impl From<String> for Ns {
     fn from(s: String) -> Self {
-        Ns(Arc::from(s.as_str()))
+        Ns(Arc::from(s))
     }
 }
 
@@ -180,6 +180,27 @@ pub(crate) struct PrimaryWrite {
     pub expected_head: Option<ExpectedHead>,
     /// Kind of write, carrying any associated payload bytes.
     pub(crate) op: PrimaryOp,
+}
+
+/// Target primary tree metadata captured when a write is staged.
+#[derive(Debug, Clone)]
+pub(crate) struct PrimaryTarget {
+    ns_id: i64,
+    ns: Ns,
+    root_page: u32,
+    root_level: u8,
+}
+
+impl PrimaryTarget {
+    /// Create primary tree metadata for a staged write.
+    pub(crate) fn new(ns_id: i64, ns: impl Into<Ns>, root_page: u32, root_level: u8) -> Self {
+        Self {
+            ns_id,
+            ns: ns.into(),
+            root_page,
+            root_level,
+        }
+    }
 }
 
 /// Primary-tree mutation kind.
@@ -357,19 +378,16 @@ impl WriteTxn {
     /// Stage a primary-tree insert for commit-time chain installation.
     pub(crate) fn stage_primary_insert(
         &mut self,
-        ns_id: i64,
-        ns: impl Into<Ns>,
-        root_page: u32,
-        root_level: u8,
+        target: PrimaryTarget,
         key: Vec<u8>,
         data: Vec<u8>,
         expected_head: Option<ExpectedHead>,
     ) {
         self.pending_primary.push(PrimaryWrite {
-            ns_id,
-            ns: ns.into(),
-            root_page,
-            root_level,
+            ns_id: target.ns_id,
+            ns: target.ns,
+            root_page: target.root_page,
+            root_level: target.root_level,
             key,
             expected_head,
             op: PrimaryOp::Insert { data },
@@ -379,19 +397,16 @@ impl WriteTxn {
     /// Stage a primary-tree update for commit-time chain installation.
     pub(crate) fn stage_primary_update(
         &mut self,
-        ns_id: i64,
-        ns: impl Into<Ns>,
-        root_page: u32,
-        root_level: u8,
+        target: PrimaryTarget,
         key: Vec<u8>,
         data: Vec<u8>,
         expected_head: Option<ExpectedHead>,
     ) {
         self.pending_primary.push(PrimaryWrite {
-            ns_id,
-            ns: ns.into(),
-            root_page,
-            root_level,
+            ns_id: target.ns_id,
+            ns: target.ns,
+            root_page: target.root_page,
+            root_level: target.root_level,
             key,
             expected_head,
             op: PrimaryOp::Update { data },
@@ -502,9 +517,11 @@ impl WriteTxn {
     ///    chain. The returned `Vec<OverflowRef>` must be consumed by the
     ///    caller; otherwise the refcounts decref on vec drop and the newly
     ///    committed chain becomes dangling.
+    ///
     /// Returns `(commit_ts, pending, pending_sec_index)`. Callers that
     /// stage no overflow data may drop the returned vecs, which runs
-    /// `OverflowRef::Drop` on every entry — correct for no-op commits.
+    /// `OverflowRef::Drop` on every entry - correct for no-op commits.
+    ///
     /// Build and drain the ChainCommit payload without appending it.
     pub(crate) fn prepare_chain_commit_payload(
         mut self,

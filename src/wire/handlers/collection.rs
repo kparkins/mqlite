@@ -83,7 +83,7 @@ pub(super) fn handle_list_collections(body: &Document, state: &ServerState) -> D
         .filter_map(|name| {
             // Names are stored as "db.collection" — strip the db prefix.
             let name = name.strip_prefix(&db_prefix)?;
-            if name_filter.map_or(false, |filter| name != filter) {
+            if name_filter.is_some_and(|filter| name != filter) {
                 return None;
             }
             Some(bson::Bson::Document(doc! {

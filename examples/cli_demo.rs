@@ -48,13 +48,13 @@ fn main() -> mqlite::Result<()> {
     };
 
     tasks.insert_one(&t1)?;
-    println!("  ✓ Inserted: {}", t1.title);
+    println!("  Inserted: {}", t1.title);
     tasks.insert_one(&t2)?;
-    println!("  ✓ Inserted: {}", t2.title);
+    println!("  Inserted: {}", t2.title);
     tasks.insert_one(&t3)?;
-    println!("  ✓ Inserted: {}", t3.title);
+    println!("  Inserted: {}", t3.title);
     tasks.insert_one(&t4)?;
-    println!("  ✓ Inserted: {}", t4.title);
+    println!("  Inserted: {}", t4.title);
 
     // --- Count all tasks ---
     println!(
@@ -101,7 +101,7 @@ fn main() -> mqlite::Result<()> {
         .run()?;
     for task in cursor.take(10) {
         let t = task?;
-        let status = if t.done { "✓" } else { "○" };
+        let status = if t.done { "done" } else { "open" };
         println!(
             "  {} [{priority}] {}",
             status,

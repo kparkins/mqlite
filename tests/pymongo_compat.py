@@ -63,10 +63,10 @@ def test(name):
             try:
                 fn(client)
                 _passed.append(name)
-                print(f"  ✓ {name}")
+                print(f"  PASS {name}")
             except Exception as exc:
                 _failed.append((name, exc))
-                print(f"  ✗ {name}: {exc}")
+                print(f"  FAIL {name}: {exc}")
         wrapper._test_name = name
         return wrapper
     return decorator
@@ -319,7 +319,7 @@ def test_find_one_and_update_no_match_returns_none(client):
         {"nonexistent": True},
         {"$set": {"x": 1}},
     )
-    assert_true(result is None, "no match → None")
+    assert_true(result is None, "no match returns None")
 
 
 @register
@@ -553,10 +553,10 @@ def run_all(port: int) -> int:
         try:
             fn(client)
             _passed.append(name)
-            print(f"  ✓ {name}")
+            print(f"  PASS {name}")
         except Exception as exc:
             _failed.append((name, exc))
-            print(f"  ✗ {name}: {exc}")
+            print(f"  FAIL {name}: {exc}")
 
     client.close()
 
@@ -565,9 +565,9 @@ def run_all(port: int) -> int:
     if _failed:
         print("\nFailed tests:")
         for name, exc in _failed:
-            print(f"  ✗ {name}: {exc}")
+            print(f"  FAIL {name}: {exc}")
     else:
-        print("All tests passed ✓")
+        print("All tests passed")
     print(f"{'=' * 65}\n")
 
     return 0 if not _failed else 1

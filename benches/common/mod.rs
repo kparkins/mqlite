@@ -10,7 +10,7 @@ use mqlite::{Client, DurabilityMode, OpenOptions};
 use tempfile::TempDir;
 
 /// Human-readable label for the shared interval durability setting.
-pub(crate) const INTERVAL_100MS_LABEL: &str = "Interval(100ms)";
+pub(crate) const INTERVAL_50MS_LABEL: &str = "Interval(50ms)";
 
 /// Return host metadata printed by benchmark harnesses.
 pub(crate) fn host_metadata() -> String {
@@ -51,8 +51,8 @@ pub(crate) fn non_empty_command_output(program: &str, args: &[&str]) -> String {
 }
 
 /// Return the interval durability mode shared by throughput benchmarks.
-pub(crate) fn interval_100ms() -> DurabilityMode {
-    DurabilityMode::Interval(Duration::from_millis(100))
+pub(crate) fn interval_50ms() -> DurabilityMode {
+    DurabilityMode::Interval(Duration::from_millis(50))
 }
 
 /// Open a benchmark database at `path` using the supplied durability mode.
@@ -61,7 +61,7 @@ pub(crate) fn open_client(path: &Path, mode: DurabilityMode) -> Client {
     Client::open_with_options(path, opts).expect("open must succeed")
 }
 
-/// Open `bench.mqlite` in `dir` with 100ms interval durability.
+/// Open `bench.mqlite` in `dir` with 50ms interval durability.
 pub(crate) fn open_interval_client(dir: &TempDir) -> Client {
-    open_client(&dir.path().join("bench.mqlite"), interval_100ms())
+    open_client(&dir.path().join("bench.mqlite"), interval_50ms())
 }

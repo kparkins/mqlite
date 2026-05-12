@@ -185,7 +185,10 @@ fn concurrent_with_chain_calls_serialize_through_the_latch() {
             slot.take()
         })
         .unwrap();
-    assert!(taken.is_some(), "take returns the previously installed chain");
+    assert!(
+        taken.is_some(),
+        "take returns the previously installed chain"
+    );
 
     pool.with_chain_under_latch(PAGE_ID, KEY, LatchMode::Exclusive, |slot| {
         assert!(slot.is_none(), "third closure must observe the take");

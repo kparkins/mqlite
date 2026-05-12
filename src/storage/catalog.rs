@@ -557,13 +557,10 @@ impl<S: BTreePageStore> Catalog<S> {
         // Remove all index entries first (range delete).
         let start = index_prefix_start(name);
         let end_excl = index_prefix_end(name);
-        let index_entries = self.tree.range_scan(Some(&start), Some(&end_excl))?;
-        let index_keys: Vec<Vec<u8>> = index_entries
-            .into_iter()
-            .filter(|(k, _)| k.starts_with(&start) && k < &end_excl)
-            .map(|(k, _)| k)
-            .collect();
-        for k in index_keys {
+        for (k, _) in self.tree.range_scan(Some(&start), Some(&end_excl))? {
+            if !k.starts_with(&start) || k >= end_excl {
+                break;
+            }
             self.tree.delete(&k)?;
         }
 

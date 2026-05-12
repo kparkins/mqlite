@@ -816,9 +816,12 @@ fn t3_5_merge_into_left_migrates_orphan_chain() {
 
     let orphan = tree
         .store
-        .with_chain_under_latch(tree.root_page, b"orphan-key", LatchMode::Exclusive, |slot| {
-            slot.take()
-        })
+        .with_chain_under_latch(
+            tree.root_page,
+            b"orphan-key",
+            LatchMode::Exclusive,
+            |slot| slot.take(),
+        )
         .unwrap()
         .expect("orphan chain survived merge-into-left");
     assert_eq!(orphan[0].txn_id, 0xEE);
@@ -856,9 +859,12 @@ fn t3_5_merge_into_right_migrates_orphan_chain() {
 
     let orphan = tree
         .store
-        .with_chain_under_latch(tree.root_page, b"orphan-key", LatchMode::Exclusive, |slot| {
-            slot.take()
-        })
+        .with_chain_under_latch(
+            tree.root_page,
+            b"orphan-key",
+            LatchMode::Exclusive,
+            |slot| slot.take(),
+        )
         .unwrap()
         .expect("orphan chain survived merge-into-right");
     assert_eq!(orphan[0].txn_id, 0xFF);

@@ -250,14 +250,11 @@ fn dispatch_op_msg_list_databases() {
         !dbs.is_empty(),
         "at least one database must appear after insert"
     );
-    let names: Vec<&str> = dbs
+    let has_testdb = dbs
         .iter()
         .map(|d| d.as_document().unwrap().get_str("name").unwrap())
-        .collect();
-    assert!(
-        names.contains(&"testdb"),
-        "testdb must appear in listDatabases"
-    );
+        .any(|name| name == "testdb");
+    assert!(has_testdb, "testdb must appear in listDatabases");
 }
 
 #[test]
@@ -1334,7 +1331,7 @@ fn merge_doc_sequences_merges_kind1_documents() {
         Section::Body(body.clone()),
         Section::DocSequence {
             identifier: "documents".to_owned(),
-            documents: docs.clone(),
+            documents: docs,
         },
     ];
     let merged = merge_doc_sequences_into_body(&body, &sections);

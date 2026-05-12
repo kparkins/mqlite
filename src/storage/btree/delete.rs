@@ -213,24 +213,31 @@ impl<S: BTreePageStore> BTree<S> {
                 .with_all_chains_under_latch(left_page, LatchMode::Exclusive, |c| {
                     std::mem::take(c).into_iter().collect()
                 })?;
-        chains.extend(
-            self.store
-                .with_all_chains_under_latch(right_page, LatchMode::Exclusive, |c| {
-                    std::mem::take(c).into_iter().collect::<Vec<_>>()
-                })?,
-        );
+        chains.extend(self.store.with_all_chains_under_latch(
+            right_page,
+            LatchMode::Exclusive,
+            |c| std::mem::take(c).into_iter().collect::<Vec<_>>(),
+        )?);
 
         for (key, chain) in chains {
             if key.as_slice() < separator_key {
-                self.store
-                    .with_chain_under_latch(left_page, &key, LatchMode::Exclusive, |slot| {
+                self.store.with_chain_under_latch(
+                    left_page,
+                    &key,
+                    LatchMode::Exclusive,
+                    |slot| {
                         *slot = Some(chain);
-                    })?;
+                    },
+                )?;
             } else {
-                self.store
-                    .with_chain_under_latch(right_page, &key, LatchMode::Exclusive, |slot| {
+                self.store.with_chain_under_latch(
+                    right_page,
+                    &key,
+                    LatchMode::Exclusive,
+                    |slot| {
                         *slot = Some(chain);
-                    })?;
+                    },
+                )?;
             }
         }
 

@@ -881,7 +881,7 @@ fn test_ddl_during_writer_body_does_not_deadlock_or_post_durable_write_conflict(
     );
     let ddl_done = Arc::new(AtomicBool::new(false));
     let ddl_done_flag = Arc::clone(&ddl_done);
-    let ddl_client = client.clone();
+    let ddl_client = client;
     let ddl = thread::spawn(move || -> Result<(), Error> {
         let res = ddl_client.database(DB).create_collection(COLL_B);
         ddl_done_flag.store(true, Ordering::Release);
@@ -1012,7 +1012,7 @@ fn test_admitted_writer_ticket_blocks_close_and_drain() {
         .__us036_admit_writer(ns_id, 5_000)
         .expect("admit writer ticket");
 
-    let drain_client = client.clone();
+    let drain_client = client;
     let drain = thread::spawn(move || drain_client.__us036_close_and_drain(ns_id, 5_000));
 
     // Give the drain thread time to enter its wait loop.
@@ -1024,11 +1024,10 @@ fn test_admitted_writer_ticket_blocks_close_and_drain() {
 
     drop(ticket);
 
-    let res = drain
+    drain
         .join()
         .expect("drain thread joined")
         .expect("close_and_drain completes after the ticket drops");
-    let _ = res;
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,7 +1058,7 @@ fn test_create_index_barrier_drains_writers() {
 
     let ddl_done = Arc::new(AtomicBool::new(false));
     let ddl_done_flag = Arc::clone(&ddl_done);
-    let ddl_client = client.clone();
+    let ddl_client = client;
     let ddl = thread::spawn(move || -> Result<(), Error> {
         let res = ddl_client
             .database(DB)
@@ -1119,7 +1118,7 @@ fn test_ddl_writer_pre_admit_id_capture_interleaving_does_not_deadlock() {
 
     let ddl_done = Arc::new(AtomicBool::new(false));
     let ddl_done_flag = Arc::clone(&ddl_done);
-    let ddl_client = client.clone();
+    let ddl_client = client;
     let ddl = thread::spawn(move || -> Result<(), Error> {
         let res = ddl_client
             .database(DB)
@@ -1987,7 +1986,7 @@ fn test_drop_namespace_force_expire_with_concurrent_writers() {
 
     let drop_done = Arc::new(AtomicBool::new(false));
     let drop_done_flag = Arc::clone(&drop_done);
-    let drop_client = client.clone();
+    let drop_client = client;
     let dropper = thread::spawn(move || -> Result<(), Error> {
         let res = drop_client.database(DB).drop_collection(COLL_A);
         drop_done_flag.store(true, Ordering::Release);

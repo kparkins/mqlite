@@ -40,6 +40,16 @@ use super::state::SharedState;
 type SnapshotPairs = Vec<(Vec<u8>, Document)>;
 type PlannedSnapshotPairs = (ScanPlan, SnapshotPairs);
 
+struct SnapshotIndexScan<'a> {
+    ready_indexes: &'a [&'a PublishedIndex],
+    filter: &'a Document,
+    view: &'a ReadView,
+    index_name: &'a str,
+    primary_field: &'a str,
+    condition: &'a IndexCondition,
+    match_limit: Option<usize>,
+}
+
 pub(super) fn open_snapshot_read_view(
     shared: &SharedState,
     epoch: Arc<PublishedEpoch>,
@@ -181,22 +191,17 @@ pub(super) fn apply_find_opts(mut docs: Vec<Document>, opts: &FindOptions) -> Ve
 fn execute_index_scan_from_snap(
     shared: &SharedState,
     ns_snap: &NamespaceSnapshot,
-    ready_indexes: &[&PublishedIndex],
-    filter: &Document,
-    view: &ReadView,
-    index_name: &str,
-    primary_field: &str,
-    condition: &IndexCondition,
-    match_limit: Option<usize>,
+    scan: SnapshotIndexScan<'_>,
 ) -> Result<Vec<(Vec<u8>, Document)>> {
-    let idx_snap = ready_indexes
+    let idx_snap = scan
+        .ready_indexes
         .iter()
-        .find(|i| i.name == index_name)
-        .ok_or_else(|| Error::Internal(format!("index '{}' not in snapshot", index_name)))?;
+        .find(|i| i.name == scan.index_name)
+        .ok_or_else(|| Error::Internal(format!("index '{}' not in snapshot", scan.index_name)))?;
 
     let ascending = idx_snap
         .key_pattern
-        .get(primary_field)
+        .get(scan.primary_field)
         .map(|v| !matches!(v, Bson::Int32(-1) | Bson::Int64(-1)))
         .unwrap_or(true);
 
@@ -212,9 +217,11 @@ fn execute_index_scan_from_snap(
             return Ok(true);
         }
         let data_key = encode_key(&id_bson);
-        if let Some(pair) = fetch_primary_pair(&data_tree, data_key, filter, view, Some(&probe))? {
+        if let Some(pair) =
+            fetch_primary_pair(&data_tree, data_key, scan.filter, scan.view, Some(&probe))?
+        {
             docs.push(pair);
-            if match_limit.is_some_and(|limit| docs.len() >= limit) {
+            if scan.match_limit.is_some_and(|limit| docs.len() >= limit) {
                 limit_reached.set(true);
                 return Ok(false);
             }
@@ -222,7 +229,7 @@ fn execute_index_scan_from_snap(
         Ok(true)
     };
 
-    if let IndexCondition::In(vals) = condition {
+    if let IndexCondition::In(vals) = scan.condition {
         for v in vals {
             let mut p = encode_compound_key(&[(v, ascending)]);
             p.push(COMPOUND_SEP);
@@ -235,7 +242,7 @@ fn execute_index_scan_from_snap(
             idx_tree.try_for_each_range_scan_mvcc_bounded(
                 Bound::Included(&p),
                 Bound::Excluded(&p_next),
-                view,
+                scan.view,
                 None,
                 |_, entry_bytes| fetch_index_entry(entry_bytes),
             )?;
@@ -244,7 +251,7 @@ fn execute_index_scan_from_snap(
             }
         }
     } else {
-        let (start, end) = index_bounds_free(condition, ascending);
+        let (start, end) = index_bounds_free(scan.condition, ascending);
         let idx_store = BufferPoolPageStore::new(Arc::clone(&handle));
         let idx_tree = BTree::open(idx_store, idx_snap.root_page, idx_snap.root_level);
         let start_bound = start.as_deref().map_or(Bound::Unbounded, Bound::Included);
@@ -252,7 +259,7 @@ fn execute_index_scan_from_snap(
         idx_tree.try_for_each_range_scan_mvcc_bounded(
             start_bound,
             end_bound,
-            view,
+            scan.view,
             None,
             |_, entry_bytes| fetch_index_entry(entry_bytes),
         )?;
@@ -359,13 +366,15 @@ fn execute_plan_from_snap(
             execute_index_scan_from_snap(
                 shared,
                 ns_snap,
-                ready_indexes,
-                filter,
-                &view,
-                index_name,
-                primary_field,
-                condition,
-                match_limit,
+                SnapshotIndexScan {
+                    ready_indexes,
+                    filter,
+                    view: &view,
+                    index_name,
+                    primary_field,
+                    condition,
+                    match_limit,
+                },
             )
         }
         ScanPlan::CollScan => {

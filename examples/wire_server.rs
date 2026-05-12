@@ -35,7 +35,7 @@ use tempfile::TempDir;
 fn main() -> mqlite::Result<()> {
     let port = parse_port();
     let addr = format!("127.0.0.1:{port}");
-    let _tempdir = TempDir::new().expect("tempdir");
+    let _tempdir = TempDir::new()?;
     let client = Client::open(_tempdir.path().join("db.mqlite"))?;
     println!("mqlite wire server starting on {addr}");
     let _server = WireProtocol::bind(&client, &addr)?;

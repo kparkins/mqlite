@@ -232,7 +232,3 @@ fn torn_non_commit_frame_before_intact_commit_boundary_discards_batch() {
         "recovery must resume appends at the torn frame offset"
     );
 }
-
-// `checkpoint_boundary_rejects_preexisting_pending_legacy_frame` deleted —
-// the legacy 24-byte page-frame allocator (and its `legacy_pending_start_offset`
-// validator) is gone now that every journal write goes through `LogManager`.

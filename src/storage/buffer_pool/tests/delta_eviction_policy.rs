@@ -10,26 +10,13 @@ use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::buffer_pool::partition::Partition;
 use crate::storage::header::FileHeader;
+use crate::storage::test_support::ZeroIo;
 
 const DELTA_PAGE: u32 = 101;
 const SPARE_PAGE: u32 = 102;
 const PRESSURE_PAGE: u32 = 103;
 const DELTA_KEY: &[u8] = b"delta-only";
 const BLOCKED_REASON: &str = "delta-bearing frame; Phase 4 reconcile not yet available";
-
-struct ZeroIo;
-
-impl PageSource for ZeroIo {
-    fn read_page(&self, _page_number: u32, size: PageSize, buf: &mut [u8]) -> Result<()> {
-        assert_eq!(buf.len(), size.bytes());
-        buf.fill(0);
-        Ok(())
-    }
-
-    fn write_page(&self, _page_number: u32, _size: PageSize, _buf: &[u8]) -> Result<()> {
-        Ok(())
-    }
-}
 
 fn ts(physical_ms: u64) -> Ts {
     Ts {

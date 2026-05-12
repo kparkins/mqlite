@@ -234,7 +234,7 @@ def run_spike(server_port: int = 27017):
     findings = {}
 
     try:
-        print(f"Connecting via proxy on :{proxy.proxy_port} → mqlite :{server_port}")
+        print(f"Connecting via proxy on :{proxy.proxy_port} -> mqlite :{server_port}")
         client = pymongo.MongoClient(
             proxy_uri,
             serverSelectionTimeoutMS=5000,
@@ -246,14 +246,14 @@ def run_spike(server_port: int = 27017):
         print("\n[1] admin.command('ping') ...")
         result = client.admin.command("ping")
         assert result.get("ok") == 1, f"ping returned {result}"
-        print(f"    ✓ ping → {result}")
+        print(f"    PASS ping -> {result}")
         findings["ping_ok"] = True
 
         # --- Test 2: hello ---
         print("\n[2] admin.command('hello') ...")
         result = client.admin.command("hello")
         assert result.get("ok") == 1, f"hello returned {result}"
-        print(f"    ✓ hello → ok=1")
+        print("    PASS hello -> ok=1")
         print(f"      isWritablePrimary = {result.get('isWritablePrimary')}")
         print(f"      maxWireVersion    = {result.get('maxWireVersion')}")
         print(f"      mqlite.version    = {result.get('mqlite', {}).get('version', 'n/a')}")
@@ -267,18 +267,18 @@ def run_spike(server_port: int = 27017):
         print("\n[3] admin.command('buildInfo') ...")
         result = client.admin.command("buildInfo")
         assert result.get("ok") == 1, f"buildInfo returned {result}"
-        print(f"    ✓ buildInfo → version={result.get('version')}")
+        print(f"    PASS buildInfo -> version={result.get('version')}")
         findings["buildInfo_ok"] = True
 
-        # --- Test 4: unknown command → CommandNotFound ---
+        # --- Test 4: unknown command returns CommandNotFound ---
         print("\n[4] admin.command('aggregate') [should fail with CommandNotFound] ...")
         try:
             client.admin.command("aggregate")
             findings["unknown_cmd_raises"] = False
-            print("    ✗ Expected OperationFailure, but no error raised")
+            print("    FAIL Expected OperationFailure, but no error raised")
         except pymongo.errors.OperationFailure as e:
             if e.code == 59:
-                print(f"    ✓ Got CommandNotFound (code 59): {e.details.get('errmsg', '')}")
+                print(f"    PASS Got CommandNotFound (code 59): {e.details.get('errmsg', '')}")
                 findings["unknown_cmd_raises"] = True
             else:
                 print(f"    ? Got error code {e.code}: {e}")
@@ -292,7 +292,7 @@ def run_spike(server_port: int = 27017):
 
         # --- Analyse section kinds ---
         print("\n" + "=" * 60)
-        print("Section Kind Analysis (OP_MSG sections from pymongo → mqlite)")
+        print("Section Kind Analysis (OP_MSG sections from pymongo to mqlite)")
         print("=" * 60)
         kind1_seen = False
         for i, req in enumerate(proxy.captured_requests):
@@ -304,7 +304,7 @@ def run_spike(server_port: int = 27017):
             print(
                 f"  Request {i + 1}: sections={kinds}"
                 f"  checksum={checksum}"
-                + (" ← KIND-1!" if has_kind1 else "")
+                + (" <- KIND-1!" if has_kind1 else "")
             )
             for s in req["sections"]:
                 if s["kind"] == 1:
@@ -314,7 +314,7 @@ def run_spike(server_port: int = 27017):
                     )
 
         if not proxy.captured_requests:
-            print("  (no requests captured — proxy may have missed traffic)")
+            print("  (no requests captured - proxy may have missed traffic)")
 
         findings["kind1_observed"] = kind1_seen
         findings["total_requests_captured"] = len(proxy.captured_requests)
@@ -325,12 +325,18 @@ def run_spike(server_port: int = 27017):
         print("\n" + "=" * 60)
         print("SPIKE FINDINGS SUMMARY")
         print("=" * 60)
-        print(f"  ping:        {'✓' if findings.get('ping_ok') else '✗'}")
-        print(f"  hello:       {'✓' if findings.get('hello_ok') else '✗'}")
-        print(f"  buildInfo:   {'✓' if findings.get('buildInfo_ok') else '✗'}")
-        print(f"  CommandNotFound (code 59): {'✓' if findings.get('unknown_cmd_raises') is True else '✗/partial'}")
+        print(f"  ping:        {'PASS' if findings.get('ping_ok') else 'FAIL'}")
+        print(f"  hello:       {'PASS' if findings.get('hello_ok') else 'FAIL'}")
+        print(f"  buildInfo:   {'PASS' if findings.get('buildInfo_ok') else 'FAIL'}")
+        print(
+            "  CommandNotFound (code 59): "
+            f"{'PASS' if findings.get('unknown_cmd_raises') is True else 'FAIL/partial'}"
+        )
         print(f"  Requests captured: {findings.get('total_requests_captured', 0)}")
-        print(f"  Kind-1 sections:   {'YES — implementation needed' if kind1_seen else 'NO — Kind-0 only for these commands'}")
+        print(
+            "  Kind-1 sections:   "
+            f"{'YES - implementation needed' if kind1_seen else 'NO - Kind-0 only for these commands'}"
+        )
         print(f"  CRC32C checksums:  {'YES' if findings.get('checksums_seen') else 'NO'}")
         print()
 
@@ -339,13 +345,13 @@ def run_spike(server_port: int = 27017):
 
     except pymongo.errors.ServerSelectionTimeoutError as e:
         proxy.stop()
-        print(f"\n✗ Could not connect to mqlite server on port {server_port}")
+        print(f"\nFAIL Could not connect to mqlite server on port {server_port}")
         print(f"  Start the server first: cargo run --features wire --example wire_server")
         print(f"  Error: {e}")
         sys.exit(1)
     except Exception as e:
         proxy.stop()
-        print(f"\n✗ Unexpected error: {type(e).__name__}: {e}")
+        print(f"\nFAIL Unexpected error: {type(e).__name__}: {e}")
         raise
 
 
@@ -368,4 +374,4 @@ if __name__ == "__main__":
     if failed:
         print(f"FAILED: {failed}")
         sys.exit(1)
-    print("SPIKE PASSED ✓")
+    print("SPIKE PASSED")

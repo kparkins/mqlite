@@ -1322,18 +1322,7 @@ fn upsert_document(
 }
 
 fn read_ids(collection: &Collection<Document>) -> BoxResult<Vec<i64>> {
-    let cursor = collection.find(doc! {}).limit(0).run()?;
-    let mut values = Vec::new();
-
-    for doc in cursor {
-        let doc = doc?;
-        let value =
-            integer_field(&doc, "_id")?.ok_or_else(|| invalid_data("document is missing _id"))?;
-        values.push(value);
-    }
-
-    values.sort_unstable();
-    Ok(values)
+    read_ids_by_filter(collection, doc! {})
 }
 
 fn read_ids_by_filter(collection: &Collection<Document>, filter: Document) -> BoxResult<Vec<i64>> {

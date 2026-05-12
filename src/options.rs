@@ -22,7 +22,7 @@ pub enum DurabilityMode {
 
 impl Default for DurabilityMode {
     fn default() -> Self {
-        DurabilityMode::Interval(Duration::from_millis(100))
+        DurabilityMode::Interval(Duration::from_millis(50))
     }
 }
 
@@ -55,7 +55,7 @@ impl std::fmt::Debug for BusyHandler {
 pub struct OpenOptions {
     /// Buffer pool size in bytes. Default: 64MB.
     pub(crate) buffer_pool_size: usize,
-    /// Durability mode. Default: `Interval(100ms)`.
+    /// Durability mode. Default: `Interval(50ms)`.
     pub(crate) durability: DurabilityMode,
     /// Journal auto-checkpoint threshold in pages. Default: 1000.
     pub(crate) journal_auto_checkpoint: u32,

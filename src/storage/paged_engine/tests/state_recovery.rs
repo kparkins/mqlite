@@ -130,7 +130,7 @@ fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
         main_file.read_exact(&mut buf).expect("read header");
         FileHeader::from_bytes(&buf).expect("decode header")
     };
-    let mut mgr = JournalManager::open_or_create(db_path, &header, &mut main_file)
+    let mgr = JournalManager::open_or_create(db_path, &header, &mut main_file)
         .expect("open journal manager");
     let (salt1, salt2) = mgr.salts();
     let commit_ts = synthetic_uncheckpointed_ts(&header, commit_ts);

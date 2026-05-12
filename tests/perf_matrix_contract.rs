@@ -12,6 +12,8 @@ const REQUIRED_AXES: &[&str] = &[
     "multi_writer_multi_ns_batch",
 ];
 
+const REQUIRED_DURABILITIES: &[&str] = &["full-sync", "interval-50ms", "none"];
+
 #[test]
 fn benchmark_surface_is_consolidated_under_benches() {
     assert!(Path::new("benches/perf/perf_matrix.rs").is_file());
@@ -27,11 +29,11 @@ fn benchmark_surface_is_consolidated_under_benches() {
 }
 
 #[test]
-fn perf_matrix_lists_required_write_axes() {
+fn perf_matrix_lists_required_write_axes() -> Result<(), String> {
     let output = Command::new(env!("CARGO_BIN_EXE_perf_matrix"))
         .arg("--list-axes")
         .output()
-        .expect("run perf_matrix --list-axes");
+        .map_err(|error| format!("run perf_matrix --list-axes: {error}"))?;
     assert!(
         output.status.success(),
         "perf_matrix --list-axes failed: {}",
@@ -42,10 +44,33 @@ fn perf_matrix_lists_required_write_axes() {
     for axis in REQUIRED_AXES {
         assert!(stdout.lines().any(|line| line == *axis), "missing {axis}");
     }
+    Ok(())
 }
 
 #[test]
-fn perf_matrix_smoke_runs_single_and_multi_namespace_axes() {
+fn perf_matrix_lists_required_durability_modes() -> Result<(), String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_perf_matrix"))
+        .arg("--list-durability")
+        .output()
+        .map_err(|error| format!("run perf_matrix --list-durability: {error}"))?;
+    assert!(
+        output.status.success(),
+        "perf_matrix --list-durability failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for durability in REQUIRED_DURABILITIES {
+        assert!(
+            stdout.lines().any(|line| line == *durability),
+            "missing {durability}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn perf_matrix_smoke_runs_single_and_multi_namespace_axes() -> Result<(), String> {
     for (axis, writers) in [
         ("single_writer_single_ns_single", "1"),
         ("multi_writer_multi_ns_batch", "2"),
@@ -60,9 +85,10 @@ fn perf_matrix_smoke_runs_single_and_multi_namespace_axes() {
                 "2",
                 "--batch-size",
                 "2",
+                "--exit-after-measurement",
             ])
             .output()
-            .unwrap_or_else(|error| panic!("run perf_matrix {axis}: {error}"));
+            .map_err(|error| format!("run perf_matrix {axis}: {error}"))?;
         assert!(
             output.status.success(),
             "perf_matrix {axis} failed: {}",
@@ -73,4 +99,37 @@ fn perf_matrix_smoke_runs_single_and_multi_namespace_axes() {
         assert!(stdout.contains("\"timed_scope\":\"operation_only\""));
         assert!(stdout.contains(&format!("\"axis\":\"{axis}\"")));
     }
+    Ok(())
+}
+
+#[test]
+fn perf_matrix_smoke_runs_supported_durability_modes() -> Result<(), String> {
+    for durability in REQUIRED_DURABILITIES {
+        let output = Command::new(env!("CARGO_BIN_EXE_perf_matrix"))
+            .args([
+                "--axis",
+                "single_writer_single_ns_single",
+                "--durability",
+                durability,
+                "--writers",
+                "1",
+                "--docs-per-writer",
+                "1",
+                "--batch-size",
+                "1",
+                "--exit-after-measurement",
+            ])
+            .output()
+            .map_err(|error| format!("run perf_matrix {durability}: {error}"))?;
+        assert!(
+            output.status.success(),
+            "perf_matrix {durability} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"timed_scope\":\"operation_only\""));
+        assert!(stdout.contains(&format!("\"durability\":\"{durability}\"")));
+    }
+    Ok(())
 }

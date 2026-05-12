@@ -50,7 +50,6 @@ use crate::storage::page::PAGE_SIZE_LEAF;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::paged_engine::group_commit_observations;
 
-
 pub(crate) use self::recovery::ParsedLogicalFrames;
 
 use self::log_file::{

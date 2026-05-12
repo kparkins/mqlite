@@ -75,13 +75,13 @@ use crate::journal::log_file::PageId;
 use crate::mvcc::metrics;
 use crate::mvcc::read_view::{ChainSnapshot, ReadView, ReadViewRegistry};
 use crate::mvcc::version::{VersionEntry, VersionState};
-use crate::mvcc::{ExpectedHead, Ts};
+use crate::mvcc::Ts;
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::page::{LEAF_HEADER_SIZE, PAGE_SIZE_LEAF, PAGE_TYPE_LEAF};
 use crate::storage::reconcile::driver::TreeIdent;
 
-use page_latch::{PageLatch, PageLatchExclusive, PageLatchShared};
 pub(crate) use page_latch::LatchMode;
+use page_latch::{PageLatch, PageLatchExclusive, PageLatchShared};
 use partition::{Frame, Partition};
 
 /// Default warning threshold for delta-bearing frame density.
@@ -394,11 +394,11 @@ impl<'pool> LatchedPinnedPage<'pool> {
         Ok(ChainSnapshot::new_for_key(&frame.deltas, key, view))
     }
 
-    /// Return the identity of the current live chain head for `key`.
+    /// Return the current live chain head for `key`.
     ///
     /// Aborted entries are ignored. Foreign pending entries still count as
     /// live heads for first-committer-wins checks.
-    pub(crate) fn expected_head(&self, key: &[u8]) -> Option<ExpectedHead> {
+    pub(crate) fn live_head(&self, key: &[u8]) -> Option<VersionEntry> {
         // SAFETY: this handle owns a live pin, so the frame slot cannot be
         // evicted. The page latch held by this handle serializes access to
         // the frame-local delta map for latch-aware callers.
@@ -409,10 +409,7 @@ impl<'pool> LatchedPinnedPage<'pool> {
                 .find(|entry| {
                     entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted)
                 })
-                .map(|entry| ExpectedHead {
-                    commit_ts: entry.start_ts,
-                    txn_id: entry.txn_id,
-                })
+                .cloned()
         })
     }
 
@@ -515,7 +512,9 @@ impl<'pool> LatchedPinnedPage<'pool> {
         // shrinks via tombstone or removal.
         let cur = frame.live_delta_payload_bytes.load(Ordering::Acquire);
         let next = cur.wrapping_add(after).wrapping_sub(before);
-        frame.live_delta_payload_bytes.store(next, Ordering::Release);
+        frame
+            .live_delta_payload_bytes
+            .store(next, Ordering::Release);
         Ok(result)
     }
 
@@ -539,7 +538,9 @@ impl<'pool> LatchedPinnedPage<'pool> {
         // full recompute. Used only by leaf-merge migration / overflow
         // repurpose paths — both rare events.
         let total = chains::frame_live_delta_payload_bytes(&frame.deltas);
-        frame.live_delta_payload_bytes.store(total, Ordering::Release);
+        frame
+            .live_delta_payload_bytes
+            .store(total, Ordering::Release);
         Ok(result)
     }
 
@@ -642,9 +643,7 @@ impl<'pool> LatchedPinnedPage<'pool> {
         // not byte-neutral because `Aborted` heads are filtered out by
         // `chain_live_head_bytes`. Keep the running sum in sync by
         // applying the same per-key byte delta as `with_chain`.
-        let mut live_delta_payload_bytes = frame
-            .live_delta_payload_bytes
-            .load(Ordering::Acquire);
+        let mut live_delta_payload_bytes = frame.live_delta_payload_bytes.load(Ordering::Acquire);
         for swap in prepared {
             let before = chains::chain_live_head_bytes(&swap.key, &swap.expected_old);
             let after = chains::chain_live_head_bytes(&swap.key, &swap.new_chain);
@@ -1180,7 +1179,9 @@ impl BufferPool {
         // also has to publish the new leaf-image bytes atomically with
         // the chain swap, so we maintain the cache inline here.
         let total = chains::frame_live_delta_payload_bytes(&frame.deltas);
-        frame.live_delta_payload_bytes.store(total, Ordering::Release);
+        frame
+            .live_delta_payload_bytes
+            .store(total, Ordering::Release);
         frame.mark_unflushable_if_clean();
 
         Ok(())
@@ -1448,9 +1449,7 @@ impl BufferPool {
                 let acquire_start = std::time::Instant::now();
                 let h = LatchHold::Shared(latch_ref.lock_shared());
                 #[cfg(feature = "perf-counters")]
-                metrics_perf::record_shared_latch_wait_ns(
-                    acquire_start.elapsed().as_nanos() as u64,
-                );
+                metrics_perf::record_shared_latch_wait_ns(acquire_start.elapsed().as_nanos() as u64);
                 h
             }
             LatchMode::Exclusive => LatchHold::Exclusive(latch_ref.lock_exclusive()),

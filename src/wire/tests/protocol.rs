@@ -138,7 +138,7 @@ fn invalid_checksum_rejected() {
 #[test]
 fn oversized_message_rejected() {
     // Build a header claiming the message is 49 MiB.
-    let claimed_size = (49 * 1024 * 1024) as i32;
+    let claimed_size = 49 * 1024 * 1024;
     let header = MsgHeader {
         message_length: claimed_size,
         request_id: 1,

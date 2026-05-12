@@ -43,8 +43,9 @@ pub(crate) fn parse_op_query_body(buf: &[u8]) -> Result<Document> {
             detail: "OP_QUERY body too short for query document".into(),
         });
     }
-    let doc_size =
-        i32::from_le_bytes(buf[doc_offset..doc_offset + 4].try_into().expect("4 bytes")) as usize;
+    let mut doc_size_bytes = [0u8; 4];
+    doc_size_bytes.copy_from_slice(&buf[doc_offset..doc_offset + 4]);
+    let doc_size = i32::from_le_bytes(doc_size_bytes) as usize;
     if doc_offset + doc_size > buf.len() {
         return Err(crate::error::Error::InvalidWireMessage {
             detail: format!(
