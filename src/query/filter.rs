@@ -12,7 +12,14 @@
 //!
 //! **Array:** `$elemMatch`, `$all`, `$size`
 //!
-//! **Evaluation:** `$regex`
+//! **Evaluation:** `$regex`, `$mod`
+//!
+//! **Bitwise:** `$bitsAllSet`, `$bitsAnySet`, `$bitsAllClear`, `$bitsAnyClear`
+//!
+//! **Expression:** `$expr` (top-level only; evaluates an aggregation
+//! expression against the whole document and matches on a truthy result)
+//!
+//! **Annotation:** `$comment` (top-level only; parsed and ignored)
 //!
 //! # Cross-type comparison
 //!
@@ -43,12 +50,13 @@ use std::cmp::Ordering;
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result};
+use crate::query::expr::{eval_expr_to_bool, ExprContext};
 
 pub(crate) use util::get_nested_field;
 
 use operators::{
-    eval_all, eval_cmp, eval_elem_match, eval_eq, eval_exists, eval_in, eval_not, eval_regex,
-    eval_size, eval_type,
+    eval_all, eval_bits, eval_cmp, eval_elem_match, eval_eq, eval_exists, eval_in, eval_mod,
+    eval_not, eval_regex, eval_size, eval_type, BitTest,
 };
 use util::{bad_value, require_array, require_document};
 
@@ -92,18 +100,23 @@ fn eval_top_level(doc: &Document, key: &str, condition: &Bson) -> Result<bool> {
         "$and" => eval_logical_and(doc, condition),
         "$or" => eval_logical_or(doc, condition),
         "$nor" => eval_logical_nor(doc, condition),
+        // $comment is a top-level query annotation: parsed and ignored. It has
+        // no effect on matching and accepts any BSON value (MongoDB does not
+        // reject non-string $comment values at this layer).
+        "$comment" => Ok(true),
         // $not at the top level is not a valid MongoDB operator.
         "$not" => Err(bad_value(
             "$not cannot be used at the top level; use $nor instead",
         )),
-        // $expr is explicitly rejected — it uses aggregation expressions which
-        // are not supported in mqlite.  It must never be silently passed through.
+        // $expr evaluates an aggregation expression against the whole document
+        // and matches when the result is truthy. The document is the root of
+        // field paths and `$$ROOT`/`$$CURRENT`. As a top-level key it composes
+        // with siblings via the implicit-AND loop in `eval_filter`, and it
+        // nests inside `$and`/`$or`/`$nor` because those recurse through
+        // `eval_filter`, which dispatches back here.
         "$expr" => {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(target: "mqlite", operator = "$expr", "mqlite::unsupported_op");
-            Err(Error::UnsupportedOperator {
-                operator: "$expr".to_owned(),
-            })
+            let ctx = ExprContext::new(doc);
+            eval_expr_to_bool(condition, &ctx)
         }
         k if k.starts_with('$') => {
             #[cfg(feature = "tracing")]
@@ -257,12 +270,17 @@ fn eval_single_op(field_value: Option<&Bson>, op: &str, arg: &Bson) -> Result<bo
         "$elemMatch" => eval_elem_match(field_value, arg),
         "$all" => eval_all(field_value, arg),
         "$size" => eval_size(field_value, arg),
+        // ---- Evaluation ----
+        "$mod" => eval_mod(field_value, arg),
+        // ---- Bitwise ----
+        "$bitsAllSet" => eval_bits(field_value, arg, BitTest::AllSet),
+        "$bitsAnySet" => eval_bits(field_value, arg, BitTest::AnySet),
+        "$bitsAllClear" => eval_bits(field_value, arg, BitTest::AllClear),
+        "$bitsAnyClear" => eval_bits(field_value, arg, BitTest::AnyClear),
         // ---- Explicitly unsupported operators (error code 9) ----
         // These are named individually to ensure they are never silently ignored.
         "$regex" | "$options" // Evaluation pair — handled by eval_operator_document.
-        | "$expr"         // Aggregation-expression passthrough — explicitly forbidden.
         | "$jsonSchema"   // JSON Schema validation — not implemented.
-        | "$mod"          // Modulo arithmetic — not implemented.
         | "$text"         // Full-text search — not implemented.
         | "$where"        // JavaScript evaluation — intentionally unsupported.
         | "$geoWithin" | "$geoIntersects" | "$near" | "$nearSphere" // Geospatial.

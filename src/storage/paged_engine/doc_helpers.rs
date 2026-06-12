@@ -36,8 +36,8 @@ pub(in crate::storage::paged_engine) fn ensure_id(doc: &mut Document) -> Bson {
 ///
 /// Rejects `text`, `2d`, `2dsphere`, and `hashed` indexes (not yet implemented).
 pub(in crate::storage::paged_engine) fn validate_index_keys(keys: &Document) -> Result<()> {
-    const SUGGESTION: &str = "Supported: single-field, compound, unique, sparse, and multikey \
-         indexes. Text, geospatial, hashed, TTL, and partial indexes are \
+    const SUGGESTION: &str = "Supported: single-field, compound, unique, sparse, multikey, \
+         and partial indexes. Text, geospatial, hashed, and TTL indexes are \
          planned for a future release.";
 
     for (_field, value) in keys {
@@ -138,7 +138,7 @@ pub(in crate::storage::paged_engine) fn check_unique_constraints_mvcc<S: BTreePa
 // Sort / projection helpers (replicated from engine.rs for local use)
 // ---------------------------------------------------------------------------
 
-pub(in crate::storage::paged_engine) fn compare_docs(
+pub(crate) fn compare_docs(
     a: &Document,
     b: &Document,
     sort: &Document,
@@ -156,10 +156,158 @@ pub(in crate::storage::paged_engine) fn compare_docs(
     std::cmp::Ordering::Equal
 }
 
-pub(in crate::storage::paged_engine) fn apply_projection_to_doc(
-    mut doc: Document,
-    proj: &Document,
-) -> Document {
+/// Dotted path separator used by MongoDB projection field names.
+const PATH_SEP: char = '.';
+
+/// A node in the projection path trie.
+///
+/// Each node represents one path segment. A node is `terminal` when a
+/// projection spec named exactly that path (e.g. `"a.b"` makes the `b`
+/// node under `a` terminal). Children are kept in an insertion-ordered
+/// `Vec` so shared-prefix specs merge under one parent (spec point 3).
+///
+/// MongoDB raises a "Path collision" error when a projection names both a
+/// prefix and a path beneath it (e.g. `{"a": 1, "a.b": 1}`). Because
+/// [`apply_projection_to_doc`] is infallible (its callers in `aggregate.rs`
+/// and `read_exec.rs` do not thread a `Result`), collisions are resolved
+/// **last-spec-wins** instead of erroring: a later child spec clears an
+/// earlier terminal, and a later terminal spec clears earlier children.
+#[derive(Default)]
+struct ProjTrie {
+    terminal: bool,
+    children: Vec<(String, ProjTrie)>,
+}
+
+impl ProjTrie {
+    /// Insert a dotted `path` into the trie, marking its final node terminal.
+    ///
+    /// Applies last-spec-wins collision resolution: descending through an
+    /// existing terminal clears that terminal (a child now overrides it), and
+    /// marking a node terminal clears any children it had accumulated.
+    fn insert(&mut self, path: &str) {
+        let mut node = self;
+        let mut parts = path.split(PATH_SEP).peekable();
+        while let Some(seg) = parts.next() {
+            let is_last = parts.peek().is_none();
+            if is_last {
+                // Last-spec-wins: a terminal prefix drops any earlier
+                // children projected beneath it.
+                node = node.child_entry(seg);
+                node.terminal = true;
+                node.children.clear();
+                return;
+            }
+            // Descending past a node clears its terminal flag so a deeper
+            // child spec overrides an earlier prefix spec.
+            node = node.child_entry(seg);
+            node.terminal = false;
+        }
+    }
+
+    /// Return a mutable reference to the child node for `seg`, inserting an
+    /// empty node (preserving insertion order) when absent.
+    fn child_entry(&mut self, seg: &str) -> &mut ProjTrie {
+        let pos = match self.children.iter().position(|(k, _)| k == seg) {
+            Some(pos) => pos,
+            None => {
+                self.children.push((seg.to_owned(), ProjTrie::default()));
+                self.children.len() - 1
+            }
+        };
+        &mut self.children[pos].1
+    }
+
+    /// Look up the immediate child node for `seg`, if any.
+    fn child(&self, seg: &str) -> Option<&ProjTrie> {
+        self.children
+            .iter()
+            .find(|(k, _)| k == seg)
+            .map(|(_, node)| node)
+    }
+}
+
+/// Project a single BSON value against a non-terminal trie `node` in
+/// inclusion mode, returning the projected value to keep, or `None` when the
+/// value must be omitted from the parent.
+///
+/// - Document: keep only fields named by the node (recursing for subnodes);
+///   preserves the document's own field order (spec point 6).
+/// - Array: project each element; document elements are retained even when
+///   they become empty `{}`; non-document elements are removed (spec point 1).
+/// - Scalar at a prefix position: omitted (spec point 1).
+fn project_value_include(value: &Bson, node: &ProjTrie) -> Option<Bson> {
+    match value {
+        Bson::Document(sub) => Some(Bson::Document(project_doc_include(sub, node))),
+        Bson::Array(arr) => {
+            let projected = arr
+                .iter()
+                .filter_map(|elem| match elem {
+                    Bson::Document(sub) => {
+                        Some(Bson::Document(project_doc_include(sub, node)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            Some(Bson::Array(projected))
+        }
+        _ => None,
+    }
+}
+
+/// Build an inclusion-projected document from `doc` against the trie `node`,
+/// preserving `doc`'s field order.
+fn project_doc_include(doc: &Document, node: &ProjTrie) -> Document {
+    let mut result = Document::new();
+    for (key, value) in doc {
+        let Some(child) = node.child(key) else {
+            continue;
+        };
+        if child.terminal {
+            result.insert(key, value.clone());
+        } else if let Some(projected) = project_value_include(value, child) {
+            result.insert(key, projected);
+        }
+    }
+    result
+}
+
+/// Apply an exclusion-projected pass over `doc` in place against `node`.
+///
+/// For each field named by a child: a terminal child removes the field; a
+/// non-terminal child recurses into the field's subdocument (or each document
+/// element of an array). Fields not named by the trie pass through unchanged
+/// (spec point 2).
+fn project_doc_exclude(doc: &mut Document, node: &ProjTrie) {
+    for (seg, child) in &node.children {
+        if child.terminal {
+            doc.remove(seg);
+            continue;
+        }
+        match doc.get_mut(seg) {
+            Some(Bson::Document(sub)) => project_doc_exclude(sub, child),
+            Some(Bson::Array(arr)) => {
+                for elem in arr.iter_mut() {
+                    if let Bson::Document(sub) = elem {
+                        project_doc_exclude(sub, child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Apply a MongoDB find projection to a single document.
+///
+/// Supports dotted paths (`{"a.b": 1}`) at arbitrary depth (spec point 7),
+/// including projection into arrays of embedded documents. Inclusion mode is
+/// selected when any non-`_id` projection value is truthy (spec point 5);
+/// `_id` is retained in inclusion mode unless explicitly excluded.
+///
+/// Path collisions (`{"a": 1, "a.b": 1}`) — which MongoDB rejects — are
+/// resolved last-spec-wins here because this function is infallible; see
+/// [`ProjTrie`].
+pub(crate) fn apply_projection_to_doc(mut doc: Document, proj: &Document) -> Document {
     let is_inclusion = proj
         .iter()
         .filter(|(k, _)| k.as_str() != "_id")
@@ -170,27 +318,158 @@ pub(in crate::storage::paged_engine) fn apply_projection_to_doc(
         .is_some_and(|v| matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false)));
 
     if is_inclusion {
+        let mut trie = ProjTrie::default();
+        for (k, v) in proj {
+            if k == "_id" {
+                continue;
+            }
+            if !matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false)) {
+                trie.insert(k);
+            }
+        }
+
         let mut result = Document::new();
         if !explicit_id_excl {
             if let Some(id) = doc.get("_id") {
                 result.insert("_id", id.clone());
             }
         }
-        for (k, v) in proj {
-            if k == "_id" {
+        // Walk the document in its own field order (spec point 6), skipping
+        // `_id` which is handled above to honor its inclusion override.
+        for (key, value) in &doc {
+            if key == "_id" {
                 continue;
             }
-            if !matches!(v, Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false)) {
-                if let Some(val) = doc.get(k) {
-                    result.insert(k, val.clone());
-                }
+            let Some(child) = trie.child(key) else {
+                continue;
+            };
+            if child.terminal {
+                result.insert(key, value.clone());
+            } else if let Some(projected) = project_value_include(value, child) {
+                result.insert(key, projected);
             }
         }
         result
     } else {
+        let mut trie = ProjTrie::default();
         for (k, _) in proj {
-            doc.remove(k);
+            trie.insert(k);
         }
+        project_doc_exclude(&mut doc, &trie);
         doc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_projection_to_doc;
+    use bson::{doc, Bson};
+
+    #[test]
+    fn nested_inclusion_keeps_only_named_subfield() {
+        let input = doc! { "_id": 1, "a": { "b": 2, "c": 3 }, "d": 4 };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 1 });
+        assert_eq!(out, doc! { "_id": 1, "a": { "b": 2 } });
+    }
+
+    #[test]
+    fn nested_inclusion_omits_scalar_at_prefix() {
+        let input = doc! { "_id": 1, "a": 7 };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 1 });
+        assert_eq!(out, doc! { "_id": 1 });
+    }
+
+    #[test]
+    fn nested_exclusion_removes_only_named_subfield() {
+        let input = doc! { "_id": 1, "a": { "b": 2, "c": 3 }, "d": 4 };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 0 });
+        assert_eq!(out, doc! { "_id": 1, "a": { "c": 3 }, "d": 4 });
+    }
+
+    #[test]
+    fn array_of_docs_inclusion_retains_empty_and_drops_non_docs() {
+        let input = doc! {
+            "_id": 1,
+            "a": [
+                doc! { "b": 1, "x": 9 },
+                doc! { "x": 9 },
+                Bson::Int32(7),
+            ],
+        };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 1 });
+        // Document elements project to only `b`; the doc without `b`
+        // becomes empty `{}` and is retained; the scalar `7` is removed.
+        assert_eq!(
+            out,
+            doc! { "_id": 1, "a": [doc! { "b": 1 }, doc! {}] }
+        );
+    }
+
+    #[test]
+    fn array_of_docs_exclusion_removes_subfield_per_element() {
+        let input = doc! {
+            "_id": 1,
+            "a": [
+                doc! { "b": 1, "c": 2 },
+                doc! { "c": 3 },
+                Bson::Int32(7),
+            ],
+        };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 0 });
+        assert_eq!(
+            out,
+            doc! { "_id": 1, "a": [doc! { "c": 2 }, doc! { "c": 3 }, Bson::Int32(7)] }
+        );
+    }
+
+    #[test]
+    fn shared_prefix_inclusion_merges_into_one_subdoc() {
+        let input = doc! { "_id": 1, "a": { "b": 1, "c": 2, "d": 3 } };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 1, "a.c": 1 });
+        assert_eq!(out, doc! { "_id": 1, "a": { "b": 1, "c": 2 } });
+    }
+
+    #[test]
+    fn three_level_depth_inclusion() {
+        let input = doc! {
+            "_id": 1,
+            "a": { "b": { "c": 5, "x": 6 }, "y": 7 },
+        };
+        let out = apply_projection_to_doc(input, &doc! { "a.b.c": 1 });
+        assert_eq!(out, doc! { "_id": 1, "a": { "b": { "c": 5 } } });
+    }
+
+    #[test]
+    fn id_excluded_in_nested_inclusion() {
+        let input = doc! { "_id": 1, "a": { "b": 2, "c": 3 } };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 1, "_id": 0 });
+        assert_eq!(out, doc! { "a": { "b": 2 } });
+    }
+
+    #[test]
+    fn inclusion_preserves_document_field_order() {
+        // Projection names `c` before `a`, but output must follow the
+        // document's own field order (spec point 6).
+        let input = doc! { "_id": 1, "a": 1, "b": 2, "c": 3 };
+        let out = apply_projection_to_doc(input, &doc! { "c": 1, "a": 1 });
+        let keys: Vec<&str> = out.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["_id", "a", "c"]);
+    }
+
+    #[test]
+    fn collision_parent_then_child_is_last_spec_wins() {
+        // MongoDB errors on `{"a": 1, "a.b": 1}`; mqlite resolves it
+        // last-spec-wins, so the deeper `a.b` spec governs.
+        let input = doc! { "_id": 1, "a": { "b": 2, "c": 3 } };
+        let out = apply_projection_to_doc(input, &doc! { "a": 1, "a.b": 1 });
+        assert_eq!(out, doc! { "_id": 1, "a": { "b": 2 } });
+    }
+
+    #[test]
+    fn collision_child_then_parent_is_last_spec_wins() {
+        // Reverse order: the later whole-`a` spec wins, keeping all of `a`.
+        let input = doc! { "_id": 1, "a": { "b": 2, "c": 3 } };
+        let out = apply_projection_to_doc(input, &doc! { "a.b": 1, "a": 1 });
+        assert_eq!(out, doc! { "_id": 1, "a": { "b": 2, "c": 3 } });
     }
 }

@@ -2,7 +2,22 @@ use super::*;
 use bson::doc;
 
 fn apply(doc: &mut Document, update: &Document) -> Result<()> {
-    apply_update(doc, update, false)
+    apply_update(doc, update, &Document::new(), None, false)
+}
+
+/// Apply an update with a query `filter` (for the positional `$` operator) and
+/// no `arrayFilters`.
+fn apply_with_filter(doc: &mut Document, update: &Document, filter: &Document) -> Result<()> {
+    apply_update(doc, update, filter, None, false)
+}
+
+/// Apply an update with `arrayFilters` and an empty query filter.
+fn apply_with_array_filters(
+    doc: &mut Document,
+    update: &Document,
+    array_filters: &[Document],
+) -> Result<()> {
+    apply_update(doc, update, &Document::new(), Some(array_filters), false)
 }
 
 // ---- $set ---------------------------------------------------------------
@@ -478,7 +493,7 @@ fn pull_all_empty_list_removes_nothing() {
 fn unsupported_operator_returns_error() {
     let mut doc = doc! {};
     // $where takes a string (not a doc) - ensures we check operator before args
-    let result = apply_update(&mut doc, &doc! { "$where": "x > 5" }, false);
+    let result = apply_update(&mut doc, &doc! { "$where": "x > 5" }, &Document::new(), None, false);
     assert!(
         matches!(result, Err(Error::UnsupportedOperator { .. })),
         "expected UnsupportedOperator, got: {:?}",
@@ -486,15 +501,243 @@ fn unsupported_operator_returns_error() {
     );
 }
 
+// ---- $bit ---------------------------------------------------------------
+
 #[test]
-fn bit_operator_returns_unsupported() {
+fn bit_and_i32() {
+    let mut doc = doc! { "flags": 0b1111i32 };
+    apply(&mut doc, &doc! { "$bit": { "flags": { "and": 0b1010i32 } } }).unwrap();
+    assert_eq!(doc.get_i32("flags").unwrap(), 0b1010);
+}
+
+#[test]
+fn bit_or_i32() {
+    let mut doc = doc! { "flags": 0b0101i32 };
+    apply(&mut doc, &doc! { "$bit": { "flags": { "or": 0b1010i32 } } }).unwrap();
+    assert_eq!(doc.get_i32("flags").unwrap(), 0b1111);
+}
+
+#[test]
+fn bit_xor_i32() {
+    let mut doc = doc! { "flags": 0b1100i32 };
+    apply(&mut doc, &doc! { "$bit": { "flags": { "xor": 0b1010i32 } } }).unwrap();
+    assert_eq!(doc.get_i32("flags").unwrap(), 0b0110);
+}
+
+#[test]
+fn bit_and_i64() {
+    let mut doc = doc! { "flags": 0b1111i64 };
+    apply(&mut doc, &doc! { "$bit": { "flags": { "and": 0b1010i64 } } }).unwrap();
+    assert_eq!(doc.get_i64("flags").unwrap(), 0b1010);
+}
+
+#[test]
+fn bit_or_i64() {
+    let mut doc = doc! { "flags": 0b0101i64 };
+    apply(&mut doc, &doc! { "$bit": { "flags": { "or": 0b1010i64 } } }).unwrap();
+    assert_eq!(doc.get_i64("flags").unwrap(), 0b1111);
+}
+
+#[test]
+fn bit_xor_i64() {
+    let mut doc = doc! { "flags": 0b1100i64 };
+    apply(&mut doc, &doc! { "$bit": { "flags": { "xor": 0b1010i64 } } }).unwrap();
+    assert_eq!(doc.get_i64("flags").unwrap(), 0b0110);
+}
+
+#[test]
+fn bit_width_promotion_i32_op_i64_gives_i64() {
+    // Int32 field, Int64 operand → result is Int64.
+    let mut doc = doc! { "v": 0b1111i32 };
+    apply(&mut doc, &doc! { "$bit": { "v": { "and": 0b1010i64 } } }).unwrap();
+    let val = doc.get("v").unwrap();
+    assert!(matches!(val, Bson::Int64(0b1010)), "expected Int64(10), got {val:?}");
+}
+
+#[test]
+fn bit_sequential_multi_op() {
+    // Multiple ops in one doc applied in document order.
+    // Start 0b1111 (15): OR 0b0001 → 15, AND 0b1010 → 10, XOR 0b0011 → 9.
+    let mut doc = doc! { "v": 0b1111i32 };
+    apply(
+        &mut doc,
+        &doc! { "$bit": { "v": { "or": 0b0001i32, "and": 0b1010i32, "xor": 0b0011i32 } } },
+    )
+    .unwrap();
+    assert_eq!(doc.get_i32("v").unwrap(), (0b1111 | 0b0001) & 0b1010 ^ 0b0011);
+}
+
+#[test]
+fn bit_missing_field_created_as_zero() {
     let mut doc = doc! {};
+    apply(&mut doc, &doc! { "$bit": { "flags": { "or": 5i32 } } }).unwrap();
+    assert_eq!(doc.get_i32("flags").unwrap(), 5);
+}
+
+#[test]
+fn bit_dotted_path() {
+    let mut doc = doc! { "a": { "b": 0b1111i32 } };
+    apply(&mut doc, &doc! { "$bit": { "a.b": { "and": 0b1010i32 } } }).unwrap();
+    let inner = doc.get_document("a").unwrap();
+    assert_eq!(inner.get_i32("b").unwrap(), 0b1010);
+}
+
+#[test]
+fn bit_double_operand_error() {
+    let mut doc = doc! { "v": 1i32 };
+    let result = apply(&mut doc, &doc! { "$bit": { "v": { "and": 1.0 } } });
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "expected Internal error for Double operand, got {result:?}"
+    );
+}
+
+#[test]
+fn bit_unknown_op_key_error() {
+    let mut doc = doc! { "v": 1i32 };
+    let result = apply(&mut doc, &doc! { "$bit": { "v": { "nand": 1i32 } } });
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "expected Internal error for unknown op key, got {result:?}"
+    );
+}
+
+#[test]
+fn bit_non_integer_target_error() {
+    let mut doc = doc! { "v": "hello" };
+    let result = apply(&mut doc, &doc! { "$bit": { "v": { "or": 1i32 } } });
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "expected Internal error for non-integer target, got {result:?}"
+    );
+}
+
+#[test]
+fn bit_empty_doc_error() {
+    let mut doc = doc! { "v": 1i32 };
+    // The per-field arg is an empty document.
     let result = apply_update(
         &mut doc,
-        &doc! { "$bit": { "flags": { "or": 3i32 } } },
+        &bson::doc! { "$bit": { "v": {} } },
+        &Document::new(),
+        None,
         false,
     );
-    assert!(matches!(result, Err(Error::UnsupportedOperator { .. })));
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "expected Internal error for empty per-field doc, got {result:?}"
+    );
+}
+
+// ---- $[] all-positional -------------------------------------------------
+
+#[test]
+fn all_positional_set_trailing() {
+    // { $set: { "arr.$[]": 99 } } sets every element of `arr`.
+    let mut doc = doc! { "arr": [1i32, 2i32, 3i32] };
+    apply(&mut doc, &doc! { "$set": { "arr.$[]": 99i32 } }).unwrap();
+    let arr = doc.get_array("arr").unwrap();
+    assert_eq!(arr, &[Bson::Int32(99), Bson::Int32(99), Bson::Int32(99)]);
+}
+
+#[test]
+fn all_positional_nested_field() {
+    // { $set: { "docs.$[].score": 0 } } sets the `score` field in every element.
+    let mut doc = doc! {
+        "docs": [
+            { "score": 10i32 },
+            { "score": 20i32 },
+        ]
+    };
+    apply(&mut doc, &doc! { "$set": { "docs.$[].score": 0i32 } }).unwrap();
+    let arr = doc.get_array("docs").unwrap();
+    for elem in arr {
+        assert_eq!(elem.as_document().unwrap().get_i32("score").unwrap(), 0);
+    }
+}
+
+#[test]
+fn all_positional_doubly_nested() {
+    // `outer.$[].inner.$[]` — two levels of array expansion.
+    let mut doc = doc! {
+        "outer": [
+            { "inner": [1i32, 2i32] },
+            { "inner": [3i32, 4i32] },
+        ]
+    };
+    apply(&mut doc, &doc! { "$set": { "outer.$[].inner.$[]": 0i32 } }).unwrap();
+    let outer = doc.get_array("outer").unwrap();
+    for elem in outer {
+        let inner = elem.as_document().unwrap().get_array("inner").unwrap();
+        assert_eq!(inner, &[Bson::Int32(0), Bson::Int32(0)]);
+    }
+}
+
+#[test]
+fn all_positional_empty_array_noop() {
+    // `$[]` on an empty array succeeds and leaves it empty.
+    let mut doc = doc! { "arr": [] };
+    apply(&mut doc, &doc! { "$set": { "arr.$[]": 99i32 } }).unwrap();
+    let arr = doc.get_array("arr").unwrap();
+    assert!(arr.is_empty());
+}
+
+#[test]
+fn all_positional_missing_path_error() {
+    // Array prefix does not exist → Internal error.
+    let mut doc = doc! {};
+    let result = apply(&mut doc, &doc! { "$set": { "arr.$[]": 1i32 } });
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "expected Internal error for missing prefix, got {result:?}"
+    );
+}
+
+#[test]
+fn all_positional_non_array_error() {
+    // Prefix exists but is not an array → Internal error.
+    let mut doc = doc! { "arr": "not-an-array" };
+    let result = apply(&mut doc, &doc! { "$set": { "arr.$[]": 1i32 } });
+    assert!(
+        matches!(result, Err(Error::Internal(_))),
+        "expected Internal error for non-array prefix, got {result:?}"
+    );
+}
+
+#[test]
+fn all_positional_inc_through_array() {
+    // $inc works through $[] as well.
+    let mut doc = doc! { "scores": [10i32, 20i32, 30i32] };
+    apply(&mut doc, &doc! { "$inc": { "scores.$[]": 5i32 } }).unwrap();
+    let arr = doc.get_array("scores").unwrap();
+    assert_eq!(
+        arr,
+        &[Bson::Int32(15), Bson::Int32(25), Bson::Int32(35)]
+    );
+}
+
+#[test]
+fn positional_dollar_without_query_condition_errors() {
+    // `$` requires a query condition on the array; an empty filter has none.
+    let mut doc = doc! { "arr": [1i32] };
+    let result = apply(&mut doc, &doc! { "$set": { "arr.$": 99i32 } });
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("did not find the match needed from the query"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn filtered_positional_without_array_filter_errors() {
+    // `$[identifier]` requires a matching entry in `arrayFilters`.
+    let mut doc = doc! { "arr": [1i32] };
+    let result = apply(&mut doc, &doc! { "$set": { "arr.$[elem]": 99i32 } });
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        msg.contains("No array filter found for identifier 'elem'"),
+        "{msg}"
+    );
 }
 
 // ---- upsert base from filter --------------------------------------------
@@ -523,6 +766,24 @@ fn upsert_base_skips_logical_operators() {
     assert!(!base.contains_key("x"));
 }
 
+#[test]
+fn upsert_base_adopts_equality_id() {
+    let filter = doc! { "_id": 42i32, "name": "Ann" };
+    let base = upsert_base_from_filter(&filter);
+    assert_eq!(base.get_i32("_id").unwrap(), 42);
+    assert_eq!(base.get_str("name").unwrap(), "Ann");
+}
+
+#[test]
+fn set_allows_nested_id_field() {
+    let mut doc = doc! { "a": { "_id": 1i32 } };
+    apply(&mut doc, &doc! { "$set": { "a._id": 2i32 } }).unwrap();
+    assert_eq!(
+        doc.get_document("a").unwrap().get_i32("_id").unwrap(),
+        2
+    );
+}
+
 // ---- $setOnInsert -------------------------------------------------------
 
 #[test]
@@ -531,6 +792,8 @@ fn set_on_insert_applied_when_is_insert() {
     apply_update(
         &mut doc,
         &doc! { "$setOnInsert": { "created": 1i32 } },
+        &Document::new(),
+        None,
         true,
     )
     .unwrap();
@@ -543,8 +806,255 @@ fn set_on_insert_not_applied_when_not_insert() {
     apply_update(
         &mut doc,
         &doc! { "$setOnInsert": { "created": 1i32 } },
+        &Document::new(),
+        None,
         false,
     )
     .unwrap();
     assert!(!doc.contains_key("created"));
+}
+
+// ---- arrayFilters / $[<identifier>] -------------------------------------
+
+#[test]
+fn array_filter_basic_scalar_condition() {
+    // Set every grade >= 100 to 100.
+    let mut doc = doc! { "grades": [95i32, 102i32, 110i32, 80i32] };
+    apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "grades.$[elem]": 100i32 } },
+        &[doc! { "elem": { "$gte": 100i32 } }],
+    )
+    .unwrap();
+    let grades = doc.get_array("grades").unwrap();
+    assert_eq!(grades[0].as_i32().unwrap(), 95);
+    assert_eq!(grades[1].as_i32().unwrap(), 100);
+    assert_eq!(grades[2].as_i32().unwrap(), 100);
+    assert_eq!(grades[3].as_i32().unwrap(), 80);
+}
+
+#[test]
+fn array_filter_dotted_condition_on_embedded_docs() {
+    // Set mean=100 for embedded docs whose grade >= 85.
+    let mut doc = doc! {
+        "grades": [
+            { "grade": 80i32, "mean": 75i32 },
+            { "grade": 85i32, "mean": 90i32 },
+            { "grade": 90i32, "mean": 85i32 },
+        ]
+    };
+    apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "grades.$[elem].mean": 100i32 } },
+        &[doc! { "elem.grade": { "$gte": 85i32 } }],
+    )
+    .unwrap();
+    let grades = doc.get_array("grades").unwrap();
+    assert_eq!(grades[0].as_document().unwrap().get_i32("mean").unwrap(), 75);
+    assert_eq!(grades[1].as_document().unwrap().get_i32("mean").unwrap(), 100);
+    assert_eq!(grades[2].as_document().unwrap().get_i32("mean").unwrap(), 100);
+}
+
+#[test]
+fn array_filter_multiple_identifiers_in_one_path() {
+    // Nested arrays addressed by two identifiers in one path.
+    let mut doc = doc! {
+        "items": [
+            { "tags": [ { "k": "a", "v": 1i32 }, { "k": "b", "v": 2i32 } ] },
+        ]
+    };
+    apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "items.$[i].tags.$[t].v": 99i32 } },
+        &[doc! { "i.tags": { "$exists": true } }, doc! { "t.k": "b" }],
+    )
+    .unwrap();
+    let tags = doc.get_array("items").unwrap()[0]
+        .as_document()
+        .unwrap()
+        .get_array("tags")
+        .unwrap();
+    assert_eq!(tags[0].as_document().unwrap().get_i32("v").unwrap(), 1);
+    assert_eq!(tags[1].as_document().unwrap().get_i32("v").unwrap(), 99);
+}
+
+#[test]
+fn array_filter_no_match_is_noop() {
+    let mut doc = doc! { "grades": [95i32, 80i32] };
+    apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "grades.$[elem]": 100i32 } },
+        &[doc! { "elem": { "$gte": 200i32 } }],
+    )
+    .unwrap();
+    let grades = doc.get_array("grades").unwrap();
+    assert_eq!(grades[0].as_i32().unwrap(), 95);
+    assert_eq!(grades[1].as_i32().unwrap(), 80);
+}
+
+#[test]
+fn array_filter_unused_is_error() {
+    let mut doc = doc! { "grades": [95i32] };
+    let result = apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "grades.$[a]": 1i32 } },
+        &[doc! { "a": { "$gte": 0i32 } }, doc! { "b": { "$gte": 0i32 } }],
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains("was not used in the update"), "{msg}");
+}
+
+#[test]
+fn array_filter_missing_identifier_is_error() {
+    let mut doc = doc! { "grades": [95i32] };
+    let result = apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "grades.$[missing]": 1i32 } },
+        &[doc! { "elem": { "$gte": 0i32 } }],
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains("No array filter found for identifier 'missing'"), "{msg}");
+}
+
+#[test]
+fn array_filter_duplicate_identifier_is_error() {
+    let mut doc = doc! { "grades": [95i32] };
+    let result = apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "grades.$[a]": 1i32 } },
+        &[doc! { "a": { "$gte": 0i32 } }, doc! { "a": { "$lte": 9i32 } }],
+    );
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains("Found multiple array filters"), "{msg}");
+}
+
+#[test]
+fn array_filter_bad_identifier_is_error() {
+    // `$[1bad]` begins with a digit: not a valid identifier.
+    let mut doc = doc! { "grades": [95i32] };
+    let result = apply_with_array_filters(
+        &mut doc,
+        &doc! { "$set": { "grades.$[1bad]": 1i32 } },
+        &[doc! { "elem": { "$gte": 0i32 } }],
+    );
+    assert!(
+        matches!(result, Err(Error::UnsupportedOperator { .. })),
+        "expected UnsupportedOperator, got {result:?}"
+    );
+}
+
+// ---- positional $ -------------------------------------------------------
+
+#[test]
+fn positional_basic_via_filter_equality() {
+    let mut doc = doc! { "grades": [80i32, 85i32, 90i32] };
+    let filter = doc! { "grades": 85i32 };
+    apply_with_filter(&mut doc, &doc! { "$set": { "grades.$": 100i32 } }, &filter).unwrap();
+    let grades = doc.get_array("grades").unwrap();
+    assert_eq!(grades[0].as_i32().unwrap(), 80);
+    assert_eq!(grades[1].as_i32().unwrap(), 100);
+    assert_eq!(grades[2].as_i32().unwrap(), 90);
+}
+
+#[test]
+fn positional_via_elem_match() {
+    let mut doc = doc! {
+        "items": [
+            { "k": "a", "v": 1i32 },
+            { "k": "b", "v": 2i32 },
+        ]
+    };
+    let filter = doc! { "items": { "$elemMatch": { "k": "b" } } };
+    apply_with_filter(&mut doc, &doc! { "$set": { "items.$.v": 99i32 } }, &filter).unwrap();
+    let items = doc.get_array("items").unwrap();
+    assert_eq!(items[0].as_document().unwrap().get_i32("v").unwrap(), 1);
+    assert_eq!(items[1].as_document().unwrap().get_i32("v").unwrap(), 99);
+}
+
+#[test]
+fn positional_via_dotted_condition() {
+    let mut doc = doc! {
+        "items": [
+            { "k": "a", "v": 1i32 },
+            { "k": "b", "v": 2i32 },
+        ]
+    };
+    let filter = doc! { "items.k": "b" };
+    apply_with_filter(&mut doc, &doc! { "$set": { "items.$.v": 7i32 } }, &filter).unwrap();
+    let items = doc.get_array("items").unwrap();
+    assert_eq!(items[1].as_document().unwrap().get_i32("v").unwrap(), 7);
+}
+
+#[test]
+fn positional_no_condition_is_error() {
+    // Filter references a different field than the positional array path.
+    let mut doc = doc! { "grades": [1i32, 2i32] };
+    let filter = doc! { "other": 1i32 };
+    let result = apply_with_filter(&mut doc, &doc! { "$set": { "grades.$": 9i32 } }, &filter);
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains("did not find the match needed from the query"), "{msg}");
+}
+
+#[test]
+fn positional_no_match_is_error() {
+    let mut doc = doc! { "grades": [1i32, 2i32] };
+    let filter = doc! { "grades": 99i32 };
+    let result = apply_with_filter(&mut doc, &doc! { "$set": { "grades.$": 9i32 } }, &filter);
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains("did not find the match needed from the query"), "{msg}");
+}
+
+#[test]
+fn positional_too_many_is_error() {
+    let mut doc = doc! { "a": [ { "b": [1i32] } ] };
+    let filter = doc! { "a.b": 1i32 };
+    let result = apply_with_filter(&mut doc, &doc! { "$set": { "a.$.b.$": 9i32 } }, &filter);
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains("Too many positional"), "{msg}");
+}
+
+// ---- pipeline-form updates ----------------------------------------------
+
+#[test]
+fn pipeline_set_computed_from_existing_fields() {
+    let original = doc! { "_id": 1i32, "price": 4i32, "qty": 3i32 };
+    let result = apply_update_pipeline(
+        &original,
+        &[doc! { "$set": { "total": { "$multiply": ["$price", "$qty"] } } }],
+    )
+    .unwrap();
+    assert_eq!(result.get_i32("total").unwrap(), 12);
+    assert_eq!(result.get_i32("_id").unwrap(), 1);
+}
+
+#[test]
+fn pipeline_disallowed_stage_is_error() {
+    let original = doc! { "_id": 1i32 };
+    let result = apply_update_pipeline(&original, &[doc! { "$match": { "_id": 1i32 } }]);
+    let msg = format!("{:?}", result.unwrap_err());
+    assert!(msg.contains("is not allowed to be used within an update"), "{msg}");
+}
+
+#[test]
+fn pipeline_id_mutation_is_error() {
+    let original = doc! { "_id": 1i32, "v": 0i32 };
+    let result = apply_update_pipeline(&original, &[doc! { "$set": { "_id": 2i32 } }]);
+    assert!(result.is_err(), "expected immutable _id error");
+}
+
+#[test]
+fn pipeline_restores_dropped_id() {
+    let original = doc! { "_id": 7i32, "v": 1i32 };
+    let result =
+        apply_update_pipeline(&original, &[doc! { "$replaceWith": { "v": 2i32 } }]).unwrap();
+    assert_eq!(result.get_i32("_id").unwrap(), 7);
+    assert_eq!(result.get_i32("v").unwrap(), 2);
+}
+
+#[test]
+fn update_modifications_from_impls() {
+    let from_doc: UpdateModifications = doc! { "$set": { "a": 1i32 } }.into();
+    assert!(matches!(from_doc, UpdateModifications::Document(_)));
+    let from_vec: UpdateModifications = vec![doc! { "$set": { "a": 1i32 } }].into();
+    assert!(matches!(from_vec, UpdateModifications::Pipeline(_)));
 }

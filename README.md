@@ -22,9 +22,10 @@ not yet frozen (see [Release policy](#release-policy)).
 
 ## Highlights
 
-- **MongoDB 8.0 operator semantics**: filters, updates, projections, and
-  index-backed queries, with typed (serde) or untyped `Document` collections.
-  See the [Compatibility Matrix](docs/COMPATIBILITY.md).
+- **MongoDB 8.0 operator semantics**: filters, updates, projections, a
+  minimal aggregation pipeline, and index-backed queries, with typed (serde)
+  or untyped `Document` collections. See the
+  [Compatibility Matrix](docs/COMPATIBILITY.md).
 - **Single file on disk**: one `.mqlite` file after a clean checkpoint, plus
   an append-only journal during writes. Recovery is automatic on open.
 - **WiredTiger-style storage engine**: MVCC snapshot reads, timestamp-ordered
@@ -251,8 +252,12 @@ disk and the next `Client::open` recovers it automatically.
   guard cross-process access).
 - The wire shim has no authentication or TLS; it is for local development
   only ([WIRE-SECURITY.md](docs/WIRE-SECURITY.md)).
-- Aggregation pipelines and a handful of operators are unsupported; the
-  [Compatibility Matrix](docs/COMPATIBILITY.md) is the source of truth.
+- Aggregation supports a substantial stage subset (`$match`, `$sort`,
+  `$skip`, `$limit`, `$project`, `$count`, `$group`, `$addFields`/`$set`,
+  `$unset`, `$replaceRoot`/`$replaceWith`, `$unwind`, `$lookup`,
+  `$sortByCount`) with a broad expression language; some stages and operators
+  are unsupported. The [Compatibility Matrix](docs/COMPATIBILITY.md) is the
+  source of truth.
 
 ## Documentation
 

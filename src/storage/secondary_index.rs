@@ -226,6 +226,30 @@ fn index_field_values<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// Partial-index membership
+// ---------------------------------------------------------------------------
+
+/// Whether `doc` belongs in `index_entry` given its partial filter.
+///
+/// A non-partial index (no `partial_filter_expression`) admits every document.
+/// A partial index admits `doc` iff the document satisfies the partial filter
+/// under the crate's filter evaluator.
+///
+/// # Errors
+///
+/// Propagates any evaluator error (e.g. an unsupported operator). The filter is
+/// validated at create time, so a failure here is a corrupt-catalog signal.
+pub(crate) fn doc_matches_partial_filter(
+    doc: &Document,
+    index_entry: &IndexEntry,
+) -> Result<bool> {
+    match &index_entry.partial_filter_expression {
+        None => Ok(true),
+        Some(pfe) => crate::query::eval_filter(doc, pfe),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unique constraint check
 // ---------------------------------------------------------------------------
 
@@ -377,6 +401,11 @@ pub(crate) fn update_index_on_insert<S: BTreePageStore>(
     history: Option<&dyn HistoryProbe>,
     txn: &mut WriteTxn,
 ) -> Result<bool> {
+    // Partial index: a document outside the partial filter has no entries.
+    if !doc_matches_partial_filter(doc, index_entry)? {
+        return Ok(false);
+    }
+
     let (keys, is_multikey) =
         build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
 
@@ -444,6 +473,12 @@ pub(crate) fn update_index_on_delete(
     index_entry: &IndexEntry,
     txn: &mut WriteTxn,
 ) -> Result<()> {
+    // Partial index: a document outside the partial filter never had entries,
+    // so there is nothing to delete.
+    if !doc_matches_partial_filter(doc, index_entry)? {
+        return Ok(());
+    }
+
     let (keys, _) = build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
 
     for key in keys {
@@ -478,18 +513,26 @@ pub(crate) fn update_index_on_update<S: BTreePageStore>(
     history: Option<&dyn HistoryProbe>,
     txn: &mut WriteTxn,
 ) -> Result<bool> {
-    let (old_keys, _) = build_index_keys(
-        old_doc,
-        &index_entry.key_pattern,
-        old_id,
-        index_entry.sparse,
-    )?;
-    let (new_keys, is_multikey) = build_index_keys(
-        new_doc,
-        &index_entry.key_pattern,
-        new_id,
-        index_entry.sparse,
-    )?;
+    // Partial index: gate each side on membership so the four transitions fall
+    // out of the key-set diff below. A document outside the partial filter
+    // contributes no keys, so:
+    //   stayed-in  (both members)  -> normal diff of changed keys
+    //   stayed-out (neither member) -> both empty -> no-op
+    //   left       (old member only) -> old keys deleted
+    //   entered    (new member only) -> new keys inserted
+    let old_member = doc_matches_partial_filter(old_doc, index_entry)?;
+    let new_member = doc_matches_partial_filter(new_doc, index_entry)?;
+
+    let old_keys = if old_member {
+        build_index_keys(old_doc, &index_entry.key_pattern, old_id, index_entry.sparse)?.0
+    } else {
+        Vec::new()
+    };
+    let (new_keys, is_multikey) = if new_member {
+        build_index_keys(new_doc, &index_entry.key_pattern, new_id, index_entry.sparse)?
+    } else {
+        (Vec::new(), false)
+    };
 
     let old_keys: HashSet<Vec<u8>> = old_keys.into_iter().collect();
     let new_keys: HashSet<Vec<u8>> = new_keys.into_iter().collect();
@@ -555,6 +598,11 @@ fn update_index_on_insert_direct<S: BTreePageStore>(
     index_tree: &mut BTree<S>,
     index_entry: &IndexEntry,
 ) -> Result<bool> {
+    // Partial index: the build scan inserts entries only for matching docs.
+    if !doc_matches_partial_filter(doc, index_entry)? {
+        return Ok(false);
+    }
+
     let (keys, is_multikey) =
         build_index_keys(doc, &index_entry.key_pattern, doc_id, index_entry.sparse)?;
 

@@ -4,7 +4,25 @@ use bson::doc;
 fn make_indexes<'a>(specs: &'a [(&'a str, Document)]) -> Vec<IndexMeta<'a>> {
     specs
         .iter()
-        .map(|(name, keys)| IndexMeta { name, keys })
+        .map(|(name, keys)| IndexMeta {
+            name,
+            keys,
+            pfe: None,
+        })
+        .collect()
+}
+
+/// Build index metas where each spec may carry a partial filter expression.
+fn make_partial_indexes<'a>(
+    specs: &'a [(&'a str, Document, Option<Document>)],
+) -> Vec<IndexMeta<'a>> {
+    specs
+        .iter()
+        .map(|(name, keys, pfe)| IndexMeta {
+            name,
+            keys,
+            pfe: pfe.as_ref(),
+        })
         .collect()
 }
 
@@ -167,4 +185,284 @@ fn collscan_for_exists_false() {
     let indexes = make_indexes(&specs);
     let plan = select_plan(&doc! { "email": { "$exists": false } }, &indexes);
     assert!(matches!(plan, ScanPlan::CollScan));
+}
+
+// ---- select_plan_with_hint ----------------------------------------------
+
+#[test]
+fn hint_none_matches_select_plan() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let plan =
+        select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, None).unwrap();
+    match plan {
+        ScanPlan::IndexScan { ref index_name, .. } => assert_eq!(index_name, "email_1"),
+        _ => panic!("expected IXSCAN"),
+    }
+}
+
+#[test]
+fn hint_by_name_selects_index() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Name("email_1".to_owned());
+    let plan =
+        select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint)).unwrap();
+    match plan {
+        ScanPlan::IndexScan { ref index_name, .. } => assert_eq!(index_name, "email_1"),
+        _ => panic!("expected IXSCAN via name hint"),
+    }
+}
+
+#[test]
+fn hint_by_keys_selects_index() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Keys(doc! { "email": 1i32 });
+    let plan =
+        select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint)).unwrap();
+    match plan {
+        ScanPlan::IndexScan { ref index_name, .. } => assert_eq!(index_name, "email_1"),
+        _ => panic!("expected IXSCAN via keys hint"),
+    }
+}
+
+#[test]
+fn hint_keys_direction_must_match() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    // Asking for descending key pattern when only ascending exists.
+    let hint = Hint::Keys(doc! { "email": -1i32 });
+    let err = select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint));
+    assert!(err.is_err(), "descending key pattern must not match ascending index");
+}
+
+#[test]
+fn hint_overrides_better_index() {
+    // Filter has an exact equality on `email` (would normally pick email_1),
+    // but the hint forces the unrelated `age_1` index. Override must win, and
+    // because the filter has no bound on `age` the scan is unbounded (Any).
+    let specs = [
+        ("email_1", doc! { "email": 1i32 }),
+        ("age_1", doc! { "age": 1i32 }),
+    ];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Name("age_1".to_owned());
+    let plan =
+        select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint)).unwrap();
+    match plan {
+        ScanPlan::IndexScan {
+            ref index_name,
+            ref primary_field,
+            ref condition,
+        } => {
+            assert_eq!(index_name, "age_1");
+            assert_eq!(primary_field, "age");
+            assert!(matches!(condition, IndexCondition::Any));
+        }
+        _ => panic!("hint must override the heuristically-better index"),
+    }
+}
+
+#[test]
+fn hint_with_bounds_uses_filter_condition() {
+    let specs = [("age_1", doc! { "age": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Name("age_1".to_owned());
+    let plan = select_plan_with_hint(
+        &doc! { "age": { "$gt": 18i32 } },
+        &indexes,
+        Some(&hint),
+    )
+    .unwrap();
+    match plan {
+        ScanPlan::IndexScan { ref condition, .. } => {
+            assert!(matches!(condition, IndexCondition::Range { .. }));
+        }
+        _ => panic!("expected bounded IXSCAN from hint + filter"),
+    }
+}
+
+#[test]
+fn bad_hint_name_errors() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Name("nonexistent_1".to_owned());
+    let result = select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint));
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("bad hint name must error"),
+    };
+    assert!(
+        msg.contains("hint provided does not correspond to an existing index"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[test]
+fn bad_hint_keys_errors() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Keys(doc! { "nope": 1i32 });
+    let err = select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint));
+    assert!(err.is_err());
+}
+
+#[test]
+fn natural_hint_forces_collscan() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Keys(doc! { "$natural": 1i32 });
+    // Even with an exact equality match on an indexed field, $natural wins.
+    let plan =
+        select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint)).unwrap();
+    assert!(matches!(plan, ScanPlan::CollScan));
+}
+
+#[test]
+fn natural_hint_negative_one_forces_forward_collscan() {
+    // Divergence: the engine has no reverse scan, so $natural: -1 is treated
+    // as a FORWARD collection scan rather than reverse-order traversal.
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Keys(doc! { "$natural": -1i32 });
+    let plan =
+        select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint)).unwrap();
+    assert!(matches!(plan, ScanPlan::CollScan));
+}
+
+#[test]
+fn id_hint_by_name_with_eq_uses_primary_lookup() {
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Name("_id_".to_owned());
+    let plan = select_plan_with_hint(&doc! { "_id": 7i32 }, &indexes, Some(&hint)).unwrap();
+    assert!(matches!(plan, ScanPlan::PrimaryKeyLookup { .. }));
+}
+
+#[test]
+fn id_hint_by_keys_with_eq_uses_primary_lookup() {
+    let indexes: Vec<IndexMeta<'_>> = Vec::new();
+    let hint = Hint::Keys(doc! { "_id": 1i32 });
+    let plan = select_plan_with_hint(&doc! { "_id": 7i32 }, &indexes, Some(&hint)).unwrap();
+    assert!(matches!(plan, ScanPlan::PrimaryKeyLookup { .. }));
+}
+
+#[test]
+fn id_hint_without_bound_degrades_to_collscan() {
+    // Divergence: no unbounded primary-scan path exists, so an `_id` hint with
+    // no usable `_id` predicate degrades to a collection scan.
+    let specs = [("email_1", doc! { "email": 1i32 })];
+    let indexes = make_indexes(&specs);
+    let hint = Hint::Name("_id_".to_owned());
+    let plan =
+        select_plan_with_hint(&doc! { "email": "a@b.com" }, &indexes, Some(&hint)).unwrap();
+    assert!(matches!(plan, ScanPlan::CollScan));
+}
+
+// ---- partial-index selection (conservative subsumption) ----------------
+
+#[test]
+fn partial_index_selected_when_filter_covers_pfe() {
+    // PFE {qty: {$gt: 10}}; query carries the identical condition plus the
+    // extra leading-field predicate, so the partial index is eligible.
+    let specs = [(
+        "qty_1",
+        doc! { "qty": 1i32 },
+        Some(doc! { "qty": { "$gt": 10i32 } }),
+    )];
+    let indexes = make_partial_indexes(&specs);
+    let plan = select_plan(&doc! { "qty": { "$gt": 10i32 } }, &indexes);
+    match plan {
+        ScanPlan::IndexScan { ref index_name, .. } => assert_eq!(index_name, "qty_1"),
+        _ => panic!("expected partial index to be selected"),
+    }
+}
+
+#[test]
+fn partial_index_skipped_when_filter_does_not_cover_pfe() {
+    // PFE {status: "active"}; query is on a different value, so the index is
+    // skipped and the planner falls back to a collection scan.
+    let specs = [(
+        "status_1",
+        doc! { "status": 1i32 },
+        Some(doc! { "status": "active" }),
+    )];
+    let indexes = make_partial_indexes(&specs);
+    let plan = select_plan(&doc! { "status": "inactive" }, &indexes);
+    assert!(matches!(plan, ScanPlan::CollScan));
+}
+
+#[test]
+fn partial_index_requires_exact_syntactic_condition_match() {
+    // Conservative rule: PFE {qty: {$gt: 10}} is NOT covered by a strictly
+    // narrower query {qty: {$gt: 50}}, even though the result set is a subset.
+    let specs = [(
+        "qty_1",
+        doc! { "qty": 1i32 },
+        Some(doc! { "qty": { "$gt": 10i32 } }),
+    )];
+    let indexes = make_partial_indexes(&specs);
+    let plan = select_plan(&doc! { "qty": { "$gt": 50i32 } }, &indexes);
+    assert!(matches!(plan, ScanPlan::CollScan));
+}
+
+#[test]
+fn uncovered_partial_index_falls_through_to_other_index() {
+    // Two indexes on the same field: a partial one whose PFE is NOT covered and
+    // a plain one. The planner skips the partial and selects the plain index.
+    let specs = [
+        (
+            "qty_partial",
+            doc! { "qty": 1i32 },
+            Some(doc! { "qty": { "$gt": 10i32 } }),
+        ),
+        ("qty_plain", doc! { "qty": 1i32 }, None),
+    ];
+    let indexes = make_partial_indexes(&specs);
+    let plan = select_plan(&doc! { "qty": { "$gt": 50i32 } }, &indexes);
+    match plan {
+        ScanPlan::IndexScan { ref index_name, .. } => assert_eq!(index_name, "qty_plain"),
+        _ => panic!("expected fallback to the plain index"),
+    }
+}
+
+#[test]
+fn partial_index_covered_with_multikey_pfe_keys() {
+    // A PFE with two top-level pairs is covered only when both appear
+    // identically in the query filter.
+    let pfe = doc! { "a": { "$exists": true }, "b": 1i32 };
+    let specs = [("ab_partial", doc! { "a": 1i32 }, Some(pfe))];
+    let indexes = make_partial_indexes(&specs);
+
+    // Missing the `b` pair -> not covered.
+    let plan = select_plan(&doc! { "a": { "$exists": true } }, &indexes);
+    assert!(matches!(plan, ScanPlan::CollScan));
+
+    // Both pairs present and identical -> selected.
+    let plan = select_plan(
+        &doc! { "a": { "$exists": true }, "b": 1i32 },
+        &indexes,
+    );
+    assert!(matches!(plan, ScanPlan::IndexScan { .. }));
+}
+
+#[test]
+fn hint_selects_partial_index_even_when_pfe_uncovered() {
+    // Decision: an explicit hint naming a partial index honors the user's
+    // intent and selects it regardless of PFE coverage (matches MongoDB's
+    // ambiguous behavior toward selecting the hinted index).
+    let specs = [(
+        "qty_partial",
+        doc! { "qty": 1i32 },
+        Some(doc! { "qty": { "$gt": 10i32 } }),
+    )];
+    let indexes = make_partial_indexes(&specs);
+    let hint = Hint::Name("qty_partial".to_owned());
+    let plan =
+        select_plan_with_hint(&doc! { "qty": { "$gt": 50i32 } }, &indexes, Some(&hint)).unwrap();
+    match plan {
+        ScanPlan::IndexScan { ref index_name, .. } => assert_eq!(index_name, "qty_partial"),
+        _ => panic!("expected the hinted partial index to be selected"),
+    }
 }

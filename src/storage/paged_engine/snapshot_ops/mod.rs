@@ -32,7 +32,8 @@ mod read_exec;
 pub(in crate::storage::paged_engine) use checkpoint::{checkpoint, journal_sync, snapshot_bytes};
 pub(in crate::storage::paged_engine) use read_exec::{
     apply_find_opts, open_snapshot_read_view, plan_and_collect_snapshot_pairs,
-    plan_and_collect_snapshot_pairs_limited, primary_history_probe, PrimaryHistoryProbe,
+    plan_and_collect_snapshot_pairs_hinted, plan_and_collect_snapshot_pairs_limited,
+    primary_history_probe, PrimaryHistoryProbe,
 };
 // `open_snapshot_read_view_for_epoch` (caller-supplied epoch variant) is
 // used only by the F36 / stale-epoch regression tests, which run under

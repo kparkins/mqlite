@@ -1,10 +1,11 @@
 mod actions;
 
 pub use actions::{
-    Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update,
+    Aggregate, Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Replace,
+    Update,
 };
 
-use bson::Document;
+use bson::{Bson, Document};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{marker::PhantomData, sync::Arc};
 
@@ -17,6 +18,7 @@ use crate::{
         InsertManyOptions, UpdateOptions,
     },
     results::{DeleteResult, InsertOneResult},
+    update::UpdateModifications,
 };
 
 const DEFAULT_FIND_LIMIT: i64 = 100;
@@ -168,6 +170,43 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     }
 
     // -------------------------------------------------------------------------
+    // Aggregate
+    // -------------------------------------------------------------------------
+
+    /// Run an aggregation `pipeline` over the collection.
+    ///
+    /// Returns an [`Aggregate`] action; call `.run()` to execute. The result is
+    /// a [`crate::Cursor`] of raw [`Document`]s regardless of `T`, because a
+    /// pipeline can reshape documents (mirroring the MongoDB Rust driver's
+    /// untyped `aggregate`).
+    ///
+    /// Supported stages: `$match`, `$sort`, `$skip`, `$limit`, `$count`,
+    /// `$project`, and `$group`. A leading `$match` is index-accelerated via
+    /// the same planner the find path uses; all later stages run in memory.
+    /// ```no_run
+    /// # use mqlite::{Client, doc};
+    /// # use bson::Document;
+    /// # fn main() -> mqlite::error::Result<()> {
+    /// # let client = Client::open("/tmp/db.mqlite")?;
+    /// # let col = client.database("test").collection::<Document>("orders");
+    /// let cursor = col
+    ///     .aggregate(vec![
+    ///         doc! { "$match": { "status": "shipped" } },
+    ///         doc! { "$group": { "_id": "$region", "total": { "$sum": "$amount" } } },
+    ///     ])
+    ///     .run()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn aggregate(&self, pipeline: Vec<Document>) -> Aggregate<'_, T> {
+        Aggregate {
+            coll: self,
+            pipeline,
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Update
     // -------------------------------------------------------------------------
 
@@ -187,11 +226,15 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// # }
     /// ```
     #[must_use]
-    pub fn update_one(&self, filter: Document, update: Document) -> Update<'_, T> {
+    pub fn update_one(
+        &self,
+        filter: Document,
+        update: impl Into<UpdateModifications>,
+    ) -> Update<'_, T> {
         Update {
             coll: self,
             filter,
-            update,
+            update: update.into(),
             options: UpdateOptions::default(),
             multi: false,
         }
@@ -200,14 +243,54 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// Update all documents matching `filter`.
     ///
     /// Returns an [`Update`] action. Chain option methods before calling `.run()`.
+    /// `update` is either a classic operator/replacement [`Document`] or an
+    /// aggregation pipeline (`Vec<Document>`), via [`UpdateModifications`].
     #[must_use]
-    pub fn update_many(&self, filter: Document, update: Document) -> Update<'_, T> {
+    pub fn update_many(
+        &self,
+        filter: Document,
+        update: impl Into<UpdateModifications>,
+    ) -> Update<'_, T> {
         Update {
             coll: self,
             filter,
-            update,
+            update: update.into(),
             options: UpdateOptions::default(),
             multi: true,
+        }
+    }
+
+    /// Replace at most one document matching `filter` with `replacement`.
+    ///
+    /// Returns a [`Replace`] action. Chain `.upsert(true)` before calling
+    /// `.run()`:
+    /// ```no_run
+    /// # use mqlite::{Client, doc};
+    /// # use bson::Document;
+    /// # fn main() -> mqlite::error::Result<()> {
+    /// # let client = Client::open("/tmp/db.mqlite")?;
+    /// # let col = client.database("test").collection::<Document>("users");
+    /// col.replace_one(doc! { "email": "a@b.com" }, &doc! { "email": "a@b.com" })
+    ///     .upsert(true)
+    ///     .run()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The serialized `replacement` is a full document image: it must not
+    /// contain top-level update operators (keys beginning with `$`). The
+    /// replacement keeps the matched document's `_id` when it has none; a
+    /// replacement `_id` that differs from the matched `_id` is an
+    /// immutable-field error. On `.upsert(true)` with no match the inserted
+    /// `_id` is the replacement `_id`, else an equality `_id` from the filter,
+    /// else a generated [`bson::oid::ObjectId`].
+    #[must_use]
+    pub fn replace_one<'a>(&'a self, filter: Document, replacement: &'a T) -> Replace<'a, T> {
+        Replace {
+            coll: self,
+            filter,
+            replacement,
+            upsert: false,
         }
     }
 
@@ -258,12 +341,12 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     pub fn find_one_and_update(
         &self,
         filter: Document,
-        update: Document,
+        update: impl Into<UpdateModifications>,
     ) -> FindOneAndUpdate<'_, T> {
         FindOneAndUpdate {
             coll: self,
             filter,
-            update,
+            update: update.into(),
             options: FindOneAndUpdateOptions::default(),
         }
     }
@@ -318,6 +401,25 @@ impl<T: Serialize + DeserializeOwned> Collection<T> {
     /// Returns an error if the query cannot be evaluated.
     pub fn count_documents(&self, filter: Document) -> Result<u64> {
         self.inner.count_documents(&self.namespace(), filter)
+    }
+
+    /// Return the distinct values of `field_name` across documents matching
+    /// `filter`, as raw BSON regardless of `T`.
+    ///
+    /// `field_name` is resolved as a dotted path with MongoDB array traversal:
+    /// when the resolved value is an array each element is a candidate value
+    /// (the array itself is not), and path segments through arrays of documents
+    /// unwrap per element. A missing field contributes nothing; an explicit
+    /// `null` contributes `null`; nested arrays unwrap one level only. Values
+    /// are deduplicated with cross-numeric BSON equality (`1` and `1.0` are one
+    /// value) and returned in first-encountered order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `field_name` is empty or begins with `$`, or if the
+    /// query cannot be evaluated.
+    pub fn distinct(&self, field_name: &str, filter: Document) -> Result<Vec<Bson>> {
+        self.inner.distinct(&self.namespace(), field_name, filter)
     }
 
     // -------------------------------------------------------------------------

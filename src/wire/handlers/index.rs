@@ -8,6 +8,20 @@ use super::qualified_coll;
 use crate::index::IndexModel;
 use crate::options::IndexOptions;
 
+/// Parse a wire `expireAfterSeconds` value into an `i64`.
+///
+/// MongoDB accepts an integral `Int32`, `Int64`, or `Double` (e.g. `3600` or
+/// `3600.0`). A fractional `Double` or any non-numeric type is a `BadValue`.
+/// Range / single-field / `_id` validation happens in the engine.
+fn parse_expire_after_seconds(value: &Bson) -> Result<i64, &'static str> {
+    match value {
+        Bson::Int32(n) => Ok(*n as i64),
+        Bson::Int64(n) => Ok(*n),
+        Bson::Double(f) if f.is_finite() && f.fract() == 0.0 => Ok(*f as i64),
+        _ => Err("expireAfterSeconds must be an integral number"),
+    }
+}
+
 /// `createIndexes` — create one or more indexes on a collection.
 ///
 /// Each index specification in `indexes` must contain at minimum a `key`
@@ -68,9 +82,34 @@ pub(super) fn handle_create_indexes(body: &Document, state: &ServerState) -> Doc
             opts = opts.name(name);
         }
 
+        // Parse the optional partial-index filter. The engine validates it
+        // (non-empty, evaluator-acceptable, not combined with sparse, not on
+        // `_id`) and surfaces failures through `err_from_mqlite`.
+        let partial_filter_expression = match spec.get("partialFilterExpression") {
+            None => None,
+            Some(Bson::Document(d)) => Some(d.clone()),
+            Some(_) => {
+                return err_bad_value("partialFilterExpression must be a document")
+            }
+        };
+
+        // Parse the optional TTL. MongoDB accepts an integral Int32/Int64/Double
+        // (e.g. `3600` or `3600.0`); a fractional or non-numeric value is a
+        // BadValue. The engine performs the structural checks (non-negative,
+        // single-field, not on `_id`) and surfaces them via `err_from_mqlite`.
+        let expire_after_seconds = match spec.get("expireAfterSeconds") {
+            None => None,
+            Some(value) => match parse_expire_after_seconds(value) {
+                Ok(seconds) => Some(seconds),
+                Err(message) => return err_bad_value(message),
+            },
+        };
+
         let model = IndexModel {
             keys: key,
             options: opts,
+            partial_filter_expression,
+            expire_after_seconds,
         };
         if let Err(e) = state.database.create_index(&namespace, model) {
             return err_from_mqlite(e);
@@ -212,6 +251,12 @@ pub(super) fn handle_list_indexes(body: &Document, state: &ServerState) -> Docum
         }
         if idx.sparse {
             idx_doc.insert("sparse", true);
+        }
+        if let Some(pfe) = &idx.partial_filter_expression {
+            idx_doc.insert("partialFilterExpression", pfe.clone());
+        }
+        if let Some(seconds) = idx.expire_after_seconds {
+            idx_doc.insert("expireAfterSeconds", seconds);
         }
         first_batch.push(bson::Bson::Document(idx_doc));
     }

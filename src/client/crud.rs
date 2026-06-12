@@ -19,6 +19,7 @@ use crate::{
         InsertManyOptions, UpdateOptions,
     },
     results::{BulkWriteError, DeleteResult, InsertManyResult, InsertOneResult, UpdateResult},
+    update::UpdateModifications,
 };
 
 use super::{path::reject_symlink, ClientInner};
@@ -205,24 +206,43 @@ impl ClientInner {
         Ok(Cursor::new(docs, explain))
     }
 
+    pub(crate) fn aggregate(
+        &self,
+        name: &str,
+        pipeline: Vec<Document>,
+    ) -> Result<Cursor<Document>> {
+        let stages: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
+        let parsed = crate::query::aggregate::Pipeline::parse(&stages)?;
+        let docs = self.engine.aggregate(name, &parsed)?;
+        Ok(Cursor::new(
+            docs,
+            crate::query::explain::ExplainResult::from_plan(
+                &crate::query::planner::ScanPlan::CollScan,
+                0,
+            ),
+        ))
+    }
+
     pub(crate) fn update_one(
         &self,
         name: &str,
         filter: Document,
-        update: Document,
+        update: UpdateModifications,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        self.engine.update(name, &filter, &update, &opts, false)
+        self.engine
+            .update(name, &filter, &update, opts.array_filters.as_deref(), &opts, false)
     }
 
     pub(crate) fn update_many(
         &self,
         name: &str,
         filter: Document,
-        update: Document,
+        update: UpdateModifications,
         opts: UpdateOptions,
     ) -> Result<UpdateResult> {
-        self.engine.update(name, &filter, &update, &opts, true)
+        self.engine
+            .update(name, &filter, &update, opts.array_filters.as_deref(), &opts, true)
     }
 
     pub(crate) fn delete_one(&self, name: &str, filter: Document) -> Result<DeleteResult> {
@@ -237,13 +257,16 @@ impl ClientInner {
         &self,
         name: &str,
         filter: Document,
-        update: Document,
+        update: UpdateModifications,
         opts: FindOneAndUpdateOptions,
     ) -> Result<Option<T>> {
-        match self
-            .engine
-            .find_one_and_update(name, &filter, &update, &opts)?
-        {
+        match self.engine.find_one_and_update(
+            name,
+            &filter,
+            &update,
+            opts.array_filters.as_deref(),
+            &opts,
+        )? {
             None => Ok(None),
             Some(doc) => bson::from_document(doc)
                 .map(Some)
@@ -284,6 +307,27 @@ impl ClientInner {
         }
     }
 
+    pub(crate) fn replace_one<T: Serialize>(
+        &self,
+        name: &str,
+        filter: Document,
+        replacement: &T,
+        upsert: bool,
+    ) -> Result<UpdateResult> {
+        let replacement_doc = bson::to_document(replacement).map_err(Error::BsonSerialization)?;
+        self.engine
+            .replace_one(name, &filter, &replacement_doc, upsert)
+    }
+
+    pub(crate) fn distinct(
+        &self,
+        name: &str,
+        field_name: &str,
+        filter: Document,
+    ) -> Result<Vec<Bson>> {
+        self.engine.distinct(name, field_name, &filter)
+    }
+
     pub(crate) fn estimated_document_count(&self, name: &str) -> Result<u64> {
         self.engine.count(name, &Document::new())
     }
@@ -302,6 +346,10 @@ impl ClientInner {
 
     pub(crate) fn list_indexes(&self, name: &str) -> Result<Vec<IndexInfo>> {
         self.engine.list_indexes(name)
+    }
+
+    pub(crate) fn sweep_expired(&self) -> Result<u64> {
+        self.engine.sweep_expired()
     }
 
     pub(crate) fn list_collection_names(&self) -> Result<Vec<String>> {

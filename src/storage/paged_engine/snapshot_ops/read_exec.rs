@@ -18,10 +18,10 @@ use crate::keys::{encode_compound_key, encode_key, COMPOUND_SEP};
 use crate::mvcc::read_view::ReadView;
 use crate::mvcc::registry::ReadViewRegistry;
 use crate::mvcc::timestamp::Ts;
-use crate::options::FindOptions;
+use crate::options::{FindOptions, Hint};
 use crate::query::eval_filter;
 use crate::query::planner::{
-    select_plan, IndexCondition, IndexMeta, PrimaryKeyCondition, ScanPlan,
+    select_plan_with_hint, IndexCondition, IndexMeta, PrimaryKeyCondition, ScanPlan,
 };
 use crate::storage::btree::{BTree, BTreePageStore, CellValue, HistoryProbe};
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -477,6 +477,38 @@ pub(in crate::storage::paged_engine) fn plan_and_collect_snapshot_pairs_limited(
     allow_secondary_indexes: bool,
     match_limit: Option<usize>,
 ) -> Result<PlannedSnapshotPairs> {
+    plan_and_collect_snapshot_pairs_hinted(
+        shared,
+        ns_snap,
+        filter,
+        view,
+        allow_secondary_indexes,
+        match_limit,
+        None,
+    )
+}
+
+/// Like [`plan_and_collect_snapshot_pairs_limited`] but honours an optional
+/// index `hint` (see [`select_plan_with_hint`]).
+///
+/// A hint forces a specific access path, overriding the cost-free heuristics.
+/// A hint that does not resolve to any existing index returns
+/// [`crate::error::Error::InvalidQuery`] (MongoDB `BadValue`). A `$natural`
+/// hint forces a collection scan. When `allow_secondary_indexes` is `false`
+/// no secondary index can satisfy a non-`_id`, non-`$natural` hint, so such a
+/// hint is unresolvable in that mode.
+///
+/// `ns_snap` MUST be routed from `view.published_epoch()` (see
+/// [`plan_and_collect_snapshot_pairs_limited`]).
+pub(in crate::storage::paged_engine) fn plan_and_collect_snapshot_pairs_hinted(
+    shared: &SharedState,
+    ns_snap: &NamespaceSnapshot,
+    filter: &Document,
+    view: &ReadView,
+    allow_secondary_indexes: bool,
+    match_limit: Option<usize>,
+    hint: Option<&Hint>,
+) -> Result<PlannedSnapshotPairs> {
     let ready_indexes: Vec<&PublishedIndex> = if allow_secondary_indexes {
         ns_snap
             .indexes
@@ -491,10 +523,11 @@ pub(in crate::storage::paged_engine) fn plan_and_collect_snapshot_pairs_limited(
         .map(|i| IndexMeta {
             name: &i.name,
             keys: &i.key_pattern,
+            pfe: i.partial_filter_expression.as_ref(),
         })
         .collect();
 
-    let plan = select_plan(filter, &index_metas);
+    let plan = select_plan_with_hint(filter, &index_metas, hint)?;
     let pairs = execute_plan_from_snap(
         &plan,
         shared,

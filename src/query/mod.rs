@@ -7,9 +7,14 @@
 //! filter evaluation (comparison, logical, element, array operators, `$regex`),
 //! and query planning (index selection, sort, projection).
 
+pub(crate) mod aggregate;
 pub(crate) mod explain;
+pub(crate) mod expr;
 mod filter;
 pub(crate) mod planner;
 
 pub(crate) use filter::eval_filter;
 pub(crate) use filter::get_nested_field;
+pub(crate) use crate::storage::paged_engine::doc_helpers::{
+    apply_projection_to_doc, compare_docs,
+};

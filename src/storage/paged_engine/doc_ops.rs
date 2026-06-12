@@ -16,7 +16,10 @@ use crate::options::{
 };
 use crate::results::{DeleteResult, UpdateResult};
 use crate::storage::btree::{read_overflow_chain, BTree};
-use crate::update::{apply_update, is_operator_update, upsert_base_from_filter};
+use crate::update::{
+    apply_update, apply_update_pipeline, is_operator_update, upsert_base_from_filter,
+    UpdateModifications,
+};
 use crate::validation::validate_document;
 
 use super::btree_ops::prepare_insert_document;
@@ -27,7 +30,7 @@ use super::index_maint::{
 };
 use super::snapshot_ops::{
     apply_find_opts, open_snapshot_read_view, plan_and_collect_snapshot_pairs,
-    plan_and_collect_snapshot_pairs_limited,
+    plan_and_collect_snapshot_pairs_hinted, plan_and_collect_snapshot_pairs_limited,
 };
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
@@ -232,18 +235,83 @@ pub(super) fn find(
         }
         Some(n) => n,
     };
-    let (plan, pairs) = plan_and_collect_snapshot_pairs_limited(
+    let (plan, pairs) = plan_and_collect_snapshot_pairs_hinted(
         &engine.shared,
         ns_snap,
         filter,
         &view,
         true,
         unsorted_materialization_limit(opts),
+        opts.hint.as_ref(),
     )?;
     let docs_examined = pairs.len() as u64;
     let matched: Vec<Document> = pairs.into_iter().map(|(_, doc)| doc).collect();
     let explain = crate::query::explain::ExplainResult::from_plan(&plan, docs_examined);
     Ok((apply_find_opts(matched, opts), explain))
+}
+
+/// Execute an aggregation `pipeline` over namespace `ns`.
+///
+/// Seeds the pipeline with candidate documents from the snapshot read path.
+/// When the first stage is `$match` its filter is routed through the
+/// index-aware planner (so a leading `$match` benefits from index
+/// acceleration); the planner-filtered documents seed the in-memory pipeline
+/// and the leading `$match` is not re-evaluated. Otherwise every document is
+/// scanned and the full pipeline runs in memory. A nonexistent namespace
+/// yields an empty result.
+///
+/// `$lookup` foreign collections are resolved against the SAME pinned read
+/// view as the main scan: the resolver qualifies the bare `from` name with this
+/// namespace's database prefix and scans the foreign namespace from
+/// `view.published_epoch()`, so all reads in one aggregation observe one
+/// consistent snapshot. A nonexistent `from` collection resolves to an empty
+/// document set.
+///
+/// # Errors
+///
+/// Propagates any error from opening the read view, planning/scanning the
+/// candidate documents, or executing a pipeline stage.
+pub(super) fn aggregate(
+    engine: &super::PagedEngine,
+    ns: &str,
+    pipeline: &crate::query::aggregate::Pipeline,
+) -> Result<Vec<Document>> {
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
+    let ns_snap = match snap.catalog.get_by_name(ns) {
+        None => return Ok(Vec::new()),
+        Some(n) => n,
+    };
+
+    // Route a leading $match through the planner so indexes accelerate it; the
+    // empty filter (no leading $match) scans every document.
+    let empty_filter = Document::new();
+    let seed_filter = pipeline.leading_match_filter().unwrap_or(&empty_filter);
+    let (_, pairs) =
+        plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, seed_filter, &view, true)?;
+    let docs: Vec<Document> = pairs.into_iter().map(|(_, doc)| doc).collect();
+
+    // The active database prefix: everything before the first '.' of `ns`.
+    // `$lookup` writes a bare collection name, qualified here against the same
+    // database and read from the same pinned snapshot for consistency.
+    let db_prefix = ns.split_once('.').map_or("", |(db, _)| db);
+    let resolve_foreign = |from: &str| -> Result<Vec<Document>> {
+        let qualified = format!("{db_prefix}.{from}");
+        let foreign_snap = match snap.catalog.get_by_name(&qualified) {
+            None => return Ok(Vec::new()),
+            Some(n) => n,
+        };
+        let (_, pairs) = plan_and_collect_snapshot_pairs(
+            &engine.shared,
+            foreign_snap,
+            &empty_filter,
+            &view,
+            true,
+        )?;
+        Ok(pairs.into_iter().map(|(_, doc)| doc).collect())
+    };
+
+    pipeline.execute(docs, pipeline.first_stage_is_match(), &resolve_foreign)
 }
 
 /// Return the first document that matches `filter`, short-circuiting after
@@ -271,20 +339,61 @@ pub(super) fn find_first(
     Ok(pairs.into_iter().next().map(|(_, doc)| doc))
 }
 
+/// Apply an [`UpdateModifications`] (operator update or pipeline) to `doc`,
+/// returning the post-update document.
+///
+/// `filter` and `array_filters` thread the positional `$` match position and
+/// the `$[<identifier>]` conditions into the operator-update path; pipeline
+/// updates ignore them. `is_insert` enables `$setOnInsert` for the operator
+/// path and is unused by pipelines.
+///
+/// # Errors
+///
+/// Propagates any operator-update, pipeline-validation, or pipeline-execution
+/// error (including `_id` immutability violations).
+fn apply_modifications(
+    doc: &Document,
+    mods: &UpdateModifications,
+    filter: &Document,
+    array_filters: Option<&[Document]>,
+    is_insert: bool,
+) -> Result<Document> {
+    match mods {
+        UpdateModifications::Document(update_doc) => {
+            let mut next = doc.clone();
+            apply_update(&mut next, update_doc, filter, array_filters, is_insert)?;
+            Ok(next)
+        }
+        UpdateModifications::Pipeline(pipeline) => apply_update_pipeline(doc, pipeline),
+    }
+}
+
+/// Reject an operator-document update that is actually a replacement document.
+///
+/// Pipeline updates are always valid here (validation runs during execution).
+fn reject_non_operator_update(mods: &UpdateModifications) -> Result<()> {
+    if let UpdateModifications::Document(update_doc) = mods {
+        if !is_operator_update(update_doc) {
+            return Err(Error::Internal(
+                "update requires an operator update document (e.g. {$set: {...}}); \
+                 use find_one_and_replace for replacements"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
-    update_doc: &Document,
+    mods: &UpdateModifications,
+    array_filters: Option<&[Document]>,
     opts: &UpdateOptions,
     many: bool,
 ) -> Result<UpdateResult> {
-    if !is_operator_update(update_doc) {
-        return Err(Error::Internal(
-            "update requires an operator update document (e.g. {$set: {...}});                  use find_one_and_replace for replacements"
-                .into(),
-        ));
-    }
+    reject_non_operator_update(mods)?;
 
     let view = open_snapshot_read_view(&engine.shared)?;
     let snap = view.published_epoch();
@@ -292,7 +401,7 @@ pub(super) fn update(
     let matched_pairs: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = match ns_snap_opt {
         None => {
             if opts.upsert {
-                return upsert_for_update(engine, ns, filter, update_doc);
+                return upsert_for_update(engine, ns, filter, mods, array_filters);
             }
             return Ok(UpdateResult {
                 matched_count: 0,
@@ -304,7 +413,7 @@ pub(super) fn update(
     };
 
     if matched_pairs.is_empty() && opts.upsert {
-        return upsert_for_update(engine, ns, filter, update_doc);
+        return upsert_for_update(engine, ns, filter, mods, array_filters);
     }
 
     let pairs_to_process: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = if many {
@@ -317,11 +426,10 @@ pub(super) fn update(
     engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
         let mut matched_count = 0u64;
         let mut modified_count = 0u64;
-        for (key, mut doc, expected_head) in pairs_to_process {
+        for (key, before, expected_head) in pairs_to_process {
             matched_count += 1;
-            let before = doc.clone();
             let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
-            apply_update(&mut doc, update_doc, false)?;
+            let doc = apply_modifications(&before, mods, filter, array_filters, false)?;
             if doc != before {
                 modified_count += 1;
                 let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
@@ -416,17 +524,136 @@ pub(super) fn count(engine: &super::PagedEngine, ns: &str, filter: &Document) ->
     )
 }
 
+/// Build a MongoDB `BadValue` (code 2) error for invalid distinct input.
+///
+/// Mirrors the query layer's `bad_value`, which carries `BadValue` messages
+/// through [`Error::BsonDeserialization`].
+fn distinct_bad_value(msg: &str) -> Error {
+    use serde::de::Error as _;
+    Error::BsonDeserialization(bson::de::Error::custom(format!("BadValue: {msg}")))
+}
+
+/// Collect the distinct values of `field_name` across documents matching
+/// `filter`.
+///
+/// Every matching document is scanned through the normal planner/scan path.
+/// `field_name` is resolved as a dotted path with MongoDB array-traversal
+/// semantics (see [`collect_path_values`]). Values are deduplicated under the
+/// crate's canonical BSON equality ([`crate::keys::encode_key`]); the first
+/// representation encountered wins and discovery order is preserved.
+///
+/// # Errors
+///
+/// Returns [`Error::BsonDeserialization`] (carrying a `BadValue` message) if
+/// `field_name` is empty or begins with `$`, plus any error surfaced by the
+/// scan path.
+pub(super) fn distinct(
+    engine: &super::PagedEngine,
+    ns: &str,
+    field_name: &str,
+    filter: &Document,
+) -> Result<Vec<Bson>> {
+    if field_name.is_empty() {
+        return Err(distinct_bad_value("distinct field name must not be empty"));
+    }
+    if field_name.starts_with('$') {
+        return Err(distinct_bad_value(
+            "distinct field name must not start with '$'",
+        ));
+    }
+
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
+    let ns_snap = match snap.catalog.get_by_name(ns) {
+        None => return Ok(Vec::new()),
+        Some(n) => n,
+    };
+    let (_, pairs) =
+        plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, filter, &view, false)?;
+
+    let mut seen_keys: Vec<Vec<u8>> = Vec::new();
+    let mut values: Vec<Bson> = Vec::new();
+    for (_, doc) in pairs {
+        let mut candidates = Vec::new();
+        collect_path_values(&Bson::Document(doc), field_name, &mut candidates);
+        for value in candidates {
+            let key = crate::keys::encode_key(&value);
+            if seen_keys.iter().any(|existing| existing == &key) {
+                continue;
+            }
+            seen_keys.push(key);
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+/// Resolve a dotted `path` against `value`, appending every candidate value to
+/// `out` using MongoDB distinct array-traversal semantics.
+///
+/// - When traversal reaches the end of the path and lands on an array, each
+///   element is contributed (the array itself is not). A nested array element
+///   is contributed as-is (only one level is unwrapped).
+/// - When a path segment traverses an array of documents, the remaining path
+///   is resolved against each element.
+/// - A missing field contributes nothing; an explicit `Bson::Null` contributes
+///   `null`.
+fn collect_path_values(value: &Bson, path: &str, out: &mut Vec<Bson>) {
+    if path.is_empty() {
+        match value {
+            Bson::Array(arr) => out.extend(arr.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+        return;
+    }
+
+    let mut parts = path.splitn(2, '.');
+    let head = match parts.next() {
+        Some(h) => h,
+        None => return,
+    };
+    let rest = parts.next().unwrap_or("");
+
+    match value {
+        Bson::Document(doc) => {
+            if let Some(child) = doc.get(head) {
+                collect_path_values(child, rest, out);
+            }
+        }
+        Bson::Array(arr) => {
+            // Traverse arrays of documents: re-resolve the full remaining path
+            // (head + rest) against each element. A numeric segment also
+            // addresses an array position directly.
+            if let Ok(idx) = head.parse::<usize>() {
+                if let Some(elem) = arr.get(idx) {
+                    collect_path_values(elem, rest, out);
+                }
+                return;
+            }
+            for elem in arr {
+                if let Bson::Document(_) = elem {
+                    collect_path_values(elem, path, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn find_one_and_update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
-    update_doc: &Document,
+    mods: &UpdateModifications,
+    array_filters: Option<&[Document]>,
     opts: &FindOneAndUpdateOptions,
 ) -> Result<Option<Document>> {
-    if !is_operator_update(update_doc) {
-        return Err(Error::Internal(
-            "find_one_and_update requires an operator update document".into(),
-        ));
+    if let UpdateModifications::Document(update_doc) = mods {
+        if !is_operator_update(update_doc) {
+            return Err(Error::Internal(
+                "find_one_and_update requires an operator update document".into(),
+            ));
+        }
     }
 
     let view = open_snapshot_read_view(&engine.shared)?;
@@ -435,7 +662,14 @@ pub(super) fn find_one_and_update(
         match snap.catalog.get_by_name(ns) {
             None => {
                 if opts.upsert {
-                    return upsert_for_find_one_and_update(engine, ns, filter, update_doc, opts);
+                    return upsert_for_find_one_and_update(
+                        engine,
+                        ns,
+                        filter,
+                        mods,
+                        array_filters,
+                        opts,
+                    );
                 }
                 return Ok(None);
             }
@@ -444,7 +678,7 @@ pub(super) fn find_one_and_update(
 
     if matched.is_empty() {
         if opts.upsert {
-            return upsert_for_find_one_and_update(engine, ns, filter, update_doc, opts);
+            return upsert_for_find_one_and_update(engine, ns, filter, mods, array_filters, opts);
         }
         return Ok(None);
     }
@@ -453,10 +687,9 @@ pub(super) fn find_one_and_update(
         matched.sort_by(|(_, a, _), (_, b, _)| compare_docs(a, b, s));
     }
 
-    let (key, mut doc, expected_head) = matched.remove(0);
-    let before = doc.clone();
+    let (key, before, expected_head) = matched.remove(0);
     let before_id = before.get("_id").cloned().unwrap_or(Bson::Null);
-    apply_update(&mut doc, update_doc, false)?;
+    let doc = apply_modifications(&before, mods, filter, array_filters, false)?;
     let new_id = doc.get("_id").cloned().unwrap_or(Bson::Null);
     let new_bytes = bson::to_vec(&doc).map_err(Error::BsonSerialization)?;
 
@@ -604,6 +837,165 @@ pub(super) fn find_one_and_replace(
     }))
 }
 
+/// Reject a replacement document that contains top-level update operators.
+///
+/// A replacement document is a full document image, so any top-level key
+/// beginning with `$` is illegal. Mirrors MongoDB, which rejects such
+/// replacements with a validation error.
+fn reject_replacement_operators(replacement: &Document) -> Result<()> {
+    if replacement.keys().any(|k| k.starts_with('$')) {
+        return Err(Error::DocumentValidationFailure {
+            detail: "replacement document must not contain update operators".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Replace at most one document matching `filter` with `replacement`.
+///
+/// Reuses the same snapshot/candidate-collection, secondary-index
+/// maintenance, and primary-staging machinery as
+/// [`find_one_and_replace`], differing only in `_id` semantics and the
+/// [`UpdateResult`] return shape:
+///
+/// - The replacement keeps the matched document's `_id` when it has none.
+/// - A replacement `_id` that differs from the matched document's `_id` is
+///   an immutable-field error.
+/// - On upsert-insert the new document's `_id` is the replacement `_id`,
+///   else an equality `_id` taken from the filter, else a generated
+///   [`bson::oid::ObjectId`].
+///
+/// # Errors
+///
+/// Returns [`Error::DocumentValidationFailure`] if `replacement` contains
+/// top-level update operators or attempts to change the matched `_id`, plus
+/// any error surfaced by the underlying staging/commit machinery.
+pub(super) fn replace_one(
+    engine: &super::PagedEngine,
+    ns: &str,
+    filter: &Document,
+    replacement: &Document,
+    upsert: bool,
+) -> Result<UpdateResult> {
+    reject_replacement_operators(replacement)?;
+
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
+    let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
+        match snap.catalog.get_by_name(ns) {
+            None => {
+                if upsert {
+                    return replace_upsert_insert(engine, ns, filter, replacement);
+                }
+                return Ok(UpdateResult {
+                    matched_count: 0,
+                    modified_count: 0,
+                    upserted_id: None,
+                });
+            }
+            Some(ns_snap) => collect_mutation_candidates(&engine.shared, ns_snap, filter, &view)?,
+        };
+
+    if matched.is_empty() {
+        if upsert {
+            return replace_upsert_insert(engine, ns, filter, replacement);
+        }
+        return Ok(UpdateResult {
+            matched_count: 0,
+            modified_count: 0,
+            upserted_id: None,
+        });
+    }
+
+    let (old_key, old_doc, expected_head) = matched.remove(0);
+    let original_id = old_doc.get("_id").cloned().unwrap_or(Bson::Null);
+
+    let mut new_doc = replacement.clone();
+    match new_doc.get("_id") {
+        None => {
+            new_doc.insert("_id", original_id.clone());
+        }
+        Some(replacement_id) if !ids_equal(replacement_id, &original_id) => {
+            return Err(Error::DocumentValidationFailure {
+                detail: "replacement _id differs from the matched document _id; \
+                         _id is immutable"
+                    .into(),
+            });
+        }
+        Some(_) => {}
+    }
+    validate_document(&new_doc)?;
+
+    let modified = new_doc != old_doc;
+    let new_bytes = bson::to_vec(&new_doc).map_err(Error::BsonSerialization)?;
+
+    let ns_arc = Ns::from(ns);
+    engine.run_write_commit_envelope(ns, None, |shared, md, txn, vis| {
+        maintain_secondary_on_update(
+            shared,
+            md,
+            ns,
+            &old_doc,
+            &new_doc,
+            &original_id,
+            &original_id,
+            vis,
+            txn,
+        )?;
+        if let Some(entry) = md.catalog_lock().get_collection(ns)? {
+            txn.stage_primary_update(
+                PrimaryTarget::new(
+                    entry.id,
+                    ns_arc.clone(),
+                    entry.data_root_page,
+                    entry.data_root_level,
+                ),
+                old_key.clone(),
+                new_bytes.clone(),
+                expected_head,
+            );
+        }
+        Ok(())
+    })?;
+
+    Ok(UpdateResult {
+        matched_count: 1,
+        modified_count: u64::from(modified),
+        upserted_id: None,
+    })
+}
+
+/// Insert the replacement document for a `replace_one` upsert with no match.
+///
+/// The inserted `_id` is the replacement `_id`, else an equality `_id` taken
+/// from `filter`, else a generated [`bson::oid::ObjectId`].
+fn replace_upsert_insert(
+    engine: &super::PagedEngine,
+    ns: &str,
+    filter: &Document,
+    replacement: &Document,
+) -> Result<UpdateResult> {
+    let mut doc = replacement.clone();
+    if doc.get("_id").is_none() {
+        if let Some(id) = upsert_base_from_filter(filter).get("_id") {
+            doc.insert("_id", id.clone());
+        }
+    }
+    ensure_id(&mut doc);
+    let (id, _) = upsert_stage(engine, ns, doc)?;
+    Ok(UpdateResult {
+        matched_count: 0,
+        modified_count: 0,
+        upserted_id: Some(id),
+    })
+}
+
+/// Compare two `_id` BSON values under MongoDB's canonical equality
+/// (`Int32(1)` equals `Double(1.0)`).
+fn ids_equal(a: &Bson, b: &Bson) -> bool {
+    crate::keys::encode_key(a) == crate::keys::encode_key(b)
+}
+
 fn upsert_stage(engine: &super::PagedEngine, ns: &str, doc: Document) -> Result<(Bson, Document)> {
     let snapshot = doc.clone();
     let id = engine.run_write(ns, |shared, md, txn, vis| {
@@ -616,10 +1008,11 @@ pub(super) fn upsert_for_update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
-    update_doc: &Document,
+    mods: &UpdateModifications,
+    array_filters: Option<&[Document]>,
 ) -> Result<UpdateResult> {
-    let mut doc = upsert_base_from_filter(filter);
-    apply_update(&mut doc, update_doc, true)?;
+    let base = upsert_base_from_filter(filter);
+    let doc = apply_modifications(&base, mods, filter, array_filters, true)?;
     let (id, _) = upsert_stage(engine, ns, doc)?;
     Ok(UpdateResult {
         matched_count: 0,
@@ -632,11 +1025,12 @@ pub(super) fn upsert_for_find_one_and_update(
     engine: &super::PagedEngine,
     ns: &str,
     filter: &Document,
-    update_doc: &Document,
+    mods: &UpdateModifications,
+    array_filters: Option<&[Document]>,
     opts: &FindOneAndUpdateOptions,
 ) -> Result<Option<Document>> {
-    let mut doc = upsert_base_from_filter(filter);
-    apply_update(&mut doc, update_doc, true)?;
+    let base = upsert_base_from_filter(filter);
+    let mut doc = apply_modifications(&base, mods, filter, array_filters, true)?;
     ensure_id(&mut doc);
     let (_, after) = upsert_stage(engine, ns, doc)?;
     Ok(match opts.return_document {

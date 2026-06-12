@@ -132,7 +132,10 @@ fn crud_installs_mark_primary_and_secondary_dirty_leaves() {
         .update(
             NS,
             &doc! { "_id": 1 },
-            &doc! { "$set": { "email": "b@example.com" } },
+            &crate::update::UpdateModifications::Document(
+                doc! { "$set": { "email": "b@example.com" } },
+            ),
+            None,
             &UpdateOptions::default(),
             false,
         )

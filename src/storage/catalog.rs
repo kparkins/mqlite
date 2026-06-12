@@ -194,6 +194,14 @@ pub(crate) struct IndexEntry {
     pub unique: bool,
     /// Whether the index is sparse (skips documents lacking the indexed field).
     pub sparse: bool,
+    /// Partial-index filter expression (MongoDB `partialFilterExpression`).
+    /// When set, only documents matching this filter have index entries.
+    /// `None` for ordinary indexes.
+    pub partial_filter_expression: Option<Document>,
+    /// TTL expiry in seconds (MongoDB `expireAfterSeconds`). When set, the TTL
+    /// sweep deletes documents whose indexed date field is older than
+    /// `now - expire_after_seconds`. `None` for non-TTL indexes.
+    pub expire_after_seconds: Option<i64>,
     /// Whether any indexed value is or was an array (set on first array insert).
     pub multikey: bool,
     /// Number of entries in the index.
@@ -210,7 +218,7 @@ impl IndexEntry {
             IndexState::Building => "building",
             IndexState::Ready => "ready",
         };
-        let doc = doc! {
+        let mut doc = doc! {
             "id": self.id,
             "name": &self.name,
             "collection": &self.collection,
@@ -223,6 +231,18 @@ impl IndexEntry {
             "entryCount": self.entry_count,
             "state": state_str,
         };
+        // Persist the partial filter only when present. Absence on read
+        // deserializes back to `None`, matching how a non-partial index has
+        // no `partialFilterExpression` field at all.
+        if let Some(pfe) = &self.partial_filter_expression {
+            doc.insert("partialFilterExpression", pfe.clone());
+        }
+        // Persist the TTL only when present. Absence on read deserializes back
+        // to `None`, matching how a non-TTL index has no `expireAfterSeconds`
+        // field at all (backwards compatible with pre-TTL catalog records).
+        if let Some(seconds) = self.expire_after_seconds {
+            doc.insert("expireAfterSeconds", seconds);
+        }
         Ok(bson::to_vec(&doc)?)
     }
 
@@ -258,6 +278,16 @@ impl IndexEntry {
         let sparse = doc
             .get_bool("sparse")
             .map_err(|e| Error::Internal(format!("catalog: missing 'sparse': {e}")))?;
+        // `partialFilterExpression` is optional: records written by ordinary
+        // (non-partial) indexes — and all pre-partial-index catalog records —
+        // carry no such field and deserialize as `None`.
+        let partial_filter_expression = match doc.get_document("partialFilterExpression") {
+            Ok(pfe) => Some(pfe.clone()),
+            Err(_) => None,
+        };
+        // `expireAfterSeconds` is optional: non-TTL indexes — and all pre-TTL
+        // catalog records — carry no such field and deserialize as `None`.
+        let expire_after_seconds = doc.get_i64("expireAfterSeconds").ok();
         let multikey = doc
             .get_bool("multikey")
             .map_err(|e| Error::Internal(format!("catalog: missing 'multikey': {e}")))?;
@@ -286,6 +316,8 @@ impl IndexEntry {
             key_pattern,
             unique,
             sparse,
+            partial_filter_expression,
+            expire_after_seconds,
             multikey,
             entry_count,
             state,
@@ -687,6 +719,8 @@ impl<S: BTreePageStore> Catalog<S> {
             key_pattern: model.keys.clone(),
             unique: model.options.unique,
             sparse: model.options.sparse,
+            partial_filter_expression: model.partial_filter_expression.clone(),
+            expire_after_seconds: model.expire_after_seconds,
             multikey: false,
             entry_count: 0,
             // Default is `Ready`. Callers that want a multi-phase build

@@ -180,7 +180,7 @@ pub use query::explain::ExplainResult;
 pub use error::{Error, Result};
 
 // Configuration
-pub use options::{DurabilityMode, IndexOptions, OpenOptions, ReturnDocument};
+pub use options::{DurabilityMode, Hint, IndexOptions, OpenOptions, ReturnDocument};
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use storage::write_crash_cut_contract::{WriteEnvelopeProbeCut, WriteEnvelopeProbeReport};
@@ -255,13 +255,20 @@ pub use storage::paged_engine::publish_registry_harness::{
 };
 
 // Collection action types (returned by Collection methods; users chain options onto them)
-pub use client::{Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update};
+pub use client::{
+    Aggregate, Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Replace,
+    Update,
+};
 
 // Index
 pub use index::{IndexInfo, IndexModel};
 
 // Operation results
 pub use results::{BulkWriteError, DeleteResult, InsertManyResult, InsertOneResult, UpdateResult};
+
+// Update modifications: classic operator/replacement document or aggregation
+// pipeline (mirrors the official MongoDB Rust driver).
+pub use update::UpdateModifications;
 
 // BSON re-exports — users don't need a direct `bson` dependency for basic usage
 pub use bson::{doc, Bson, DateTime, Document, ObjectId};

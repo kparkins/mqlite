@@ -284,6 +284,15 @@ pub enum Error {
         detail: String,
     },
 
+    /// A query could not be planned because its parameters are invalid — for
+    /// example, a `hint` that does not correspond to any existing index.
+    /// MongoDB error code 2 (BadValue).
+    #[error("error processing query: {detail}")]
+    InvalidQuery {
+        /// Human-readable description of why the query is invalid.
+        detail: String,
+    },
+
     /// The journal file's magic bytes or format version does not match what this build supports.
     /// Produced when the journal sidecar on disk was created by an incompatible mqlite version.
     #[error(
@@ -564,6 +573,7 @@ impl Error {
             Error::UnsupportedOperator { .. } => Some(codes::UNSUPPORTED_OPERATOR),
             Error::UnsupportedIndexOption { .. } => Some(codes::CANNOT_CREATE_INDEX),
             Error::InvalidConfig { .. } => Some(codes::BAD_VALUE),
+            Error::InvalidQuery { .. } => Some(codes::BAD_VALUE),
             _ => None,
         }
     }

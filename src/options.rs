@@ -211,6 +211,21 @@ impl OpenOptions {
     }
 }
 
+/// An index hint forcing the query planner to use a specific access path.
+///
+/// Mirrors the MongoDB Rust driver's `Hint`. A hint either names an existing
+/// index or supplies a key pattern matched against the collection's indexes.
+/// The synthetic `{ "$natural": 1 }` key pattern forces a collection scan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Hint {
+    /// Force the index with this name (e.g. `"email_1"`, `"_id_"`).
+    Name(String),
+    /// Force the index whose key pattern exactly matches this document
+    /// (field names and directions, order-sensitive). The reserved pattern
+    /// `{ "$natural": 1 }` (or `-1`) forces a collection scan.
+    Keys(Document),
+}
+
 /// Options for `find` and `find_one` operations.
 /// All fields are optional — omit to use defaults.
 #[derive(Debug, Clone, Default)]
@@ -225,6 +240,9 @@ pub(crate) struct FindOptions {
     pub projection: Option<Document>,
     /// Number of documents to fetch per internal batch. Default: 101.
     pub batch_size: Option<u32>,
+    /// Index hint forcing a specific access path. `None` lets the planner
+    /// choose. See [`Hint`].
+    pub hint: Option<Hint>,
 }
 
 /// Options for `update_one` and `update_many` operations.
@@ -232,6 +250,9 @@ pub(crate) struct FindOptions {
 pub(crate) struct UpdateOptions {
     /// If true, insert a new document when no document matches the filter.
     pub upsert: bool,
+    /// Filters for the filtered-positional `$[<identifier>]` update operator.
+    /// Each document declares one identifier and its match condition.
+    pub array_filters: Option<Vec<Document>>,
 }
 
 /// Options for `insert_many` operations.
@@ -313,6 +334,8 @@ pub(crate) struct FindOneAndUpdateOptions {
     pub upsert: bool,
     /// Sort order — determines which document to operate on when multiple match.
     pub sort: Option<Document>,
+    /// Filters for the filtered-positional `$[<identifier>]` update operator.
+    pub array_filters: Option<Vec<Document>>,
 }
 
 /// Options for `find_one_and_delete` operations.

@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 
 use bson::{doc, Bson, DateTime, Document};
 
+use super::super::errors::err_from_mqlite;
 use super::super::server::ServerState;
+use super::extract_db_name;
 
 /// `hello` / `isMaster` — driver handshake response.
 ///
@@ -175,6 +177,49 @@ pub(super) fn handle_list_databases(state: &ServerState) -> Document {
         "totalSizeMb": Bson::Int64(size_on_disk / (1024 * 1024)),
         "ok": 1.0_f64,
     }
+}
+
+/// `dropDatabase` — drop every collection belonging to the named database.
+///
+/// The database is identified by the command's `$db` field.  Every collection
+/// whose name is prefixed with `<db>.` is dropped; collections in other
+/// databases are untouched.  The `dropped` field is always included, even when
+/// the database had no collections (drivers tolerate this).
+///
+/// Response format (MongoDB 8.0):
+/// ```json
+/// { "dropped": "<dbName>", "ok": 1.0 }
+/// ```
+pub(super) fn handle_drop_database(body: &Document, state: &ServerState) -> Document {
+    let db_name = extract_db_name(body);
+
+    let all_names = match state.database.list_collection_names() {
+        Ok(n) => n,
+        Err(e) => return err_from_mqlite(e),
+    };
+
+    let db_prefix = format!("{db_name}.");
+    for name in all_names {
+        if !name.starts_with(&db_prefix) {
+            continue;
+        }
+        if let Err(e) = state.database.drop_collection(&name) {
+            return err_from_mqlite(e);
+        }
+    }
+
+    doc! {
+        "dropped": db_name,
+        "ok": 1.0_f64,
+    }
+}
+
+/// `endSessions` — no-op session teardown.
+///
+/// Drivers send `endSessions` when a client or session pool closes.  mqlite has
+/// no session state, so this is a no-op that returns `{ ok: 1 }`.
+pub(super) fn handle_end_sessions() -> Document {
+    doc! { "ok": 1.0_f64 }
 }
 
 /// Unknown command — returns `CommandNotFound` (error code 59).

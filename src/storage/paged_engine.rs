@@ -30,7 +30,7 @@
 mod btree_ops;
 mod checkpoint_gate;
 mod commit_envelope;
-mod doc_helpers;
+pub(crate) mod doc_helpers;
 mod doc_ops;
 mod durability;
 mod ns_ddl;
@@ -67,6 +67,7 @@ pub mod smo_classification_observations;
 mod smo_latch;
 mod snapshot_ops;
 mod state;
+mod ttl_sweep;
 mod visibility;
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "paged_engine/tests/write_crash_cut_harness.rs"]
@@ -318,6 +319,21 @@ impl PagedEngine {
             next_interval_sync_ms: AtomicU64::new(next_interval_sync_ms),
         };
         engine.resume_building_indexes_after_open()?;
+        // Run one TTL sweep now that recovery has fully completed (catalog
+        // restored, Building indexes resumed). A non-fatal sweep error must
+        // not brick open — the next sweep (on-demand or the wire timer) will
+        // retry — but an `EngineFatal` is a genuine poison and must propagate.
+        if let Err(error) = engine.sweep_expired() {
+            if matches!(error, Error::EngineFatal { .. }) {
+                return Err(error);
+            }
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                target: "mqlite",
+                error = %error,
+                "mqlite::ttl_sweep open-time sweep failed (non-fatal)"
+            );
+        }
         Ok(engine)
     }
 }
@@ -349,16 +365,26 @@ impl PagedEngine {
         doc_ops::find_first(self, ns, filter)
     }
 
+    pub(crate) fn aggregate(
+        &self,
+        ns: &str,
+        pipeline: &crate::query::aggregate::Pipeline,
+    ) -> Result<Vec<Document>> {
+        self.shared.check_engine_not_poisoned()?;
+        doc_ops::aggregate(self, ns, pipeline)
+    }
+
     pub(crate) fn update(
         &self,
         ns: &str,
         filter: &Document,
-        update: &Document,
+        mods: &crate::update::UpdateModifications,
+        array_filters: Option<&[Document]>,
         opts: &UpdateOptions,
         many: bool,
     ) -> Result<UpdateResult> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::update(self, ns, filter, update, opts, many)
+        doc_ops::update(self, ns, filter, mods, array_filters, opts, many)
     }
 
     pub(crate) fn delete(&self, ns: &str, filter: &Document, many: bool) -> Result<DeleteResult> {
@@ -371,15 +397,26 @@ impl PagedEngine {
         doc_ops::count(self, ns, filter)
     }
 
+    pub(crate) fn distinct(
+        &self,
+        ns: &str,
+        field_name: &str,
+        filter: &Document,
+    ) -> Result<Vec<Bson>> {
+        self.shared.check_engine_not_poisoned()?;
+        doc_ops::distinct(self, ns, field_name, filter)
+    }
+
     pub(crate) fn find_one_and_update(
         &self,
         ns: &str,
         filter: &Document,
-        update: &Document,
+        mods: &crate::update::UpdateModifications,
+        array_filters: Option<&[Document]>,
         opts: &FindOneAndUpdateOptions,
     ) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
-        doc_ops::find_one_and_update(self, ns, filter, update, opts)
+        doc_ops::find_one_and_update(self, ns, filter, mods, array_filters, opts)
     }
 
     pub(crate) fn find_one_and_delete(
@@ -401,6 +438,17 @@ impl PagedEngine {
     ) -> Result<Option<Document>> {
         self.shared.check_engine_not_poisoned()?;
         doc_ops::find_one_and_replace(self, ns, filter, replacement, opts)
+    }
+
+    pub(crate) fn replace_one(
+        &self,
+        ns: &str,
+        filter: &Document,
+        replacement: &Document,
+        upsert: bool,
+    ) -> Result<UpdateResult> {
+        self.shared.check_engine_not_poisoned()?;
+        doc_ops::replace_one(self, ns, filter, replacement, upsert)
     }
 
     pub(crate) fn create_index(&self, ns: &str, model: &IndexModel) -> Result<String> {

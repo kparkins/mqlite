@@ -333,6 +333,341 @@ pub(super) fn eval_size(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> 
 }
 
 // ---------------------------------------------------------------------------
+// $mod
+// ---------------------------------------------------------------------------
+
+/// Number of elements MongoDB requires in a `$mod` argument array.
+const MOD_ARG_LEN: usize = 2;
+
+/// Evaluate `$mod` — `{field: {$mod: [divisor, remainder]}}`.
+///
+/// The argument must be a two-element array of numbers. `Double` divisor and
+/// remainder are truncated toward zero (e.g. `4.5` becomes `4`). Matching uses
+/// Rust's `%` on `i64`, which is C-style truncated division and therefore
+/// agrees with MongoDB for negative operands.
+///
+/// Only numeric field values can match. `Double` field values are truncated
+/// toward zero before the modulo; non-finite doubles never match. Array fields
+/// unwrap: the operator matches if any element matches. A missing field or a
+/// non-numeric value yields no match and no error.
+///
+/// # Errors
+///
+/// Returns `BadValue` when the argument is not an array
+/// (`"malformed mod, needs to be an array"`), has fewer than two elements
+/// (`"malformed mod, not enough elements"`), has more than two elements
+/// (`"malformed mod, too many elements"`), when the divisor or remainder is
+/// non-numeric or non-finite, or when the divisor truncates to zero
+/// (`"divisor cannot be 0"`).
+pub(super) fn eval_mod(field_value: Option<&Bson>, arg: &Bson) -> Result<bool> {
+    let Bson::Array(arr) = arg else {
+        return Err(bad_value("malformed mod, needs to be an array"));
+    };
+    if arr.len() < MOD_ARG_LEN {
+        return Err(bad_value("malformed mod, not enough elements"));
+    }
+    if arr.len() > MOD_ARG_LEN {
+        return Err(bad_value("malformed mod, too many elements"));
+    }
+    let divisor = mod_operand_to_i64(&arr[0])?;
+    let remainder = mod_operand_to_i64(&arr[1])?;
+    if divisor == 0 {
+        return Err(bad_value("divisor cannot be 0"));
+    }
+
+    let val = match field_value {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let elems = if let Bson::Array(elements) = val {
+        elements.as_slice()
+    } else {
+        slice::from_ref(val)
+    };
+    Ok(elems
+        .iter()
+        .filter_map(mod_field_value_to_i64)
+        .any(|v| v % divisor == remainder))
+}
+
+/// Convert a `$mod` divisor or remainder argument to `i64`.
+///
+/// Accepts `Int32`, `Int64`, and finite `Double` (truncated toward zero).
+///
+/// # Errors
+///
+/// Returns `BadValue` for non-numeric values and for `NaN`/`Infinity` doubles.
+fn mod_operand_to_i64(val: &Bson) -> Result<i64> {
+    match val {
+        Bson::Int32(n) => Ok(*n as i64),
+        Bson::Int64(n) => Ok(*n),
+        Bson::Double(f) if f.is_finite() => Ok(*f as i64),
+        _ => Err(bad_value(
+            "malformed mod, divisor and remainder must be numbers",
+        )),
+    }
+}
+
+/// Convert a `$mod` field value to `i64`, or `None` if it cannot match.
+///
+/// Accepts `Int32`, `Int64`, and finite `Double` (truncated toward zero).
+/// Non-numeric values and non-finite doubles return `None` (no match).
+fn mod_field_value_to_i64(val: &Bson) -> Option<i64> {
+    match val {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(f) if f.is_finite() => Some(*f as i64),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bit-test operators: $bitsAllSet, $bitsAnySet, $bitsAllClear, $bitsAnyClear
+// ---------------------------------------------------------------------------
+
+/// The bit-test mode requested by a `$bits*` operator.
+#[derive(Clone, Copy)]
+pub(super) enum BitTest {
+    /// `$bitsAllSet` — every mask bit must be set in the value.
+    AllSet,
+    /// `$bitsAnySet` — at least one mask bit must be set in the value.
+    AnySet,
+    /// `$bitsAllClear` — every mask bit must be clear in the value.
+    AllClear,
+    /// `$bitsAnyClear` — at least one mask bit must be clear in the value.
+    AnyClear,
+}
+
+impl BitTest {
+    /// The operator name, used in error messages.
+    fn op_name(self) -> &'static str {
+        match self {
+            BitTest::AllSet => "$bitsAllSet",
+            BitTest::AnySet => "$bitsAnySet",
+            BitTest::AllClear => "$bitsAllClear",
+            BitTest::AnyClear => "$bitsAnyClear",
+        }
+    }
+}
+
+/// Number of bits in a byte.
+const BITS_PER_BYTE: usize = 8;
+
+/// Evaluate a bit-test operator (`$bitsAllSet`, `$bitsAnySet`,
+/// `$bitsAllClear`, `$bitsAnyClear`) against `field_value`.
+///
+/// The mask argument is one of: a non-negative numeric value (`Int32`,
+/// `Int64`, or `Double` with a non-negative integral value), an array of
+/// non-negative integer bit positions, or a `BinData` little-endian bit
+/// string (byte `i` holds bit positions `[8*i, 8*i+8)`, least-significant-bit
+/// first within each byte).
+///
+/// Only `Int32`, `Int64`, integral `Double` representable in `i64`, and
+/// `BinData` field values pass the type gate; every other value yields no
+/// match and no error. Numeric field values are treated as 64-bit two's
+/// complement with infinite sign extension (negative values have every bit at
+/// position `>= 64` set); `BinData` field values have every bit beyond their
+/// length clear. Array fields unwrap: the operator matches if any element
+/// matches.
+///
+/// # Errors
+///
+/// Returns `BadValue` for a negative or fractional numeric mask, a bit-position
+/// array containing a negative, fractional, or non-numeric element, or a mask
+/// argument of any other type.
+pub(super) fn eval_bits(field_value: Option<&Bson>, arg: &Bson, test: BitTest) -> Result<bool> {
+    let mask = BitMask::from_arg(arg, test)?;
+    let val = match field_value {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let elems = if let Bson::Array(elements) = val {
+        elements.as_slice()
+    } else {
+        slice::from_ref(val)
+    };
+    Ok(elems.iter().any(|elem| mask.matches(elem, test)))
+}
+
+/// A normalised bit mask: the sorted, de-duplicated set of bit positions to
+/// test. Positions may exceed 63 (only meaningful against negative numeric
+/// values via sign extension).
+struct BitMask {
+    positions: Vec<u64>,
+}
+
+impl BitMask {
+    /// Build a [`BitMask`] from a `$bits*` argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BadValue` for invalid numeric, array, or unsupported mask
+    /// argument types (see [`eval_bits`]).
+    fn from_arg(arg: &Bson, test: BitTest) -> Result<Self> {
+        let op = test.op_name();
+        let positions = match arg {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+                bit_positions_from_numeric_mask(arg, op)?
+            }
+            Bson::Array(arr) => bit_positions_from_array_mask(arr, op)?,
+            Bson::Binary(bin) => bit_positions_from_bytes(&bin.bytes),
+            _ => {
+                return Err(bad_value(&format!(
+                    "{op} takes an integer, array, or BinData mask"
+                )))
+            }
+        };
+        Ok(BitMask { positions })
+    }
+
+    /// Test the mask against a single field value under `test` semantics.
+    ///
+    /// Returns `false` for any value that fails the type gate.
+    fn matches(&self, val: &Bson, test: BitTest) -> bool {
+        let Some(is_set) = bit_reader(val) else {
+            return false;
+        };
+        match test {
+            BitTest::AllSet => self.positions.iter().all(|&p| is_set(p)),
+            BitTest::AnySet => self.positions.iter().any(|&p| is_set(p)),
+            BitTest::AllClear => self.positions.iter().all(|&p| !is_set(p)),
+            BitTest::AnyClear => self.positions.iter().any(|&p| !is_set(p)),
+        }
+    }
+}
+
+/// Extract bit positions from a numeric mask argument.
+///
+/// # Errors
+///
+/// Returns `BadValue` for a negative value or a fractional `Double`.
+fn bit_positions_from_numeric_mask(arg: &Bson, op: &str) -> Result<Vec<u64>> {
+    let bits = numeric_mask_to_u64(arg, op)?;
+    Ok((0..u64::BITS as u64)
+        .filter(|&p| bits & (1 << p) != 0)
+        .collect())
+}
+
+/// Convert a numeric `$bits*` mask to its `u64` bit pattern.
+///
+/// # Errors
+///
+/// Returns `BadValue` for a negative value or a non-integral `Double`.
+fn numeric_mask_to_u64(arg: &Bson, op: &str) -> Result<u64> {
+    match arg {
+        Bson::Int32(n) if *n >= 0 => Ok(*n as u64),
+        Bson::Int64(n) if *n >= 0 => Ok(*n as u64),
+        Bson::Double(f) if f.is_finite() && *f >= 0.0 && f.fract() == 0.0 => Ok(*f as u64),
+        _ => Err(bad_value(&format!(
+            "{op} numeric mask must be a non-negative integer"
+        ))),
+    }
+}
+
+/// Extract bit positions from a bit-position array mask argument.
+///
+/// # Errors
+///
+/// Returns `BadValue` for any negative, fractional, or non-numeric element.
+fn bit_positions_from_array_mask(arr: &[Bson], op: &str) -> Result<Vec<u64>> {
+    let mut positions = Vec::with_capacity(arr.len());
+    for elem in arr {
+        positions.push(bit_position_value(elem, op)?);
+    }
+    Ok(positions)
+}
+
+/// Convert a single bit-position array element to a `u64` position.
+///
+/// # Errors
+///
+/// Returns `BadValue` for a negative, fractional, or non-numeric element.
+fn bit_position_value(elem: &Bson, op: &str) -> Result<u64> {
+    let position = match elem {
+        Bson::Int32(n) if *n >= 0 => *n as u64,
+        Bson::Int64(n) if *n >= 0 => *n as u64,
+        Bson::Double(f) if f.is_finite() && *f >= 0.0 && f.fract() == 0.0 => *f as u64,
+        _ => {
+            return Err(bad_value(&format!(
+                "{op} bit positions must be non-negative integers"
+            )))
+        }
+    };
+    Ok(position)
+}
+
+/// Extract the set bit positions from a little-endian `BinData` byte slice.
+///
+/// Byte `i` holds positions `[8*i, 8*i+8)`, least-significant-bit first.
+fn bit_positions_from_bytes(bytes: &[u8]) -> Vec<u64> {
+    let mut positions = Vec::new();
+    for (i, byte) in bytes.iter().enumerate() {
+        for bit in 0..BITS_PER_BYTE {
+            if byte & (1 << bit) != 0 {
+                positions.push((i * BITS_PER_BYTE + bit) as u64);
+            }
+        }
+    }
+    positions
+}
+
+/// Build a "is bit at position set?" reader for a bit-testable field value.
+///
+/// Returns `None` for values that fail the type gate (fractional doubles,
+/// non-finite doubles, doubles outside `i64`, and all non-numeric, non-BinData
+/// types).
+///
+/// Numeric values are read as 64-bit two's complement with infinite sign
+/// extension. `BinData` values are read little-endian, with every bit beyond
+/// the data length treated as clear.
+fn bit_reader(val: &Bson) -> Option<Box<dyn Fn(u64) -> bool + '_>> {
+    match val {
+        Bson::Int32(n) => {
+            let bits = *n as i64;
+            Some(Box::new(move |p| signed_bit_set(bits, p)))
+        }
+        Bson::Int64(n) => {
+            let bits = *n;
+            Some(Box::new(move |p| signed_bit_set(bits, p)))
+        }
+        Bson::Double(f) if f.is_finite() && f.fract() == 0.0 && double_fits_i64(*f) => {
+            let bits = *f as i64;
+            Some(Box::new(move |p| signed_bit_set(bits, p)))
+        }
+        Bson::Binary(bin) => Some(Box::new(move |p| binary_bit_set(&bin.bytes, p))),
+        _ => None,
+    }
+}
+
+/// Return whether `f` is exactly representable as an `i64`.
+fn double_fits_i64(f: f64) -> bool {
+    f >= i64::MIN as f64 && f <= i64::MAX as f64
+}
+
+/// Return whether bit `position` is set in a 64-bit two's-complement integer
+/// with infinite sign extension.
+///
+/// For `position >= 64` the result is the sign bit: negative values report
+/// every high bit as set, non-negative values as clear.
+fn signed_bit_set(bits: i64, position: u64) -> bool {
+    if position >= u64::BITS as u64 {
+        return bits < 0;
+    }
+    bits & (1_i64 << position) != 0
+}
+
+/// Return whether bit `position` is set in a little-endian `BinData` byte
+/// slice. Positions beyond the data length are clear.
+fn binary_bit_set(bytes: &[u8], position: u64) -> bool {
+    let byte_index = (position / BITS_PER_BYTE as u64) as usize;
+    let Some(byte) = bytes.get(byte_index) else {
+        return false;
+    };
+    let bit_in_byte = position % BITS_PER_BYTE as u64;
+    byte & (1 << bit_in_byte) != 0
+}
+
+// ---------------------------------------------------------------------------
 // $regex
 // ---------------------------------------------------------------------------
 

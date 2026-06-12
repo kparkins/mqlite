@@ -46,10 +46,11 @@ use super::handlers;
 use super::handlers::get_i64;
 #[cfg(test)]
 use super::handlers::{
-    handle_build_info, handle_create, handle_create_indexes, handle_delete, handle_drop,
-    handle_drop_indexes, handle_find, handle_find_and_modify, handle_get_more, handle_hello,
-    handle_insert, handle_kill_cursors, handle_list_collections, handle_list_databases,
-    handle_list_indexes, handle_server_status, handle_update,
+    handle_aggregate, handle_build_info, handle_count, handle_create, handle_create_indexes,
+    handle_delete, handle_distinct, handle_drop, handle_drop_database, handle_drop_indexes,
+    handle_end_sessions, handle_explain, handle_find, handle_find_and_modify, handle_get_more,
+    handle_hello, handle_insert, handle_kill_cursors, handle_list_collections,
+    handle_list_databases, handle_list_indexes, handle_server_status, handle_update,
 };
 pub(crate) use cursors::{cursor_sweep_task, ConnectionCursors};
 #[cfg(test)]
@@ -66,6 +67,10 @@ const OP_QUERY: i32 = 2004;
 
 /// How long to wait for any read on an idle connection before closing it.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the background TTL sweep runs (MongoDB `ttlMonitorSleepSecs`
+/// default is 60 seconds).
+const TTL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -263,9 +268,12 @@ impl WireProtocol {
                     }
                 };
 
-                // Run the accept loop until the shutdown signal arrives.
+                // Run the accept loop and the TTL sweep loop until the shutdown
+                // signal arrives. `select!` drops the losing futures, so the
+                // sweep loop stops cleanly when the server shuts down.
                 tokio::select! {
                     _ = accept_loop(listener, state.clone()) => {}
+                    _ = ttl_sweep_loop(state.clone()) => {}
                     _ = shutdown_rx => {
                         // Signal all connection tasks to stop, then wait up
                         // to 5 seconds for them to drain.
@@ -321,6 +329,33 @@ async fn accept_loop(listener: tokio::net::TcpListener, state: ServerState) {
     // Drain remaining connection tasks with a 5-second grace period.
     let drain = async { while join_set.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+}
+
+// ---------------------------------------------------------------------------
+// TTL sweep loop
+// ---------------------------------------------------------------------------
+
+/// Periodically delete documents that have outlived their TTL index window.
+///
+/// Sweeps every [`TTL_SWEEP_INTERVAL`] (MongoDB's `ttlMonitorSleepSecs`
+/// default). Each sweep races against the server [`CancellationToken`] so the
+/// loop exits promptly on shutdown. A sweep error is logged and the loop
+/// continues — a transient failure must not stop future sweeps.
+async fn ttl_sweep_loop(state: ServerState) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(TTL_SWEEP_INTERVAL) => {}
+            _ = state.cancel.cancelled() => break,
+        }
+        if let Err(_error) = state.database.sweep_expired() {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                target: "mqlite",
+                error = %_error,
+                "mqlite::ttl_sweep background sweep failed (non-fatal)"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,12 +558,18 @@ fn route_command(
         "buildinfo" => handlers::handle_build_info(),
         "serverstatus" => handlers::handle_server_status(state),
         "listdatabases" => handlers::handle_list_databases(state),
+        "dropdatabase" => handlers::handle_drop_database(body, state),
+        "endsessions" => handlers::handle_end_sessions(),
         // CRUD commands
         "insert" => handlers::handle_insert(body, state),
         "find" => handlers::handle_find(body, state, cursors),
+        "aggregate" => handlers::handle_aggregate(body, state, cursors),
         "update" => handlers::handle_update(body, state),
         "delete" => handlers::handle_delete(body, state),
         "findandmodify" => handlers::handle_find_and_modify(body, state),
+        "count" => handlers::handle_count(body, state),
+        "distinct" => handlers::handle_distinct(body, state),
+        "explain" => handlers::handle_explain(body, state),
         // Cursor management
         "getmore" => handlers::handle_get_more(body, state, cursors),
         "killcursors" => handlers::handle_kill_cursors(body, cursors),
@@ -600,3 +641,7 @@ fn merge_doc_sequences_into_body(body: &Document, sections: &[Section]) -> Docum
 #[cfg(test)]
 #[path = "tests/server_commands.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/index_commands.rs"]
+mod index_commands_tests;

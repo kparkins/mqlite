@@ -12,9 +12,10 @@ use crate::{
     error::Result,
     options::{
         FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions, FindOptions,
-        InsertManyOptions, ReturnDocument, UpdateOptions,
+        Hint, InsertManyOptions, ReturnDocument, UpdateOptions,
     },
     results::{InsertManyResult, UpdateResult},
+    update::UpdateModifications,
 };
 
 use super::Collection;
@@ -62,6 +63,18 @@ impl<'a, T: DeserializeOwned> Find<'a, T> {
         self
     }
 
+    /// Force a specific index access path via a [`Hint`].
+    ///
+    /// A [`Hint::Name`] selects an index by name; a [`Hint::Keys`] selects it
+    /// by its key pattern. The reserved pattern `{ "$natural": 1 }` forces a
+    /// collection scan. A hint that does not correspond to an existing index
+    /// makes `.run()` return a `BadValue` error.
+    #[must_use]
+    pub fn hint(mut self, hint: Hint) -> Self {
+        self.options.hint = Some(hint);
+        self
+    }
+
     /// Execute the find and return a [`Cursor`].
     ///
     /// # Errors
@@ -71,6 +84,32 @@ impl<'a, T: DeserializeOwned> Find<'a, T> {
         self.coll
             .inner
             .find(&self.coll.namespace(), self.filter, self.options)
+    }
+}
+
+/// Action returned by [`Collection::aggregate`]. Call `.run()` to execute.
+///
+/// Unlike the typed [`Find`] action, an aggregation pipeline can reshape
+/// documents (e.g. via `$group`/`$project`) so its output no longer matches
+/// `T`. The result is therefore always a [`Cursor`] of raw [`Document`]s,
+/// mirroring the MongoDB Rust driver's untyped `Collection::aggregate`.
+pub struct Aggregate<'a, T> {
+    pub(super) coll: &'a Collection<T>,
+    pub(super) pipeline: Vec<Document>,
+}
+
+impl<T> Aggregate<'_, T> {
+    /// Execute the pipeline and return a [`Cursor`] of result documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipeline is malformed (unknown stage,
+    /// non-object element, invalid stage argument, unsupported accumulator or
+    /// expression) or if the storage engine cannot execute the pipeline.
+    pub fn run(self) -> Result<Cursor<Document>> {
+        self.coll
+            .inner
+            .aggregate(&self.coll.namespace(), self.pipeline)
     }
 }
 
@@ -107,7 +146,7 @@ impl<'a, T: Serialize> InsertMany<'a, T> {
 pub struct Update<'a, T> {
     pub(super) coll: &'a Collection<T>,
     pub(super) filter: Document,
-    pub(super) update: Document,
+    pub(super) update: UpdateModifications,
     pub(super) options: UpdateOptions,
     pub(super) multi: bool,
 }
@@ -117,6 +156,15 @@ impl<'a, T> Update<'a, T> {
     #[must_use]
     pub fn upsert(mut self, upsert: bool) -> Self {
         self.options.upsert = upsert;
+        self
+    }
+
+    /// Supply `arrayFilters` for the filtered-positional `$[<identifier>]`
+    /// update operator. Each document declares one identifier and its match
+    /// condition.
+    #[must_use]
+    pub fn array_filters(mut self, array_filters: Vec<Document>) -> Self {
+        self.options.array_filters = Some(array_filters);
         self
     }
 
@@ -144,11 +192,45 @@ impl<'a, T> Update<'a, T> {
     }
 }
 
+/// Action returned by [`Collection::replace_one`]. Chain option methods, then call `.run()`.
+pub struct Replace<'a, T> {
+    pub(super) coll: &'a Collection<T>,
+    pub(super) filter: Document,
+    pub(super) replacement: &'a T,
+    pub(super) upsert: bool,
+}
+
+impl<'a, T: Serialize> Replace<'a, T> {
+    /// Insert the replacement as a new document when no document matches the
+    /// filter.
+    #[must_use]
+    pub fn upsert(mut self, upsert: bool) -> Self {
+        self.upsert = upsert;
+        self
+    }
+
+    /// Execute the replacement and return an [`UpdateResult`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the replacement cannot be serialized, if it
+    /// contains top-level update operators, if it would change the matched
+    /// document's `_id`, or if the storage engine cannot apply the write.
+    pub fn run(self) -> Result<UpdateResult> {
+        self.coll.inner.replace_one(
+            &self.coll.namespace(),
+            self.filter,
+            self.replacement,
+            self.upsert,
+        )
+    }
+}
+
 /// Action returned by [`Collection::find_one_and_update`]. Chain option methods, then call `.run()`.
 pub struct FindOneAndUpdate<'a, T> {
     pub(super) coll: &'a Collection<T>,
     pub(super) filter: Document,
-    pub(super) update: Document,
+    pub(super) update: UpdateModifications,
     pub(super) options: FindOneAndUpdateOptions,
 }
 
@@ -171,6 +253,14 @@ impl<'a, T: Serialize + DeserializeOwned> FindOneAndUpdate<'a, T> {
     #[must_use]
     pub fn sort(mut self, sort: Document) -> Self {
         self.options.sort = Some(sort);
+        self
+    }
+
+    /// Supply `arrayFilters` for the filtered-positional `$[<identifier>]`
+    /// update operator.
+    #[must_use]
+    pub fn array_filters(mut self, array_filters: Vec<Document>) -> Self {
+        self.options.array_filters = Some(array_filters);
         self
     }
 

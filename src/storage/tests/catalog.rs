@@ -115,6 +115,8 @@ fn index_entry_roundtrip() {
         key_pattern: doc! { "email": 1 },
         unique: true,
         sparse: false,
+        partial_filter_expression: None,
+        expire_after_seconds: None,
         multikey: false,
         entry_count: 5000,
         state: IndexState::Ready,
@@ -123,6 +125,32 @@ fn index_entry_roundtrip() {
     let decoded = IndexEntry::from_bson_bytes(&bytes).unwrap();
     assert_eq!(decoded, entry);
     assert_eq!(decoded.id, 11);
+}
+
+#[test]
+fn index_entry_roundtrip_with_partial_filter() {
+    let entry = IndexEntry {
+        id: 12,
+        name: "qty_1".to_owned(),
+        collection: "inventory".to_owned(),
+        root_page: 100,
+        root_level: 0,
+        key_pattern: doc! { "qty": 1 },
+        unique: false,
+        sparse: false,
+        partial_filter_expression: Some(doc! { "qty": { "$gt": 10i32 } }),
+        expire_after_seconds: None,
+        multikey: false,
+        entry_count: 3,
+        state: IndexState::Ready,
+    };
+    let bytes = entry.to_bson_bytes().unwrap();
+    let decoded = IndexEntry::from_bson_bytes(&bytes).unwrap();
+    assert_eq!(decoded, entry);
+    assert_eq!(
+        decoded.partial_filter_expression,
+        Some(doc! { "qty": { "$gt": 10i32 } })
+    );
 }
 
 // -----------------------------------------------------------------------

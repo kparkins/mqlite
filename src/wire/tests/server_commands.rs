@@ -261,7 +261,7 @@ fn dispatch_op_msg_list_databases() {
 fn dispatch_op_msg_unknown_command() {
     let state = ServerState::default();
     // Use $db: "admin" (always allowed) to test CommandNotFound, not Unauthorized.
-    let req_buf = make_op_msg_request(7, &doc! { "aggregate": 1, "$db": "admin" });
+    let req_buf = make_op_msg_request(7, &doc! { "frobnicate": 1, "$db": "admin" });
     let msg = OpMsg::parse(&req_buf).unwrap();
     let resp_bytes =
         dispatch_op_msg(&msg, 16, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
@@ -270,6 +270,35 @@ fn dispatch_op_msg_unknown_command() {
     assert_eq!(body.get_f64("ok").unwrap(), 0.0);
     assert_eq!(body.get_i32("code").unwrap(), 59);
     assert_eq!(body.get_str("codeName").unwrap(), "CommandNotFound");
+}
+
+#[test]
+fn dispatch_op_msg_end_sessions_returns_ok() {
+    // Drivers send endSessions on close; it must be a no-op returning ok:1.
+    let state = ServerState::default();
+    let req_buf = make_op_msg_request(
+        8,
+        &doc! {
+            "endSessions": [{ "id": bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Uuid,
+                bytes: vec![0u8; 16],
+            }) }],
+            "$db": "admin",
+        },
+    );
+    let msg = OpMsg::parse(&req_buf).unwrap();
+    let resp_bytes =
+        dispatch_op_msg(&msg, 18, msg.header.request_id, &state, 1, &dummy_cursors()).unwrap();
+    let resp = OpMsg::parse(&resp_bytes).unwrap();
+    let body = resp.body().unwrap();
+    assert_eq!(body.get_f64("ok").unwrap(), 1.0);
+    assert!(!body.contains_key("code"), "endSessions must not error");
+}
+
+#[test]
+fn end_sessions_handler_returns_ok() {
+    let body = handle_end_sessions();
+    assert_eq!(body.get_f64("ok").unwrap(), 1.0);
 }
 
 // -----------------------------------------------------------------------
@@ -1078,6 +1107,77 @@ fn update_collation_returns_bad_value() {
     assert_eq!(result.get_i32("code").unwrap(), 2);
 }
 
+#[test]
+fn update_with_array_filters() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+    handle_insert(
+        &doc! { "insert": "afcoll", "documents": [{"_id": 1i32, "grades": [95i32, 102i32, 90i32]}], "$db": "local" },
+        &state,
+    );
+
+    let body = doc! {
+        "update": "afcoll",
+        "updates": [{
+            "q": {"_id": 1i32},
+            "u": {"$set": {"grades.$[elem]": 100i32}},
+            "arrayFilters": [{"elem": {"$gte": 100i32}}],
+        }],
+        "$db": "local",
+    };
+    let result = handle_update(&body, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    assert_eq!(result.get_i64("nModified").unwrap(), 1);
+
+    let find_res = handle_find(
+        &doc! { "find": "afcoll", "filter": {"_id": 1i32}, "$db": "local" },
+        &state,
+        &cursors,
+    );
+    let batch = find_res
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    let grades = batch[0].as_document().unwrap().get_array("grades").unwrap();
+    assert_eq!(grades[1].as_i32().unwrap(), 100);
+    assert_eq!(grades[2].as_i32().unwrap(), 90);
+}
+
+#[test]
+fn update_with_pipeline_u_field() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+    handle_insert(
+        &doc! { "insert": "pipecoll", "documents": [{"_id": 1i32, "price": 4i32, "qty": 3i32}], "$db": "local" },
+        &state,
+    );
+
+    let body = doc! {
+        "update": "pipecoll",
+        "updates": [{
+            "q": {"_id": 1i32},
+            "u": [{"$set": {"total": {"$multiply": ["$price", "$qty"]}}}],
+        }],
+        "$db": "local",
+    };
+    let result = handle_update(&body, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    assert_eq!(result.get_i64("nModified").unwrap(), 1);
+
+    let find_res = handle_find(
+        &doc! { "find": "pipecoll", "filter": {"_id": 1i32}, "$db": "local" },
+        &state,
+        &cursors,
+    );
+    let batch = find_res
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(batch[0].as_document().unwrap().get_i32("total").unwrap(), 12);
+}
+
 // ---- delete ----
 
 #[test]
@@ -1213,6 +1313,30 @@ fn find_and_modify_update_new_true_returns_updated_doc() {
     assert_eq!(result.get_f64("ok").unwrap(), 1.0);
     let value = result.get_document("value").unwrap();
     assert_eq!(value.get_i32("v").unwrap(), 2); // post-update
+}
+
+#[test]
+fn find_and_modify_with_array_filters() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "famaf", "documents": [{"_id": 1i32, "grades": [80i32, 90i32]}], "$db": "local" },
+        &state,
+    );
+
+    let body = doc! {
+        "findandmodify": "famaf",
+        "query": {"_id": 1i32},
+        "update": {"$set": {"grades.$[hi]": 100i32}},
+        "arrayFilters": [{"hi": {"$gte": 85i32}}],
+        "new": true,
+        "$db": "local",
+    };
+    let result = handle_find_and_modify(&body, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let value = result.get_document("value").unwrap();
+    let grades = value.get_array("grades").unwrap();
+    assert_eq!(grades[0].as_i32().unwrap(), 80);
+    assert_eq!(grades[1].as_i32().unwrap(), 100);
 }
 
 #[test]
@@ -2014,4 +2138,700 @@ fn create_indexes_numbers_correct_on_buffered_backend() {
     assert_eq!(result.get_i32("numIndexesBefore").unwrap(), 1);
     // After: 1 user index + 1 synthetic _id_ = 2.
     assert_eq!(result.get_i32("numIndexesAfter").unwrap(), 2);
+}
+
+// -----------------------------------------------------------------------
+// count
+// -----------------------------------------------------------------------
+
+#[test]
+fn count_all_documents_without_query() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "cntcoll", "documents": [{"x": 1i32}, {"x": 2i32}, {"x": 3i32}], "$db": "local" },
+        &state,
+    );
+    let result = handle_count(&doc! { "count": "cntcoll", "$db": "local" }, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    assert_eq!(result.get_i64("n").unwrap(), 3);
+}
+
+#[test]
+fn count_with_query_filters_documents() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "cntqcoll", "documents": [
+            {"s": "a"}, {"s": "b"}, {"s": "a"}
+        ], "$db": "local" },
+        &state,
+    );
+    let result = handle_count(
+        &doc! { "count": "cntqcoll", "query": {"s": "a"}, "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(result.get_i64("n").unwrap(), 2);
+}
+
+#[test]
+fn count_with_skip_and_limit() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "cntskcoll", "documents": [
+            {"i": 0i32}, {"i": 1i32}, {"i": 2i32}, {"i": 3i32}, {"i": 4i32}
+        ], "$db": "local" },
+        &state,
+    );
+    // 5 docs, skip 1 -> 4 remaining, limit 2 -> count 2.
+    let result = handle_count(
+        &doc! { "count": "cntskcoll", "skip": 1i32, "limit": 2i32, "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(result.get_i64("n").unwrap(), 2);
+}
+
+#[test]
+fn count_negative_limit_treated_as_absolute() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "cntneglim", "documents": [
+            {"i": 0i32}, {"i": 1i32}, {"i": 2i32}, {"i": 3i32}
+        ], "$db": "local" },
+        &state,
+    );
+    // limit -2 must behave like limit 2.
+    let result = handle_count(
+        &doc! { "count": "cntneglim", "limit": -2i32, "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(result.get_i64("n").unwrap(), 2);
+}
+
+#[test]
+fn count_negative_skip_returns_bad_value() {
+    let state = ServerState::default();
+    let result = handle_count(
+        &doc! { "count": "cntcoll", "skip": -1i32, "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+    assert_eq!(result.get_i32("code").unwrap(), 2); // BadValue
+    assert_eq!(result.get_str("codeName").unwrap(), "BadValue");
+}
+
+#[test]
+fn count_missing_collection_returns_zero() {
+    let state = ServerState::default();
+    let result = handle_count(&doc! { "count": "ghostcoll", "$db": "local" }, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(result.get_i64("n").unwrap(), 0);
+}
+
+// -----------------------------------------------------------------------
+// distinct
+// -----------------------------------------------------------------------
+
+#[test]
+fn distinct_basic_returns_unique_values() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "distcoll", "documents": [
+            {"color": "red"}, {"color": "blue"}, {"color": "red"}
+        ], "$db": "local" },
+        &state,
+    );
+    let result = handle_distinct(
+        &doc! { "distinct": "distcoll", "key": "color", "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let values = result.get_array("values").unwrap();
+    assert_eq!(values.len(), 2);
+    let strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    assert!(strs.contains(&"red"));
+    assert!(strs.contains(&"blue"));
+}
+
+#[test]
+fn distinct_with_query_filter() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "distqcoll", "documents": [
+            {"t": "x", "v": 1i32}, {"t": "y", "v": 2i32}, {"t": "x", "v": 3i32}
+        ], "$db": "local" },
+        &state,
+    );
+    let result = handle_distinct(
+        &doc! { "distinct": "distqcoll", "key": "v", "query": {"t": "x"}, "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    let values = result.get_array("values").unwrap();
+    // Only docs with t=x: v in {1, 3}.
+    assert_eq!(values.len(), 2);
+}
+
+#[test]
+fn distinct_unwraps_array_field_values() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "distarrcoll", "documents": [
+            {"tags": ["a", "b"]}, {"tags": ["b", "c"]}
+        ], "$db": "local" },
+        &state,
+    );
+    let result = handle_distinct(
+        &doc! { "distinct": "distarrcoll", "key": "tags", "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    let values = result.get_array("values").unwrap();
+    let strs: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+    // Array elements are unwound: a, b, c.
+    assert_eq!(strs.len(), 3);
+    assert!(strs.contains(&"a"));
+    assert!(strs.contains(&"b"));
+    assert!(strs.contains(&"c"));
+}
+
+#[test]
+fn distinct_missing_key_returns_bad_value() {
+    let state = ServerState::default();
+    let result = handle_distinct(&doc! { "distinct": "distcoll", "$db": "local" }, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+    assert_eq!(result.get_i32("code").unwrap(), 2); // BadValue
+    assert_eq!(result.get_str("codeName").unwrap(), "BadValue");
+}
+
+#[test]
+fn distinct_missing_collection_returns_empty() {
+    let state = ServerState::default();
+    let result = handle_distinct(
+        &doc! { "distinct": "ghostcoll", "key": "x", "$db": "local" },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    assert!(result.get_array("values").unwrap().is_empty());
+}
+
+// -----------------------------------------------------------------------
+// dropDatabase
+// -----------------------------------------------------------------------
+
+#[test]
+fn drop_database_drops_only_target_db() {
+    let state = ServerState::default();
+    // Two collections in "dropme", one in "keepme".
+    handle_insert(
+        &doc! { "insert": "c1", "documents": [{"x": 1i32}], "$db": "dropme" },
+        &state,
+    );
+    handle_insert(
+        &doc! { "insert": "c2", "documents": [{"y": 2i32}], "$db": "dropme" },
+        &state,
+    );
+    handle_insert(
+        &doc! { "insert": "survivor", "documents": [{"z": 3i32}], "$db": "keepme" },
+        &state,
+    );
+
+    let result = handle_drop_database(&doc! { "dropDatabase": 1i32, "$db": "dropme" }, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    assert_eq!(result.get_str("dropped").unwrap(), "dropme");
+
+    // "dropme" collections are gone.
+    let dropme_list =
+        handle_list_collections(&doc! { "listCollections": 1i32, "$db": "dropme" }, &state);
+    assert!(dropme_list
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()
+        .is_empty());
+
+    // "keepme" survives.
+    let keepme_list =
+        handle_list_collections(&doc! { "listCollections": 1i32, "$db": "keepme" }, &state);
+    let keep_batch = keepme_list
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(keep_batch.len(), 1);
+    assert_eq!(
+        keep_batch[0].as_document().unwrap().get_str("name").unwrap(),
+        "survivor"
+    );
+}
+
+#[test]
+fn drop_database_empty_db_includes_dropped_field() {
+    let state = ServerState::default();
+    let result = handle_drop_database(&doc! { "dropDatabase": 1i32, "$db": "neverexisted" }, &state);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    // `dropped` is always present, even with no collections.
+    assert_eq!(result.get_str("dropped").unwrap(), "neverexisted");
+}
+
+// -----------------------------------------------------------------------
+// explain
+// -----------------------------------------------------------------------
+
+#[test]
+fn explain_find_unindexed_field_reports_collscan() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "expcoll", "documents": [{"a": 1i32}, {"a": 2i32}], "$db": "local" },
+        &state,
+    );
+    let result = handle_explain(
+        &doc! {
+            "explain": {"find": "expcoll", "filter": {"a": 1i32}},
+            "$db": "local",
+        },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    assert_eq!(result.get_str("explainVersion").unwrap(), "1");
+    let qp = result.get_document("queryPlanner").unwrap();
+    assert!(qp.get_str("namespace").unwrap().contains("expcoll"));
+    assert!(!qp.get_bool("indexFilterSet").unwrap());
+    assert!(qp.contains_key("parsedQuery"));
+    assert!(qp.get_array("rejectedPlans").unwrap().is_empty());
+    let winning = qp.get_document("winningPlan").unwrap();
+    assert_eq!(winning.get_str("stage").unwrap(), "COLLSCAN");
+    // The command echo must be present.
+    assert!(result.contains_key("command"));
+}
+
+#[test]
+fn explain_find_indexed_field_reports_ixscan() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "expidxcoll", "documents": [
+            {"email": "a@x.com"}, {"email": "b@x.com"}
+        ], "$db": "local" },
+        &state,
+    );
+    handle_create_indexes(
+        &doc! {
+            "createIndexes": "expidxcoll",
+            "indexes": [{"key": {"email": 1i32}, "name": "email_1"}],
+            "$db": "local",
+        },
+        &state,
+    );
+    let result = handle_explain(
+        &doc! {
+            "explain": {"find": "expidxcoll", "filter": {"email": "a@x.com"}},
+            "$db": "local",
+        },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let winning = result
+        .get_document("queryPlanner")
+        .unwrap()
+        .get_document("winningPlan")
+        .unwrap();
+    assert_eq!(winning.get_str("stage").unwrap(), "FETCH");
+    let input = winning.get_document("inputStage").unwrap();
+    assert_eq!(input.get_str("stage").unwrap(), "IXSCAN");
+    assert_eq!(input.get_str("indexName").unwrap(), "email_1");
+    let key_pattern = input.get_document("keyPattern").unwrap();
+    assert_eq!(key_pattern.get_i32("email").unwrap(), 1);
+}
+
+#[test]
+fn explain_unsupported_inner_command_returns_command_not_found() {
+    let state = ServerState::default();
+    let result = handle_explain(
+        &doc! {
+            "explain": {"aggregate": "coll", "pipeline": []},
+            "$db": "local",
+        },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 0.0);
+    assert_eq!(result.get_i32("code").unwrap(), 59); // CommandNotFound
+    assert_eq!(result.get_str("codeName").unwrap(), "CommandNotFound");
+    // The message must name the unsupported explain target.
+    assert!(result.get_str("errmsg").unwrap().contains("aggregate"));
+}
+
+#[test]
+fn explain_default_verbosity_returns_query_planner_only() {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "expdefcoll", "documents": [{"a": 1i32}], "$db": "local" },
+        &state,
+    );
+    // No verbosity supplied — must default to queryPlanner (no executionStats).
+    let result = handle_explain(
+        &doc! {
+            "explain": {"find": "expdefcoll", "filter": {}},
+            "$db": "local",
+        },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0);
+    assert!(result.contains_key("queryPlanner"));
+    assert!(
+        !result.contains_key("executionStats"),
+        "queryPlanner-only response must omit executionStats"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Full OP_MSG dispatch tests for count / distinct / dropDatabase / explain
+// -----------------------------------------------------------------------
+
+#[test]
+fn dispatch_op_msg_count_and_distinct() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+
+    // Seed three docs.
+    let ins_req = make_op_msg_request(
+        400,
+        &doc! { "insert": "dcoll", "documents": [
+            {"k": "a"}, {"k": "b"}, {"k": "a"}
+        ], "$db": "local" },
+    );
+    let ins_msg = OpMsg::parse(&ins_req).unwrap();
+    dispatch_op_msg(&ins_msg, 500, ins_msg.header.request_id, &state, 1, &cursors).unwrap();
+
+    // count via dispatch.
+    let cnt_req = make_op_msg_request(401, &doc! { "count": "dcoll", "$db": "local" });
+    let cnt_msg = OpMsg::parse(&cnt_req).unwrap();
+    let cnt_bytes =
+        dispatch_op_msg(&cnt_msg, 501, cnt_msg.header.request_id, &state, 1, &cursors).unwrap();
+    let cnt_resp = OpMsg::parse(&cnt_bytes).unwrap();
+    let cnt_body = cnt_resp.body().unwrap();
+    assert_eq!(cnt_body.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(cnt_body.get_i64("n").unwrap(), 3);
+
+    // distinct via dispatch.
+    let dst_req =
+        make_op_msg_request(402, &doc! { "distinct": "dcoll", "key": "k", "$db": "local" });
+    let dst_msg = OpMsg::parse(&dst_req).unwrap();
+    let dst_bytes =
+        dispatch_op_msg(&dst_msg, 502, dst_msg.header.request_id, &state, 1, &cursors).unwrap();
+    let dst_resp = OpMsg::parse(&dst_bytes).unwrap();
+    let dst_body = dst_resp.body().unwrap();
+    assert_eq!(dst_body.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(dst_body.get_array("values").unwrap().len(), 2);
+}
+
+#[test]
+fn dispatch_op_msg_drop_database_and_explain() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+
+    // Seed a collection in "ddb".
+    let ins_req = make_op_msg_request(
+        410,
+        &doc! { "insert": "things", "documents": [{"x": 1i32}], "$db": "ddb" },
+    );
+    let ins_msg = OpMsg::parse(&ins_req).unwrap();
+    dispatch_op_msg(&ins_msg, 510, ins_msg.header.request_id, &state, 1, &cursors).unwrap();
+
+    // dropDatabase via dispatch.
+    let dd_req = make_op_msg_request(411, &doc! { "dropDatabase": 1i32, "$db": "ddb" });
+    let dd_msg = OpMsg::parse(&dd_req).unwrap();
+    let dd_bytes =
+        dispatch_op_msg(&dd_msg, 511, dd_msg.header.request_id, &state, 1, &cursors).unwrap();
+    let dd_resp = OpMsg::parse(&dd_bytes).unwrap();
+    let dd_body = dd_resp.body().unwrap();
+    assert_eq!(dd_body.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(dd_body.get_str("dropped").unwrap(), "ddb");
+
+    // explain via dispatch.
+    let ex_req = make_op_msg_request(
+        412,
+        &doc! { "explain": {"find": "things", "filter": {}}, "$db": "local" },
+    );
+    let ex_msg = OpMsg::parse(&ex_req).unwrap();
+    let ex_bytes =
+        dispatch_op_msg(&ex_msg, 512, ex_msg.header.request_id, &state, 1, &cursors).unwrap();
+    let ex_resp = OpMsg::parse(&ex_bytes).unwrap();
+    let ex_body = ex_resp.body().unwrap();
+    assert_eq!(ex_body.get_f64("ok").unwrap(), 1.0);
+    assert_eq!(ex_body.get_str("explainVersion").unwrap(), "1");
+}
+
+// -----------------------------------------------------------------------
+// aggregate
+// -----------------------------------------------------------------------
+
+#[test]
+fn aggregate_countdocuments_pymongo_shape() {
+    // pymongo countDocuments: [{$match: filter}, {$group: {_id: 1, n: {$sum: 1}}}]
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+    handle_insert(
+        &doc! { "insert": "aggcnt", "documents": [
+            {"status": "a"}, {"status": "b"}, {"status": "a"}
+        ], "$db": "local" },
+        &state,
+    );
+    let body = doc! {
+        "aggregate": "aggcnt",
+        "pipeline": [
+            { "$match": { "status": "a" } },
+            { "$group": { "_id": 1i32, "n": { "$sum": 1i32 } } },
+        ],
+        "cursor": {},
+        "$db": "local",
+    };
+    let result = handle_aggregate(&body, &state, &cursors);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let cursor_doc = result.get_document("cursor").unwrap();
+    let batch = cursor_doc.get_array("firstBatch").unwrap();
+    assert_eq!(batch.len(), 1);
+    let group_doc = batch[0].as_document().unwrap();
+    assert_eq!(group_doc.get_i32("n").unwrap(), 2);
+}
+
+#[test]
+fn aggregate_cursor_field_required() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+    let body = doc! {
+        "aggregate": "somecoll",
+        "pipeline": [],
+        // "cursor" field intentionally omitted
+        "$db": "local",
+    };
+    let result = handle_aggregate(&body, &state, &cursors);
+    assert_eq!(result.get_f64("ok").unwrap(), 0.0, "{result:?}");
+    assert_eq!(result.get_i32("code").unwrap(), 2); // BadValue
+    let msg = result.get_str("errmsg").unwrap();
+    assert!(
+        msg.contains("cursor"),
+        "error must mention 'cursor', got: {msg}"
+    );
+}
+
+#[test]
+fn aggregate_getmore_continuation_with_small_batch_size() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+    // Insert 5 docs.
+    handle_insert(
+        &doc! { "insert": "aggbatch", "documents": [
+            {"i": 0i32}, {"i": 1i32}, {"i": 2i32}, {"i": 3i32}, {"i": 4i32}
+        ], "$db": "local" },
+        &state,
+    );
+    // Aggregate with batchSize=2: should get firstBatch of 2 and a live cursor.
+    let body = doc! {
+        "aggregate": "aggbatch",
+        "pipeline": [ { "$match": {} } ],
+        "cursor": { "batchSize": 2i32 },
+        "$db": "local",
+    };
+    let result = handle_aggregate(&body, &state, &cursors);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let cursor_doc = result.get_document("cursor").unwrap();
+    assert_eq!(cursor_doc.get_array("firstBatch").unwrap().len(), 2);
+    let cursor_id = cursor_doc.get_i64("id").unwrap();
+    assert_ne!(cursor_id, 0, "cursor must be live when more docs remain");
+
+    // getMore: drain the rest.
+    let more = handle_get_more(
+        &doc! { "getMore": bson::Bson::Int64(cursor_id),
+                "collection": "aggbatch", "$db": "local" },
+        &state,
+        &cursors,
+    );
+    assert_eq!(more.get_f64("ok").unwrap(), 1.0, "{more:?}");
+    let more_cursor = more.get_document("cursor").unwrap();
+    let next_batch = more_cursor.get_array("nextBatch").unwrap();
+    assert_eq!(next_batch.len(), 3);
+    assert_eq!(more_cursor.get_i64("id").unwrap(), 0, "cursor exhausted");
+}
+
+#[test]
+fn aggregate_unknown_stage_error_response() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+    let body = doc! {
+        "aggregate": "anycoll",
+        "pipeline": [ { "$bogus": {} } ],
+        "cursor": {},
+        "$db": "local",
+    };
+    let result = handle_aggregate(&body, &state, &cursors);
+    assert_eq!(result.get_f64("ok").unwrap(), 0.0, "{result:?}");
+    let msg = result.get_str("errmsg").unwrap();
+    assert!(
+        msg.contains("$bogus"),
+        "error must name unknown stage, got: {msg}"
+    );
+}
+
+#[test]
+fn aggregate_nonexistent_collection_empty_batch() {
+    let state = ServerState::default();
+    let cursors = dummy_cursors();
+    let body = doc! {
+        "aggregate": "doesnotexist",
+        "pipeline": [ { "$match": { "x": 1i32 } } ],
+        "cursor": {},
+        "$db": "local",
+    };
+    let result = handle_aggregate(&body, &state, &cursors);
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let cursor_doc = result.get_document("cursor").unwrap();
+    assert!(
+        cursor_doc.get_array("firstBatch").unwrap().is_empty(),
+        "nonexistent collection must return empty firstBatch"
+    );
+    assert_eq!(cursor_doc.get_i64("id").unwrap(), 0);
+}
+
+// -----------------------------------------------------------------------
+// find / explain with `hint`
+// -----------------------------------------------------------------------
+
+/// Seed `hintcoll` in `local` with an `email_1` index, returning the state.
+fn seed_hint_collection() -> ServerState {
+    let state = ServerState::default();
+    handle_insert(
+        &doc! { "insert": "hintcoll", "documents": [
+            {"email": "a@x.com"}, {"email": "b@x.com"}
+        ], "$db": "local" },
+        &state,
+    );
+    handle_create_indexes(
+        &doc! {
+            "createIndexes": "hintcoll",
+            "indexes": [{"key": {"email": 1i32}, "name": "email_1"}],
+            "$db": "local",
+        },
+        &state,
+    );
+    state
+}
+
+#[test]
+fn find_with_hint_string_returns_matching_docs() {
+    let state = seed_hint_collection();
+    let cursors = dummy_cursors();
+    let result = handle_find(
+        &doc! {
+            "find": "hintcoll",
+            "filter": {"email": "a@x.com"},
+            "hint": "email_1",
+            "$db": "local",
+        },
+        &state,
+        &cursors,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let first_batch = result
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(first_batch.len(), 1);
+}
+
+#[test]
+fn find_with_hint_document_returns_matching_docs() {
+    let state = seed_hint_collection();
+    let cursors = dummy_cursors();
+    let result = handle_find(
+        &doc! {
+            "find": "hintcoll",
+            "filter": {"email": "b@x.com"},
+            "hint": {"email": 1i32},
+            "$db": "local",
+        },
+        &state,
+        &cursors,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let first_batch = result
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(first_batch.len(), 1);
+}
+
+#[test]
+fn find_with_bad_hint_returns_bad_value_error() {
+    let state = seed_hint_collection();
+    let cursors = dummy_cursors();
+    let result = handle_find(
+        &doc! {
+            "find": "hintcoll",
+            "filter": {"email": "a@x.com"},
+            "hint": "nonexistent_idx",
+            "$db": "local",
+        },
+        &state,
+        &cursors,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 0.0, "{result:?}");
+    assert_eq!(result.get_i32("code").unwrap(), 2); // BadValue
+    assert_eq!(result.get_str("codeName").unwrap(), "BadValue");
+    assert!(result
+        .get_str("errmsg")
+        .unwrap()
+        .contains("hint provided does not correspond to an existing index"));
+}
+
+#[test]
+fn explain_find_with_hint_reports_ixscan() {
+    let state = seed_hint_collection();
+    let result = handle_explain(
+        &doc! {
+            "explain": {
+                "find": "hintcoll",
+                "filter": {},
+                "hint": "email_1",
+            },
+            "$db": "local",
+        },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let winning = result
+        .get_document("queryPlanner")
+        .unwrap()
+        .get_document("winningPlan")
+        .unwrap();
+    // Empty filter + hint -> unbounded index scan, still an IXSCAN.
+    assert_eq!(winning.get_str("stage").unwrap(), "FETCH");
+    let input = winning.get_document("inputStage").unwrap();
+    assert_eq!(input.get_str("stage").unwrap(), "IXSCAN");
+    assert_eq!(input.get_str("indexName").unwrap(), "email_1");
+}
+
+#[test]
+fn explain_find_with_natural_hint_reports_collscan() {
+    let state = seed_hint_collection();
+    let result = handle_explain(
+        &doc! {
+            "explain": {
+                "find": "hintcoll",
+                "filter": {"email": "a@x.com"},
+                "hint": {"$natural": 1i32},
+            },
+            "$db": "local",
+        },
+        &state,
+    );
+    assert_eq!(result.get_f64("ok").unwrap(), 1.0, "{result:?}");
+    let winning = result
+        .get_document("queryPlanner")
+        .unwrap()
+        .get_document("winningPlan")
+        .unwrap();
+    assert_eq!(winning.get_str("stage").unwrap(), "COLLSCAN");
 }

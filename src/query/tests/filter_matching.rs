@@ -1,5 +1,14 @@
 use super::*;
-use bson::{doc, Bson, DateTime};
+use bson::spec::BinarySubtype;
+use bson::{doc, Binary, Bson, DateTime};
+
+/// Build a generic-subtype `BinData` BSON value from raw bytes (test helper).
+fn bin_data(bytes: Vec<u8>) -> Bson {
+    Bson::Binary(Binary {
+        subtype: BinarySubtype::Generic,
+        bytes,
+    })
+}
 
 // -----------------------------------------------------------------------
 // Helpers
@@ -937,24 +946,19 @@ fn regex_invalid_pattern_errors() {
 fn unsupported_operators_return_error() {
     // Top-level
     assert!(errors(
-        doc! { "$expr": { "$gt": ["$a", 5] } },
-        doc! { "a": 1 }
-    ));
-    assert!(errors(
         doc! { "$text": { "$search": "foo" } },
         doc! { "a": 1 }
     ));
     assert!(errors(doc! { "$where": "this.a > 1" }, doc! { "a": 1 }));
 
     // Field-level
-    assert!(errors(doc! { "a": { "$mod": [4, 0] } }, doc! { "a": 4 }));
     assert!(errors(doc! { "a": { "$jsonSchema": {} } }, doc! { "a": 1 }));
 }
 
 #[test]
 fn unsupported_operator_has_code_9() {
     use crate::error::codes;
-    let result = eval_filter(&doc! { "a": 1 }, &doc! { "$expr": { "$gt": ["$a", 0] } });
+    let result = eval_filter(&doc! { "a": 1 }, &doc! { "$where": "this.a > 1" });
     let err = result.unwrap_err();
     assert_eq!(
         err.code(),
@@ -963,4 +967,557 @@ fn unsupported_operator_has_code_9() {
     );
     // Confirm it's actually code 9.
     assert_eq!(codes::UNSUPPORTED_OPERATOR, 9);
+}
+
+// -----------------------------------------------------------------------
+// $mod
+// -----------------------------------------------------------------------
+
+#[test]
+fn mod_basic_match() {
+    assert!(matches(doc! { "a": { "$mod": [4, 0] } }, doc! { "a": 8 }));
+    assert!(matches(doc! { "a": { "$mod": [4, 1] } }, doc! { "a": 9 }));
+    assert!(no_match(doc! { "a": { "$mod": [4, 0] } }, doc! { "a": 9 }));
+}
+
+#[test]
+fn mod_array_unwrap() {
+    // Matches if any element matches.
+    assert!(matches(
+        doc! { "a": { "$mod": [4, 0] } },
+        doc! { "a": [1, 2, 8] }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$mod": [4, 0] } },
+        doc! { "a": [1, 2, 3] }
+    ));
+}
+
+#[test]
+fn mod_missing_field_no_match() {
+    assert!(no_match(doc! { "a": { "$mod": [4, 0] } }, doc! { "b": 8 }));
+}
+
+#[test]
+fn mod_non_numeric_field_no_match() {
+    // Non-numeric field value never matches, never errors.
+    assert!(no_match(
+        doc! { "a": { "$mod": [4, 0] } },
+        doc! { "a": "8" }
+    ));
+}
+
+#[test]
+fn mod_double_field_truncates_toward_zero() {
+    // 8.9 truncates to 8; 8 % 4 == 0.
+    assert!(matches(
+        doc! { "a": { "$mod": [4, 0] } },
+        doc! { "a": 8.9_f64 }
+    ));
+    // -8.9 truncates to -8; -8 % 4 == 0.
+    assert!(matches(
+        doc! { "a": { "$mod": [4, 0] } },
+        doc! { "a": -8.9_f64 }
+    ));
+}
+
+#[test]
+fn mod_non_finite_double_field_no_match() {
+    assert!(no_match(
+        doc! { "a": { "$mod": [4, 0] } },
+        doc! { "a": f64::NAN }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$mod": [4, 0] } },
+        doc! { "a": f64::INFINITY }
+    ));
+}
+
+#[test]
+fn mod_negative_operands_c_style() {
+    // Rust % on i64 is C-style truncated division (matches MongoDB).
+    // -7 % 3 == -1.
+    assert!(matches(doc! { "a": { "$mod": [3, -1] } }, doc! { "a": -7 }));
+    // -7 % -3 == -1.
+    assert!(matches(
+        doc! { "a": { "$mod": [-3, -1] } },
+        doc! { "a": -7 }
+    ));
+}
+
+#[test]
+fn mod_double_divisor_remainder_truncate() {
+    // Divisor 4.5 -> 4, remainder 1.9 -> 1. 9 % 4 == 1.
+    assert!(matches(
+        doc! { "a": { "$mod": [4.5_f64, 1.9_f64] } },
+        doc! { "a": 9 }
+    ));
+}
+
+#[test]
+fn mod_not_an_array_errors() {
+    assert!(errors(doc! { "a": { "$mod": 4 } }, doc! { "a": 8 }));
+}
+
+#[test]
+fn mod_not_enough_elements_errors() {
+    assert!(errors(doc! { "a": { "$mod": [4] } }, doc! { "a": 8 }));
+    assert!(errors(doc! { "a": { "$mod": [] } }, doc! { "a": 8 }));
+}
+
+#[test]
+fn mod_too_many_elements_errors() {
+    assert!(errors(doc! { "a": { "$mod": [4, 0, 1] } }, doc! { "a": 8 }));
+}
+
+#[test]
+fn mod_non_numeric_operand_errors() {
+    assert!(errors(doc! { "a": { "$mod": ["4", 0] } }, doc! { "a": 8 }));
+    assert!(errors(doc! { "a": { "$mod": [4, "0"] } }, doc! { "a": 8 }));
+}
+
+#[test]
+fn mod_non_finite_operand_errors() {
+    assert!(errors(
+        doc! { "a": { "$mod": [f64::NAN, 0] } },
+        doc! { "a": 8 }
+    ));
+    assert!(errors(
+        doc! { "a": { "$mod": [f64::INFINITY, 0] } },
+        doc! { "a": 8 }
+    ));
+}
+
+#[test]
+fn mod_zero_divisor_errors() {
+    assert!(errors(doc! { "a": { "$mod": [0, 0] } }, doc! { "a": 8 }));
+    // 0.5 truncates to 0 -> still a zero divisor.
+    assert!(errors(
+        doc! { "a": { "$mod": [0.5_f64, 0] } },
+        doc! { "a": 8 }
+    ));
+}
+
+// -----------------------------------------------------------------------
+// Bit-test operators: numeric masks
+// -----------------------------------------------------------------------
+
+#[test]
+fn bits_all_set_numeric_mask() {
+    // 54 = 0b110110; bits 4,5 set. Mask 0b110000 = 48.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": 48_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    // Mask bit 0 is not set in 54.
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": 1_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+}
+
+#[test]
+fn bits_any_set_numeric_mask() {
+    // 54 has bit 1 set; mask 0b10 = 2.
+    assert!(matches(
+        doc! { "a": { "$bitsAnySet": 2_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    // 54 has neither bit 0 nor bit 3 set; mask 0b1001 = 9.
+    assert!(no_match(
+        doc! { "a": { "$bitsAnySet": 9_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+}
+
+#[test]
+fn bits_all_clear_numeric_mask() {
+    // 54 = 0b110110; bits 0 and 3 are clear. Mask 0b1001 = 9.
+    assert!(matches(
+        doc! { "a": { "$bitsAllClear": 9_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    // Bit 4 is set, so AllClear fails for a mask including it.
+    assert!(no_match(
+        doc! { "a": { "$bitsAllClear": 16_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+}
+
+#[test]
+fn bits_any_clear_numeric_mask() {
+    // 54 has bit 0 clear; mask 0b1 = 1.
+    assert!(matches(
+        doc! { "a": { "$bitsAnyClear": 1_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    // Every bit of mask 0b110110 = 54 is set in 54, so none is clear.
+    assert!(no_match(
+        doc! { "a": { "$bitsAnyClear": 54_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+}
+
+#[test]
+fn bits_double_integral_mask_and_value() {
+    // Integral double mask and value pass the type gate.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": 48.0_f64 } },
+        doc! { "a": 54.0_f64 }
+    ));
+}
+
+#[test]
+fn bits_array_position_mask() {
+    // 54 = 0b110110; bits 4 and 5 set.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": [4_i32, 5_i32] } },
+        doc! { "a": 54_i32 }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": [0_i32, 4_i32] } },
+        doc! { "a": 54_i32 }
+    ));
+}
+
+#[test]
+fn bits_array_position_exceeds_63_positive() {
+    // Non-negative value: bit 100 is clear.
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": [100_i64] } },
+        doc! { "a": 54_i32 }
+    ));
+    assert!(matches(
+        doc! { "a": { "$bitsAllClear": [100_i64] } },
+        doc! { "a": 54_i32 }
+    ));
+}
+
+#[test]
+fn bits_array_position_exceeds_63_negative() {
+    // Negative value: infinite sign extension sets every bit >= 64.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": [100_i64] } },
+        doc! { "a": Bson::Int64(-1) }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAllClear": [100_i64] } },
+        doc! { "a": Bson::Int64(-1) }
+    ));
+}
+
+#[test]
+fn bits_negative_value_low_bits() {
+    // -1 has every low bit set.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": [0_i32, 1_i32, 63_i32] } },
+        doc! { "a": Bson::Int64(-1) }
+    ));
+    // -2 = 0b...1110; bit 0 is clear.
+    assert!(matches(
+        doc! { "a": { "$bitsAllClear": [0_i32] } },
+        doc! { "a": Bson::Int64(-2) }
+    ));
+}
+
+#[test]
+fn bits_bindata_mask_docs_example() {
+    // Docs example: BinData(0, "MA==") = one byte 0x30 = bits 4,5.
+    // Value 54 = 0b110110 has bits 4,5 set.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": bin_data(vec![0x30]) } },
+        doc! { "a": 54_i32 }
+    ));
+    assert!(matches(
+        doc! { "a": { "$bitsAnySet": bin_data(vec![0x30]) } },
+        doc! { "a": 54_i32 }
+    ));
+    // 0b000001 has bit 0 only, which is clear in 54.
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": bin_data(vec![0x01]) } },
+        doc! { "a": 54_i32 }
+    ));
+}
+
+#[test]
+fn bits_bindata_multibyte_little_endian() {
+    // Two bytes [0x00, 0x01] -> bit position 8 (LSB of second byte).
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": bin_data(vec![0x00, 0x01]) } },
+        doc! { "a": 256_i32 }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": bin_data(vec![0x00, 0x01]) } },
+        doc! { "a": 255_i32 }
+    ));
+}
+
+#[test]
+fn bits_bindata_field_value() {
+    // BinData field value: byte 0x30 = bits 4,5 set.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": [4_i32, 5_i32] } },
+        doc! { "a": bin_data(vec![0x30]) }
+    ));
+    // Bits beyond the data length are clear.
+    assert!(matches(
+        doc! { "a": { "$bitsAllClear": [100_i32] } },
+        doc! { "a": bin_data(vec![0x30]) }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": [100_i32] } },
+        doc! { "a": bin_data(vec![0x30]) }
+    ));
+}
+
+#[test]
+fn bits_array_unwrap() {
+    // Match if any element passes.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": [4_i32, 5_i32] } },
+        doc! { "a": [1_i32, 54_i32] }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": [4_i32, 5_i32] } },
+        doc! { "a": [1_i32, 2_i32] }
+    ));
+}
+
+#[test]
+fn bits_missing_field_no_match() {
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": 1_i32 } },
+        doc! { "b": 1_i32 }
+    ));
+}
+
+#[test]
+fn bits_type_gate_no_match_no_error() {
+    // Fractional double: no match, no error.
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": 1_i32 } },
+        doc! { "a": 1.5_f64 }
+    ));
+    // Non-finite double.
+    assert!(no_match(
+        doc! { "a": { "$bitsAnySet": 1_i32 } },
+        doc! { "a": f64::NAN }
+    ));
+    // String.
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": 1_i32 } },
+        doc! { "a": "x" }
+    ));
+}
+
+#[test]
+fn bits_empty_mask_semantics() {
+    // Numeric 0 mask: AllSet/AllClear vacuously match a type-gated field;
+    // AnySet/AnyClear match nothing.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": 0_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    assert!(matches(
+        doc! { "a": { "$bitsAllClear": 0_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAnySet": 0_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAnyClear": 0_i32 } },
+        doc! { "a": 54_i32 }
+    ));
+    // Empty position array and all-zero BinData behave identically.
+    assert!(matches(
+        doc! { "a": { "$bitsAllSet": [] } },
+        doc! { "a": 54_i32 }
+    ));
+    assert!(no_match(
+        doc! { "a": { "$bitsAnySet": bin_data(vec![0x00]) } },
+        doc! { "a": 54_i32 }
+    ));
+    // Empty mask still requires the field to pass the type gate.
+    assert!(no_match(
+        doc! { "a": { "$bitsAllSet": 0_i32 } },
+        doc! { "a": "x" }
+    ));
+}
+
+#[test]
+fn bits_negative_numeric_mask_errors() {
+    assert!(errors(
+        doc! { "a": { "$bitsAllSet": -1_i32 } },
+        doc! { "a": 1_i32 }
+    ));
+}
+
+#[test]
+fn bits_fractional_numeric_mask_errors() {
+    assert!(errors(
+        doc! { "a": { "$bitsAllSet": 1.5_f64 } },
+        doc! { "a": 1_i32 }
+    ));
+}
+
+#[test]
+fn bits_invalid_array_element_errors() {
+    // Negative position.
+    assert!(errors(
+        doc! { "a": { "$bitsAllSet": [-1_i32] } },
+        doc! { "a": 1_i32 }
+    ));
+    // Fractional position.
+    assert!(errors(
+        doc! { "a": { "$bitsAllSet": [1.5_f64] } },
+        doc! { "a": 1_i32 }
+    ));
+    // Non-numeric position.
+    assert!(errors(
+        doc! { "a": { "$bitsAllSet": ["1"] } },
+        doc! { "a": 1_i32 }
+    ));
+}
+
+#[test]
+fn bits_invalid_mask_type_errors() {
+    assert!(errors(
+        doc! { "a": { "$bitsAllSet": "mask" } },
+        doc! { "a": 1_i32 }
+    ));
+}
+
+// -----------------------------------------------------------------------
+// $comment (top-level no-op)
+// -----------------------------------------------------------------------
+
+#[test]
+fn comment_top_level_no_op_alone() {
+    // A lone $comment matches every document and never errors.
+    assert!(matches(doc! { "$comment": "find active" }, doc! { "a": 1 }));
+    assert!(matches(doc! { "$comment": "x" }, doc! {}));
+}
+
+#[test]
+fn comment_top_level_with_other_predicates() {
+    // $comment is ignored; the sibling predicate still applies.
+    assert!(matches(
+        doc! { "$comment": "note", "a": 1 },
+        doc! { "a": 1 }
+    ));
+    assert!(no_match(
+        doc! { "$comment": "note", "a": 1 },
+        doc! { "a": 2 }
+    ));
+}
+
+#[test]
+fn comment_top_level_non_string_accepted() {
+    // Non-string $comment values are accepted silently (no error).
+    assert!(matches(
+        doc! { "$comment": 42_i32, "a": 1 },
+        doc! { "a": 1 }
+    ));
+    assert!(matches(
+        doc! { "$comment": { "nested": true }, "a": 1 },
+        doc! { "a": 1 }
+    ));
+}
+
+#[test]
+fn comment_field_level_still_errors() {
+    // A field-level $comment remains an unknown-operator error.
+    assert!(errors(doc! { "a": { "$comment": "x" } }, doc! { "a": 1 }));
+}
+
+// -----------------------------------------------------------------------
+// $expr (top-level aggregation-expression filter)
+// -----------------------------------------------------------------------
+
+#[test]
+fn expr_field_to_field_comparison() {
+    // {$expr: {$gt: ["$a", "$b"]}} compares two fields of the same document.
+    let filter = doc! { "$expr": { "$gt": ["$a", "$b"] } };
+    assert!(matches(filter.clone(), doc! { "a": 5, "b": 3 }));
+    assert!(no_match(filter, doc! { "a": 2, "b": 3 }));
+}
+
+#[test]
+fn expr_arithmetic_comparison() {
+    // {$expr: {$gt: [{$add: ["$a", 5]}, "$b"]}} — arithmetic inside $expr.
+    let filter = doc! { "$expr": { "$gt": [{ "$add": ["$a", 5] }, "$b"] } };
+    // 1 + 5 = 6 > 4 -> match.
+    assert!(matches(filter.clone(), doc! { "a": 1, "b": 4 }));
+    // 1 + 5 = 6 > 10 is false -> no match.
+    assert!(no_match(filter, doc! { "a": 1, "b": 10 }));
+}
+
+#[test]
+fn expr_and_composed_with_normal_predicate() {
+    // $expr is a sibling of a normal field predicate (implicit AND).
+    let filter = doc! { "$expr": { "$gt": ["$a", "$b"] }, "c": 1 };
+    assert!(matches(filter.clone(), doc! { "a": 5, "b": 3, "c": 1 }));
+    // $expr matches but the normal predicate fails.
+    assert!(no_match(filter.clone(), doc! { "a": 5, "b": 3, "c": 2 }));
+    // Normal predicate matches but $expr fails.
+    assert!(no_match(filter, doc! { "a": 1, "b": 3, "c": 1 }));
+}
+
+#[test]
+fn expr_inside_or() {
+    // $expr nested inside $or composes via top-level recursion.
+    let filter = doc! {
+        "$or": [
+            { "$expr": { "$gt": ["$a", "$b"] } },
+            { "c": 1 },
+        ]
+    };
+    // First branch ($expr) matches.
+    assert!(matches(filter.clone(), doc! { "a": 5, "b": 3, "c": 0 }));
+    // Second branch matches even though $expr does not.
+    assert!(matches(filter.clone(), doc! { "a": 1, "b": 3, "c": 1 }));
+    // Neither branch matches.
+    assert!(no_match(filter, doc! { "a": 1, "b": 3, "c": 0 }));
+}
+
+#[test]
+fn expr_boolean_literals() {
+    // {$expr: true} matches every document; {$expr: false} matches none.
+    assert!(matches(doc! { "$expr": true }, doc! { "a": 1 }));
+    assert!(no_match(doc! { "$expr": false }, doc! { "a": 1 }));
+}
+
+#[test]
+fn expr_truthiness() {
+    // Numeric zero is falsy; a non-empty value (string) is truthy.
+    assert!(no_match(doc! { "$expr": "$a" }, doc! { "a": 0_i32 }));
+    assert!(matches(doc! { "$expr": "$a" }, doc! { "a": "x" }));
+}
+
+#[test]
+fn expr_root_based_comparison() {
+    // $$ROOT-based comparison: compare a field reached through $$ROOT.
+    let filter = doc! { "$expr": { "$gt": ["$$ROOT.a", "$b"] } };
+    assert!(matches(filter.clone(), doc! { "a": 5, "b": 3 }));
+    assert!(no_match(filter, doc! { "a": 1, "b": 3 }));
+}
+
+#[test]
+fn expr_unknown_operator_errors() {
+    // An unknown expression operator inside $expr propagates as an error.
+    assert!(errors(
+        doc! { "$expr": { "$bogusOp": ["$a", 1] } },
+        doc! { "a": 1 }
+    ));
+}
+
+#[test]
+fn expr_field_level_still_errors() {
+    // Field-level {field: {$expr: ...}} is invalid (unknown-operator path).
+    assert!(errors(
+        doc! { "a": { "$expr": { "$gt": ["$a", 1] } } },
+        doc! { "a": 1 }
+    ));
 }

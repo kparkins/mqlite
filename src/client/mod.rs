@@ -51,7 +51,8 @@ mod write_crash_cut_hook;
 mod tests;
 
 pub use collection::{
-    Collection, Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany, Update,
+    Aggregate, Collection, Find, FindOneAndDelete, FindOneAndReplace, FindOneAndUpdate, InsertMany,
+    Replace, Update,
 };
 pub use database::Database;
 pub use handle::Client;

@@ -191,7 +191,8 @@ fn assert_held_view_survives_checkpoint(engine: &PagedEngine) -> Result<()> {
     engine.update(
         NS,
         &doc! { "_id": 1 },
-        &doc! { "$set": { "value": "v2" } },
+        &crate::update::UpdateModifications::Document(doc! { "$set": { "value": "v2" } }),
+        None,
         &UpdateOptions::default(),
         false,
     )?;
@@ -260,7 +261,8 @@ fn history_spill_page_writes_precede_folded_leaf_write_with_journal() -> Result<
     engine.update(
         NS,
         &doc! { "_id": 1 },
-        &doc! { "$set": { "value": "v2" } },
+        &crate::update::UpdateModifications::Document(doc! { "$set": { "value": "v2" } }),
+        None,
         &UpdateOptions::default(),
         false,
     )?;
@@ -322,7 +324,8 @@ fn checkpoint_spill_flushes_are_chunked_across_trees() -> Result<()> {
         engine.update(
             ns,
             &doc! { "_id": 1 },
-            &doc! { "$set": { "value": "v2" } },
+            &crate::update::UpdateModifications::Document(doc! { "$set": { "value": "v2" } }),
+            None,
             &UpdateOptions::default(),
             false,
         )?;

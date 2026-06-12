@@ -10,6 +10,13 @@ framing used by MongoDB 8.0 drivers.
 
 ## Query (Filter) Operators
 
+Dotted paths traverse embedded documents and support numeric array indexes
+(`"a.0.b"`), and the final path value unwraps arrays (equality and comparison
+operators match any element). However, **dotted paths do not traverse arrays
+of documents**: `{"items.k": "b"}` does not match `{items: [{k: "b"}]}` — use
+`{items: {$elemMatch: {k: "b"}}}` instead. This is mqlite's most significant
+filter divergence from MongoDB (see Known Divergences).
+
 ### Comparison Operators
 
 | Operator | Status | Notes |
@@ -53,11 +60,24 @@ framing used by MongoDB 8.0 drivers.
 |----------|--------|-------|
 | `$regex` | ✅ Supported | **No PCRE lookahead/lookbehind** (uses Rust `regex` crate, not PCRE). Options: `i`, `m`, `s`, `x`. |
 | `$options` | ✅ Supported | Only valid alongside `$regex` |
-| `$mod` | ❌ Not Supported | |
+| `$mod` | ✅ Supported | `[divisor, remainder]`; doubles truncated toward zero; C-style remainder for negatives |
 | `$text` | ❌ Not Supported | Full-text search |
 | `$where` | ❌ Not Supported | JavaScript evaluation. Not planned (security) |
-| `$expr` | ❌ Not Supported | Aggregation expressions |
+| `$expr` | ✅ Supported | Top-level only; full expression language (see Aggregation Pipeline → Expressions) |
 | `$jsonSchema` | ❌ Not Supported | JSON Schema validation |
+
+### Bitwise Operators
+
+| Operator | Status | Notes |
+|----------|--------|-------|
+| `$bitsAllSet` | ✅ Supported | Mask forms: non-negative integer, bit-position array, BinData (little-endian) |
+| `$bitsAnySet` | ✅ Supported | Same mask forms |
+| `$bitsAllClear` | ✅ Supported | Same mask forms |
+| `$bitsAnyClear` | ✅ Supported | Same mask forms |
+
+Numeric field values are treated as 64-bit two's complement with sign extension
+beyond bit 63; fractional doubles never match; non-numeric/non-BinData fields
+never match (no error). Array fields unwrap.
 
 ### Geospatial Operators
 
@@ -72,9 +92,24 @@ framing used by MongoDB 8.0 drivers.
 
 | Operator | Status | Notes |
 |----------|--------|-------|
-| `$comment` | ❌ Not Supported | Query annotation |
-| `$rand` | ❌ Not Supported | Random sampling |
+| `$comment` | ✅ Supported | Top-level only; parsed and ignored (any BSON type accepted) |
+| `$rand` | ✅ Supported | As an expression: `{$expr: {$lt: [{$rand: {}}, 0.33]}}` |
 | `$natural` | ❌ Not Supported | Not valid in query filters |
+
+### Projection Operators
+
+Plain projections (`{field: 1}` / `{field: 0}` with `_id` handling) are
+supported, including dotted paths (`{"a.b": 1}`) at arbitrary depth with
+MongoDB's array-of-documents semantics. Path collisions
+(`{"a": 1, "a.b": 1}`) resolve last-spec-wins instead of erroring (see
+Divergences).
+
+| Operator | Status | Notes |
+|----------|--------|-------|
+| `$` (positional projection) | ❌ Not Supported | |
+| `$elemMatch` (projection) | ❌ Not Supported | |
+| `$slice` (projection) | ❌ Not Supported | |
+| `$meta` | ❌ Not Supported | No text search |
 
 ---
 
@@ -93,7 +128,7 @@ framing used by MongoDB 8.0 drivers.
 | `$max` | ✅ Supported | Update if new value > current |
 | `$currentDate` | ✅ Supported | Set to current date or timestamp |
 | `$setOnInsert` | ✅ Supported | Applied only on upsert insert |
-| `$bit` | ❌ Not Supported | Bitwise update. Not planned |
+| `$bit` | ✅ Supported | `and`/`or`/`xor` on Int32/Int64; Int64 result if either side is Int64 |
 
 ### Array Update Operators
 
@@ -104,9 +139,102 @@ framing used by MongoDB 8.0 drivers.
 | `$pullAll` | ✅ Supported | Remove all occurrences of specified values |
 | `$addToSet` | ✅ Supported | Add without duplicates; `$each` modifier supported |
 | `$pop` | ✅ Supported | Remove first (`-1`) or last (`1`) array element |
-| `$` (positional) | ❌ Not Supported | |
-| `$[]` (all positional) | ❌ Not Supported | |
-| `$[<identifier>]` (filtered) | ❌ Not Supported | |
+| `$` (positional) | ✅ Supported | First element matched by the query; resolved per document |
+| `$[]` (all positional) | ✅ Supported | Works with every update operator, including nested (`a.$[].b.$[]`) |
+| `$[<identifier>]` (filtered) | ✅ Supported | Via `arrayFilters`; nestable and mixable with `$[]` |
+
+### Pipeline-Form Updates
+
+The `update` and `findAndModify` commands and the native `update_one` /
+`update_many` / `find_one_and_update` methods accept an aggregation pipeline
+as the update (`u: [...]` / `UpdateModifications::Pipeline`), restricted to
+`$addFields` / `$set` / `$project` / `$unset` / `$replaceRoot` /
+`$replaceWith` exactly as MongoDB restricts them. `_id` is immutable.
+
+---
+
+## Aggregation Pipeline
+
+An in-memory subset, available through the native
+`Collection::aggregate(pipeline)` (returns raw `Document`s regardless of the
+collection's type parameter) and the wire `aggregate` command (full cursor
+protocol including `getMore`). A leading `$match` stage is index-accelerated
+through the query planner; later stages evaluate in memory. All reads in one
+aggregation (including `$lookup`) observe a single MVCC snapshot. Driver
+`countDocuments()` implementations (which send `$match` + `$group`/`$sum`)
+work over the wire.
+
+### Stages
+
+| Stage | Status | Notes |
+|-------|--------|-------|
+| `$match` | ✅ Supported | Same operator coverage as find filters; first stage uses indexes |
+| `$sort` | ✅ Supported | Stable; same BSON ordering as find sort |
+| `$skip` | ✅ Supported | |
+| `$limit` | ✅ Supported | |
+| `$project` | ✅ Supported | Include/exclude with dotted paths, plus computed fields via the full expression language |
+| `$count` | ✅ Supported | |
+| `$group` | ✅ Supported | `_id` and accumulator arguments accept the full expression language |
+| `$addFields` / `$set` | ✅ Supported | Original-document snapshot semantics; dotted targets |
+| `$unset` / `$replaceRoot` / `$replaceWith` | ✅ Supported | |
+| `$unwind` | ✅ Supported | `includeArrayIndex`, `preserveNullAndEmptyArrays` |
+| `$lookup` | ✅ Supported | Equality form (`localField`/`foreignField`), snapshot-consistent; `let`/pipeline form not supported |
+| `$sortByCount` | ✅ Supported | |
+| `$graphLookup` / `$unionWith` | ❌ Not Supported | |
+| `$facet` / `$bucket` / `$bucketAuto` | ❌ Not Supported | |
+| `$sample` | ❌ Not Supported | |
+| `$out` / `$merge` | ❌ Not Supported | |
+| `$geoNear` | ❌ Not Supported | Not planned (no geospatial) |
+| `$densify` / `$fill` / `$setWindowFields` | ❌ Not Supported | |
+| `$redact` / `$documents` / `$collStats` / `$indexStats` | ❌ Not Supported | |
+| `$changeStream` | ❌ Not Supported | No change streams |
+| `$search` / `$searchMeta` / `$vectorSearch` | ❌ Not Supported | Atlas-only in MongoDB |
+
+### Group Accumulators
+
+| Accumulator | Status | Notes |
+|-------------|--------|-------|
+| `$sum` | ✅ Supported | Ignores non-numeric values; `{$sum: 1}` counts documents |
+| `$avg` | ✅ Supported | Ignores non-numeric; empty group yields `null`; result is Double |
+| `$min` / `$max` | ✅ Supported | Ignore `null` and missing |
+| `$first` / `$last` | ✅ Supported | Missing values yield `null` (matches server) |
+| `$push` | ✅ Supported | Missing values contribute nothing |
+| `$addToSet` | ✅ Supported | BSON-equality dedup; order unspecified |
+| `$count` (accumulator) | ✅ Supported | Argument must be `{}` |
+| `$stdDevPop` / `$stdDevSamp` | ✅ Supported | Welford; empty group yields `null` (`$stdDevPop` of one value is `0.0`) |
+| `$mergeObjects` | ✅ Supported | Later fields overwrite; null/missing ignored |
+| `$firstN` / `$lastN` / `$minN` / `$maxN` | ✅ Supported | `n` must be a positive integer constant (MongoDB allows expressions) |
+| `$topN` / `$bottomN` / `$top` / `$bottom` | ❌ Not Supported | |
+| `$median` / `$percentile` | ❌ Not Supported | |
+| `$accumulator` | ❌ Not Supported | JavaScript; not planned |
+
+### Expressions
+
+The expression language is available in `$expr`, `$project`, `$addFields` /
+`$set`, `$group` (`_id` and accumulator arguments), `$replaceRoot` /
+`$replaceWith`, `$sortByCount`, and pipeline-form updates.
+
+| Family | Operators |
+|--------|-----------|
+| Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
+| Arithmetic | `$add` `$subtract` `$multiply` `$divide` `$mod` `$abs` `$ceil` `$floor` `$trunc` `$round` `$pow` `$sqrt` `$exp` `$ln` `$log10` |
+| Boolean | `$and` `$or` `$not` |
+| Conditional | `$cond` `$ifNull` `$switch` |
+| String | `$concat` `$toUpper` `$toLower` `$strLenCP` `$substrCP` `$split` `$trim` `$ltrim` `$rtrim` `$toString` |
+| Array | `$size` `$isArray` `$in` `$arrayElemAt` `$first` `$last` `$concatArrays` `$slice` `$filter` `$map` `$range` |
+| Type | `$type` `$toInt` `$toLong` `$toDouble` `$toBool` `$toDate` |
+| Date (UTC only) | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$millisecond` `$dayOfWeek` `$dayOfYear` |
+| Other | `$literal` `$rand`; variables `$$ROOT` `$$CURRENT` `$$NOW` `$$this` (and `as`-bound) |
+
+Not supported: `$convert`, `$dateToString` and timezone options, `$let`,
+`$reduce`, `$zip`, `$objectToArray` / `$arrayToObject`, `$regexMatch`,
+`$$REMOVE`, and any operator not listed above. Known divergences: expression
+field paths do not collect values across arrays of documents (such a path
+yields missing); `$trunc` takes one argument; `$toDate` accepts numeric
+milliseconds only.
+
+There is no 100 MB per-stage memory limit emulation: every stage materializes
+in memory (embedded, single-node model).
 
 ---
 
@@ -120,6 +248,7 @@ framing used by MongoDB 8.0 drivers.
 |---------|--------|-------|
 | `hello` / `isMaster` | ✅ Supported | Returns topology info; `ismaster: true` |
 | `ping` | ✅ Supported | Returns `{ok: 1}` |
+| `endSessions` | ✅ Supported | No-op acknowledgement (drivers send it on close) |
 | `buildInfo` | ✅ Supported | Returns mqlite version info |
 | `serverStatus` | ✅ Supported | Returns connection + database stats |
 
@@ -128,18 +257,23 @@ framing used by MongoDB 8.0 drivers.
 | Command | Status | Notes |
 |---------|--------|-------|
 | `listDatabases` | ✅ Supported | Returns list of databases in the file |
+| `dropDatabase` | ✅ Supported | Drops every collection in the database; response includes `dropped` |
 
 ### CRUD Commands
 
 | Command | Status | Notes |
 |---------|--------|-------|
-| `find` | ✅ Supported | Supports filter, sort, limit, skip, projection, batchSize |
+| `find` | ✅ Supported | filter, sort, limit, skip, projection, batchSize, hint (incl. `$natural`) |
 | `insert` | ✅ Supported | `ordered` flag supported |
-| `update` | ✅ Supported | `upsert` supported; `arrayFilters` not supported |
+| `update` | ✅ Supported | `upsert`, `arrayFilters`, and pipeline-form updates (`u: [...]`) supported |
 | `delete` | ✅ Supported | `deleteOne` and `deleteMany` via `limit` field |
-| `findAndModify` | ✅ Supported | `new`, `upsert`, `sort` options supported |
+| `findAndModify` | ✅ Supported | `new`, `upsert`, `sort`, `remove`, `arrayFilters`, pipeline updates |
+| `aggregate` | ✅ Supported | Minimal stage subset; requires `cursor` option (see Aggregation Pipeline) |
 | `getMore` | ✅ Supported | Cursor continuation |
 | `killCursors` | ✅ Supported | Explicit cursor cleanup |
+| `count` | ✅ Supported | `query`, `skip`, `limit` (negative limit = absolute value) |
+| `distinct` | ✅ Supported | `key`, `query`; array values unwound per MongoDB semantics |
+| `explain` | ✅ Supported | Inner `find` only; `queryPlanner` verbosity only (see Divergences) |
 
 ### Collection Admin Commands
 
@@ -161,11 +295,7 @@ framing used by MongoDB 8.0 drivers.
 
 | Command | Status | Notes |
 |---------|--------|-------|
-| `aggregate` | ❌ Not Supported | |
-| `distinct` | ❌ Not Supported | |
-| `count` | ❌ Not Supported | Use `countDocuments` via native API |
 | `mapReduce` | ❌ Not Supported | Not planned |
-| `explain` | ❌ Not Supported | Available in native API |
 | `currentOp` | ❌ Not Supported | |
 | Authentication | ❌ Not Supported | See [WIRE-SECURITY.md](WIRE-SECURITY.md) |
 | Replication commands | ❌ Not Supported | mqlite is standalone, not a replica set |
@@ -182,11 +312,11 @@ framing used by MongoDB 8.0 drivers.
 | Unique | ✅ Supported | Enforced on insert and upsert |
 | Sparse | ✅ Supported | Only indexes documents where the key field exists |
 | Multikey (array fields) | ✅ Supported | Automatically applied when indexing array fields |
-| TTL | ❌ Not Supported | |
+| TTL | ✅ Supported | `expireAfterSeconds` on single-field indexes; sweeps at open, on demand (`Client::sweep_expired`), and every 60 s under the wire server |
 | Text | ❌ Not Supported | |
 | Geospatial | ❌ Not Supported | Not planned |
 | Hashed | ❌ Not Supported | Not planned |
-| Partial | ❌ Not Supported | |
+| Partial | ✅ Supported | `partialFilterExpression` accepts any supported filter (superset of MongoDB); conservative planner subsumption |
 | Wildcard | ❌ Not Supported | Not planned |
 
 ---
@@ -219,10 +349,17 @@ handshake.
 | Read concern | `local`, `majority`, `snapshot` | Ignored (MVCC snapshot per read) |
 | Transactions | Multi-document ACID | Not supported |
 | Change streams | `$changeStream` aggregation | Not supported |
-| Aggregation pipeline | Full `$match`, `$group`, `$lookup`, … | Not supported |
+| Aggregation pipeline | Full stage/expression language | Subset: 15 stages, 16 accumulators, broad expression language (see Aggregation Pipeline) |
+| Filter dotted paths through arrays of documents | `{"items.k": "b"}` matches `{items: [{k: "b"}]}` | No match — use `$elemMatch` (leaf-level array unwrap still applies) |
+| Expression field paths | Collect values across arrays of documents | Yield missing for paths into arrays of documents |
+| `hint: {$natural: -1}` | Reverse collection scan | Forward scan (no reverse iteration) |
+| Partial index planning | Logical implication of `partialFilterExpression` | Exact syntactic subsumption (conservative; equal conditions only) |
+| TTL deletion | Continuous background monitor (60 s) | Sweep at open, on demand, and 60 s timer under the wire server |
+| Projection path collision | Error (`Path collision at a.b`) | Last-spec-wins |
+| `$firstN`/`$lastN`/`$minN`/`$maxN` `n` | Any expression | Positive integer constant |
 | `ObjectId` generation | Server-generated | Client-generated (compatible format) |
 | `_id` type enforcement | Any BSON type | Any BSON type |
 | Capped collections | Fixed-size, oldest-doc-removal | Not supported |
 | GridFS | Chunked file storage | Not supported |
 | Authentication | SCRAM-SHA-256, x.509 | None (embedded trust model; see [WIRE-SECURITY.md](WIRE-SECURITY.md)) |
-| `explain` output format | Rich query plan JSON | Simplified (`IXSCAN`/`COLLSCAN` via native API) |
+| `explain` output format | Rich query plan JSON; `executionStats` / `allPlansExecution` verbosities | Simplified `queryPlanner`-only output (`COLLSCAN` or `FETCH`+`IXSCAN`); all verbosities return the same shape |

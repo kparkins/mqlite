@@ -89,6 +89,8 @@ pub(crate) fn build_published_catalog(
                 key_pattern: idx.key_pattern.clone(),
                 unique: idx.unique,
                 sparse: idx.sparse,
+                partial_filter_expression: idx.partial_filter_expression.clone(),
+                expire_after_seconds: idx.expire_after_seconds,
                 state: idx.state,
             });
         }

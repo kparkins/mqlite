@@ -56,6 +56,8 @@ pub(super) fn create_index(
     model: &IndexModel,
 ) -> crate::error::Result<String> {
     validate_index_keys(&model.keys)?;
+    validate_partial_filter_expression(model)?;
+    validate_ttl(model)?;
     let name = model
         .options
         .name
@@ -88,6 +90,106 @@ pub(super) fn create_index(
 
     engine.create_index_commit(ns, &name, &reservation)?;
     Ok(name)
+}
+
+/// Name of the immutable primary `_id` field — partial indexes are forbidden
+/// on it (MongoDB restriction).
+const ID_FIELD: &str = "_id";
+
+/// Validate a partial index's `partialFilterExpression` at create time.
+///
+/// Enforces the MongoDB restrictions mqlite supports:
+/// - the filter must be a non-empty document;
+/// - the filter must be one the crate's evaluator accepts (mqlite admits ANY
+///   evaluator-supported filter — a SUPERSET of MongoDB's restricted operator
+///   set);
+/// - it must not be combined with `sparse: true`;
+/// - the index must not be on the `_id` field.
+///
+/// Returns `Ok(())` for an ordinary (non-partial) index.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidQuery`] (MongoDB `BadValue`, code 2) for any
+/// violation. Divergence: MongoDB returns `CannotCreateIndex` (code 67) for the
+/// sparse/`_id` conflicts; mqlite reports them all as `BadValue`.
+fn validate_partial_filter_expression(model: &IndexModel) -> Result<()> {
+    let Some(pfe) = &model.partial_filter_expression else {
+        return Ok(());
+    };
+
+    if pfe.is_empty() {
+        return Err(Error::InvalidQuery {
+            detail: "partialFilterExpression must be a non-empty document".to_owned(),
+        });
+    }
+
+    if model.options.sparse {
+        return Err(Error::InvalidQuery {
+            detail: "cannot specify both partialFilterExpression and sparse".to_owned(),
+        });
+    }
+
+    if model.keys.keys().any(|field| field == ID_FIELD) {
+        return Err(Error::InvalidQuery {
+            detail: "_id index cannot be a partial index".to_owned(),
+        });
+    }
+
+    // Validate that the evaluator accepts the filter. Evaluating against an
+    // empty document surfaces structural/operator errors (e.g. an unknown `$`
+    // operator) without needing a real document.
+    crate::query::eval_filter(&bson::Document::new(), pfe).map_err(|e| Error::InvalidQuery {
+        detail: format!("invalid partialFilterExpression: {e}"),
+    })?;
+
+    Ok(())
+}
+
+/// Validate a TTL index's `expireAfterSeconds` at create time.
+///
+/// Enforces the MongoDB restrictions mqlite supports:
+/// - the value must be non-negative (`0` means expire at the field's date);
+/// - TTL is only valid on single-field indexes (compound indexes are rejected);
+/// - the index must not be on the `_id` field.
+///
+/// TTL combines freely with `unique`, `sparse`, and `partialFilterExpression`
+/// (MongoDB permits all three with a TTL index). Integral/type validation of
+/// the wire value happens at the wire layer; here `expire_after_seconds` is
+/// already an `i64`.
+///
+/// Returns `Ok(())` for an ordinary (non-TTL) index.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidQuery`] (MongoDB `BadValue`, code 2) for any
+/// violation.
+fn validate_ttl(model: &IndexModel) -> Result<()> {
+    let Some(seconds) = model.expire_after_seconds else {
+        return Ok(());
+    };
+
+    if seconds < 0 {
+        return Err(Error::InvalidQuery {
+            detail: "TTL index expireAfterSeconds must be a non-negative number".to_owned(),
+        });
+    }
+
+    if model.keys.len() != 1 {
+        return Err(Error::InvalidQuery {
+            detail: "TTL indexes are single-field indexes, compound indexes do not \
+                     support the expireAfterSeconds option"
+                .to_owned(),
+        });
+    }
+
+    if model.keys.keys().any(|field| field == ID_FIELD) {
+        return Err(Error::InvalidQuery {
+            detail: "_id index cannot be a TTL index".to_owned(),
+        });
+    }
+
+    Ok(())
 }
 
 pub(super) fn drop_index(
@@ -200,6 +302,8 @@ pub(super) fn list_indexes(
             keys: i.key_pattern.clone(),
             unique: i.unique,
             sparse: i.sparse,
+            partial_filter_expression: i.partial_filter_expression.clone(),
+            expire_after_seconds: i.expire_after_seconds,
         })
         .collect())
 }

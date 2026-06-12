@@ -129,10 +129,20 @@ fn make_index_entry(key_pattern: Document, unique: bool, sparse: bool) -> IndexE
         key_pattern,
         unique,
         sparse,
+        partial_filter_expression: None,
+        expire_after_seconds: None,
         multikey: false,
         entry_count: 0,
         state: crate::storage::catalog::IndexState::Ready,
     }
+}
+
+/// Build an `IndexEntry` carrying a partial filter expression for the
+/// partial-index maintenance tests.
+fn make_partial_index_entry(key_pattern: Document, pfe: Document) -> IndexEntry {
+    let mut entry = make_index_entry(key_pattern, false, false);
+    entry.partial_filter_expression = Some(pfe);
+    entry
 }
 
 fn oid_bson() -> Bson {
@@ -781,4 +791,178 @@ fn index_supports_prefix_query() {
 
     let results = tree.range_scan(Some(&start), Some(&end)).unwrap();
     assert_eq!(results.len(), 2, "two docs with score=100 should be found");
+}
+
+// -----------------------------------------------------------------------
+// partial index maintenance (partialFilterExpression)
+// -----------------------------------------------------------------------
+
+/// Partial index `{qty:1}` with PFE `{qty: {$gt: 10}}`.
+fn partial_qty_entry() -> IndexEntry {
+    make_partial_index_entry(doc! { "qty": 1 }, doc! { "qty": { "$gt": 10i32 } })
+}
+
+#[test]
+fn partial_insert_indexes_only_matching_docs() {
+    let mut tree = fresh_tree();
+    let entry = partial_qty_entry();
+
+    let id_in = Bson::Int32(1);
+    let doc_in = doc! { "_id": id_in.clone(), "qty": 50i32 };
+    let id_out = Bson::Int32(2);
+    let doc_out = doc! { "_id": id_out.clone(), "qty": 5i32 };
+
+    stage_insert(&doc_in, &id_in, &mut tree, &entry).unwrap();
+    stage_insert(&doc_out, &id_out, &mut tree, &entry).unwrap();
+
+    let all = tree.range_scan(None, None).unwrap();
+    assert_eq!(all.len(), 1, "only the matching document is indexed");
+}
+
+#[test]
+fn partial_delete_of_nonmatching_doc_is_noop() {
+    let mut tree = fresh_tree();
+    let entry = partial_qty_entry();
+
+    let id_in = Bson::Int32(1);
+    let doc_in = doc! { "_id": id_in.clone(), "qty": 50i32 };
+    stage_insert(&doc_in, &id_in, &mut tree, &entry).unwrap();
+
+    // Deleting a doc that never matched must not touch the index.
+    let id_out = Bson::Int32(2);
+    let doc_out = doc! { "_id": id_out.clone(), "qty": 5i32 };
+    stage_delete(&doc_out, &id_out, &mut tree, &entry).unwrap();
+
+    let all = tree.range_scan(None, None).unwrap();
+    assert_eq!(all.len(), 1, "non-matching delete leaves the index intact");
+}
+
+#[test]
+fn partial_update_stayed_in_updates_entry() {
+    let mut tree = fresh_tree();
+    let entry = partial_qty_entry();
+    let id = Bson::Int32(1);
+
+    let old_doc = doc! { "_id": id.clone(), "qty": 20i32 };
+    let new_doc = doc! { "_id": id.clone(), "qty": 30i32 };
+    stage_insert(&old_doc, &id, &mut tree, &entry).unwrap();
+    stage_update(&old_doc, &new_doc, &id, &id, &mut tree, &entry).unwrap();
+
+    let all = tree.range_scan(None, None).unwrap();
+    assert_eq!(all.len(), 1, "stayed-in: one entry remains");
+    let (old_keys, _) = build_index_keys(&old_doc, &entry.key_pattern, &id, false).unwrap();
+    let (new_keys, _) = build_index_keys(&new_doc, &entry.key_pattern, &id, false).unwrap();
+    assert!(tree.search(&old_keys[0]).unwrap().is_none(), "old key gone");
+    assert!(tree.search(&new_keys[0]).unwrap().is_some(), "new key present");
+}
+
+#[test]
+fn partial_update_stayed_out_is_noop() {
+    let mut tree = fresh_tree();
+    let entry = partial_qty_entry();
+    let id = Bson::Int32(1);
+
+    let old_doc = doc! { "_id": id.clone(), "qty": 3i32 };
+    let new_doc = doc! { "_id": id.clone(), "qty": 7i32 };
+    // Neither version matches the PFE; insert was a no-op too.
+    stage_insert(&old_doc, &id, &mut tree, &entry).unwrap();
+    stage_update(&old_doc, &new_doc, &id, &id, &mut tree, &entry).unwrap();
+
+    let all = tree.range_scan(None, None).unwrap();
+    assert!(all.is_empty(), "stayed-out: index stays empty");
+}
+
+#[test]
+fn partial_update_left_removes_entry() {
+    let mut tree = fresh_tree();
+    let entry = partial_qty_entry();
+    let id = Bson::Int32(1);
+
+    let old_doc = doc! { "_id": id.clone(), "qty": 50i32 }; // matches
+    let new_doc = doc! { "_id": id.clone(), "qty": 5i32 }; // no longer matches
+    stage_insert(&old_doc, &id, &mut tree, &entry).unwrap();
+    assert_eq!(tree.range_scan(None, None).unwrap().len(), 1);
+
+    stage_update(&old_doc, &new_doc, &id, &id, &mut tree, &entry).unwrap();
+    let all = tree.range_scan(None, None).unwrap();
+    assert!(all.is_empty(), "left: old entry removed");
+}
+
+#[test]
+fn partial_update_entered_adds_entry() {
+    let mut tree = fresh_tree();
+    let entry = partial_qty_entry();
+    let id = Bson::Int32(1);
+
+    let old_doc = doc! { "_id": id.clone(), "qty": 5i32 }; // not matching
+    let new_doc = doc! { "_id": id.clone(), "qty": 50i32 }; // now matches
+    stage_insert(&old_doc, &id, &mut tree, &entry).unwrap();
+    assert!(tree.range_scan(None, None).unwrap().is_empty());
+
+    stage_update(&old_doc, &new_doc, &id, &id, &mut tree, &entry).unwrap();
+    let all = tree.range_scan(None, None).unwrap();
+    assert_eq!(all.len(), 1, "entered: new entry added");
+    let (new_keys, _) = build_index_keys(&new_doc, &entry.key_pattern, &id, false).unwrap();
+    assert!(tree.search(&new_keys[0]).unwrap().is_some());
+}
+
+#[test]
+fn partial_build_indexes_only_matching_existing_docs() {
+    // Build over a mixed data tree: only PFE-matching docs get entries.
+    let mut data = fresh_tree();
+    for (i, qty) in [(1, 50i32), (2, 5i32), (3, 11i32), (4, 10i32)] {
+        let id = Bson::Int32(i);
+        let doc = doc! { "_id": id.clone(), "qty": qty };
+        let bytes = bson::to_vec(&doc).unwrap();
+        let key = crate::keys::encode_key(&id);
+        data.insert(&key, &bytes).unwrap();
+    }
+
+    let mut idx = fresh_tree();
+    let entry = partial_qty_entry();
+    build_index(&data, &mut idx, &entry).unwrap();
+
+    // qty values 50 and 11 are > 10; 5 and 10 are not.
+    let all = idx.range_scan(None, None).unwrap();
+    assert_eq!(all.len(), 2, "only qty>10 docs are indexed by the build");
+}
+
+#[test]
+fn unique_partial_allows_duplicates_outside_pfe() {
+    // Unique constraint applies ONLY within the PFE. Two non-matching docs may
+    // share the indexed value freely.
+    let mut tree = fresh_tree();
+    let mut entry = make_partial_index_entry(doc! { "qty": 1 }, doc! { "active": true });
+    entry.unique = true;
+
+    let id1 = Bson::Int32(1);
+    let id2 = Bson::Int32(2);
+    // Both have qty=7 but active=false -> outside the PFE -> no entries, no
+    // uniqueness enforcement.
+    let doc1 = doc! { "_id": id1.clone(), "qty": 7i32, "active": false };
+    let doc2 = doc! { "_id": id2.clone(), "qty": 7i32, "active": false };
+    stage_insert(&doc1, &id1, &mut tree, &entry).unwrap();
+    stage_insert(&doc2, &id2, &mut tree, &entry)
+        .expect("duplicates outside the PFE are allowed");
+
+    assert!(tree.range_scan(None, None).unwrap().is_empty());
+}
+
+#[test]
+fn unique_partial_blocks_duplicates_inside_pfe() {
+    // Within the PFE, the unique constraint is enforced normally.
+    let mut tree = fresh_tree();
+    let mut entry = make_partial_index_entry(doc! { "qty": 1 }, doc! { "active": true });
+    entry.unique = true;
+
+    let id1 = Bson::Int32(1);
+    let id2 = Bson::Int32(2);
+    let doc1 = doc! { "_id": id1.clone(), "qty": 7i32, "active": true };
+    let doc2 = doc! { "_id": id2.clone(), "qty": 7i32, "active": true };
+    stage_insert(&doc1, &id1, &mut tree, &entry).unwrap();
+    let result = stage_insert(&doc2, &id2, &mut tree, &entry);
+    assert!(
+        matches!(result, Err(Error::DuplicateKey { .. })),
+        "unique partial: duplicate inside PFE must fail"
+    );
 }

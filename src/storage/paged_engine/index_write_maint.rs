@@ -105,6 +105,8 @@ pub(super) fn maintain_secondary_on_insert_snapshot(
             key_pattern: index.key_pattern.clone(),
             unique: index.unique,
             sparse: index.sparse,
+            partial_filter_expression: index.partial_filter_expression.clone(),
+            expire_after_seconds: index.expire_after_seconds,
             multikey: false,
             entry_count: 0,
             state: index.state,

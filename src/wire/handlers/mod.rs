@@ -46,6 +46,14 @@ pub(super) fn handle_list_databases(state: &ServerState) -> Document {
     admin::handle_list_databases(state)
 }
 
+pub(super) fn handle_drop_database(body: &Document, state: &ServerState) -> Document {
+    admin::handle_drop_database(body, state)
+}
+
+pub(super) fn handle_end_sessions() -> Document {
+    admin::handle_end_sessions()
+}
+
 pub(super) fn handle_unknown(name: &str) -> Document {
     admin::handle_unknown(name)
 }
@@ -62,6 +70,14 @@ pub(super) fn handle_find(
     crud::handle_find(body, state, cursors)
 }
 
+pub(super) fn handle_aggregate(
+    body: &Document,
+    state: &ServerState,
+    cursors: &Arc<Mutex<ConnectionCursors>>,
+) -> Document {
+    crud::handle_aggregate(body, state, cursors)
+}
+
 pub(super) fn handle_update(body: &Document, state: &ServerState) -> Document {
     crud::handle_update(body, state)
 }
@@ -72,6 +88,18 @@ pub(super) fn handle_delete(body: &Document, state: &ServerState) -> Document {
 
 pub(super) fn handle_find_and_modify(body: &Document, state: &ServerState) -> Document {
     crud::handle_find_and_modify(body, state)
+}
+
+pub(super) fn handle_count(body: &Document, state: &ServerState) -> Document {
+    crud::handle_count(body, state)
+}
+
+pub(super) fn handle_distinct(body: &Document, state: &ServerState) -> Document {
+    crud::handle_distinct(body, state)
+}
+
+pub(super) fn handle_explain(body: &Document, state: &ServerState) -> Document {
+    crud::handle_explain(body, state)
 }
 
 pub(super) fn handle_get_more(

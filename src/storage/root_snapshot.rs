@@ -51,6 +51,15 @@ pub(crate) struct PublishedIndex {
     pub key_pattern: Document,
     pub unique: bool,
     pub sparse: bool,
+    /// Partial-index filter expression (MongoDB `partialFilterExpression`).
+    /// `None` for ordinary indexes. The write path gates entry maintenance on
+    /// this filter; the planner only selects the index when the query filter
+    /// syntactically covers it.
+    pub partial_filter_expression: Option<Document>,
+    /// TTL expiry in seconds (MongoDB `expireAfterSeconds`). `None` for non-TTL
+    /// indexes. The TTL sweep reads this from the published snapshot to find
+    /// candidate documents to expire.
+    pub expire_after_seconds: Option<i64>,
     /// Lifecycle state. Query planning must skip any index whose state
     /// is not `Ready` — the contents may be incomplete.
     pub state: IndexState,

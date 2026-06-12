@@ -1598,24 +1598,23 @@ fn bson_roundtrip_object_id_preserved() {
 // Commands outside the Phase 1 surface must return CommandNotFound.
 // MongoDB 8.0 format: {ok:0, code:59, codeName:"CommandNotFound"}.
 
-/// aggregate → CommandNotFound (code 59).
+/// aggregate without the required `cursor` option → BadValue (code 2).
 #[test]
-fn unsupported_command_aggregate_returns_command_not_found() {
+fn aggregate_without_cursor_option_returns_bad_value() {
     let (_dir, _db, _srv, addr) = start_server();
     let mut s = connect(addr);
 
-    let body = round_trip(&mut s, 1, &doc! { "aggregate": "coll", "$db": "local" });
+    let body = round_trip(
+        &mut s,
+        1,
+        &doc! { "aggregate": "coll", "pipeline": [], "$db": "local" },
+    );
 
     assert_eq!(body.get_f64("ok").unwrap(), 0.0, "aggregate must fail");
     assert_eq!(
         body.get_i32("code").unwrap(),
-        59,
-        "error code must be 59 (CommandNotFound)"
-    );
-    assert_eq!(
-        body.get_str("codeName").unwrap(),
-        "CommandNotFound",
-        "codeName must be 'CommandNotFound'"
+        2,
+        "error code must be 2 (BadValue)"
     );
     // errmsg must be present.
     assert!(body.get_str("errmsg").is_ok(), "errmsg field required");

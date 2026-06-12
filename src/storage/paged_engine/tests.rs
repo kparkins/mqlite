@@ -5,12 +5,19 @@ use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
+use crate::update::UpdateModifications;
 use bson::doc;
 use std::sync::atomic::Ordering;
 
 fn engine() -> PagedEngine {
     let (e, _io) = buffered_engine();
     e
+}
+
+/// Wrap an operator/replacement document as an [`UpdateModifications`] for the
+/// engine `update`/`find_one_and_update` test call sites.
+fn ops(update: Document) -> UpdateModifications {
+    UpdateModifications::Document(update)
 }
 
 #[test]
@@ -73,7 +80,8 @@ fn update_one_modifies_field() {
         .update(
             "test.c",
             &doc! { "name": "Alice" },
-            &doc! { "$set": { "age": 31 } },
+            &ops(doc! { "$set": { "age": 31 } }),
+            None,
             &UpdateOptions::default(),
             false,
         )
@@ -96,7 +104,8 @@ fn add_to_set_duplicate_only_does_not_modify_document() {
         .update(
             "test.c",
             &doc! {},
-            &doc! { "$addToSet": { "tags": "b" } },
+            &ops(doc! { "$addToSet": { "tags": "b" } }),
+            None,
             &UpdateOptions::default(),
             false,
         )
@@ -117,7 +126,8 @@ fn add_to_set_empty_each_does_not_modify_document() {
         .update(
             "test.c",
             &doc! {},
-            &doc! { "$addToSet": { "tags": { "$each": [] } } },
+            &ops(doc! { "$addToSet": { "tags": { "$each": [] } } }),
+            None,
             &UpdateOptions::default(),
             false,
         )
@@ -181,8 +191,12 @@ fn upsert_creates_document_when_no_match() {
         .update(
             "test.c",
             &doc! { "email": "a@b.com" },
-            &doc! { "$set": { "name": "Alice" } },
-            &UpdateOptions { upsert: true },
+            &ops(doc! { "$set": { "name": "Alice" } }),
+            None,
+            &UpdateOptions {
+                upsert: true,
+                ..Default::default()
+            },
             false,
         )
         .unwrap();
@@ -248,12 +262,14 @@ fn find_one_and_update_conflicts_when_selected_snapshot_is_behind_pending_head()
             return_document: ReturnDocument::After,
             upsert: false,
             sort: Some(doc! { "_id": 1 }),
+            array_filters: None,
         };
         first_engine
             .find_one_and_update(
                 NS,
                 &doc! { "claimed": false },
-                &doc! { "$set": { "claimed": true, "worker": 1i32 } },
+                &ops(doc! { "$set": { "claimed": true, "worker": 1i32 } }),
+                None,
                 &opts,
             )
             .expect("first claim should commit")
@@ -292,11 +308,13 @@ fn find_one_and_update_conflicts_when_selected_snapshot_is_behind_pending_head()
         return_document: ReturnDocument::After,
         upsert: false,
         sort: Some(doc! { "_id": 1 }),
+        array_filters: None,
     };
     let second = engine.find_one_and_update(
         NS,
         &doc! { "claimed": false },
-        &doc! { "$set": { "claimed": true, "worker": 2i32 } },
+        &ops(doc! { "$set": { "claimed": true, "worker": 2i32 } }),
+        None,
         &opts,
     );
 
@@ -753,7 +771,8 @@ fn buffered_index_maintained_on_update() {
     e.update(
         "test.users",
         &doc! { "email": "old@test.com" },
-        &doc! { "$set": { "email": "new@test.com" } },
+        &ops(doc! { "$set": { "email": "new@test.com" } }),
+        None,
         &UpdateOptions::default(),
         false,
     )
@@ -1378,7 +1397,8 @@ fn update_read_phase_plus_write_visibility_performs_two_epoch_loads() {
         .update(
             "test.u_scope",
             &bson::doc! { "_id": 1 },
-            &bson::doc! { "$set": { "v": 1 } },
+            &ops(bson::doc! { "$set": { "v": 1 } }),
+            None,
             &UpdateOptions::default(),
             false,
         )

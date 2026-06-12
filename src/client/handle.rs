@@ -112,6 +112,27 @@ impl Client {
         self.inner.backup(dest.as_ref())
     }
 
+    /// Sweep expired documents from every TTL index, returning the number of
+    /// documents deleted.
+    ///
+    /// mqlite has no continuous TTL monitor in embedded mode: a sweep runs once
+    /// automatically on [`Client::open`] (after recovery), and otherwise only
+    /// when this method is called (or, with the `wire` feature, on a 60-second
+    /// server timer). Embedded applications should schedule periodic calls if
+    /// they require timely expiry. Expired-but-unswept documents remain visible
+    /// to queries between sweeps — matching MongoDB's documented behavior
+    /// between TTL monitor runs.
+    ///
+    /// Deletes route through the ordinary delete path, so this is safe to call
+    /// concurrently with other writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying scan or delete fails.
+    pub fn sweep_expired(&self) -> Result<u64> {
+        self.inner.sweep_expired()
+    }
+
     /// Flush the journal, checkpoint, and close the client.
     ///
     /// Use this when you need a guarantee that all committed data is in the main
