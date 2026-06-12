@@ -126,43 +126,30 @@ runs after a discarded warm-up. Methodology, axes, and the machine-readable
 baseline sidecar live in [PERFORMANCE.md](docs/PERFORMANCE.md) and
 [docs/perf-baselines/](docs/perf-baselines/).
 
-Baseline below collected 2026-05-11 on a MacBook Pro (Apple M3 Pro, 12 cores,
-36 GB), 20,000 docs per writer, batch size 100:
+Collected 2026-06-11 from this revision on a desktop AMD Ryzen 7 7800X3D
+(8 cores / 16 threads, 32 GB, Windows 11, NVMe), batch size 100, medians of
+11 runs per cell ([sidecars](docs/perf-baselines/)):
 
 | Axis | Unit | `full-sync` | `interval-50ms` (default) | `none` |
 |---|---|---:|---:|---:|
-| 1 writer, 1 namespace, `insert_one` | docs/s | 142 | 14,158 | 16,599 |
-| 1 writer, 1 namespace, `insert_many` | docs/s | 15,188 | 175,227 | 186,384 |
-| 4 writers, 1 namespace, `insert_one` | docs/s | 583 | 1,408 | 1,478 |
-| 4 writers, 1 namespace, `insert_many` | docs/s | 50,789 | 101,937 | 90,115 |
-| 4 writers, 4 namespaces, `insert_one` | docs/s | 542 | 10,104 | 10,127 |
-| 4 writers, 4 namespaces, `insert_many` | docs/s | 54,399 | 208,252 | 215,871 |
-| point reads (`find_one` by `_id`) | ops/s | 424,932 | 429,477 | 461,730 |
+| 1 writer, 1 namespace, `insert_one` | docs/s | 65 | 12,372 | 16,353 |
+| 1 writer, 1 namespace, `insert_many` | docs/s | 6,495 | 114,221 | 177,473 |
+| 4 writers, 1 namespace, `insert_one` | docs/s | 259 | 4,906 | 5,355 |
+| 4 writers, 1 namespace, `insert_many` | docs/s | 26,224 | 164,486 | 240,554 |
+| 4 writers, 4 namespaces, `insert_one` | docs/s | 259 | 42,292 | 52,428 |
+| 4 writers, 4 namespaces, `insert_many` | docs/s | 26,274 | 333,697 | 436,137 |
+| point reads (`find_one` by `_id`) | ops/s | 449,169 | 444,561 | 449,887 |
 
-Numbers are platform-sensitive, the fsync-bound `full-sync` rows especially
-so (fsync latency varies by an order of magnitude across OS/filesystem/disk).
-A few cells show `interval-50ms` ahead of `none`; that is run-to-run variance
-(the sidecar records the min/max envelope per cell), not a real inversion.
-Reproduce on your hardware with `benches/perf/run_baselines.py`.
-
-For a second platform data point, the same harness on a desktop AMD Ryzen 7
-7800X3D (8c/16t, Windows 11, NVMe), default `interval-50ms` profile only,
-collected 2026-06-11 from this revision
-([sidecar](docs/perf-baselines/2026-06-11-ryzen-7800x3d-windows-interval.json)):
-
-| Axis | Unit | `interval-50ms` (default) |
-|---|---|---:|
-| 1 writer, 1 namespace, `insert_one` | docs/s | 9,677 |
-| 1 writer, 1 namespace, `insert_many` | docs/s | 156,464 |
-| 4 writers, 1 namespace, `insert_one` | docs/s | 4,722 |
-| 4 writers, 1 namespace, `insert_many` | docs/s | 224,223 |
-| 4 writers, 4 namespaces, `insert_one` | docs/s | 30,872 |
-| 4 writers, 4 namespaces, `insert_many` | docs/s | 329,919 |
-| point reads (`find_one` by `_id`) | ops/s | 448,514 |
-
-Run-to-run variance was higher on this box than on the Mac baseline; the
-sidecar's per-row min/max envelopes carry the spread, and the medians above
-are over 11 runs.
+The `interval-50ms` and `none` columns use the canonical 20,000 documents per
+writer. The `full-sync` column uses 1,000 documents per writer: every
+acknowledged commit waits for an fsync (about 15 ms on this disk), so
+canonical-length runs would take hours, and throughput is rate-based either
+way. The fsync-bound rows are also the most stable in the matrix, with
+run-to-run envelopes under 2%; the per-row min/max spread for every cell is
+recorded in the sidecars. Numbers are platform-sensitive, the fsync-bound
+`full-sync` column especially so (fsync latency varies by an order of
+magnitude across OS/filesystem/disk). Reproduce on your hardware with
+`benches/perf/run_baselines.py`.
 
 ### Durability modes
 

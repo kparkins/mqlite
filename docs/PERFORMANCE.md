@@ -108,13 +108,23 @@ cargo test --test perf_baseline_schema
 
 ## Current Baseline Snapshot
 
-The current checked-in snapshot is
-[`docs/perf-baselines/current.json`](perf-baselines/current.json), collected on
-2026-05-11 from branch label `docs-durability-matrix-full`.
+The current checked-in snapshot was collected on 2026-06-11.
 
-Hardware: MacBook Pro `Mac15,7`, Apple M3 Pro, 12 cores, 36 GB memory.
+Hardware: desktop AMD Ryzen 7 7800X3D, 8 cores / 16 threads, 32 GB memory,
+NVMe SSD, Windows 11.
 
-Command:
+It is split across two sidecars:
+
+- [`current.json`](perf-baselines/current.json): the `interval-50ms` and
+  `none` durability labels at the canonical 20,000 documents per writer.
+- [`current-full-sync.json`](perf-baselines/current-full-sync.json): the
+  `full-sync` label at 1,000 documents per writer. Every `insert_one` commit
+  waits for an fsync (about 15 ms on this hardware), so canonical-length runs
+  are impractically long. Throughput is rate-based, so the shorter runs
+  measure the same steady-state cost, and the fsync-bound rows carry the
+  tightest envelopes in the matrix (under 2%).
+
+Commands:
 
 ```sh
 benches/perf/run_baselines.py \
@@ -124,38 +134,43 @@ benches/perf/run_baselines.py \
     --batch-size 100 \
     --read-ops 100000 \
     --read-seed-docs 20000 \
-    --branch docs-durability-matrix-full
+    --durability interval-50ms --durability none \
+    --branch master
+
+benches/perf/run_baselines.py \
+    --out docs/perf-baselines/current-full-sync.json \
+    --runs 11 \
+    --docs-per-writer 1000 \
+    --batch-size 100 \
+    --read-ops 100000 \
+    --read-seed-docs 20000 \
+    --durability full-sync \
+    --branch master
 ```
 
 The runner used one discarded warm-up plus 11 measured runs per
-`(axis, writers, durability)` row. Write rows use 20,000 documents per writer;
-the read row uses 20,000 seed documents and 100,000 point reads. The sidecar
-records `teardown_policy: exit_after_operation_measurement`, so these medians
-are operation-only throughput and do not include final close/checkpoint time.
+`(axis, writers, durability)` row. The read row uses 20,000 seed documents and
+100,000 point reads. The sidecars record
+`teardown_policy: exit_after_operation_measurement`, so these medians are
+operation-only throughput and do not include final close/checkpoint time.
 
 Median throughput:
 
 | Axis | Unit | `full-sync` | `interval-50ms` | `none` |
 |---|---|---:|---:|---:|
-| `single_writer_single_ns_single` | docs/s | 142.34* | 14,157.96* | 16,598.84* |
-| `single_writer_single_ns_batch` | docs/s | 15,188.26* | 175,227.38* | 186,384.32* |
-| `multi_writer_single_ns_single` | docs/s | 582.83* | 1,408.10* | 1,478.01* |
-| `multi_writer_single_ns_batch` | docs/s | 50,788.98 | 101,937.11* | 90,115.07* |
-| `multi_writer_multi_ns_single` | docs/s | 542.00* | 10,103.67* | 10,126.83* |
-| `multi_writer_multi_ns_batch` | docs/s | 54,399.46 | 208,252.46* | 215,870.68* |
-| `read_find_one` | ops/s | 424,932.49* | 429,476.55* | 461,730.43* |
+| `single_writer_single_ns_single` | docs/s | 64.72 | 12,372.37* | 16,352.72* |
+| `single_writer_single_ns_batch` | docs/s | 6,495.27 | 114,221.36* | 177,472.68* |
+| `multi_writer_single_ns_single` | docs/s | 258.92 | 4,906.49* | 5,355.32 |
+| `multi_writer_single_ns_batch` | docs/s | 26,224.11 | 164,485.99* | 240,554.12 |
+| `multi_writer_multi_ns_single` | docs/s | 258.94 | 42,291.85* | 52,427.76* |
+| `multi_writer_multi_ns_batch` | docs/s | 26,274.29 | 333,696.65* | 436,136.77* |
+| `read_find_one` | ops/s | 449,169.31* | 444,560.62* | 449,887.28* |
 
 `*` means the row's `(max - min) / median` envelope exceeded 5% and should be
-treated as noisy. The raw sidecar keeps `min_dps`, `max_dps`, `envelope`, and
-`raw_dps` for every row.
-
-A second-platform sidecar,
-[`2026-06-11-ryzen-7800x3d-windows-interval.json`](perf-baselines/2026-06-11-ryzen-7800x3d-windows-interval.json),
-covers the default `interval-50ms` profile only (AMD Ryzen 7 7800X3D, 8c/16t,
-Windows 11, NVMe; same 11-run median methodology). The `full-sync` column is
-omitted there: Windows `FlushFileBuffers` latency makes fsync-bound rows
-impractically slow to collect at the canonical document counts, and the
-numbers would measure the platform's fsync cost more than the engine.
+treated as noisy. The `interval-50ms` write rows carry the widest envelopes
+(the 50 ms sync cadence interacts with run length), while the `full-sync`
+rows are the most stable. The raw sidecars keep `min_dps`, `max_dps`,
+`envelope`, and `raw_dps` for every row.
 
 ## Specialized Criterion Benches
 

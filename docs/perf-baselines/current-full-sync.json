@@ -1,0 +1,172 @@
+{
+  "date": "2026-06-11",
+  "branch": "master",
+  "hardware": "Windows-11-10.0.26200-SP0; AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD; 16 logical cores",
+  "build_cmd": "cargo build --release --bin perf_matrix",
+  "matrix_version": "perf_matrix_v1",
+  "teardown_policy": "exit_after_operation_measurement",
+  "durabilities": [
+    "full-sync"
+  ],
+  "axis_runs": 11,
+  "docs_per_writer": 1000,
+  "batch_size": 100,
+  "read_ops": 100000,
+  "read_seed_docs": 20000,
+  "rows": [
+    {
+      "axis": "single_writer_single_ns_single",
+      "durability": "full-sync",
+      "writers": 1,
+      "median_dps": 64.72,
+      "min_dps": 64.69,
+      "max_dps": 64.75,
+      "envelope": 0.0009,
+      "raw_dps": [
+        64.74,
+        64.72,
+        64.72,
+        64.72,
+        64.75,
+        64.7,
+        64.73,
+        64.72,
+        64.72,
+        64.69,
+        64.74
+      ]
+    },
+    {
+      "axis": "single_writer_single_ns_batch",
+      "durability": "full-sync",
+      "writers": 1,
+      "median_dps": 6495.27,
+      "min_dps": 6426.21,
+      "max_dps": 6528.44,
+      "envelope": 0.0157,
+      "raw_dps": [
+        6488.88,
+        6496.58,
+        6496.59,
+        6518.5,
+        6426.21,
+        6493.72,
+        6492.72,
+        6528.44,
+        6496.21,
+        6495.27,
+        6479.9
+      ]
+    },
+    {
+      "axis": "multi_writer_single_ns_single",
+      "durability": "full-sync",
+      "writers": 4,
+      "median_dps": 258.92,
+      "min_dps": 258.36,
+      "max_dps": 259.1,
+      "envelope": 0.0029,
+      "raw_dps": [
+        258.62,
+        258.72,
+        259.1,
+        258.36,
+        258.94,
+        259.01,
+        258.82,
+        258.87,
+        258.94,
+        258.92,
+        258.98
+      ]
+    },
+    {
+      "axis": "multi_writer_single_ns_batch",
+      "durability": "full-sync",
+      "writers": 4,
+      "median_dps": 26224.11,
+      "min_dps": 26108.3,
+      "max_dps": 26422.54,
+      "envelope": 0.012,
+      "raw_dps": [
+        26177.7,
+        26267.71,
+        26238.06,
+        26108.3,
+        26253.56,
+        26422.54,
+        26224.11,
+        26165.22,
+        26172.41,
+        26263.75,
+        26124.92
+      ]
+    },
+    {
+      "axis": "multi_writer_multi_ns_single",
+      "durability": "full-sync",
+      "writers": 4,
+      "median_dps": 258.94,
+      "min_dps": 258.72,
+      "max_dps": 259.29,
+      "envelope": 0.0022,
+      "raw_dps": [
+        258.94,
+        258.96,
+        258.74,
+        259.06,
+        259.17,
+        258.81,
+        258.72,
+        258.92,
+        258.82,
+        259.0,
+        259.29
+      ]
+    },
+    {
+      "axis": "multi_writer_multi_ns_batch",
+      "durability": "full-sync",
+      "writers": 4,
+      "median_dps": 26274.29,
+      "min_dps": 26130.67,
+      "max_dps": 26409.56,
+      "envelope": 0.0106,
+      "raw_dps": [
+        26409.56,
+        26305.3,
+        26383.59,
+        26248.46,
+        26285.03,
+        26268.82,
+        26274.29,
+        26130.67,
+        26307.93,
+        26272.65,
+        26232.16
+      ]
+    },
+    {
+      "axis": "read_find_one",
+      "durability": "full-sync",
+      "writers": 1,
+      "median_dps": 449169.31,
+      "min_dps": 435068.81,
+      "max_dps": 483010.35,
+      "envelope": 0.1067,
+      "raw_dps": [
+        483010.35,
+        441370.74,
+        481363.07,
+        442587.74,
+        447806.78,
+        449169.31,
+        443981.32,
+        478057.86,
+        435068.81,
+        449257.69,
+        452659.51
+      ]
+    }
+  ]
+}
