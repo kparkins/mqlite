@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
-use crate::journal::log_file::JournalPageSize;
+use crate::journal::wire::JournalPageSize;
 use crate::journal::{journal_path_for, CheckpointPoolKind, JournalManager};
 use crate::mvcc::Ts;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
@@ -126,7 +126,7 @@ fn eio_mid_emergency_checkpoint_resumes_on_reopen() -> Result<()> {
     );
     assert_eq!(
         journal_len(&db_path)?,
-        crate::journal::log_file::JOURNAL_HEADER_SIZE as u64,
+        crate::journal::wire::JOURNAL_HEADER_SIZE as u64,
         "completed recovery must truncate the copied checkpoint journal"
     );
     Ok(())
@@ -160,7 +160,7 @@ fn mid_step_10_crash_cut_replays_boundary_and_truncates_journal() -> Result<()> 
     );
     assert_eq!(
         journal_len(&db_path)?,
-        crate::journal::log_file::JOURNAL_HEADER_SIZE as u64
+        crate::journal::wire::JOURNAL_HEADER_SIZE as u64
     );
     Ok(())
 }

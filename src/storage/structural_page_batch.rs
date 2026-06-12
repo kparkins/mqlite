@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::mvcc::read_view::ChainSnapshot;
+use crate::mvcc::chain_snapshot::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::btree::{
     empty_internal_page_bytes, empty_leaf_page_bytes, BTreePageStore, LeafPageImage,
@@ -145,10 +145,22 @@ struct BatchAllocatedPage {
 /// Overflow deferred-free pages drained from [`PageLifetimeQueue`] are freed on
 /// commit and requeued on abort so refcount/lifetime fencing stays distinct
 /// from retired-tree work.
+///
+/// Frees of pages NOT allocated within the batch are deferred here too:
+/// `AllocatorHandle::free_*` destroys the page in place (free-list link stamp
+/// over the first 4 bytes, rest zeroed, frame dirtied), while the staged leaf
+/// bytes that DE-reference the page only land at commit. Freeing such a page
+/// straight through would corrupt the durable base image on abort, open a
+/// WAL-before-data crash window on the success path, and let the allocator
+/// hand the page out again mid-batch. Deferred frees are applied at
+/// `commit_lsn_fenced` (after the staged bytes) and dropped on abort.
 #[derive(Default)]
 pub(crate) struct AllocatorLifetimeBatch {
     new_allocs: Vec<BatchAllocatedPage>,
     deferred_free_pages: Vec<u32>,
+    /// Pages freed by the batch but allocated before it. Destroyed only at
+    /// commit; abort drops them so the base image keeps its pages.
+    deferred_frees: Vec<BatchAllocatedPage>,
 }
 
 impl AllocatorLifetimeBatch {
@@ -156,6 +168,7 @@ impl AllocatorLifetimeBatch {
         Self {
             new_allocs: Vec::new(),
             deferred_free_pages: handle.allocator().drain_deferred_free_pages(),
+            deferred_frees: Vec::new(),
         }
     }
 
@@ -168,25 +181,78 @@ impl AllocatorLifetimeBatch {
             .retain(|allocated| allocated.page != page || allocated.size != size);
     }
 
+    /// True iff `page` was allocated by this batch (and not freed since).
+    fn allocated_in_batch(&self, page: u32, size: PageSize) -> bool {
+        self.new_allocs
+            .iter()
+            .any(|allocated| allocated.page == page && allocated.size == size)
+    }
+
+    /// Defer freeing a page the durable base image may still reference.
+    fn record_deferred_free(&mut self, page: u32, size: PageSize) {
+        // N32: a duplicate deferred free would destroy the page twice at
+        // commit (double free-list push of the same page id).
+        debug_assert!(
+            !self.deferred_frees.iter().any(|freed| freed.page == page),
+            "structural batch double-deferred-free of page {page}"
+        );
+        self.deferred_frees.push(BatchAllocatedPage { page, size });
+    }
+
     fn commit_lsn_fenced(self, handle: &BufferPoolHandle, last_lsn: u64) -> Result<()> {
+        // In-batch frees of pre-existing pages: the staged bytes that
+        // dereference them were applied just before this call, so the
+        // in-place destruction now respects WAL-before-data ordering.
+        let any_frees = !self.deferred_frees.is_empty() || !self.deferred_free_pages.is_empty();
+        for freed in self.deferred_frees {
+            handle.free_page(freed.page, freed.size)?;
+        }
         for page in self.deferred_free_pages {
             handle.free_page(page, PageSize::Large32k)?;
+        }
+        // F29: ONE pool-wide stamp covering every free above instead of one
+        // per freed page (each stamp locks all four partition mutexes in
+        // both pools and full-scans every frame slot, contending the hot
+        // pin path during checkpoint/DDL commits). Equivalent because the
+        // stamp only transitions Unflushable -> Dirty{lsn} and Unflushable
+        // frames can neither flush nor be evicted in the interim, so no
+        // frame freed by an earlier iteration can lose its Unflushable
+        // state before the single stamp lands — it performs exactly the
+        // transitions the per-free stamps would, at the same LSN.
+        if any_frees {
             handle.stamp_unflushable_dirty_pages_lsn(last_lsn)?;
         }
         Ok(())
     }
 
     fn abort(self, handle: &BufferPoolHandle) -> Result<()> {
+        // `deferred_frees` is intentionally dropped: those pages were never
+        // freed, and the durable base image still references them.
+        //
+        // Collect the first error instead of early-returning so the
+        // lifetime-queue re-enqueue below always runs — every caller uses
+        // `let _ = batch.abort(..)`, and a `?` here would silently leak the
+        // drained deferred-free pages out of the queue forever.
+        let mut first_err = None;
         for allocated in self.new_allocs {
-            handle.free_page(allocated.page, allocated.size)?;
-            handle
-                .pool()
-                .invalidate_page(allocated.page, allocated.size)?;
+            let freed = handle
+                .free_page(allocated.page, allocated.size)
+                .and_then(|()| {
+                    handle
+                        .pool()
+                        .invalidate_page(allocated.page, allocated.size)
+                });
+            if let Err(err) = freed {
+                first_err.get_or_insert(err);
+            }
         }
         for page in self.deferred_free_pages {
             handle.allocator().enqueue_overflow_deferred_free(page);
         }
-        Ok(())
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 
@@ -285,6 +351,37 @@ pub(crate) struct StructuralPageBatch {
     writes: StructuralPageWrites,
     lifetime: AllocatorLifetimeBatch,
     header: HeaderCatalogRootBatch,
+    /// Set when a chain was RE-HOMED through the batch store onto a shared
+    /// frame (the single-key `with_chain_under_latch` placement step every
+    /// structural migration ends with). The whole-map
+    /// `with_all_chains_under_latch` is intentionally NOT a trigger — its only
+    /// batch caller is the overflow-page clear, which discards nothing
+    /// committed (see the mutator docs).
+    ///
+    /// Chain moves are NOT staged copy-on-write — they mutate the shared
+    /// frames directly (see the module docstring). A structural split that
+    /// migrated committed resident chains onto a batch-allocated page is
+    /// therefore NOT undone by [`Self::abort`]: abort frees + invalidates the
+    /// destination page, so the migrated chains are lost while the durable
+    /// base still routes their keys to the (now chain-less) source leaf —
+    /// silent data loss for committed-but-uncheckpointed versions.
+    ///
+    /// The CHECKPOINT materialize path is the only production path that runs a
+    /// structural batch over a tree that still carries live committed chains
+    /// (its rebuild folds resident deltas over the existing primary/secondary
+    /// roots). A materialize abort that migrated chains must NOT be classified
+    /// `Recoverable`; the checkpoint caller queries [`Self::migrated_chains`]
+    /// and escalates to a poison-and-reopen so recovery rebuilds the lost
+    /// chains from the journal.
+    ///
+    /// DDL paths (`ns_ddl` / `index_ddl`) never set this flag: they create or
+    /// free WHOLE trees — `BTree::create_at` / `create` populate FRESH pages
+    /// that hold no committed chains, and drop frees/clears (retire, not
+    /// migrate). No DDL structural batch opens a tree carrying live committed
+    /// chains, so chain migration is unreachable there and their abort safely
+    /// drops staged bytes only. [`Self::abort`] `debug_assert`s this invariant
+    /// for the no-escalation callers via the dropped batch's flag.
+    migrated_chains: bool,
 }
 
 impl StructuralPageBatch {
@@ -294,12 +391,28 @@ impl StructuralPageBatch {
             writes: StructuralPageWrites::default(),
             lifetime: AllocatorLifetimeBatch::new(handle),
             header: HeaderCatalogRootBatch::default(),
+            migrated_chains: false,
         }
     }
 
     /// Open a transaction-local page store for structural B-tree writes.
     pub(crate) fn store(&mut self, base: BufferPoolPageStore) -> StructuralBatchStore<'_> {
-        StructuralBatchStore::new(base, &mut self.writes, &mut self.lifetime)
+        StructuralBatchStore::new(
+            base,
+            &mut self.writes,
+            &mut self.lifetime,
+            &mut self.migrated_chains,
+        )
+    }
+
+    /// True iff a chain mutation passed through this batch's store onto the
+    /// shared frames (the abort-unsafe migration described on
+    /// [`StructuralPageBatch::migrated_chains`]).
+    ///
+    /// The CHECKPOINT path queries this BEFORE [`Self::abort`] to decide
+    /// whether a materialize failure is recoverable or must poison the engine.
+    pub(crate) fn migrated_chains(&self) -> bool {
+        self.migrated_chains
     }
 
     /// Return the structural page images that a typed catalog log record must
@@ -320,10 +433,47 @@ impl StructuralPageBatch {
     }
 
     /// Abort staged structural pages and restore allocator/header state.
+    ///
+    /// Callers reaching this entry must NOT have migrated resident chains
+    /// through the batch store: abort frees + invalidates batch-allocated
+    /// pages, so a migrated chain on such a page is lost with no staged-byte
+    /// undo. DDL batches uphold this by construction (they create/free whole
+    /// trees on fresh pages — see [`Self::migrated_chains`]); the `debug_assert`
+    /// catches any future DDL change that splits a chain-carrying leaf through
+    /// a structural batch. The checkpoint path, which CAN migrate, uses
+    /// [`Self::abort_after_chain_migration`] after escalating to poison.
     pub(crate) fn abort(self, handle: &BufferPoolHandle) -> Result<()> {
+        debug_assert!(
+            !self.migrated_chains,
+            "structural batch abort lost migrated committed chains: a non-checkpoint \
+             (DDL) structural batch migrated resident chains, which abort cannot undo. \
+             Use abort_after_chain_migration on a path that escalates to poison."
+        );
+        self.abort_inner(handle)
+    }
+
+    /// Abort a batch that migrated resident chains, after the caller has
+    /// already escalated the failure to a poison-and-reopen.
+    ///
+    /// Identical page/allocator/header rollback to [`Self::abort`], but WITHOUT
+    /// the no-migration `debug_assert`: the checkpoint materialize path
+    /// legitimately migrates chains during a leaf split and, on failure,
+    /// classifies the abort as `PostMutation` poison so recovery rebuilds the
+    /// lost chains from the journal. Freeing the staged/allocated pages here is
+    /// still correct — the engine is being poisoned and reopened regardless.
+    pub(crate) fn abort_after_chain_migration(self, handle: &BufferPoolHandle) -> Result<()> {
+        self.abort_inner(handle)
+    }
+
+    fn abort_inner(self, handle: &BufferPoolHandle) -> Result<()> {
         drop(self.writes);
-        self.lifetime.abort(handle)?;
-        self.header.abort(handle)
+        // F28: run BOTH owners unconditionally and surface the first error.
+        // A lifetime-abort error (surfaced since R1b) must not skip the
+        // catalog-root header rollback — the header would keep pointing at
+        // a freed batch-allocated root, and every caller drops the error.
+        let lifetime = self.lifetime.abort(handle);
+        let header = self.header.abort(handle);
+        lifetime.and(header)
     }
 
     /// Mutate catalog-root header fields through the final header owner.
@@ -349,6 +499,24 @@ pub(crate) struct StructuralBatchStore<'a> {
     base: BufferPoolPageStore,
     writes: &'a mut StructuralPageWrites,
     lifetime: &'a mut AllocatorLifetimeBatch,
+    /// Borrowed flag set when a chain mutation passes through this store to the
+    /// shared frame. See [`StructuralPageBatch::migrated_chains`] — the
+    /// checkpoint path uses it to escalate an abort to poison rather than
+    /// silently losing migrated committed chains.
+    migrated_chains: &'a mut bool,
+    /// When set, `read_leaf` returns the leaf page image WITHOUT cloning the
+    /// frame's resident MVCC delta map.
+    ///
+    /// WHY: structural rebuild (e.g. checkpoint materialize) consumes
+    /// `(key, value)` pairs that were already collected once via
+    /// `visible_delta_entries`. The structural rebuild ops (`insert`,
+    /// `replace_existing`, `delete`) only parse base + staged page bytes and
+    /// then discard the chain snapshot returned by `read_leaf`
+    /// (`let (buf, _) = self.store.read_leaf(...)`). Cloning the resident
+    /// chains on every such read is pure dead work, O(n) per read × n reads,
+    /// which made close O(n²) (measured 4.4s × (docs/4k)²). The flag routes
+    /// these reads through an image-only path that skips `snapshot_chains`.
+    chain_free_reads: bool,
 }
 
 impl<'a> StructuralBatchStore<'a> {
@@ -356,12 +524,28 @@ impl<'a> StructuralBatchStore<'a> {
         base: BufferPoolPageStore,
         writes: &'a mut StructuralPageWrites,
         lifetime: &'a mut AllocatorLifetimeBatch,
+        migrated_chains: &'a mut bool,
     ) -> Self {
         Self {
             base,
             writes,
             lifetime,
+            migrated_chains,
+            chain_free_reads: false,
         }
+    }
+
+    /// Opt this store into chain-free leaf reads.
+    ///
+    /// WHY: see the `chain_free_reads` field doc — structural rebuild callers
+    /// discard the chain snapshot `read_leaf` returns, so cloning the resident
+    /// chains per read is dead work that made close O(n²). Only use this for
+    /// structural rebuild paths (checkpoint materialize) where the (key,value)
+    /// pairs were already harvested via `visible_delta_entries` and reads only
+    /// parse base + staged page bytes.
+    pub(crate) fn with_chain_free_reads(mut self) -> Self {
+        self.chain_free_reads = true;
+        self
     }
 }
 
@@ -382,12 +566,26 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
 
     fn read_leaf(&self, page: u32) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
         if let Some(buf) = self.writes.staged_32k.get(&page).cloned() {
+            if self.chain_free_reads {
+                // Chain-free rebuild path: the caller discards the chain
+                // snapshot (`let (buf, _) = self.store.read_leaf(...)`), so we
+                // return the staged image with `None` WITHOUT pinning the real
+                // frame to snapshot its resident chains. Cloning those chains
+                // per read is the dead work that made close O(n²).
+                return Ok((LeafPageImage::owned(buf), None));
+            }
             // The chain snapshot lives on the shared frame; structural
             // page-byte staging does not duplicate chains. Pin-and-snapshot
             // against the real frame so MVCC visibility logic keeps working
             // for in-flight reads by this writer.
             let (_, snap) = self.base.read_leaf(page)?;
             return Ok((LeafPageImage::owned(buf), snap));
+        }
+        if self.chain_free_reads {
+            // Base-fallback chain-free read: copy page bytes only, skipping
+            // `snapshot_chains`. Same rationale as the staged branch above.
+            let image = self.base.read_leaf_image_only(page)?;
+            return Ok((image, None));
         }
         self.base.read_leaf(page)
     }
@@ -430,9 +628,13 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
     //
     // Every allocation made inside a structural batch is recorded in the
     // allocator/lifetime owner so abort can return the page to the free
-    // list and invalidate the cached frame. Free stays straight-through,
-    // with staged-byte eviction below to prevent alloc-then-free within the
-    // same batch from replaying page bytes onto the freed slot at commit.
+    // list and invalidate the cached frame. Frees of batch-allocated pages
+    // stay straight-through (the page is invisible outside the batch), with
+    // staged-byte eviction below to prevent alloc-then-free within the same
+    // batch from replaying page bytes onto the freed slot at commit. Frees
+    // of pre-existing pages are deferred to the lifetime owner: the live
+    // free would destroy a page the durable base image still references
+    // before the batch commits (see `AllocatorLifetimeBatch`).
 
     fn alloc_internal(&mut self) -> Result<u32> {
         let page = self.base.alloc_internal()?;
@@ -476,23 +678,29 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
         // Also evict any staged bytes: if the same batch allocated,
         // wrote, and then freed the page, we must not replay its bytes
         // onto the freed slot at commit time.
-        //
-        // If the freed page was allocated in this batch, drop the allocation
-        // record too. Otherwise rollback would double-free the page because
-        // the in-batch `free_*` already returned it to the allocator free list.
         if self.writes.staged_4k.remove(&page).is_some() {
             self.writes.touched_4k.retain(|p| *p != page);
         }
-        self.lifetime.forget_new_alloc(page, PageSize::Small4k);
-        self.base.free_internal(page)
+        if self.lifetime.allocated_in_batch(page, PageSize::Small4k) {
+            // Batch-local page: free immediately and drop the allocation
+            // record so abort does not double-free it.
+            self.lifetime.forget_new_alloc(page, PageSize::Small4k);
+            return self.base.free_internal(page);
+        }
+        self.lifetime.record_deferred_free(page, PageSize::Small4k);
+        Ok(())
     }
 
     fn free_leaf(&mut self, page: u32) -> Result<()> {
         if self.writes.staged_32k.remove(&page).is_some() {
             self.writes.touched_32k.retain(|p| *p != page);
         }
-        self.lifetime.forget_new_alloc(page, PageSize::Large32k);
-        self.base.free_leaf(page)
+        if self.lifetime.allocated_in_batch(page, PageSize::Large32k) {
+            self.lifetime.forget_new_alloc(page, PageSize::Large32k);
+            return self.base.free_leaf(page);
+        }
+        self.lifetime.record_deferred_free(page, PageSize::Large32k);
+        Ok(())
     }
 
     // ---- MVCC chain helpers: delegate to base.
@@ -518,6 +726,24 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
     where
         F: FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R,
     {
+        // This is the chain RE-HOME step of every structural migration
+        // (`partition_chains_for_split` / `move_all_leaf_chains` /
+        // `redistribute_leaf_chains` all place a drained chain onto its new
+        // owning page through here). The placement hits the shared frame, not
+        // staged bytes, so abort cannot undo it — a chain re-homed onto a
+        // batch-allocated page is lost when abort frees + invalidates that
+        // page. Record it so the checkpoint caller can escalate an abort to
+        // poison (see `StructuralPageBatch::migrated_chains`).
+        //
+        // The single-key `with_chain_under_latch` is the precise migration
+        // signal: ordinary CRUD never routes chain writes through a structural
+        // batch, and the only batch callers are the migration helpers. The
+        // whole-map `with_all_chains_under_latch` below is deliberately NOT
+        // flagged — its only batch caller is the overflow-page CLEAR
+        // (`free_overflow_chain` wipes stale remnants before freeing a
+        // repurposed page), which discards nothing committed and is idempotent
+        // on abort.
+        *self.migrated_chains = true;
         self.base.with_chain_under_latch(page, key, mode, f)
     }
 
@@ -525,6 +751,11 @@ impl<'a> BTreePageStore for StructuralBatchStore<'a> {
     where
         F: FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R,
     {
+        // NOT a migration signal — see `with_chain_under_latch` above. The
+        // migration DRAIN (`std::mem::take`) flows through here, but the
+        // matching RE-HOME (which is what abort would lose) flows through the
+        // single-key path, so flagging only that path captures every real
+        // committed-chain move without false-positiving the overflow clear.
         self.base.with_all_chains_under_latch(page, mode, f)
     }
 }
@@ -536,3 +767,11 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/structural_page_batch_store.rs"]
 mod structural_page_batch_store;
+
+#[cfg(test)]
+#[path = "tests/structural_batch_abort_free_safety.rs"]
+mod structural_batch_abort_free_safety;
+
+#[cfg(test)]
+#[path = "tests/bugsuspect_storage_chain_migration_abort.rs"]
+mod bugsuspect_storage_chain_migration_abort;

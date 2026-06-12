@@ -49,6 +49,12 @@ fn pending_head() -> VersionEntry {
     entry(VersionState::Pending { txn_id: 1 }, false)
 }
 
+fn aborted_residue_head() -> VersionEntry {
+    // Aborted first-write residue (BUG-11 shape): `state = Aborted`,
+    // `stop_ts = Ts::MAX`. Dead to every reader; never blocks eviction.
+    entry(VersionState::Aborted, false)
+}
+
 fn load_and_unpin(pool: &BufferPool, page: u32) {
     drop(pool.pin(page, PageSize::Large32k).unwrap());
 }
@@ -79,7 +85,11 @@ fn occupancy_snapshot_records_delta_bearing_frames_and_ratio() {
     assert_eq!(metrics::delta_bearing_frames_count_snapshot(), 0);
 
     let snapshot = pool.occupancy_snapshot().unwrap();
-    let expected_count = 2u64;
+    // R-metric: the metric mirrors the eviction-blocking predicate
+    // (`has_live_delta_entry`), so the Pending-only frame (PAGE_C) —
+    // which blocks eviction during the install→flip window — counts
+    // alongside the two committed-head frames.
+    let expected_count = 3u64;
     let expected_ratio = expected_count as f64 / snapshot.total_pool_frames as f64;
 
     assert_eq!(snapshot.delta_bearing_frames_count, expected_count);
@@ -95,6 +105,28 @@ fn occupancy_snapshot_records_delta_bearing_frames_and_ratio() {
     assert!(
         (metrics::delta_bearing_frames_ratio_snapshot() - expected_ratio).abs() < EPSILON,
         "metric ratio must match occupancy snapshot"
+    );
+}
+
+#[test]
+fn occupancy_snapshot_excludes_aborted_residue_frames() {
+    // R-metric: a frame whose only chain entry is aborted first-write
+    // residue never blocks eviction, so it must not count toward the
+    // delta-bearing saturation the metric reports. The partition-level
+    // snapshot is asserted directly so this test does not mutate the
+    // global metric gauges that `occupancy_snapshot_records_*` reads
+    // (gauges are process-wide and tests run concurrently).
+    let pool = BufferPool::new(POOL_BYTES, Box::new(ZeroIo));
+    for page in [PAGE_A, PAGE_B] {
+        load_and_unpin(&pool, page);
+    }
+    install_chain(&pool, PAGE_A, KEY_A, committed_head());
+    install_chain(&pool, PAGE_B, KEY_B, aborted_residue_head());
+
+    let snapshot = pool.inner_32k.lock().unwrap().occupancy_snapshot();
+    assert_eq!(
+        snapshot.delta_bearing_frames, 1,
+        "dead aborted residue must not count as a delta-bearing frame"
     );
 }
 

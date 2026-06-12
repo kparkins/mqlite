@@ -1,6 +1,8 @@
 mod tests {
     use super::super::*;
     use crate::error::Error;
+    // Only the unix fork-based cross-process lock test uses this import.
+    #[cfg(unix)]
     use crate::options::OpenOptions;
     use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
     #[cfg(unix)]

@@ -32,7 +32,9 @@ use crate::error::{Error, Result};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::keys::{compound_prefix_range_excluding_trailing_id, encode_compound_key, encode_key};
 #[cfg(any(test, feature = "test-hooks"))]
-use crate::mvcc::{SecIndexOp, SecIndexWrite, Ts, VersionData, VersionEntry, VersionState};
+use crate::mvcc::transaction::{SecIndexOp, SecIndexWrite};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::storage::btree::reconcile::{encode_folded_leaf, FoldedLeafCell, FoldedLeafLinks};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -101,6 +103,36 @@ pub(crate) fn us026_fail_if_armed(
     Ok(())
 }
 
+/// Arm one non-fatal failure for the next catalog-commit log reservation
+/// (`commit_catalog_batch_to_log`). Models `catalog_commit_payload` or
+/// `reserve_log_record` failing non-fatally during a DDL commit.
+///
+/// `cfg(test)` (not the wider test-hooks gate): the arming side is only
+/// reachable from in-crate unit tests; `pub(crate)` makes it invisible to
+/// feature-gated integration tests anyway.
+#[cfg(test)]
+pub(crate) fn arm_catalog_commit_reserve_failure(shared: &SharedState) {
+    shared
+        .test_hooks
+        .fail_next_catalog_commit_reserve
+        .store(1, Ordering::Release);
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn fail_catalog_commit_reserve_if_armed(shared: &SharedState) -> Result<()> {
+    if shared
+        .test_hooks
+        .fail_next_catalog_commit_reserve
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return Err(Error::Internal(
+            "injected catalog-commit log reservation failure".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn arm_dirty_lsn_stamp_failure(shared: &SharedState) {
     shared
@@ -165,6 +197,34 @@ pub(crate) fn fail_after_durable_before_flip_if_armed(shared: &SharedState) -> R
     {
         return Err(Error::Internal(
             "injected failure after durable record write before committed flip".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn arm_abort_flip_failure(shared: &SharedState) {
+    shared
+        .test_hooks
+        .fail_next_abort_flip
+        .store(1, Ordering::Release);
+}
+
+/// One-shot abort-flip fault injector consumed inside
+/// `flip_pending_to_aborted_for`. Returns `Err` exactly once after arming so
+/// the pre-durable cleanup path (`cleanup_registered_pre_durable_failure`)
+/// observes a failed `Pending`→`Aborted` flip and must escalate to engine
+/// poison rather than aborting the publish slot.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn fail_abort_flip_if_armed(shared: &SharedState) -> Result<()> {
+    if shared
+        .test_hooks
+        .fail_next_abort_flip
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return Err(Error::Internal(
+            "injected failure during pre-durable Pending->Aborted flip".into(),
         ));
     }
     Ok(())
@@ -257,6 +317,221 @@ pub(crate) fn install_before_log_reservation_hook(
 pub(crate) fn before_log_reservation_if_installed(shared: &SharedState) {
     let hook = {
         let Ok(mut slot) = shared.test_hooks.before_log_reservation_hook.lock() else {
+            return;
+        };
+        slot.take()
+    };
+    if let Some(hook) = hook {
+        hook.fire();
+    }
+}
+
+/// Pending test-only hook consumed inside `drop_namespace` after the tree
+/// pages have been collected for deferred retirement and before the catalog
+/// commit/publish makes the drop visible.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) struct DropNamespaceBeforeCommitHook {
+    entered_tx: Sender<()>,
+    release_rx: Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl DropNamespaceBeforeCommitHook {
+    fn fire(self) {
+        if self.entered_tx.send(()).is_ok() {
+            let _ = self.release_rx.recv();
+        }
+    }
+}
+
+/// RAII guard for the `drop_namespace` pre-commit pause hook.
+///
+/// `cfg(test)` (not the wider test-hooks gate): the install/driver side is
+/// only reachable from in-crate unit tests; the hook's fire side keeps the
+/// wider gate because production `drop_namespace` references it.
+#[cfg(test)]
+#[doc(hidden)]
+pub struct DropNamespaceBeforeCommitHookGuard {
+    shared: Arc<SharedState>,
+    entered_rx: Receiver<()>,
+    release_tx: Option<Sender<()>>,
+}
+
+#[cfg(test)]
+impl DropNamespaceBeforeCommitHookGuard {
+    /// Wait until the hooked drop reaches the pre-commit pause point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::RecvError`] if the drop exits before reaching the hook.
+    pub fn wait_until_entered(&self) -> std::result::Result<(), mpsc::RecvError> {
+        self.entered_rx.recv()
+    }
+
+    /// Release the hooked drop if it is blocked before its catalog commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::SendError`] if the drop is no longer waiting.
+    pub fn release(&mut self) -> std::result::Result<(), mpsc::SendError<()>> {
+        if let Some(tx) = self.release_tx.take() {
+            tx.send(())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for DropNamespaceBeforeCommitHookGuard {
+    fn drop(&mut self) {
+        let _ = self.release();
+        if let Ok(mut hook) = self
+            .shared
+            .test_hooks
+            .drop_namespace_before_commit_hook
+            .lock()
+        {
+            *hook = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_drop_namespace_before_commit_hook(
+    shared: &Arc<SharedState>,
+) -> DropNamespaceBeforeCommitHookGuard {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let hook = DropNamespaceBeforeCommitHook {
+        entered_tx,
+        release_rx,
+    };
+    let mut slot = shared
+        .test_hooks
+        .drop_namespace_before_commit_hook
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(hook);
+    DropNamespaceBeforeCommitHookGuard {
+        shared: Arc::clone(shared),
+        entered_rx,
+        release_tx: Some(release_tx),
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn drop_namespace_before_commit_if_installed(shared: &SharedState) {
+    let hook = {
+        let Ok(mut slot) = shared.test_hooks.drop_namespace_before_commit_hook.lock() else {
+            return;
+        };
+        slot.take()
+    };
+    if let Some(hook) = hook {
+        hook.fire();
+    }
+}
+
+/// ITEM 1 — one-shot rendezvous hook consumed inside `open_snapshot_read_view`
+/// AFTER the conservative registry pin (`register(txn_id, Ts::default())`) and
+/// BEFORE the published-epoch load. Lets a test pause a reader in exactly that
+/// window, run a writer + reconcile-prune, then resume and assert the reader
+/// still sees its version — proving the pin precedes the load.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) struct ReadViewPinBeforeEpochLoadHook {
+    entered_tx: Sender<()>,
+    release_rx: Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ReadViewPinBeforeEpochLoadHook {
+    fn fire(self) {
+        if self.entered_tx.send(()).is_ok() {
+            let _ = self.release_rx.recv();
+        }
+    }
+}
+
+/// RAII guard for the ITEM 1 pin-before-epoch-load pause hook.
+///
+/// `cfg(test)`: only in-crate unit tests install/drive it; the hook's fire
+/// side keeps the wider `test-hooks` gate because production
+/// `open_snapshot_read_view` references it.
+#[cfg(test)]
+#[doc(hidden)]
+pub struct ReadViewPinBeforeEpochLoadHookGuard {
+    shared: Arc<SharedState>,
+    entered_rx: Receiver<()>,
+    release_tx: Option<Sender<()>>,
+}
+
+#[cfg(test)]
+impl ReadViewPinBeforeEpochLoadHookGuard {
+    /// Wait until a reader reaches the pin-before-load pause point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::RecvError`] if no reader reaches the hook before the
+    /// hooked thread exits.
+    pub fn wait_until_entered(&self) -> std::result::Result<(), mpsc::RecvError> {
+        self.entered_rx.recv()
+    }
+
+    /// Release a reader paused between the conservative pin and the load.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::SendError`] if the reader is no longer waiting.
+    pub fn release(&mut self) -> std::result::Result<(), mpsc::SendError<()>> {
+        if let Some(tx) = self.release_tx.take() {
+            tx.send(())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReadViewPinBeforeEpochLoadHookGuard {
+    fn drop(&mut self) {
+        let _ = self.release();
+        if let Ok(mut hook) = self
+            .shared
+            .test_hooks
+            .read_view_pin_before_epoch_load_hook
+            .lock()
+        {
+            *hook = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_read_view_pin_before_epoch_load_hook(
+    shared: &Arc<SharedState>,
+) -> ReadViewPinBeforeEpochLoadHookGuard {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let hook = ReadViewPinBeforeEpochLoadHook {
+        entered_tx,
+        release_rx,
+    };
+    let mut slot = shared
+        .test_hooks
+        .read_view_pin_before_epoch_load_hook
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(hook);
+    ReadViewPinBeforeEpochLoadHookGuard {
+        shared: Arc::clone(shared),
+        entered_rx,
+        release_tx: Some(release_tx),
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn read_view_pin_before_epoch_load_if_installed(shared: &SharedState) {
+    let hook = {
+        let Ok(mut slot) = shared.test_hooks.read_view_pin_before_epoch_load_hook.lock() else {
             return;
         };
         slot.take()
@@ -1221,6 +1496,11 @@ impl PagedEngine {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn arm_abort_flip_failure(&self) {
+        arm_abort_flip_failure(&self.shared);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn journal_lsn_snapshot(&self) -> Result<(u64, u64, u64)> {
         self.shared.handle.journal_lsn_snapshot()
     }
@@ -1365,5 +1645,48 @@ impl PagedEngine {
             },
         )?;
         crate::storage::btree::leaf_unique_prefix_sibling_pages(&image, &start, &end)
+    }
+}
+
+impl PagedEngine {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn us039_reset_append_sync_observations(&self) {
+        crate::journal::append_sync_observations::reset();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn us039_append_sync_observations(
+        &self,
+    ) -> crate::journal::append_sync_observations::Us039AppendSyncObservations {
+        crate::journal::append_sync_observations::snapshot()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn us017_reset_group_commit_probe(&self) {
+        super::group_commit_observations::reset();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn us017_expect_group_commit_cohort_size(&self, expected: u64) {
+        super::group_commit_observations::set_expected_cohort_size(expected);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn us017_fail_next_group_commit_fsync(&self) {
+        super::group_commit_observations::fail_next_fsync();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn us017_pause_next_group_commit_after_close(
+        &self,
+    ) -> super::group_commit_observations::Us017GroupCommitPauseGuard {
+        super::group_commit_observations::install_pause_after_close()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn us017_group_commit_observations(
+        &self,
+    ) -> super::group_commit_observations::Us017GroupCommitObservations {
+        super::group_commit_observations::observations()
     }
 }

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import statistics
 import subprocess
@@ -27,7 +28,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-PERF_BIN = "target/release/perf_matrix"
+PERF_BIN = str(
+    Path("target") / "release" / ("perf_matrix.exe" if os.name == "nt" else "perf_matrix")
+)
 
 # (axis, writers, dps_field) - read_find_one reports ops_per_second.
 DPS_FIELD_DEFAULT = "docs_per_second"
@@ -169,6 +172,10 @@ def collect_axis(
 
 
 def hardware_string() -> str:
+    if os.name == "nt":
+        cpu = platform.processor() or platform.machine()
+        cores = os.cpu_count() or 0
+        return f"{platform.platform()}; {cpu}; {cores} logical cores"
     try:
         out = subprocess.run(
             ["system_profiler", "SPHardwareDataType"], capture_output=True, text=True

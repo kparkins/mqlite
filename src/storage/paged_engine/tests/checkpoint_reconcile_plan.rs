@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bson::{doc, Bson};
 
+use super::hidden_accessors::Us026PostRegisterFailpoint;
 use crate::error::{EngineFatalReason, Error, Result};
 use crate::keys::encode_key;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};

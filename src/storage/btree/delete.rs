@@ -2,12 +2,13 @@
 //! redistribution or merge, and parent separator maintenance.
 
 use crate::error::{Error, Result};
-use crate::storage::buffer_pool::LatchMode;
 use crate::storage::page::{LEAF_HEADER_SIZE, PAGE_SIZE_LEAF};
 
-use super::chain::free_overflow_chain;
+use super::layout::MIN_LEAF_BYTES;
 use super::node::{InternalNode, LeafCell, LeafNode};
-use super::{BTree, BTreePageStore, CellValue, MIN_LEAF_BYTES};
+use super::overflow::free_overflow_chain;
+use super::store::BTreePageStore;
+use super::{BTree, CellValue};
 
 impl<S: BTreePageStore> BTree<S> {
     /// Delete `key` from the tree.  Returns `true` if the key existed, `false`
@@ -154,15 +155,33 @@ impl<S: BTreePageStore> BTree<S> {
         left.used_bytes() + right.used_bytes() - LEAF_HEADER_SIZE <= PAGE_SIZE_LEAF as usize
     }
 
-    fn choose_leaf_redistribution_split(
+    /// Choose a byte-feasible split point for `cells`, preferring splits whose
+    /// halves meet `MIN_LEAF_BYTES`, then byte balance, then minimal movement
+    /// relative to `original_left_len`. Shared with the insert split path.
+    pub(super) fn choose_leaf_redistribution_split(
         cells: &[LeafCell],
         original_left_len: usize,
     ) -> Option<usize> {
+        // One O(n) prefix-sum pass over encoded cell sizes; each candidate
+        // cut is then scored in O(1). `used_bytes_for_cells(&cells[..s])`
+        // equals `LEAF_HEADER_SIZE + s * 2 + prefix[s]` (and symmetrically
+        // for the right slice), so every cut sees the exact same integers —
+        // and therefore the same scores, iteration order, and tie-breaks —
+        // as re-summing both slices per cut, without the O(n^2) blowup that
+        // stalls bulk-load checkpoints inside the writer-exclusion window.
+        let n = cells.len();
+        let mut prefix = vec![0usize; n + 1];
+        for (i, cell) in cells.iter().enumerate() {
+            prefix[i + 1] = prefix[i] + cell.encoded_size();
+        }
+        let total_cell_bytes = prefix[n];
+
         let mut best: Option<((usize, usize, usize), usize)> = None;
 
-        for split_at in 1..cells.len() {
-            let left_used = LeafNode::used_bytes_for_cells(&cells[..split_at]);
-            let right_used = LeafNode::used_bytes_for_cells(&cells[split_at..]);
+        for (split_at, &left_cell_bytes) in prefix.iter().enumerate().take(n).skip(1) {
+            let left_used = LEAF_HEADER_SIZE + split_at * 2 + left_cell_bytes;
+            let right_used =
+                LEAF_HEADER_SIZE + (n - split_at) * 2 + (total_cell_bytes - left_cell_bytes);
             if left_used > PAGE_SIZE_LEAF as usize || right_used > PAGE_SIZE_LEAF as usize {
                 continue;
             }
@@ -180,68 +199,6 @@ impl<S: BTreePageStore> BTree<S> {
         }
 
         best.map(|(_, split_at)| split_at)
-    }
-
-    fn move_all_leaf_chains(&mut self, from_page: u32, to_page: u32) -> Result<()> {
-        // Phase 3 Section 10.6: merge drains every chain from the source leaf,
-        // including delta-only chains, and keeps the existing transport shape.
-        let drained: Vec<_> =
-            self.store
-                .with_all_chains_under_latch(from_page, LatchMode::Exclusive, |c| {
-                    std::mem::take(c).into_iter().collect()
-                })?;
-        for (key, chain) in drained {
-            self.store
-                .with_chain_under_latch(to_page, &key, LatchMode::Exclusive, |slot| {
-                    *slot = Some(chain);
-                })?;
-        }
-        Ok(())
-    }
-
-    fn redistribute_leaf_chains(
-        &mut self,
-        left_page: u32,
-        right_page: u32,
-        separator_key: &[u8],
-    ) -> Result<()> {
-        // Phase 3 Section 10.6: redistribution remains a separator-key
-        // partition, so delta-only chains route by the same raw key bytes as
-        // base-backed chains.
-        let mut chains: Vec<_> =
-            self.store
-                .with_all_chains_under_latch(left_page, LatchMode::Exclusive, |c| {
-                    std::mem::take(c).into_iter().collect()
-                })?;
-        chains.extend(self.store.with_all_chains_under_latch(
-            right_page,
-            LatchMode::Exclusive,
-            |c| std::mem::take(c).into_iter().collect::<Vec<_>>(),
-        )?);
-
-        for (key, chain) in chains {
-            if key.as_slice() < separator_key {
-                self.store.with_chain_under_latch(
-                    left_page,
-                    &key,
-                    LatchMode::Exclusive,
-                    |slot| {
-                        *slot = Some(chain);
-                    },
-                )?;
-            } else {
-                self.store.with_chain_under_latch(
-                    right_page,
-                    &key,
-                    LatchMode::Exclusive,
-                    |slot| {
-                        *slot = Some(chain);
-                    },
-                )?;
-            }
-        }
-
-        Ok(())
     }
 
     fn redistribute_leaf_pair(

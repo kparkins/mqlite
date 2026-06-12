@@ -57,7 +57,7 @@ fn registry_stress_1000_concurrent_open_drop() {
                     physical_ms: 1_000 + (i as u64),
                     logical: t as u32,
                 };
-                let view = ReadView::open(reg.clone(), read_ts, txn_id);
+                let view = ReadView::open_frontier_pinned_for_tests(reg.clone(), read_ts, txn_id);
 
                 // Sanity: the registry horizon must be <= this view's ts.
                 let horizon = reg.oldest_required_ts();

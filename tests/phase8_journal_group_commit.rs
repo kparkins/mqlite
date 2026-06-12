@@ -191,22 +191,28 @@ fn sync_journal_uses_log_manager_durable_frontier() {
 fn fullsync_commit_waits_on_end_lsn_not_ticket_manager() {
     let engine = include_str!("../src/storage/paged_engine.rs");
     let state = include_str!("../src/storage/paged_engine/state.rs");
+    // The commit-envelope and durability helpers were split out of the root
+    // engine file; the FullSync end-LSN wait now lives in commit_envelope.rs
+    // and the durability-mode dispatch in durability.rs.
+    let commit_envelope = include_str!("../src/storage/paged_engine/commit_envelope.rs");
+    let durability = include_str!("../src/storage/paged_engine/durability.rs");
 
     assert!(!engine.contains("mod group_commit;"));
     assert!(!engine.contains("fullsync_group_commit"));
     assert!(!engine.contains("shared.group_commit"));
     assert!(!state.contains("GroupCommitManager"));
-    assert!(engine.contains("let commit_end_lsn = reserved.end_lsn()"));
-    assert!(engine.contains("self.wait_for_commit_durability(commit_end_lsn)?"));
-    assert!(engine.contains("DurabilityMode::FullSync"));
-    assert!(engine.contains("self.shared.handle.wait_journal_durable(end_lsn)"));
-    assert!(engine.contains("DurabilityMode::Interval(_) | DurabilityMode::None"));
-    assert!(engine.contains("self.shared.handle.wait_journal_ready(end_lsn)"));
+    assert!(commit_envelope.contains("let commit_end_lsn = reserved.end_lsn()"));
+    assert!(commit_envelope.contains("self.wait_for_commit_durability(commit_end_lsn)?"));
+    assert!(durability.contains("DurabilityMode::FullSync"));
+    assert!(durability.contains("self.shared.handle.wait_journal_durable(end_lsn)"));
+    assert!(durability.contains("DurabilityMode::Interval(_) | DurabilityMode::None"));
+    assert!(durability.contains("self.shared.handle.wait_journal_ready(end_lsn)"));
 }
 
 #[test]
 fn interval_and_none_use_ready_frontier_without_commit_sync_wait() {
-    let engine = include_str!("../src/storage/paged_engine.rs");
+    // Interval/None durability dispatch was split into durability.rs.
+    let engine = include_str!("../src/storage/paged_engine/durability.rs");
 
     assert!(engine.contains("fn maybe_sync_interval_after_publish"));
     assert!(engine.contains("DurabilityMode::Interval(interval)"));
@@ -245,22 +251,34 @@ fn dirty_eviction_skips_unflushable_or_undurable_pages() {
 
 #[test]
 fn main_file_flush_is_lsn_fenced() {
-    let handle = include_str!("../src/storage/handle.rs");
-    let buffer_pool = include_str!("../src/storage/buffer_pool/mod.rs");
+    // handle.rs became a directory during the R15 decomposition: the
+    // `flush()` LSN-fence path and `refresh_main_file_flush_lsn` stayed in
+    // handle/mod.rs, while the dormant US-005 checkpoint producer (carrying
+    // `checkpoint_applied_lsn` / `checkpoint_dirty_frame_snapshots`) moved into
+    // the gated handle/checkpoint_flush.rs sibling.
+    let handle = include_str!("../src/storage/handle/mod.rs");
+    let checkpoint_flush = include_str!("../src/storage/handle/checkpoint_flush.rs");
+    // The BufferPool flush/dirty-snapshot surface moved out of
+    // buffer_pool/mod.rs into the sibling buffer_pool/flush.rs module
+    // during the R3 mechanical split; the LSN-fenced flush tokens now
+    // live there.
+    let flush = include_str!("../src/storage/buffer_pool/flush.rs");
 
     assert!(handle.contains("let durable_lsn = self.journal_durable_lsn()?"));
     assert!(handle.contains("self.pool.flush_lsn_fenced(durable_lsn)?"));
     assert!(handle.contains("self.history_pool.flush_lsn_fenced(durable_lsn)?"));
-    assert!(handle.contains("checkpoint_applied_lsn"));
-    assert!(handle.contains("checkpoint_dirty_frame_snapshots("));
-    assert!(buffer_pool.contains("pub(crate) fn flush_lsn_fenced(&self, durable_lsn: u64)"));
-    assert!(buffer_pool.contains("flush_all_lsn_fenced"));
-    assert!(buffer_pool.contains("dirty_frame_snapshots_lsn_fenced"));
+    assert!(checkpoint_flush.contains("checkpoint_applied_lsn"));
+    assert!(checkpoint_flush.contains("checkpoint_dirty_frame_snapshots("));
+    assert!(flush.contains("pub(crate) fn flush_lsn_fenced(&self, durable_lsn: u64)"));
+    assert!(flush.contains("flush_all_lsn_fenced"));
+    assert!(flush.contains("dirty_frame_snapshots_lsn_fenced"));
 }
 
 #[test]
 fn checkpoint_fsyncs_main_file_before_boundary_record() {
-    let snapshot_ops = include_str!("../src/storage/paged_engine/snapshot_ops.rs");
+    // snapshot_ops.rs became a directory; the checkpoint driver lives in
+    // snapshot_ops/checkpoint.rs.
+    let snapshot_ops = include_str!("../src/storage/paged_engine/snapshot_ops/checkpoint.rs");
     let checkpoint_body = source_between(
         snapshot_ops,
         "fn checkpoint_after_reconcile_plan",
@@ -301,7 +319,7 @@ fn checkpoint_fsyncs_main_file_before_boundary_record() {
 
 #[test]
 fn commit_stamps_dirty_pages_with_commit_end_lsn_before_waiting() {
-    let engine = include_str!("../src/storage/paged_engine.rs");
+    let engine = include_str!("../src/storage/paged_engine/commit_envelope.rs");
     let run_write_commit_envelope = source_between(
         engine,
         "fn run_write_commit_envelope",
@@ -344,7 +362,7 @@ fn commit_stamps_dirty_pages_with_commit_end_lsn_before_waiting() {
 
 #[test]
 fn pre_durable_cleanup_does_not_drop_global_dirty_pages() {
-    let engine = include_str!("../src/storage/paged_engine.rs");
+    let engine = include_str!("../src/storage/paged_engine/commit_envelope.rs");
     let cleanup = source_between(
         engine,
         "fn cleanup_registered_pre_durable_failure",
@@ -471,7 +489,7 @@ fn recovery_scans_contiguous_log_records_and_truncates_once() {
     assert!(source.contains("fn scan_log_records("));
     assert!(source.contains("fn read_log_record_at("));
     assert!(source.contains("fn truncate_tail_to_valid_end_lsn("));
-    assert!(source.contains("LogRecord::decode(&bytes)"));
+    assert!(source.contains("LogRecord::decode_classified(&bytes)"));
     assert!(source.contains("record.start_lsn != cursor"));
     assert!(source.contains("sort_by_key(|record| record.record.publish_seq)"));
     assert!(source.contains("duplicate Phase 8 LogRecord publish_seq"));

@@ -63,7 +63,7 @@ fn install_chain(
 }
 
 fn read_view() -> ReadView {
-    ReadView::new(READ_TS, READER_TXN_ID)
+    ReadView::new_frontier_pinned_for_tests(READ_TS, READER_TXN_ID)
 }
 
 fn scan_keys(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {

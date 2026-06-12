@@ -137,6 +137,19 @@ pub mod results;
 // `mvcc` is `pub` but `#[doc(hidden)]` — integration tests need to
 // reference `ReadView` / `ReadViewRegistry` / `Ts` through the crate root,
 // but the module is not part of the stable surface.
+// NOTE: removing this module-level allow was attempted as part of the US-005
+// quarantine (docs/staged-work/us-005-incremental-checkpoint.md). The removal
+// surfaced roughly twenty dead-code warnings that are NOT US-005 producers — a
+// pre-existing dead surface: log_manager accessors (bytes_len/ready_lsn/
+// reset_to/from_io/start_lsn), a handful of SPECIFIC unused wire accessors
+// (NOT the codecs themselves — CheckpointPageFramePayload decode and the
+// LogRecord wire paths are live in recovery), append-sync test observers, and
+// JournalManager fields whose only reads live in cfg(test)/test-hooks-gated
+// helpers. Those are outside the US-005 quarantine's adjudicated scope, so the
+// blanket is retained rather than mislabeling unrelated items with the US-005
+// cfg or annotating them ad hoc. The US-005 producer surface is instead
+// cfg-gated at each item. Enumerating + pruning this pre-existing dead surface
+// is its own follow-up task.
 #[allow(dead_code)]
 mod journal;
 #[doc(hidden)]
@@ -302,7 +315,7 @@ pub fn fuzz_eval_filter(doc: &bson::Document, filter: &bson::Document) -> Result
 /// application code.
 #[cfg(feature = "fuzz")]
 pub fn fuzz_logical_txn_decode_scanning(buf: &[u8], salt1: u32, salt2: u32) -> Result<()> {
-    use crate::journal::log_file::{DecodeCtx, LogicalTxnFrame};
+    use crate::journal::wire::{DecodeCtx, LogicalTxnFrame};
     let _ = LogicalTxnFrame::decode(buf, salt1, salt2, DecodeCtx::Scanning)?;
     Ok(())
 }
@@ -315,7 +328,7 @@ pub fn fuzz_logical_txn_decode_scanning(buf: &[u8], salt1: u32, salt2: u32) -> R
 /// application code.
 #[cfg(feature = "fuzz")]
 pub fn fuzz_try_skip_logical_txn(buf: &[u8], salt1: u32, salt2: u32) -> Result<()> {
-    use crate::journal::log_file::try_skip_logical_txn;
+    use crate::journal::wire::try_skip_logical_txn;
     use std::io::{Cursor, Seek};
     let mut cursor = Cursor::new(buf);
     let start = cursor.stream_position().map_err(crate::error::Error::Io)?;

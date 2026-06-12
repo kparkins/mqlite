@@ -1,5 +1,10 @@
 use super::*;
-use crate::mvcc::version::{OverflowRef, VersionData};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+
+use crate::mvcc::chain_snapshot::ChainSnapshot;
+use crate::mvcc::registry::ReadViewRegistry;
+use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::header::FileHeader;
 
@@ -21,7 +26,7 @@ fn overflow_entry(alloc: &AllocatorHandle, first_page: u32, ts: Ts) -> VersionEn
 
 #[test]
 fn new_read_view_is_live() {
-    let rv = ReadView::new(
+    let rv = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 100,
             logical: 1,
@@ -37,7 +42,7 @@ fn new_read_view_is_live() {
 
 #[test]
 fn poisoned_flag_transitions() {
-    let rv = ReadView::new(Ts::default(), 0);
+    let rv = ReadView::new_frontier_pinned_for_tests(Ts::default(), 0);
     assert!(!rv.poisoned.load(Ordering::Acquire));
     rv.poisoned.store(true, Ordering::Release);
     assert!(rv.poisoned.load(Ordering::Acquire));
@@ -45,7 +50,7 @@ fn poisoned_flag_transitions() {
 
 #[test]
 fn pin_ops_counter_tracks_in_flight() {
-    let rv = ReadView::new(Ts::default(), 0);
+    let rv = ReadView::new_frontier_pinned_for_tests(Ts::default(), 0);
     rv.pin_ops_in_flight.fetch_add(1, Ordering::Release);
     rv.pin_ops_in_flight.fetch_add(1, Ordering::Release);
     assert_eq!(rv.pin_ops_in_flight.load(Ordering::Acquire), 2);
@@ -163,7 +168,7 @@ fn chain_snapshot_poisoned_before_new_takes_no_pins() {
     source.insert(b"k".to_vec(), Arc::new(chain));
     assert_eq!(alloc.overflow_refcount(7), 1);
 
-    let view = Arc::new(ReadView::new(
+    let view = Arc::new(ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 500,
             logical: 0,
@@ -208,7 +213,7 @@ fn chain_snapshot_poisoned_after_bump_drops_clones() {
     ));
     source.insert(b"k".to_vec(), Arc::new(chain));
 
-    let view = Arc::new(ReadView::new(
+    let view = Arc::new(ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 500,
             logical: 0,
@@ -250,13 +255,86 @@ fn empty_registry_oldest_is_ts_max() {
 }
 
 // -----------------------------------------------------------------------
+// ITEM 1 — load-to-register prune race: conservative-register-then-refine.
+//
+// A reader in its load-to-register window is invisible to
+// `oldest_required_ts()`; a reconcile/eviction prune in that window can drop
+// (without history spill) a resident superseded version the reader needs.
+// `open_for_epoch_conservative_then_refine` registers at `Ts::default()`
+// first so the reader instantly pins the whole horizon, then raises its
+// registered slot to the real `read_ts`.
+// -----------------------------------------------------------------------
+
+fn ts_ms(physical_ms: u64) -> Ts {
+    Ts {
+        physical_ms,
+        logical: 0,
+    }
+}
+
+#[test]
+fn refine_read_ts_raises_registered_floor() {
+    let reg = ReadViewRegistry::new();
+    // Register conservatively at the zero floor.
+    reg.register(7, Ts::default(), std::sync::Weak::new());
+    assert_eq!(
+        reg.oldest_required_ts(),
+        Ts::default(),
+        "a conservatively registered reader pins the whole horizon"
+    );
+    // Refine up to the real read_ts.
+    reg.refine_read_ts(7, ts_ms(100));
+    assert_eq!(
+        reg.oldest_required_ts(),
+        ts_ms(100),
+        "after refine the slot pins only the reader's own read_ts"
+    );
+}
+
+#[test]
+fn refine_read_ts_is_noop_for_absent_txn() {
+    let reg = ReadViewRegistry::new();
+    // No slot for txn 42 — refine must not insert or panic.
+    reg.refine_read_ts(42, ts_ms(100));
+    assert!(reg.is_empty());
+    assert_eq!(reg.oldest_required_ts(), Ts::MAX);
+}
+
+#[test]
+fn conservative_then_refine_pins_horizon_during_registration_then_real_ts() {
+    // The fix's whole point: while a late reader is being registered, any
+    // concurrent reconcile that snapshots `oldest_required_ts()` must already
+    // observe a floor no higher than the reader's pin — never a value above
+    // its read_ts that would let it drop the reader's resident version.
+    let reg = ReadViewRegistry::new();
+    let read_ts = ts_ms(100);
+
+    let view = ReadView::open_for_epoch_conservative_then_refine_for_tests(
+        reg.clone(),
+        read_ts,
+        1,
+    );
+
+    // After construction the registered slot pins exactly read_ts (the
+    // conservative floor was refined up), so it neither over-pins forever nor
+    // exceeds the reader's snapshot.
+    assert_eq!(reg.oldest_required_ts(), read_ts);
+    assert_eq!(view.read_ts, read_ts, "the view always carries the real read_ts");
+    // Any reconcile snapshotting the floor now sees read_ts and will retain
+    // every version with stop_ts > read_ts — exactly the versions this reader
+    // can still need.
+    drop(view);
+    assert!(reg.is_empty());
+}
+
+// -----------------------------------------------------------------------
 // force_expire
 // -----------------------------------------------------------------------
 
 #[test]
 fn force_expire_sets_poisoned_and_ticks_counter() {
     crate::mvcc::metrics::reset_read_views_force_expired();
-    let rv = ReadView::new(
+    let rv = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 100,
             logical: 0,
@@ -275,7 +353,7 @@ fn force_expire_sets_poisoned_and_ticks_counter() {
 
 #[test]
 fn force_expire_returns_immediately_when_pin_ops_is_zero() {
-    let rv = ReadView::new(Ts::default(), 0);
+    let rv = ReadView::new_frontier_pinned_for_tests(Ts::default(), 0);
     assert_eq!(rv.pin_ops_in_flight.load(Ordering::Acquire), 0);
     let start = std::time::Instant::now();
     rv.force_expire();
@@ -298,9 +376,9 @@ fn three_open_views_report_min_ts() {
         physical_ms: 300,
         logical: 0,
     };
-    let v100 = ReadView::open(reg.clone(), ts100, 1);
-    let v200 = ReadView::open(reg.clone(), ts200, 2);
-    let v300 = ReadView::open(reg.clone(), ts300, 3);
+    let v100 = ReadView::open_frontier_pinned_for_tests(reg.clone(), ts100, 1);
+    let v200 = ReadView::open_frontier_pinned_for_tests(reg.clone(), ts200, 2);
+    let v300 = ReadView::open_frontier_pinned_for_tests(reg.clone(), ts300, 3);
     assert_eq!(reg.len(), 3);
     assert_eq!(reg.oldest_required_ts(), ts100);
     // Keep all three alive through the assertion.
@@ -323,9 +401,9 @@ fn drop_oldest_advances_horizon() {
         physical_ms: 300,
         logical: 0,
     };
-    let v100 = ReadView::open(reg.clone(), ts100, 1);
-    let _v200 = ReadView::open(reg.clone(), ts200, 2);
-    let _v300 = ReadView::open(reg.clone(), ts300, 3);
+    let v100 = ReadView::open_frontier_pinned_for_tests(reg.clone(), ts100, 1);
+    let _v200 = ReadView::open_frontier_pinned_for_tests(reg.clone(), ts200, 2);
+    let _v300 = ReadView::open_frontier_pinned_for_tests(reg.clone(), ts300, 3);
     assert_eq!(reg.oldest_required_ts(), ts100);
     drop(v100);
     assert_eq!(reg.oldest_required_ts(), ts200);
@@ -334,12 +412,12 @@ fn drop_oldest_advances_horizon() {
 
 #[test]
 fn standalone_new_does_not_register() {
-    // ReadView::new(..) paths (tests, snapshot fixtures) must not
+    // ReadView::new_frontier_pinned_for_tests(..) paths (tests, snapshot fixtures) must not
     // affect any registry — the `registry` field is None and Drop is
     // a no-op.
     let reg = ReadViewRegistry::new();
     {
-        let _rv = ReadView::new(
+        let _rv = ReadView::new_frontier_pinned_for_tests(
             Ts {
                 physical_ms: 500,
                 logical: 0,
@@ -393,21 +471,21 @@ fn chain_snapshot_mem_store_shape_visibility() {
 
     let snap = ChainSnapshot::new(&source, None);
 
-    let reader_old = ReadView::new(
+    let reader_old = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 150,
             logical: 0,
         },
         99,
     );
-    let reader_new = ReadView::new(
+    let reader_new = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 250,
             logical: 0,
         },
         99,
     );
-    let reader_pending = ReadView::new(
+    let reader_pending = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 200,
             logical: 0,

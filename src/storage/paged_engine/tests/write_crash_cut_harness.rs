@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{EngineFatalReason, Error, Result};
-use crate::journal::log_file::LogRecordDraft;
+use crate::journal::wire::LogRecordDraft;
 use crate::mvcc::transaction::WriteTxn;
 use crate::options::FindOptions;
 use crate::storage::write_crash_cut_contract::{WriteEnvelopeProbeCut, WriteEnvelopeProbeReport};
@@ -100,7 +100,7 @@ impl PagedEngine {
             Ok(bytes) => bytes,
             Err(e) => {
                 drop(txn);
-                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, e));
             }
         };
         let sec_pages = match install_pending_sec_index(
@@ -113,7 +113,7 @@ impl PagedEngine {
         ) {
             Ok(pages) => pages,
             Err(e) => {
-                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, e));
             }
         };
         let (primary_pages, primary_structural_tree_change) = match install_pending_primary(
@@ -126,7 +126,7 @@ impl PagedEngine {
         ) {
             Ok(result) => result,
             Err(e) => {
-                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, e));
             }
         };
         let root_changing = root_changing | primary_structural_tree_change;
@@ -141,7 +141,7 @@ impl PagedEngine {
         let prepared = match txn.prepare_chain_commit_payload(&self.shared.handle, commit_ts) {
             Ok(prepared) => prepared,
             Err(e) => {
-                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, e));
             }
         };
         let _pending = prepared.pending;
@@ -157,7 +157,7 @@ impl PagedEngine {
         let reserved = match self.shared.handle.reserve_log_record(draft) {
             Ok(reserved) => reserved,
             Err(e) => {
-                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
+                return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, e));
             }
         };
         let commit_end_lsn = reserved.end_lsn();

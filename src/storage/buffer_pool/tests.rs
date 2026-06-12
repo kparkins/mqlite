@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::error::PoolExhaustedReason;
-use crate::journal::log_file::PageId;
+use crate::journal::wire::PageId;
 
 // -----------------------------------------------------------------------
 // Mock I/O backend
@@ -688,7 +688,8 @@ fn pinned_page_number_accessor() {
 mod reconcile {
     use super::*;
     use crate::mvcc::metrics;
-    use crate::mvcc::read_view::{ReadView, ReadViewRegistry};
+    use crate::mvcc::read_view::ReadView;
+    use crate::mvcc::registry::ReadViewRegistry;
     use crate::mvcc::timestamp::Ts;
     use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
     use crate::storage::allocator::AllocatorHandle;
@@ -799,7 +800,7 @@ mod reconcile {
         let registry = Arc::new(ReadViewRegistry::new());
         // Reader pinned at ts=5 — any entry whose stop_ts > ts(5) must
         // survive.
-        let _view = ReadView::open(Arc::clone(&registry), ts(5), 77);
+        let _view = ReadView::open_frontier_pinned_for_tests(Arc::clone(&registry), ts(5), 77);
 
         let mut chain = VecDeque::new();
         chain.push_back(entry_inline(ts(100), Ts::MAX, 1, b"head"));
@@ -937,7 +938,7 @@ mod reconcile {
         // the tombstone — reconcile must leave it in place.
         let (pool, alloc, _io) = pool_with_resident_leaf(7);
         let registry = Arc::new(ReadViewRegistry::new());
-        let _view = ReadView::open(Arc::clone(&registry), ts(50), 500);
+        let _view = ReadView::open_frontier_pinned_for_tests(Arc::clone(&registry), ts(50), 500);
 
         let mut chain = VecDeque::new();
         chain.push_back(tombstone(ts(100), Ts::MAX, 1));

@@ -111,7 +111,7 @@ fn flag_set_within(flag: &AtomicBool, timeout: Duration) -> bool {
 #[test]
 fn test_run_write_commit_envelope_holds_exactly_one_metadata_read() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine.rs");
+    let path = project_root.join("src/storage/paged_engine/commit_envelope.rs");
     let body = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
 
@@ -229,26 +229,37 @@ fn test_bootstrap_write_admits_allocated_ns_id_without_name_reresolve() {
         .expect("bootstrap insert succeeds");
 
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The CRUD commit envelope (run_write / run_write_commit_envelope) lives
+    // in commit_envelope.rs and the namespace DDL paths (create_namespace,
+    // bootstrap_namespace) in ns_ddl.rs after the paged_engine split.
     let engine_path = project_root.join("src/storage/paged_engine.rs");
+    let commit_envelope_path = project_root.join("src/storage/paged_engine/commit_envelope.rs");
+    let ns_ddl_path = project_root.join("src/storage/paged_engine/ns_ddl.rs");
     let doc_ops_path = project_root.join("src/storage/paged_engine/doc_ops.rs");
     let engine_source = std::fs::read_to_string(&engine_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", engine_path.display()));
+    let commit_envelope_source = std::fs::read_to_string(&commit_envelope_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", commit_envelope_path.display()));
+    let ns_ddl_source = std::fs::read_to_string(&ns_ddl_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", ns_ddl_path.display()));
     let doc_ops_source = std::fs::read_to_string(&doc_ops_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", doc_ops_path.display()));
-    let combined = format!("{engine_source}\n{doc_ops_source}");
+    let combined = format!(
+        "{engine_source}\n{commit_envelope_source}\n{ns_ddl_source}\n{doc_ops_source}"
+    );
     assert!(
         !combined.contains("id_for_name(ns)"),
         "US-030 forbids recovering the bootstrap id through id_for_name(ns)",
     );
     assert!(
-        engine_source.contains("let ns_id = self.bootstrap_namespace(ns)?;"),
+        commit_envelope_source.contains("let ns_id = self.bootstrap_namespace(ns)?;"),
         "run_write must keep the id returned by bootstrap_namespace",
     );
     assert!(
-        !engine_source.contains("ns_writers.admit"),
+        !commit_envelope_source.contains("ns_writers.admit"),
         "ordinary CRUD must not admit through NsWriterRegistry in Phase 6",
     );
-    let create_namespace_body = extract_function_body(&engine_source, "create_namespace")
+    let create_namespace_body = extract_function_body(&ns_ddl_source, "create_namespace")
         .expect("create_namespace function body must be locatable");
     assert!(
         !create_namespace_body.contains("close_and_drain"),
@@ -279,7 +290,8 @@ fn test_standalone_create_namespace_rejects_existing_name_without_drain() {
     );
 
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let engine_path = project_root.join("src/storage/paged_engine.rs");
+    // create_namespace moved to ns_ddl.rs in the paged_engine split.
+    let engine_path = project_root.join("src/storage/paged_engine/ns_ddl.rs");
     let engine_source = std::fs::read_to_string(&engine_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", engine_path.display()));
     let create_namespace_body = extract_function_body(&engine_source, "create_namespace")
@@ -353,9 +365,15 @@ fn test_us004_structural_callers_use_page_batch_owner() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let owner_path = project_root.join("src/storage/structural_page_batch.rs");
     let engine_path = project_root.join("src/storage/paged_engine.rs");
-    let index_build_path = project_root.join("src/storage/paged_engine/index_build.rs");
-    let index_maint_path = project_root.join("src/storage/paged_engine/index_maint.rs");
-    let snapshot_path = project_root.join("src/storage/paged_engine/snapshot_ops.rs");
+    // R7 split: the create/drop index lifecycle (incl. drop_index) now lives in
+    // index_ddl.rs, and the checkpoint materialize fns moved to
+    // checkpoint_materialize.rs.
+    let index_ddl_path = project_root.join("src/storage/paged_engine/index_ddl.rs");
+    let checkpoint_materialize_path =
+        project_root.join("src/storage/paged_engine/checkpoint_materialize.rs");
+    // snapshot_ops.rs became a directory; the checkpoint driver and its
+    // pre-mutation stage now live in snapshot_ops/checkpoint.rs.
+    let snapshot_path = project_root.join("src/storage/paged_engine/snapshot_ops/checkpoint.rs");
 
     let owner = std::fs::read_to_string(&owner_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", owner_path.display()));
@@ -365,76 +383,113 @@ fn test_us004_structural_callers_use_page_batch_owner() {
             && owner.contains("lifetime: AllocatorLifetimeBatch")
             && owner.contains("pub(crate) fn commit_lsn_fenced(")
             && owner.contains("pub(crate) fn abort(")
-            && owner.contains("self.lifetime.abort(handle)?"),
+            // F28: abort must run BOTH owners unconditionally — a lifetime
+            // error must not skip the header rollback (no `?` between them).
+            && owner.contains("let lifetime = self.lifetime.abort(handle);")
+            && owner.contains("let header = self.header.abort(handle);")
+            && owner.contains("lifetime.and(header)"),
         "US-004/US-006 require structural and allocator-lifetime owners with explicit durable commit and abort semantics",
     );
 
     let engine = std::fs::read_to_string(&engine_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", engine_path.display()));
-    let index_build = std::fs::read_to_string(&index_build_path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", index_build_path.display()));
-    let index_maint = std::fs::read_to_string(&index_maint_path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", index_maint_path.display()));
+    // Namespace DDL paths (bootstrap/create/drop/run_namespace_create_ddl)
+    // moved to ns_ddl.rs in the paged_engine split.
+    let ns_ddl_path = project_root.join("src/storage/paged_engine/ns_ddl.rs");
+    let ns_ddl = std::fs::read_to_string(&ns_ddl_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", ns_ddl_path.display()));
+    let index_ddl = std::fs::read_to_string(&index_ddl_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", index_ddl_path.display()));
+    let checkpoint_materialize = std::fs::read_to_string(&checkpoint_materialize_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", checkpoint_materialize_path.display()));
     let snapshot = std::fs::read_to_string(&snapshot_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", snapshot_path.display()));
 
     for (label, source, function, required) in [
         (
             "bootstrap_namespace",
-            engine.as_str(),
+            ns_ddl.as_str(),
             "bootstrap_namespace",
             &["sync_catalog_root_structural", "new_structural_store"][..],
         ),
         (
             "create_namespace",
-            engine.as_str(),
+            ns_ddl.as_str(),
             "create_namespace",
             &["sync_catalog_root_structural", "new_structural_store"],
         ),
+        // R8: the catalog-generation reservation, batch staging, pre/post-
+        // durable commit matrix, and publish matrix now live in the shared
+        // `run_catalog_ddl_envelope` helper. Each joined site proves it routes
+        // through the envelope; the full token matrix is asserted once on the
+        // helper itself in the dedicated row below. drop_namespace keeps its
+        // genuinely site-specific tokens (page collection + deferred retire).
         (
             "drop_namespace",
-            engine.as_str(),
+            ns_ddl.as_str(),
             "drop_namespace",
             &[
-                "StructuralPageBatch::new",
-                "free_tree_pages_exclusive(&mut batch",
+                "run_catalog_ddl_envelope",
+                "collect_tree_pages",
+                "retire_dropped_tree_pages",
                 "sync_catalog_root_structural",
-                "commit_catalog_batch_to_log",
-                "batch.abort",
-                "PostDurableDdlPublishFailure",
             ],
         ),
         (
             "run_namespace_create_ddl",
-            engine.as_str(),
+            ns_ddl.as_str(),
             "run_namespace_create_ddl",
+            &["run_catalog_ddl_envelope"],
+        ),
+        // R8: the envelope is the single home of the full catalog-DDL commit
+        // matrix. Asserting the matrix here (once, where it lives) plus each
+        // site's `run_catalog_ddl_envelope` routing keeps net gate strength
+        // ≥ the pre-unification per-site assertions.
+        (
+            "run_catalog_ddl_envelope",
+            ns_ddl.as_str(),
+            "run_catalog_ddl_envelope",
             &[
                 "StructuralPageBatch::new",
+                "register_with_oracle",
                 "commit_catalog_batch_to_log",
                 "batch.abort",
+                "mark_aborted",
+                "mark_ready",
+                "rebuild_and_publish",
                 "PostDurableDdlPublishFailure",
             ],
         ),
         (
-            "free_tree_pages_exclusive",
+            "collect_tree_pages",
             engine.as_str(),
-            "free_tree_pages_exclusive",
-            &["new_structural_store", "sort_by_key", "pin_for_write_sized"],
+            "collect_tree_pages",
+            &["new_btree_store", "collect_pages_by_size"],
         ),
         (
-            "create_index_reserve",
-            index_build.as_str(),
-            "create_index_reserve",
-            &[
-                "StructuralPageBatch::new",
-                "sync_catalog_root_structural",
-                "commit_catalog_batch_to_log",
-                "batch.abort",
-            ],
+            "retire_dropped_tree_pages",
+            engine.as_str(),
+            "retire_dropped_tree_pages",
+            // R5a: BOTH page sizes ride the page-lifetime queue; no direct
+            // free of any retired tree page remains in the retire path.
+            &["enqueue_retired_tree_page", "overflow_refcount"],
         ),
+        // R8: create/drop index sites route their commit matrix through
+        // `run_catalog_ddl_envelope` (asserted by the ns_ddl helper row above).
+        // Each keeps its genuinely site-specific tokens.
+        (
+            "create_index_reserve",
+            index_ddl.as_str(),
+            "create_index_reserve",
+            &["run_catalog_ddl_envelope", "sync_catalog_root_structural"],
+        ),
+        // create_index_build_inner STAYS EXPLICIT (R8): its publish arm is the
+        // unchanged-generation no-op publish (`mark_ready(slot, |_| Ok(()))`,
+        // no `next_catalog_gen` reservation, slot registered post-body), which
+        // is not the parameterized envelope skeleton.
         (
             "create_index_build_inner",
-            index_build.as_str(),
+            index_ddl.as_str(),
             "create_index_build_inner",
             &[
                 "StructuralPageBatch::new",
@@ -446,71 +501,72 @@ fn test_us004_structural_callers_use_page_batch_owner() {
         ),
         (
             "create_index_commit",
-            index_build.as_str(),
+            index_ddl.as_str(),
             "create_index_commit",
-            &[
-                "StructuralPageBatch::new",
-                "sync_catalog_root_structural",
-                "commit_catalog_batch_to_log",
-                "batch.abort",
-                "PostDurableDdlPublishFailure",
-            ],
+            &["run_catalog_ddl_envelope", "sync_catalog_root_structural"],
         ),
         (
             "create_index_cleanup",
-            index_build.as_str(),
+            index_ddl.as_str(),
             "create_index_cleanup",
             &[
-                "StructuralPageBatch::new",
-                "free_index_pages_exclusive(&mut batch",
+                "run_catalog_ddl_envelope",
+                "free_index_pages_exclusive(batch",
                 "sync_catalog_root_structural",
-                "commit_catalog_batch_to_log",
-                "batch.abort",
-                "PostDurableDdlPublishFailure",
             ],
         ),
         (
             "free_index_pages_exclusive",
-            index_build.as_str(),
+            index_ddl.as_str(),
             "free_index_pages_exclusive",
             &["new_structural_store", "sort_by_key", "pin_for_write_sized"],
         ),
         (
             "drop_index",
-            index_maint.as_str(),
+            index_ddl.as_str(),
             "drop_index",
             &[
-                "StructuralPageBatch::new",
-                "free_index_pages_exclusive(&mut batch",
+                "run_catalog_ddl_envelope",
+                "free_index_pages_exclusive(batch",
                 "sync_catalog_root_structural",
-                "commit_catalog_batch_to_log",
-                "batch.abort",
-                "PostDurableDdlPublishFailure",
             ],
         ),
+        // The materialize rebuilds must use the CHAIN-FREE structural store:
+        // reverting to the chain-carrying `new_structural_store` silently
+        // reintroduces the O(n²) close-time checkpoint (each read_leaf would
+        // deep-clone the leaf's entire resident delta map again).
         (
             "materialize_ready_secondary_deltas_for_checkpoint",
-            index_maint.as_str(),
+            checkpoint_materialize.as_str(),
             "materialize_ready_secondary_deltas_for_checkpoint",
-            &["new_structural_store"],
+            &["new_structural_store_chain_free"],
         ),
         (
             "materialize_primary_deltas_for_checkpoint",
-            index_maint.as_str(),
+            checkpoint_materialize.as_str(),
             "materialize_primary_deltas_for_checkpoint",
-            &["new_structural_store"],
+            &["new_structural_store_chain_free"],
+        ),
+        // The checkpoint mutation window is split: `stage_checkpoint_pre_mutation`
+        // owns the recoverable pre-commit stage (batch creation, delta
+        // materialization, abort-on-failure) and `checkpoint_after_reconcile_plan`
+        // owns the post-mutation window starting at the structural commit.
+        (
+            "stage_checkpoint_pre_mutation",
+            snapshot.as_str(),
+            "stage_checkpoint_pre_mutation",
+            &[
+                "StructuralPageBatch::new",
+                "materialize_primary_deltas_for_checkpoint",
+                "materialize_ready_secondary_deltas_for_checkpoint",
+                "batch.abort",
+            ],
         ),
         (
             "checkpoint_after_reconcile_plan",
             snapshot.as_str(),
             "checkpoint_after_reconcile_plan",
-            &[
-                "StructuralPageBatch::new",
-                "materialize_primary_deltas_for_checkpoint",
-                "materialize_ready_secondary_deltas_for_checkpoint",
-                "batch.commit_lsn_fenced",
-                "batch.abort",
-            ],
+            &["stage_checkpoint_pre_mutation", "batch.commit_lsn_fenced"],
         ),
     ] {
         assert_structural_owner_body(label, source, function, required);
@@ -527,10 +583,22 @@ fn test_us005_header_catalog_root_owner_replaces_retired_helpers() {
     let production_paths: Vec<PathBuf> = vec![
         owner_path.clone(),
         project_root.join("src/storage/paged_engine.rs"),
-        project_root.join("src/storage/paged_engine/index_build.rs"),
+        project_root.join("src/storage/paged_engine/commit_envelope.rs"),
+        project_root.join("src/storage/paged_engine/ns_ddl.rs"),
+        // R7 split: index_build.rs → index_ddl.rs and index_maint.rs split into
+        // pending_install/index_write_maint/index_read_helpers/checkpoint_materialize.
+        // The facade index_maint.rs stays. WIDEN (never shrink) the forbidden-token
+        // scan basis to cover every file that now holds the split structural code.
+        project_root.join("src/storage/paged_engine/index_ddl.rs"),
         project_root.join("src/storage/paged_engine/index_maint.rs"),
+        project_root.join("src/storage/paged_engine/pending_install.rs"),
+        project_root.join("src/storage/paged_engine/index_write_maint.rs"),
+        project_root.join("src/storage/paged_engine/index_read_helpers.rs"),
+        project_root.join("src/storage/paged_engine/checkpoint_materialize.rs"),
         project_root.join("src/storage/paged_engine/publish.rs"),
-        project_root.join("src/storage/paged_engine/snapshot_ops.rs"),
+        // snapshot_ops.rs became a directory; the checkpoint driver moved to
+        // snapshot_ops/checkpoint.rs.
+        project_root.join("src/storage/paged_engine/snapshot_ops/checkpoint.rs"),
     ];
 
     let owner = std::fs::read_to_string(&owner_path)
@@ -1675,37 +1743,40 @@ fn test_create_index_commit_revalidates_ns_id_under_metadata_write() {
 #[test]
 fn test_create_index_commit_source_gate_owns_ready_publish() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine/index_build.rs");
+    // R7: create_index_commit lives in index_ddl.rs (renamed from index_build.rs).
+    let path = project_root.join("src/storage/paged_engine/index_ddl.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let body = extract_function_body(&source, "create_index_commit")
         .expect("create_index_commit function body must be locatable");
+    // FIX2: strip line comments before offset searches so a comment mentioning
+    // `run_catalog_ddl_envelope` cannot silently corrupt the ordering assertion.
+    let stripped_body = strip_line_comments(&body);
 
-    let metadata_write = body
+    let metadata_write = stripped_body
         .find(".metadata")
         .expect("create_index_commit must acquire metadata.write");
-    let collection_lookup = body
+    let collection_lookup = stripped_body
         .find(".get_collection(ns)?")
         .expect("create_index_commit must resolve namespace identity");
-    let index_lookup = body
+    let index_lookup = stripped_body
         .find(".get_index(ns, name)?")
         .expect("create_index_commit must resolve target index identity");
-    let state_check = body
+    let state_check = stripped_body
         .find("IndexState::Building")
         .expect("create_index_commit must verify Building state");
-    let drain = body
+    let drain = stripped_body
         .find("close_and_drain_guard")
         .expect("create_index_commit must drain admitted writers");
-    let reserve_gen = body
-        .find("next_catalog_gen")
-        .expect("create_index_commit must reserve a fresh catalog generation");
-    let register = body
-        .find("register_with_oracle")
-        .expect("create_index_commit must allocate a fresh publish slot");
-    let mark_ready = body
-        .find("mark_ready")
-        .expect("create_index_commit must publish through mark_ready");
-    let guard_commit = body
+    // R8: the fresh-generation reservation, publish-slot register, and
+    // mark_ready publish now live in `run_catalog_ddl_envelope`. The site
+    // proves it routes the Ready flip through the shared envelope (after the
+    // drain) and reopens admissions afterward; the reservation/register/
+    // publish matrix is asserted on the helper itself (us004 helper row).
+    let envelope = stripped_body
+        .find("run_catalog_ddl_envelope")
+        .expect("create_index_commit must publish through run_catalog_ddl_envelope");
+    let guard_commit = stripped_body
         .find("guard.commit")
         .expect("create_index_commit must reopen admissions after publish");
 
@@ -1714,20 +1785,17 @@ fn test_create_index_commit_source_gate_owns_ready_publish() {
             && collection_lookup < index_lookup
             && index_lookup < state_check
             && state_check < drain
-            && drain < reserve_gen
-            && reserve_gen < register
-            && register < mark_ready
-            && mark_ready < guard_commit,
-        "create_index_commit order must be metadata.write -> identity -> Building check -> drain -> fresh generation -> fresh slot -> publish -> guard.commit",
+            && drain < envelope
+            && envelope < guard_commit,
+        "create_index_commit order must be metadata.write -> identity -> Building check -> drain -> run_catalog_ddl_envelope -> guard.commit",
     );
     assert!(
-        body.contains("mark_aborted")
-            && body.contains("PostDurableDdlPublishFailure")
+        body.contains("IndexState::Ready")
             && !body.contains("run_ddl(")
             && !body.contains("create_index_build")
             && !body.contains("build_index_mvcc")
             && !body.contains("metadata.read()"),
-        "create_index_commit must own Ready publish/failure routing without scan work or run_ddl",
+        "create_index_commit must own the Ready flip without scan work or run_ddl",
     );
 }
 
@@ -1868,50 +1936,53 @@ fn test_create_index_cleanup_noops_if_drop_index_already_removed_building() {
 #[test]
 fn test_drop_index_revalidates_ns_and_index_under_metadata_write() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine/index_maint.rs");
+    // R7: drop_index moved into index_ddl.rs so the create/drop lifecycle is colocated.
+    let path = project_root.join("src/storage/paged_engine/index_ddl.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let body = extract_function_body(&source, "drop_index")
         .expect("drop_index function body must be locatable");
+    // FIX2: strip line comments before offset searches so a comment mentioning
+    // `run_catalog_ddl_envelope` cannot silently corrupt the ordering assertion.
+    let stripped_body = strip_line_comments(&body);
 
-    let metadata_write = body
+    let metadata_write = stripped_body
         .find(".metadata")
         .expect("drop_index must acquire metadata.write");
-    let collection_lookup = body
+    let collection_lookup = stripped_body
         .find(".get_collection(ns)?")
         .expect("drop_index must resolve namespace identity under metadata.write");
-    let index_lookup = body
+    let index_lookup = stripped_body
         .find(".get_index(ns, name)?")
         .expect("drop_index must resolve target index identity");
-    let drain = body
+    let drain = stripped_body
         .find("close_and_drain_guard")
         .expect("drop_index must close and drain the namespace writer lane");
-    let register = body
-        .find("register_with_oracle")
-        .expect("drop_index must allocate a fresh publish slot");
-    let mark_ready = body
-        .find("mark_ready")
-        .expect("drop_index must publish through mark_ready");
-    let guard_commit = body
+    // R8: the publish-slot register, mark_ready publish, and pre/post-durable
+    // failure routing now live in `run_catalog_ddl_envelope`. The site proves
+    // it routes through the shared envelope (after the drain) and reopens
+    // admissions afterward; the full matrix is asserted on the helper itself
+    // (us004 helper row).
+    let envelope = stripped_body
+        .find("run_catalog_ddl_envelope")
+        .expect("drop_index must commit/publish through run_catalog_ddl_envelope");
+    let guard_commit = stripped_body
         .find("guard.commit")
         .expect("drop_index must explicitly reopen admissions after publish");
     assert!(
         metadata_write < collection_lookup
             && collection_lookup < index_lookup
             && index_lookup < drain
-            && drain < register
-            && register < mark_ready
-            && mark_ready < guard_commit,
-        "drop_index order must be metadata.write -> identity -> drain -> fresh slot -> publish -> guard.commit",
+            && drain < envelope
+            && envelope < guard_commit,
+        "drop_index order must be metadata.write -> identity -> drain -> run_catalog_ddl_envelope -> guard.commit",
     );
     assert!(
-        body.contains("mark_aborted")
-            && body.contains("PostDurableDdlPublishFailure")
-            && !body.contains("run_ddl(")
+        !body.contains("run_ddl(")
             && !body.contains("lane_for(")
             && !body.contains("acquire_lane(")
             && !body.contains("published.store("),
-        "drop_index must not use legacy lanes/run_ddl/published.store and must route failures",
+        "drop_index must not use legacy lanes/run_ddl/published.store",
     );
 }
 
@@ -1922,12 +1993,12 @@ fn test_drop_index_revalidates_ns_and_index_under_metadata_write() {
 #[test]
 fn test_drop_index_page_free_holds_exclusive_latches_against_build_scan() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let maint_path = project_root.join("src/storage/paged_engine/index_maint.rs");
-    let build_path = project_root.join("src/storage/paged_engine/index_build.rs");
-    let maint_source = std::fs::read_to_string(&maint_path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", maint_path.display()));
-    let build_source = std::fs::read_to_string(&build_path)
-        .unwrap_or_else(|err| panic!("read {}: {err}", build_path.display()));
+    // R7: both drop_index and free_index_pages_exclusive now live in index_ddl.rs.
+    let ddl_path = project_root.join("src/storage/paged_engine/index_ddl.rs");
+    let maint_source = std::fs::read_to_string(&ddl_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", ddl_path.display()));
+    let build_source = std::fs::read_to_string(&ddl_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", ddl_path.display()));
 
     let drop_body = extract_function_body(&maint_source, "drop_index")
         .expect("drop_index function body must be locatable");
@@ -1961,7 +2032,7 @@ fn test_drop_namespace_force_expire_with_concurrent_writers() {
     let registry = client
         .__read_view_registry()
         .expect("buffer-pool backed client has a ReadViewRegistry");
-    let view = ReadView::open(
+    let view = ReadView::open_frontier_pinned_for_tests(
         Arc::clone(&registry),
         Ts {
             physical_ms: 24_000,
@@ -2096,49 +2167,53 @@ fn test_drop_namespace_admit_refused_during_drain() {
 #[test]
 fn test_drop_namespace_revalidates_ns_id_under_metadata_write() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine.rs");
+    // drop_namespace moved to ns_ddl.rs in the paged_engine split.
+    let path = project_root.join("src/storage/paged_engine/ns_ddl.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let body = extract_function_body(&source, "drop_namespace")
         .expect("drop_namespace function body must be locatable");
+    // FIX2: strip line comments before offset searches so a comment mentioning
+    // `run_catalog_ddl_envelope` cannot silently corrupt the ordering assertion.
+    let stripped_body = strip_line_comments(&body);
 
-    let metadata_write = body
+    let metadata_write = stripped_body
         .find(".metadata")
         .expect("drop_namespace must acquire metadata.write");
-    let collection_lookup = body
+    let collection_lookup = stripped_body
         .find("cat.get_collection(ns)?")
         .expect("drop_namespace must resolve namespace identity under metadata.write");
-    let drain = body
+    let drain = stripped_body
         .find("close_and_drain_guard")
         .expect("drop_namespace must close and drain the namespace writer lane");
-    let force_expire = body
+    let force_expire = stripped_body
         .find("force_expire_all")
         .expect("drop_namespace must force-expire readers");
-    let register = body
-        .find("register_with_oracle")
-        .expect("drop_namespace must allocate a fresh publish slot");
-    let mark_ready = body
-        .find("mark_ready")
-        .expect("drop_namespace must publish through mark_ready");
-    let mark_dropped = body
+    // R8: the publish-slot register, mark_ready publish, and pre/post-durable
+    // failure routing now live in `run_catalog_ddl_envelope`. The site proves
+    // it routes through the shared envelope (after force-expire) and marks the
+    // RAII guard dropped afterward; the full matrix is asserted on the helper
+    // itself (us004 helper row).
+    let envelope = stripped_body
+        .find("run_catalog_ddl_envelope")
+        .expect("drop_namespace must commit/publish through run_catalog_ddl_envelope");
+    let mark_dropped = stripped_body
         .find("mark_dropped")
         .expect("drop_namespace must mark the RAII guard as dropped");
     assert!(
         metadata_write < collection_lookup
             && collection_lookup < drain
             && drain < force_expire
-            && force_expire < register
-            && register < mark_ready
-            && mark_ready < mark_dropped,
-        "drop_namespace order must be metadata.write -> ns_id -> drain -> force_expire -> fresh slot -> publish -> mark_dropped",
+            && force_expire < envelope
+            && envelope < mark_dropped,
+        "drop_namespace order must be metadata.write -> ns_id -> drain -> force_expire -> run_catalog_ddl_envelope -> mark_dropped",
     );
     assert!(
-        body.contains("mark_aborted")
-            && body.contains("PostDurableDdlPublishFailure")
+        body.contains("restore_dropped_namespace_catalog")
             && !body.contains("run_ddl(")
             && !body.contains("ns_lanes")
             && !body.contains("guard.commit"),
-        "drop_namespace must not use legacy lanes/run_ddl, and must route pre/post-durable failures",
+        "drop_namespace must not use legacy lanes/run_ddl/guard.commit and must keep its symmetric undo",
     );
 }
 
@@ -2215,43 +2290,84 @@ fn test_dropped_namespace_name_can_be_reused_cleanly() {
 
 /// US-024 — source gate for lock ordering: drop-namespace takes
 /// `metadata.write()`, resolves and drains the namespace lane, force-expires
-/// readers, then performs page-free under explicit exclusive page latches
-/// before catalog removal and publish.
+/// readers, then collects the tree pages before catalog removal. BUG-5: the
+/// physical page retirement is deferred until AFTER the durable catalog
+/// commit and epoch publish, so a reader pinned to the pre-drop epoch can
+/// never observe the pages reused mid-snapshot.
 #[test]
 fn test_drop_namespace_does_not_invert_lock_order() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine.rs");
+    // drop_namespace moved to ns_ddl.rs in the paged_engine split.
+    let path = project_root.join("src/storage/paged_engine/ns_ddl.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let body = extract_function_body(&source, "drop_namespace")
         .expect("drop_namespace function body must be locatable");
-    let free_body = extract_function_body(&source, "free_tree_pages_exclusive")
-        .expect("free_tree_pages_exclusive function body must be locatable");
+    // FIX2: strip line comments before offset searches so a comment mentioning
+    // `run_catalog_ddl_envelope` cannot silently corrupt the ordering assertion.
+    let stripped_body = strip_line_comments(&body);
 
-    let metadata_write = body
+    let metadata_write = stripped_body
         .find(".metadata")
         .expect("drop_namespace must acquire metadata.write");
-    let drain = body
+    let drain = stripped_body
         .find("close_and_drain_guard")
         .expect("drop_namespace must drain through NsDdlBarrierGuard");
-    let force_expire = body
+    let force_expire = stripped_body
         .find("force_expire_all")
         .expect("drop_namespace must force-expire readers");
-    let free_call = body
-        .find("free_tree_pages_exclusive")
-        .expect("drop_namespace must free tree pages under exclusive latches");
-    let catalog_drop = body
+    // R8: the durable commit + epoch publish now run inside
+    // `run_catalog_ddl_envelope`. The envelope-call token precedes its body
+    // closure textually, so the page collection and catalog delete (staged in
+    // that closure) appear after the envelope token; the deferred retirement
+    // runs after the envelope returns. The durable-commit ordering matrix is
+    // asserted on the helper itself (us004 helper row).
+    let envelope = stripped_body
+        .find("run_catalog_ddl_envelope")
+        .expect("drop_namespace must commit/publish through the catalog DDL envelope");
+    let collect_call = stripped_body
+        .find("self.collect_tree_pages")
+        .expect("drop_namespace must collect the tree pages for deferred retirement");
+    let catalog_drop = stripped_body
         .find("cat.drop_collection(ns)?")
         .expect("drop_namespace must delete the catalog entry");
+    let retire_call = stripped_body
+        .find("self.retire_dropped_tree_pages")
+        .expect("drop_namespace must retire tree pages after publish");
     assert!(
         metadata_write < drain
             && drain < force_expire
-            && force_expire < free_call
-            && free_call < catalog_drop,
-        "drop_namespace lock order must be metadata -> registry drain -> force-expire -> page-free -> catalog delete",
+            && force_expire < envelope
+            && envelope < collect_call
+            && collect_call < catalog_drop
+            && catalog_drop < retire_call,
+        "drop_namespace order must be metadata -> registry drain -> force-expire -> \
+         run_catalog_ddl_envelope (page collection -> catalog delete -> durable commit -> \
+         publish, inside the body closure) -> deferred page retirement",
     );
 
-    assert_free_helper_latches_before_free(&free_body, "drop-namespace page-free");
+    // R-gate: no direct or queued page retirement may run BEFORE the durable
+    // catalog commit. The only retirement is the deferred
+    // `retire_dropped_tree_pages` AFTER the envelope returns (durable commit +
+    // publish complete); nothing in the staged body closure may free or
+    // enqueue a page. An eager free would re-open the BUG-5 window (a
+    // stale-epoch reader observing reused pages mid-snapshot).
+    // NOTE: use the stripped offsets for slicing too — retire_call is derived
+    // from stripped_body so we slice stripped_body here.
+    let pre_commit_body = strip_line_comments(&stripped_body[..retire_call]);
+    for forbidden in [
+        "free_page(",
+        "free_leaf(",
+        "free_internal(",
+        "enqueue_overflow_deferred_free(",
+        "enqueue_retired_tree_page(",
+    ] {
+        assert!(
+            !pre_commit_body.contains(forbidden),
+            "drop_namespace must not free or enqueue page retirement before the \
+             durable catalog commit; found `{forbidden}` in the pre-commit body slice",
+        );
+    }
 }
 
 /// US-024 — CRUD, checkpoint/reconcile, and drop-namespace can overlap without
@@ -2412,7 +2528,8 @@ fn test_create_index_cleanup_revalidates_ns_id_under_metadata_write() {
     );
 
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine/index_build.rs");
+    // R7: create_index_cleanup lives in index_ddl.rs.
+    let path = project_root.join("src/storage/paged_engine/index_ddl.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let body = extract_function_body(&source, "create_index_cleanup")
@@ -2435,48 +2552,50 @@ fn test_create_index_cleanup_revalidates_ns_id_under_metadata_write() {
 #[test]
 fn test_create_index_cleanup_page_free_holds_exclusive_latches_against_build_scan() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine/index_build.rs");
+    // R7: create_index_cleanup + free_index_pages_exclusive live in index_ddl.rs.
+    let path = project_root.join("src/storage/paged_engine/index_ddl.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let cleanup_body = extract_function_body(&source, "create_index_cleanup")
         .expect("create_index_cleanup function body must be locatable");
+    // FIX2: strip line comments before offset searches so a comment mentioning
+    // `run_catalog_ddl_envelope` cannot silently corrupt the ordering assertion.
+    let stripped_cleanup = strip_line_comments(&cleanup_body);
 
-    let metadata_write = cleanup_body
+    let metadata_write = stripped_cleanup
         .find(".metadata")
         .expect("cleanup must acquire metadata.write");
-    let collection_lookup = cleanup_body
+    let collection_lookup = stripped_cleanup
         .find("cat.get_collection(ns)?")
         .expect("cleanup must resolve namespace identity under metadata.write");
-    let index_lookup = cleanup_body
+    let index_lookup = stripped_cleanup
         .find("cat.get_index(ns, name)?")
         .expect("cleanup must resolve target index identity");
-    let drain = cleanup_body
+    let drain = stripped_cleanup
         .find("close_and_drain_guard")
         .expect("cleanup must close and drain the namespace writer lane");
-    let register = cleanup_body
-        .find("register_with_oracle")
-        .expect("cleanup must allocate a fresh publish slot");
-    let mark_ready = cleanup_body
-        .find("mark_ready")
-        .expect("cleanup must publish through mark_ready");
-    let guard_commit = cleanup_body
+    // R8: the publish-slot register, mark_ready publish, and pre/post-durable
+    // failure routing now live in `run_catalog_ddl_envelope`. The site proves
+    // it routes through the shared envelope (after the drain) and reopens
+    // admissions afterward; the full matrix is asserted on the helper itself
+    // (us004 helper row).
+    let envelope = stripped_cleanup
+        .find("run_catalog_ddl_envelope")
+        .expect("cleanup must commit/publish through run_catalog_ddl_envelope");
+    let guard_commit = stripped_cleanup
         .find("guard.commit")
         .expect("cleanup must explicitly reopen admissions after publish");
     assert!(
         metadata_write < collection_lookup
             && collection_lookup < index_lookup
             && index_lookup < drain
-            && drain < register
-            && register < mark_ready
-            && mark_ready < guard_commit,
-        "cleanup order must be metadata.write -> identity -> drain -> fresh slot -> publish -> guard.commit",
+            && drain < envelope
+            && envelope < guard_commit,
+        "cleanup order must be metadata.write -> identity -> drain -> run_catalog_ddl_envelope -> guard.commit",
     );
     assert!(
-        cleanup_body.contains("mark_aborted")
-            && cleanup_body.contains("PostDurableDdlPublishFailure")
-            && !cleanup_body.contains("run_ddl(")
-            && !cleanup_body.contains("published.store("),
-        "cleanup must not use run_ddl/published.store and must route pre/post-durable failures correctly",
+        !cleanup_body.contains("run_ddl(") && !cleanup_body.contains("published.store("),
+        "cleanup must not use run_ddl/published.store",
     );
 
     let free_body = extract_function_body(&source, "free_index_pages_exclusive")
@@ -2492,34 +2611,39 @@ fn test_create_index_cleanup_page_free_holds_exclusive_latches_against_build_sca
 #[test]
 fn test_create_index_reserve_revalidates_ns_id_under_metadata_write() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = project_root.join("src/storage/paged_engine/index_build.rs");
+    // R7: create_index_reserve lives in index_ddl.rs.
+    let path = project_root.join("src/storage/paged_engine/index_ddl.rs");
     let source = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let body = extract_function_body(&source, "create_index_reserve")
         .expect("create_index_reserve function body must be locatable");
+    // FIX2: strip line comments before offset searches so a comment mentioning
+    // `run_catalog_ddl_envelope` cannot silently corrupt the ordering assertion.
+    let stripped_body = strip_line_comments(&body);
 
-    let metadata_write = body
+    let metadata_write = stripped_body
         .find(".metadata")
         .expect("create_index_reserve must reference self.metadata");
-    let get_collection = body
+    let get_collection = stripped_body
         .find("cat.get_collection(ns)?")
         .expect("create_index_reserve must resolve the namespace under metadata.write");
-    let drain = body
+    let drain = stripped_body
         .find("close_and_drain_guard")
         .expect("create_index_reserve must use the RAII DDL barrier guard");
-    let register = body
-        .find("register_with_oracle")
-        .expect("create_index_reserve must register a publish slot");
-    let mark_ready = body
-        .find("mark_ready")
-        .expect("create_index_reserve must publish through mark_ready");
+    // R8: the publish-slot register and mark_ready Building publish now live
+    // in `run_catalog_ddl_envelope`. The site proves it routes the Building
+    // publish through the shared envelope after the drain; the register/
+    // publish matrix is asserted on the helper itself (us004 helper row).
+    let envelope = stripped_body
+        .find("run_catalog_ddl_envelope")
+        .expect("create_index_reserve must publish Building through run_catalog_ddl_envelope");
     assert!(
         metadata_write < get_collection && get_collection < drain,
         "namespace identity must be resolved under metadata.write before close_and_drain_guard",
     );
     assert!(
-        drain < register && register < mark_ready,
-        "create_index_reserve must drain, register, then publish Building through mark_ready",
+        drain < envelope,
+        "create_index_reserve must drain, then publish Building through run_catalog_ddl_envelope",
     );
     assert!(
         !body.contains("lane_for(") && !body.contains("acquire_lane("),
@@ -2532,10 +2656,16 @@ fn test_create_index_reserve_revalidates_ns_id_under_metadata_write() {
 #[test]
 fn test_create_index_publish_and_raii_guard_source_gates() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // R7 split: widen the DDL publish/guard scan basis across all files that
+    // now hold the create/drop index + pending-install code (never shrink it).
     let paths = [
         project_root.join("src/storage/paged_engine.rs"),
-        project_root.join("src/storage/paged_engine/index_build.rs"),
+        project_root.join("src/storage/paged_engine/index_ddl.rs"),
         project_root.join("src/storage/paged_engine/index_maint.rs"),
+        project_root.join("src/storage/paged_engine/pending_install.rs"),
+        project_root.join("src/storage/paged_engine/index_write_maint.rs"),
+        project_root.join("src/storage/paged_engine/index_read_helpers.rs"),
+        project_root.join("src/storage/paged_engine/checkpoint_materialize.rs"),
     ];
     let mut combined = String::new();
     for path in paths {
@@ -2561,5 +2691,76 @@ fn test_create_index_publish_and_raii_guard_source_gates() {
     assert!(
         !combined.contains("ns_writers.reopen") && !combined.contains(".reopen(ns_id)"),
         "DDL call sites must settle writer admissions through NsDdlBarrierGuard::commit/Drop",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX3 — envelope-internal ordering gate.
+// ---------------------------------------------------------------------------
+
+/// FIX3 — pins the internal ordering of `run_catalog_ddl_envelope` so a
+/// future refactor cannot accidentally swap the pre/post-durable error matrix.
+/// Asserts (comment-stripped):
+///   register_with_oracle < commit_catalog_batch_to_log < mark_ready
+/// and that `batch.abort` + `mark_aborted` both appear in the pre-commit
+/// region (before `commit_catalog_batch_to_log`), confirming the
+/// error-preserving abort idiom is in the right place.
+/// NOTE: `maybe_sync_interval_after_publish` is NOT in the envelope body
+/// after FIX1 (it lives at each call site); this gate does not require it.
+#[test]
+fn test_run_catalog_ddl_envelope_internal_ordering() {
+    let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = project_root.join("src/storage/paged_engine/ns_ddl.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let body = extract_function_body(&source, "run_catalog_ddl_envelope")
+        .expect("run_catalog_ddl_envelope function body must be locatable");
+    // Strip comments so a stray `// ... register_with_oracle ...` line cannot
+    // shift an offset and corrupt the ordering assertion.
+    let code = strip_line_comments(&body);
+
+    let register = code
+        .find("register_with_oracle")
+        .expect("run_catalog_ddl_envelope must call register_with_oracle");
+    let commit = code
+        .find("commit_catalog_batch_to_log")
+        .expect("run_catalog_ddl_envelope must call commit_catalog_batch_to_log");
+    let ready = code
+        .find("mark_ready")
+        .expect("run_catalog_ddl_envelope must call mark_ready");
+
+    assert!(
+        register < commit && commit < ready,
+        "run_catalog_ddl_envelope internal order must be \
+         register_with_oracle < commit_catalog_batch_to_log < mark_ready; \
+         got register={register}, commit={commit}, ready={ready}",
+    );
+
+    // The error-preserving abort idiom must fire in the PRE-commit region
+    // (body-error branch, before the durable commit). Both `batch.abort` and
+    // `mark_aborted` must appear before the `commit_catalog_batch_to_log` offset.
+    let pre_commit = &code[..commit];
+    assert!(
+        pre_commit.contains("batch.abort"),
+        "run_catalog_ddl_envelope must call batch.abort in the pre-commit error branch",
+    );
+    assert!(
+        pre_commit.contains("mark_aborted"),
+        "run_catalog_ddl_envelope must call mark_aborted in the pre-commit error branch",
+    );
+
+    // `PostDurableDdlPublishFailure` must appear after the commit (post-durable
+    // publish-failure branch only).
+    let post_commit = &code[commit..];
+    assert!(
+        post_commit.contains("PostDurableDdlPublishFailure"),
+        "run_catalog_ddl_envelope must set PostDurableDdlPublishFailure in the post-durable branch",
+    );
+
+    // `maybe_sync_interval_after_publish` must NOT be inside the envelope body
+    // after FIX1 — it lives at each call site.
+    assert!(
+        !code.contains("maybe_sync_interval_after_publish"),
+        "run_catalog_ddl_envelope must not call maybe_sync_interval_after_publish (FIX1: lives at call sites)",
     );
 }

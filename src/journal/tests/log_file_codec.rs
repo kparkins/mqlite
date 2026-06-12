@@ -1,4 +1,10 @@
+// The test module is hooked from `wire/mod.rs`, so `super::*` re-exports the
+// entire wire surface (constants + the header/record/payloads/logical types).
+// `Ts` and the page-size constants live outside `wire`, so they are imported
+// explicitly.
 use super::*;
+use crate::mvcc::timestamp::Ts;
+use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
 
 fn sample_header() -> JournalHeader {
     JournalHeader::new(0xDEAD_BEEF, 0xCAFE_BABE)

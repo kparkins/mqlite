@@ -163,6 +163,42 @@ fn structural_batch_abort_requeues_deferred_lifetime_page_once() {
     assert_eq!(header.free_page_count_32k, 0);
 }
 
+/// F28: a lifetime-abort error must not skip the catalog-root header
+/// rollback. Pre-fix, `StructuralPageBatch::abort` ran
+/// `self.lifetime.abort(handle)?;` before `self.header.abort(handle)`, so a
+/// failing batch-allocated free (post-R1b those errors are surfaced) left
+/// `header.catalog_root_page` pointing at the batch-staged root that abort
+/// just tried to tear down — and every caller `let _ = abort(..)`s the error.
+#[test]
+fn structural_batch_abort_rolls_back_header_despite_lifetime_abort_error() {
+    let handle = handle_with_header(base_header());
+    let mut batch = StructuralPageBatch::new(&handle);
+    batch
+        .update_header(&handle, |header| {
+            header.catalog_root_page = 9;
+            header.catalog_root_backup = 9;
+            header.catalog_root_level = 4;
+        })
+        .unwrap();
+    // Page 0 is the live header page, so `free_page(0, _)` always fails:
+    // this models the lifetime owner erroring mid-abort (same injection as
+    // the R1b guard in `structural_batch_abort_free_safety.rs`).
+    batch.lifetime.record_new_alloc(0, PageSize::Small4k);
+
+    assert!(
+        batch.abort(&handle).is_err(),
+        "abort must still surface the lifetime free error"
+    );
+
+    let header = handle.allocator().with_header(Clone::clone).unwrap();
+    assert_eq!(
+        header.catalog_root_page, 1,
+        "catalog root must be rolled back even when the lifetime abort errors"
+    );
+    assert_eq!(header.catalog_root_backup, 1);
+    assert_eq!(header.catalog_root_level, 0);
+}
+
 #[test]
 fn header_owner_captures_live_allocator_header_as_rollback_baseline() {
     let handle = handle_with_header(base_header());

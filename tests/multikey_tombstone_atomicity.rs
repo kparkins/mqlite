@@ -87,7 +87,7 @@ fn orphan_tombstone_shares_commit_ts_with_primary() {
     };
     let snap = snap_after_multikey_update(commit_ts, pre_commit);
 
-    let reader_after = ReadView::new(
+    let reader_after = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 1_500,
             logical: 0,
@@ -124,7 +124,7 @@ fn unaffected_sec_keys_retain_precommit_ts() {
     };
     let snap = snap_after_multikey_update(commit_ts, pre_commit);
 
-    let reader_after = ReadView::new(
+    let reader_after = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 1_500,
             logical: 0,
@@ -163,7 +163,7 @@ fn no_reader_witnesses_torn_multikey_state() {
     let snap = snap_after_multikey_update(commit_ts, pre_commit);
 
     for ts_ms in [500u64, 700, 899, 900, 901, 1_000, 2_000] {
-        let rv = ReadView::new(
+        let rv = ReadView::new_frontier_pinned_for_tests(
             Ts {
                 physical_ms: ts_ms,
                 logical: 0,

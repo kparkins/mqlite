@@ -499,24 +499,32 @@ fn test_reconcile_chain_mutation_requires_exclusive_latch() {
          reconcile latch helper"
     );
 
-    let pool = source_file("src/storage/buffer_pool/mod.rs");
+    // The R3 mechanical split moved the BufferPool buffer-pool surface out
+    // of buffer_pool/mod.rs into sibling modules: `replace_leaf_and_chains`
+    // now lives in buffer_pool/reconcile_access.rs and the
+    // `LatchedPinnedPage::snapshot_chains` doc lives in
+    // buffer_pool/latched_page.rs. Audit each token against the file that
+    // now holds it so this gate stays exactly as strong.
+    let reconcile_access = source_file("src/storage/buffer_pool/reconcile_access.rs");
+    let latched_page = source_file("src/storage/buffer_pool/latched_page.rs");
     assert!(
-        pool.contains("page: &mut LatchedPinnedPage<'_>"),
+        reconcile_access.contains("page: &mut LatchedPinnedPage<'_>"),
         "replace_leaf_and_chains must accept a LatchedPinnedPage latch token"
     );
     assert!(
-        pool.contains("page.require_exclusive(\"replace_leaf_and_chains\")"),
+        reconcile_access.contains("page.require_exclusive(\"replace_leaf_and_chains\")"),
         "resident replacement must require PageLatch::Exclusive"
     );
     assert!(
-        pool.contains("No partition mutex") && pool.contains("acquired by this helper"),
+        reconcile_access.contains("No partition mutex")
+            && reconcile_access.contains("acquired by this helper"),
         "replace_leaf_and_chains must document that it does not re-enter a \
          partition mutex while holding the page latch"
     );
     assert!(
-        pool.contains("LatchedPinnedPage::snapshot_chains")
-            && pool.contains("LatchedPinnedPage::Shared")
-            && pool.contains("copies/clones only"),
+        latched_page.contains("LatchedPinnedPage::snapshot_chains")
+            && latched_page.contains("LatchedPinnedPage::Shared")
+            && latched_page.contains("copies/clones only"),
         "snapshot_chains must be documented as a shared-latch copy path"
     );
 }
@@ -648,11 +656,12 @@ fn test_merge_does_not_deadlock_under_page_id_inversion() {
 
         let source = source_file("src/storage/paged_engine/smo_latch.rs");
         assert!(
-            source.contains("fn acquire_pages") && source.contains("BTreeSet<u32>"),
-            "SMO/reconcile latch planning must normalize an inverted page set through BTreeSet"
+            source.contains("fn acquire_pages") && source.contains("BTreeMap<u32, PageSize>"),
+            "SMO/reconcile latch planning must normalize an inverted page set through a \
+             sorted map (BTreeMap keyed by page id; BTreeSet before the size-carrying fix)"
         );
         assert!(
-            source.contains("for page_id in required_pages"),
+            source.contains("for (page_id, size) in required_pages"),
             "SMO/reconcile latch acquisition must iterate the sorted page set"
         );
     }

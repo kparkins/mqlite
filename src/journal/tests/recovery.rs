@@ -4,10 +4,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::journal::log_file::{
+use crate::journal::wire::{
     CatalogCommitKind, CatalogCommitPayload, ChainCommitFrame, CheckpointBoundaryPayload,
-    FinalizedLogRecord, LogRecordDraft, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
-    LOG_RECORD_HEADER_CRC32C_OFFSET, LOG_RECORD_HEADER_LEN, LOG_RECORD_KIND_OFFSET,
+    CheckpointPageFramePayload, CheckpointPagePool, FinalizedLogRecord, JournalPageSize,
+    LogRecordDraft, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION, LOG_RECORD_HEADER_CRC32C_OFFSET,
+    LOG_RECORD_HEADER_LEN, LOG_RECORD_KIND_OFFSET,
 };
 use crate::journal::{journal_path_for, JournalManager};
 use crate::mvcc::timestamp::Ts;
@@ -147,6 +148,27 @@ fn typed_catalog_record(
     LogRecordDraft::catalog(txn_id, publish_seq, commit_ts, payload)
         .finalize(start_lsn)
         .expect("finalize catalog")
+}
+
+fn checkpoint_page_frame_record(
+    start_lsn: u64,
+    batch_id: u64,
+    page_number: u32,
+    fill: u8,
+) -> FinalizedLogRecord {
+    let page_size = JournalPageSize::Small4k;
+    let payload = CheckpointPageFramePayload {
+        batch_id,
+        pool: CheckpointPagePool::Main,
+        page_number,
+        page_size,
+        data: vec![fill; page_size.bytes()],
+    }
+    .encode()
+    .expect("encode checkpoint page frame");
+    LogRecordDraft::checkpoint_page_frame(Ts::default(), payload)
+        .finalize(start_lsn)
+        .expect("finalize checkpoint page frame")
 }
 
 fn checkpoint_record(
@@ -380,4 +402,143 @@ fn log_record_recovery_rejects_duplicate_publish_seq_after_prefix_validation() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+/// Suspect-3 regression (orphan-truncate vs replay divergence): a checkpoint
+/// page frame whose commit boundary never arrived (an "orphan" — a torn
+/// checkpoint) is correctly excluded from replay, but it must NOT drive the
+/// journal truncation floor below a later committed CrudCommit. Checkpoint
+/// page frames and CRUD records share one LSN-ordered append stream
+/// (`reserve_log_record_on`, `&self`, no outer mutex), so a transaction
+/// committed-and-fsynced concurrently with an in-progress checkpoint lands at
+/// a HIGHER LSN than that checkpoint's page frames. If the checkpoint then
+/// crashes before its boundary, recovery sees `[orphan frame][committed
+/// CrudCommit]`.
+///
+/// The divergence bug: the orphan's `start_lsn` was used as `valid_end_lsn`,
+/// physically truncating the journal back below the committed CrudCommit —
+/// even though that same CrudCommit was simultaneously replayed into recovered
+/// state (`parsed_logical_frames`, `recovered_max_commit_ts`). Recovered state
+/// and the durable journal then disagree: the next restart finds the record
+/// gone. WiredTiger semantics: an orphan page frame is a torn checkpoint
+/// excluded from replay, but it is a fully-written record that must not corrupt
+/// the disposition of later committed records. The journal must be kept at
+/// least through every record recovery replayed.
+#[test]
+fn orphan_checkpoint_frame_must_not_truncate_later_committed_crud() {
+    let mut fixture = make_db_file();
+    let orphan = checkpoint_page_frame_record(JOURNAL_HEADER_SIZE as u64, 42, 5, 0xAB);
+    let crud = crud_record(orphan.end_lsn(), 7, 1, ts(50, 0));
+    let valid_end = crud.end_lsn();
+
+    write_journal(&fixture.db_path, &[orphan.bytes(), crud.bytes()]);
+    let journal_path = journal_path_for(&fixture.db_path);
+    // Keep `fixture` (and its tempdir) alive so the journal file is still on
+    // disk after recovery — the consuming `recover()` helper would drop it.
+    let mut manager =
+        JournalManager::open_or_create(&fixture.db_path, &fixture.header, &mut fixture.main_file)
+            .expect("recover orphan-frame journal");
+    let parsed = manager.take_parsed_logical_frames();
+
+    // The CrudCommit was replayed into recovered state.
+    assert_eq!(
+        parsed.frames,
+        vec![(crud.start_lsn(), logical_frame(ts(50, 0), 7))],
+        "the committed CrudCommit above the orphan must be replayed"
+    );
+    assert_eq!(manager.recovered_max_commit_ts(), Some(ts(50, 0)));
+
+    // ...so its bytes must survive in the journal. The orphan frame (a torn
+    // checkpoint with no boundary) is excluded from replay but must not drag
+    // the truncation floor below the committed record it precedes.
+    assert_eq!(
+        manager.write_cursor(),
+        valid_end,
+        "orphan-frame truncation must not destroy the later committed CrudCommit \
+         that recovery replayed into state (orphan-truncate vs replay divergence)"
+    );
+    let journal_len = std::fs::metadata(&journal_path)
+        .expect("journal metadata")
+        .len();
+    // Exact equality: nothing exists above the CrudCommit, so recovery must
+    // take the no-truncation path (a `>=` here could mask a partial
+    // truncation if the fixture ever shrinks).
+    assert_eq!(
+        journal_len,
+        crud.end_lsn(),
+        "recovery truncated the journal to {journal_len} bytes, physically destroying \
+         the committed CrudCommit at [{}, {}) that it replayed into recovered state",
+        crud.start_lsn(),
+        crud.end_lsn(),
+    );
+
+    // Idempotence across restarts: the orphan frame survives below the kept
+    // record, so the NEXT recovery re-encounters it, re-classifies it as an
+    // orphan, and must reach the identical end state without further
+    // truncation or replay divergence.
+    drop(manager);
+    let mut manager2 =
+        JournalManager::open_or_create(&fixture.db_path, &fixture.header, &mut fixture.main_file)
+            .expect("second recovery over surviving orphan bytes");
+    let parsed2 = manager2.take_parsed_logical_frames();
+    assert_eq!(
+        parsed2.frames,
+        vec![(crud.start_lsn(), logical_frame(ts(50, 0), 7))],
+        "second restart must replay the same CrudCommit (surviving orphan must be harmless)"
+    );
+    assert_eq!(manager2.recovered_max_commit_ts(), Some(ts(50, 0)));
+    assert_eq!(
+        manager2.write_cursor(),
+        valid_end,
+        "second restart must be a truncation no-op (byte-stable journal)"
+    );
+    assert_eq!(
+        std::fs::metadata(&journal_path)
+            .expect("journal metadata after second recovery")
+            .len(),
+        crud.end_lsn(),
+        "journal length must be byte-stable across repeated recoveries"
+    );
+}
+
+/// Multi-orphan interleaving: `[orphan B1][committed CRUD][orphan B2]`.
+/// The truncation floor is the MINIMUM orphan start (B1), but the kept-record
+/// clamp must hold it at the CRUD's end: the tail orphan B2 is discarded
+/// (classic torn-tail behavior), while B1 — pinned beneath committed data in
+/// the shared LSN stream — survives harmlessly and the CRUD is preserved.
+#[test]
+fn orphan_frames_straddling_committed_crud_truncate_only_the_tail() {
+    let mut fixture = make_db_file();
+    let orphan_below = checkpoint_page_frame_record(JOURNAL_HEADER_SIZE as u64, 42, 5, 0xAB);
+    let crud = crud_record(orphan_below.end_lsn(), 7, 1, ts(50, 0));
+    let orphan_above = checkpoint_page_frame_record(crud.end_lsn(), 43, 3, 0xCD);
+
+    write_journal(
+        &fixture.db_path,
+        &[orphan_below.bytes(), crud.bytes(), orphan_above.bytes()],
+    );
+    let journal_path = journal_path_for(&fixture.db_path);
+    let mut manager =
+        JournalManager::open_or_create(&fixture.db_path, &fixture.header, &mut fixture.main_file)
+            .expect("recover straddled-orphan journal");
+    let parsed = manager.take_parsed_logical_frames();
+
+    assert_eq!(
+        parsed.frames,
+        vec![(crud.start_lsn(), logical_frame(ts(50, 0), 7))],
+        "the committed CrudCommit between the orphans must be replayed"
+    );
+    assert_eq!(
+        manager.write_cursor(),
+        crud.end_lsn(),
+        "truncation must cut exactly at the kept CrudCommit's end: the tail \
+         orphan is discarded, the below-record orphan must not drag the floor lower"
+    );
+    assert_eq!(
+        std::fs::metadata(&journal_path)
+            .expect("journal metadata")
+            .len(),
+        crud.end_lsn(),
+        "tail orphan bytes must be physically truncated; kept bytes preserved"
+    );
 }

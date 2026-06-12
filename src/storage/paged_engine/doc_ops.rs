@@ -7,6 +7,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 
 use crate::error::{Error, Result, WriteConflictReason};
+use crate::mvcc::read_view::ReadView;
 use crate::mvcc::transaction::{ExpectedHead, Ns, PrimaryTarget};
 use crate::mvcc::{VersionData, VersionEntry, VersionState};
 use crate::options::{
@@ -25,7 +26,8 @@ use super::index_maint::{
     maintain_secondary_on_insert_snapshot, maintain_secondary_on_update,
 };
 use super::snapshot_ops::{
-    apply_find_opts, plan_and_collect_snapshot_pairs, plan_and_collect_snapshot_pairs_limited,
+    apply_find_opts, open_snapshot_read_view, plan_and_collect_snapshot_pairs,
+    plan_and_collect_snapshot_pairs_limited,
 };
 use super::state::{MetadataState, SharedState};
 use super::visibility::WriteVisibility;
@@ -119,9 +121,9 @@ fn collect_mutation_candidates(
     shared: &SharedState,
     ns_snap: &NamespaceSnapshot,
     filter: &Document,
-    epoch: Arc<crate::storage::root_snapshot::PublishedEpoch>,
+    view: &ReadView,
 ) -> Result<Vec<MutationCandidate>> {
-    let (_, pairs) = plan_and_collect_snapshot_pairs(shared, ns_snap, filter, epoch, false)?;
+    let (_, pairs) = plan_and_collect_snapshot_pairs(shared, ns_snap, filter, view, false)?;
     attach_expected_heads(shared, ns_snap, pairs)
 }
 
@@ -214,7 +216,11 @@ pub(super) fn find(
     filter: &Document,
     opts: &FindOptions,
 ) -> Result<(Vec<Document>, crate::query::explain::ExplainResult)> {
-    let snap = engine.shared.load_published();
+    // ITEM 1: open the view FIRST so the conservative registry pin precedes
+    // the epoch load, then route `ns_snap` from the view's pinned epoch — the
+    // single epoch this read uses.
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let ns_snap = match snap.catalog.get_by_name(ns) {
         None => {
             // No namespace → planner never ran; report an empty collscan.
@@ -230,7 +236,7 @@ pub(super) fn find(
         &engine.shared,
         ns_snap,
         filter,
-        Arc::clone(&snap),
+        &view,
         true,
         unsorted_materialization_limit(opts),
     )?;
@@ -248,7 +254,8 @@ pub(super) fn find_first(
     ns: &str,
     filter: &Document,
 ) -> Result<Option<Document>> {
-    let snap = engine.shared.load_published();
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let ns_snap = match snap.catalog.get_by_name(ns) {
         None => return Ok(None),
         Some(n) => n,
@@ -257,7 +264,7 @@ pub(super) fn find_first(
         &engine.shared,
         ns_snap,
         filter,
-        Arc::clone(&snap),
+        &view,
         true,
         Some(1),
     )?;
@@ -279,7 +286,8 @@ pub(super) fn update(
         ));
     }
 
-    let snap = engine.shared.load_published();
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let ns_snap_opt = snap.catalog.get_by_name(ns);
     let matched_pairs: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = match ns_snap_opt {
         None => {
@@ -292,9 +300,7 @@ pub(super) fn update(
                 upserted_id: None,
             });
         }
-        Some(ns_snap) => {
-            collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
-        }
+        Some(ns_snap) => collect_mutation_candidates(&engine.shared, ns_snap, filter, &view)?,
     };
 
     if matched_pairs.is_empty() && opts.upsert {
@@ -352,15 +358,15 @@ pub(super) fn delete(
     filter: &Document,
     many: bool,
 ) -> Result<DeleteResult> {
-    let snap = engine.shared.load_published();
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let pairs_to_delete: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> = match snap
         .catalog
         .get_by_name(ns)
     {
         None => return Ok(DeleteResult { deleted_count: 0 }),
         Some(ns_snap) => {
-            let pairs =
-                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?;
+            let pairs = collect_mutation_candidates(&engine.shared, ns_snap, filter, &view)?;
             if many {
                 pairs
             } else {
@@ -397,13 +403,14 @@ pub(super) fn delete(
 }
 
 pub(super) fn count(engine: &super::PagedEngine, ns: &str, filter: &Document) -> Result<u64> {
-    let snap = engine.shared.load_published();
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let ns_snap = match snap.catalog.get_by_name(ns) {
         None => return Ok(0),
         Some(n) => n,
     };
     Ok(
-        plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, filter, Arc::clone(&snap), false)
+        plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, filter, &view, false)
             .map(|(_, p)| p)?
             .len() as u64,
     )
@@ -422,7 +429,8 @@ pub(super) fn find_one_and_update(
         ));
     }
 
-    let snap = engine.shared.load_published();
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
         match snap.catalog.get_by_name(ns) {
             None => {
@@ -431,9 +439,7 @@ pub(super) fn find_one_and_update(
                 }
                 return Ok(None);
             }
-            Some(ns_snap) => {
-                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
-            }
+            Some(ns_snap) => collect_mutation_candidates(&engine.shared, ns_snap, filter, &view)?,
         };
 
     if matched.is_empty() {
@@ -485,13 +491,12 @@ pub(super) fn find_one_and_delete(
     filter: &Document,
     opts: &FindOneAndDeleteOptions,
 ) -> Result<Option<Document>> {
-    let snap = engine.shared.load_published();
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
         match snap.catalog.get_by_name(ns) {
             None => return Ok(None),
-            Some(ns_snap) => {
-                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
-            }
+            Some(ns_snap) => collect_mutation_candidates(&engine.shared, ns_snap, filter, &view)?,
         };
 
     if matched.is_empty() {
@@ -531,7 +536,8 @@ pub(super) fn find_one_and_replace(
     replacement: &Document,
     opts: &FindOneAndReplaceOptions,
 ) -> Result<Option<Document>> {
-    let snap = engine.shared.load_published();
+    let view = open_snapshot_read_view(&engine.shared)?;
+    let snap = view.published_epoch();
     let mut matched: Vec<(Vec<u8>, Document, Option<ExpectedHead>)> =
         match snap.catalog.get_by_name(ns) {
             None => {
@@ -540,9 +546,7 @@ pub(super) fn find_one_and_replace(
                 }
                 return Ok(None);
             }
-            Some(ns_snap) => {
-                collect_mutation_candidates(&engine.shared, ns_snap, filter, Arc::clone(&snap))?
-            }
+            Some(ns_snap) => collect_mutation_candidates(&engine.shared, ns_snap, filter, &view)?,
         };
 
     if matched.is_empty() {

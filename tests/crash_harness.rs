@@ -51,8 +51,8 @@ use std::path::Path;
 use mqlite::{Client, DurabilityMode, OpenOptions as DbOpenOptions, Result};
 
 // ---------------------------------------------------------------------------
-// Journal format constants (duplicated from src/journal/log_file.rs which is
-// pub(crate) and not reachable from integration tests)
+// Journal format constants (duplicated from src/journal/wire/ — header.rs and
+// wire/mod.rs — which are pub(crate) and not reachable from integration tests)
 // ---------------------------------------------------------------------------
 
 /// Size in bytes of the journal file header.

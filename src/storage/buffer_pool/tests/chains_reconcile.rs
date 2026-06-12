@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::mvcc::metrics;
-use crate::mvcc::read_view::ReadViewRegistry;
+use crate::mvcc::registry::ReadViewRegistry;
 use crate::mvcc::timestamp::Ts;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::allocator::AllocatorHandle;
@@ -19,6 +19,11 @@ impl BufferPool {
     ///
     /// Walks every chain on the frame and drops entries whose `stop_ts`
     /// is `<= oldest_required_ts`; no live reader can see them.
+    ///
+    /// Horizon-only mirror of `Partition::reconcile_frame_at`: it shares the
+    /// production retain predicate for the reclaim horizon but does NOT drop
+    /// `Aborted` residue, so it must not be used to test aborted-version
+    /// collection.
     ///
     /// The partition mutex is released before `drain_free_queue`, so the
     /// allocator-state mutex is never nested under a partition mutex.

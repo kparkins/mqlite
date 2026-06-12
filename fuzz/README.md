@@ -4,31 +4,31 @@ This directory holds the cargo-fuzz harness for mqlite.
 
 ## Targets
 
-- **`bson_parser`** — feeds arbitrary bytes through the BSON parser. Bar:
+- **`bson_parser`**: feeds arbitrary bytes through the BSON parser. Bar:
   never panic, never UB.
-- **`key_encoder`** — exercises the key encoder/decoder round-trip on
+- **`key_encoder`**: exercises the key encoder/decoder round-trip on
   arbitrary BSON values. Bar: encode then decode must round-trip without
   panic or UB.
-- **`query_evaluator`** — feeds arbitrary BSON documents and filter bytes
+- **`query_evaluator`**: feeds arbitrary BSON documents and filter bytes
   through the query evaluator. Bar: never panic, never UB.
-- **`logical_txn_decode`** — feeds arbitrary bytes through
+- **`logical_txn_decode`**: feeds arbitrary bytes through
   `LogicalTxnFrame::decode` in `Scanning` context. Bar: never panic, never
   loop, never UB.
-- **`logical_txn_recover`** — overwrites a fresh DB's journal sidecar
+- **`logical_txn_recover`**: overwrites a fresh DB's journal sidecar
   with the fuzzed bytes and re-opens via `Client::open`. Exercises the
   full Pass 1 / Pass 2 recovery scan over arbitrary journal bodies.
-- **`try_skip_logical_txn`** — verifies the cursor-rewind post-condition:
+- **`try_skip_logical_txn`**: verifies the cursor-rewind post-condition:
   the helper either advances by `n` (returns `Some((n, _))`) or fully
   rewinds to start (returns `None`). Any other behavior is a bug.
 
-Note: `wire_protocol` target is temporarily disabled — the `wire` feature
+Note: `wire_protocol` target is temporarily disabled. The `wire` feature
 has pre-existing visibility and import issues on master unrelated to fuzz
 hardening. Re-enable after the wire feature is fixed.
 
 ## Seed corpus
 
 The 12 seeds under `corpus/logical_txn_recovery/` cover every §9.2 named
-input shape — empty journal, single legacy commit, full envelope, torn
+input shape: empty journal, single legacy commit, full envelope, torn
 logical tail, orphan logical, duplicate commit_ts, unknown op kind,
 oversized op_count, mixed sequence, gap ordinal, unresolved ns_id, and
 legacy + chaincommit + logical mix.
@@ -39,7 +39,7 @@ Regenerate with:
 cd fuzz && cargo run --bin generate_seeds --manifest-path Cargo.toml
 ```
 
-The generator is fully reproducible — every seed is a deterministic byte
+The generator is fully reproducible: every seed is a deterministic byte
 sequence; no RNG.
 
 ## Local replay (no fuzzer required)

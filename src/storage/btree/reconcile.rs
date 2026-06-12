@@ -64,12 +64,18 @@ impl FoldedLeafCell {
     }
 
     /// Return the encoded on-page byte width of this folded cell.
+    ///
+    /// The value width comes from the already-classified [`CellValue`] (a
+    /// folded cell records whether it overflowed when it was folded); the
+    /// outer cell arithmetic is the canonical
+    /// [`super::layout::leaf_cell_encoded_size`] shared with `LeafCell` and
+    /// the SMO split classifier.
     pub(crate) fn encoded_size(&self) -> usize {
         let value_bytes = match &self.value {
             CellValue::Inline(bytes) => CELL_INLINE_LEN_BYTES + bytes.len(),
             CellValue::Overflow { .. } => CELL_OVERFLOW_REF_BYTES,
         };
-        CELL_KEY_LEN_BYTES + self.key.len() + CELL_VALUE_TYPE_BYTES + value_bytes
+        super::layout::leaf_cell_encoded_size(self.key.len(), value_bytes)
     }
 }
 

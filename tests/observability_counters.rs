@@ -23,9 +23,10 @@
 
 use bson::{doc, Document};
 use mqlite::{Client, DurabilityMode, OpenOptions};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mqlite::mvcc::metrics::{
     crud_commits_root_changing_snapshot, crud_commits_root_neutral_snapshot,
@@ -182,23 +183,48 @@ fn lane_wait_ns_total_rises_with_same_namespace_writers() {
         .expect("namespace id");
 
     reset_lane_wait_ns();
-    let first_ticket = client.__us036_admit_writer(ns_id, 1_000).unwrap();
-    let c1 = client;
-    let waiting = thread::spawn(move || {
-        c1.__us036_admit_writer(ns_id, 1_000)
-            .expect("second writer admitted after first releases")
-    });
-    thread::sleep(Duration::from_millis(20));
-    first_ticket.drop_ticket();
-    waiting.join().unwrap().drop_ticket();
 
-    let lane_wait = lane_wait_ns_snapshot();
-    assert!(
-        lane_wait > 0,
-        "two writers on the SAME namespace must record nonzero lane_wait_ns_total; \
-         saw lane_wait_ns_total={}",
-        lane_wait
-    );
+    // The rendezvous flag below proves the second writer THREAD is running,
+    // but not that it has reached the lane's wait queue: under heavy
+    // parallel-suite load that thread can be descheduled for longer than any
+    // fixed grace period between the flag store and the blocking admit call,
+    // so the first ticket drops before contention exists and the attempt
+    // records lane_wait_ns_total == 0. There is no waiter-count observation
+    // hook, so retry the contention dance until one attempt records a
+    // nonzero wait; broken accounting fails every attempt and trips the
+    // deadline instead.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let first_ticket = client.__us036_admit_writer(ns_id, 1_000).unwrap();
+        let c1 = client.clone();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_in_writer = Arc::clone(&entered);
+        let waiting = thread::spawn(move || {
+            entered_in_writer.store(true, Ordering::Release);
+            c1.__us036_admit_writer(ns_id, 1_000)
+                .expect("second writer admitted after first releases")
+        });
+        while !entered.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "second writer thread never started"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(20));
+        first_ticket.drop_ticket();
+        waiting.join().unwrap().drop_ticket();
+
+        if lane_wait_ns_snapshot() > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "two writers on the SAME namespace must record nonzero \
+             lane_wait_ns_total; every contention attempt within the deadline \
+             recorded 0"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

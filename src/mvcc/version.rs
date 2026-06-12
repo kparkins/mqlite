@@ -212,6 +212,31 @@ pub struct VersionEntry {
 }
 
 impl VersionEntry {
+    /// Canonical entry-level liveness predicate: this entry is a LIVE
+    /// HEAD iff `stop_ts == Ts::MAX` (no successor has replaced it) and
+    /// it is not `Aborted`.
+    ///
+    /// "Including pending" is deliberate: a `Pending` head counts as
+    /// live. This is the definition the buffer-pool eviction guards, the
+    /// leaf-budget byte accounting, and the install-time live-head /
+    /// range scans all share — evicting or ignoring a `Pending` head
+    /// inside the commit envelope's install→flip window would make the
+    /// post-durable flip a silent no-op and lose the committed write.
+    /// `Aborted` residue never counts, even with `stop_ts == Ts::MAX`
+    /// (an aborted first write leaves exactly that shape behind).
+    ///
+    /// The committed-only variant (`Committed` head, excluding
+    /// `Pending`) is intentionally NOT provided as a separate method:
+    /// no current call site needs it, and the four buffer-pool
+    /// predicates this method unifies all require the pending-inclusive
+    /// definition. Should a committed-only consumer appear, add a
+    /// sibling `is_live_committed_head` rather than open-coding the test.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_live_head(&self) -> bool {
+        self.stop_ts == Ts::MAX && !matches!(self.state, VersionState::Aborted)
+    }
+
     pub(crate) fn try_clone(&self) -> Option<Self> {
         Some(Self {
             start_ts: self.start_ts,

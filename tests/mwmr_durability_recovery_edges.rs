@@ -704,8 +704,12 @@ fn tc11_collect_sorted_indexes(
 
 fn tc11_assert_logical_tail_checkpoint_contract() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let engine_path = project_root.join("src/storage/paged_engine.rs");
-    let snapshot_path = project_root.join("src/storage/paged_engine/snapshot_ops.rs");
+    // run_write_commit_envelope moved to commit_envelope.rs in the
+    // paged_engine split.
+    let engine_path = project_root.join("src/storage/paged_engine/commit_envelope.rs");
+    // snapshot_ops.rs became a directory; checkpoint_after_reconcile_plan now
+    // lives in snapshot_ops/checkpoint.rs.
+    let snapshot_path = project_root.join("src/storage/paged_engine/snapshot_ops/checkpoint.rs");
 
     let engine_source = std::fs::read_to_string(&engine_path)
         .unwrap_or_else(|err| panic!("read {}: {err}", engine_path.display()));
@@ -797,9 +801,18 @@ fn tc11_strip_line_comments(source: &str) -> String {
 fn tc11_structural_paths_have_no_page_frame_commit_authority() {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for relative in [
+        // R7 split: index_build.rs → index_ddl.rs and index_maint.rs split into
+        // pending_install/index_write_maint/index_read_helpers/checkpoint_materialize.
+        // Widen (never shrink) the page-frame-commit-authority scan basis.
         "src/storage/paged_engine.rs",
-        "src/storage/paged_engine/index_build.rs",
+        "src/storage/paged_engine/commit_envelope.rs",
+        "src/storage/paged_engine/ns_ddl.rs",
+        "src/storage/paged_engine/index_ddl.rs",
         "src/storage/paged_engine/index_maint.rs",
+        "src/storage/paged_engine/pending_install.rs",
+        "src/storage/paged_engine/index_write_maint.rs",
+        "src/storage/paged_engine/index_read_helpers.rs",
+        "src/storage/paged_engine/checkpoint_materialize.rs",
     ] {
         let path = project_root.join(relative);
         let source =

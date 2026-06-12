@@ -3,13 +3,17 @@
 //! The catalog is a reserved B+ tree whose root page number is stored in
 //! the file header at two locations:
 //!
-//! - **Primary**: header offset 32 (`catalog_root_page`)
-//! - **Backup**:  header offset 72 (`catalog_root_backup`)
+//! - **Primary**: header offset 36 (`catalog_root_page`)
+//! - **Backup**:  header offset 76 (`catalog_root_backup`)
 //!
-//! On update the primary is written first; the backup is written after a
-//! successful checkpoint so it always trails the primary by at most one
-//! transaction.  On open, if the page at the primary root fails its page
-//! checksum, the backup root is tried instead and a warning is logged.
+//! Both slots are written to the same value in a single header update whenever
+//! the catalog root moves: the backup is a redundant mirror of the current
+//! root, not a one-transaction-behind snapshot. Its purpose is to survive a
+//! torn or bit-rotted primary slot, not to roll back to a previous catalog.
+//! On open, if the page at the primary root fails its page checksum, the
+//! backup root is tried instead and a warning is logged; because the two slots
+//! sit far apart in the header, a localized corruption is unlikely to destroy
+//! both copies of the root pointer at once.
 //!
 //! ## Key Format
 //!
@@ -365,10 +369,12 @@ fn index_prefix_end(collection: &str) -> Vec<u8> {
 /// 1. Try to validate the page at `header.catalog_root_page`.
 /// 2. If that page fails its checksum, fall back to `header.catalog_root_backup`
 ///    and log a warning.
-/// 3. After every successful checkpoint, write the current `catalog_root_page`
-///    into `header.catalog_root_backup` as a second write.
 ///
-/// The [`open_with_fallback`] constructor encapsulates steps 1–2.
+/// The backup slot is kept in sync by the writer side, not here: every header
+/// update that moves the catalog root stores the same new root number into
+/// both `catalog_root_page` and `catalog_root_backup` in one write, so the
+/// fallback in step 2 always names the most recent durable root. The
+/// [`open_with_fallback`] constructor encapsulates steps 1–2.
 pub(crate) struct Catalog<S: BTreePageStore> {
     tree: BTree<S>,
     /// In-memory mirror of the file-header `next_namespace_id` counter
@@ -562,6 +568,10 @@ impl<S: BTreePageStore> Catalog<S> {
                 break;
             }
             self.tree.delete(&k)?;
+            // F37 failpoint: fail mid-way — index record(s) already
+            // deleted, collection record still present.
+            #[cfg(any(test, feature = "test-hooks"))]
+            drop_collection_failpoint::fire_after_index_delete(name)?;
         }
 
         // Remove the collection entry itself.
@@ -584,17 +594,18 @@ impl<S: BTreePageStore> Catalog<S> {
 
     /// Update (overwrite) an existing collection's metadata.
     ///
-    /// This is a delete-then-insert on the underlying B+ tree.  Returns
-    /// `false` if the collection did not exist.
+    /// Atomic in-place overwrite via [`BTree::replace_existing`] — NOT
+    /// delete-then-insert. The old delete-then-insert shape lost the entry
+    /// permanently if the re-insert failed mid-update (a split alloc DiskFull,
+    /// any transient `PageSource` error): the delete had already committed but
+    /// the new entry never landed. `replace_existing` rewrites the cell in one
+    /// leaf write, so a failure leaves the OLD entry persisted and readable.
+    ///
+    /// Returns `false` if the collection did not exist.
     pub(crate) fn update_collection(&mut self, entry: &CollectionEntry) -> Result<bool> {
         let key = collection_key(&entry.name);
-        let existed = self.tree.delete(&key)?;
-        if !existed {
-            return Ok(false);
-        }
         let bytes = entry.to_bson_bytes()?;
-        self.tree.insert(&key, &bytes)?;
-        Ok(true)
+        self.tree.replace_existing(&key, &bytes)
     }
 
     /// List all collections in the catalog.
@@ -763,16 +774,20 @@ impl<S: BTreePageStore> Catalog<S> {
 
     /// Update (overwrite) an existing index's metadata.
     ///
+    /// Atomic in-place overwrite via [`BTree::replace_existing`] — see
+    /// [`Catalog::update_collection`] for why this is not delete-then-insert.
+    /// The lost-entry hazard is sharper here: `index_maint`'s multikey
+    /// promotion runs `update_index` during ordinary inserts, so a transient
+    /// re-insert failure would silently drop the index entry, the planner
+    /// would treat the index as dropped, and writers would stop maintaining
+    /// it — index/document divergence. The in-place rewrite keeps the old
+    /// entry readable on failure.
+    ///
     /// Returns `false` if the index did not exist.
     pub(crate) fn update_index(&mut self, entry: &IndexEntry) -> Result<bool> {
         let key = index_key(&entry.collection, &entry.name);
-        let existed = self.tree.delete(&key)?;
-        if !existed {
-            return Ok(false);
-        }
         let bytes = entry.to_bson_bytes()?;
-        self.tree.insert(&key, &bytes)?;
-        Ok(true)
+        self.tree.replace_existing(&key, &bytes)
     }
 
     /// List all indexes for a collection.
@@ -798,6 +813,49 @@ impl<S: BTreePageStore> Catalog<S> {
             result.push(IndexEntry::from_bson_bytes(&bytes)?);
         }
         Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F37 failpoint — fail `drop_collection` mid-way through its index loop
+// ---------------------------------------------------------------------------
+
+/// F37 failpoint: inject one non-fatal failure inside
+/// [`Catalog::drop_collection`]'s per-index delete loop — after at least one
+/// index record has been deleted, before the collection record delete.
+/// Models a mid-DDL catalog-tree failure so `drop_namespace`'s undo
+/// marker / catalog restore can be exercised at index granularity.
+///
+/// Name-filtered and one-shot: the failpoint disarms itself when it fires
+/// and never fires for any other collection name, so parallel tests using
+/// unique namespaces cannot cross-fire.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod drop_collection_failpoint {
+    use std::sync::{Mutex, PoisonError};
+
+    static ARMED: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Arm one failure for the next `drop_collection(collection)`.
+    ///
+    /// `cfg(test)` (not the wider test-hooks gate): the arming side is only
+    /// reachable from in-crate unit tests; the fire side keeps the wider
+    /// gate because production `drop_collection` references it.
+    #[cfg(test)]
+    pub(crate) fn arm(collection: &str) {
+        *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = Some(collection.to_owned());
+    }
+
+    /// Fire (and disarm) if armed for `collection`. Called after each
+    /// index-record delete inside `drop_collection`.
+    pub(super) fn fire_after_index_delete(collection: &str) -> crate::error::Result<()> {
+        let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
+        if armed.as_deref() == Some(collection) {
+            *armed = None;
+            return Err(crate::error::Error::Internal(
+                "F37 injected drop_collection failure after an index-record delete".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -881,3 +939,7 @@ where
 #[cfg(test)]
 #[path = "tests/catalog.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/bugsuspect_storage_catalog_update_atomicity.rs"]
+mod bugsuspect_storage_catalog_update_atomicity;

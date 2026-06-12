@@ -89,11 +89,11 @@ pub(super) struct Frame {
     ///
     /// A chain is present when there is at least one staged or committed
     /// resident version for that key on this frame. A chain may exist without
-    /// a matching base cell (delta-only key), and a base cell may exist
-    /// without a matching chain. Both cases are legal; see Phase 3 §10.4 for
-    /// the decision table.
+    /// a matching base cell (a key whose only live version is a resident
+    /// delta), and a base cell may exist without a matching chain (a key
+    /// already folded into the page bytes). Both cases are legal.
     pub(super) deltas: BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
-    /// PR2 running-sum cache: total `chain_live_head_bytes` over every
+    /// Leaf-budget running-sum cache: total `chain_live_head_bytes` over every
     /// chain in `deltas`. Maintained by every chain mutator that goes
     /// through `LatchedPinnedPage::with_chain` /
     /// `LatchedPinnedPage::with_all_chains` /
@@ -113,15 +113,16 @@ pub(super) struct Frame {
     /// `Release` store under the page-local exclusive latch, which already
     /// serializes mutator vs reader. The Acquire/Release pair is
     /// defense-in-depth: it makes the cache safe to read under a shared
-    /// latch without a correctness migration if a future PR chooses to relax
-    /// the read.
+    /// latch without further changes should the read ever be relaxed to a
+    /// shared latch.
     pub(super) live_delta_payload_bytes: AtomicU64,
-    /// Phase 5 §10.18 page-local latch. Acquired AFTER the partition mutex
-    /// is released by `BufferPool::pin_for_read`/`pin_for_write` and held
-    /// for the lifetime of the wrapping `LatchedPinnedPage`. The latch is
-    /// scoped to a single resident `Frame`: cache hits reuse it across
-    /// pin/unpin cycles, while a cache miss installs a fresh latch with
-    /// the new page (§10.18 rule 1 — `PageLatch` is bound to the Frame).
+    /// Page-local latch. Acquired AFTER the partition mutex is released by
+    /// `BufferPool::pin_for_read`/`pin_for_write` (so the partition mutex
+    /// and the latch are never held at once) and held for the lifetime of
+    /// the wrapping `LatchedPinnedPage`. The latch is scoped to a single
+    /// resident `Frame`: cache hits reuse it across pin/unpin cycles, while
+    /// a cache miss installs a fresh latch with the new page — the latch is
+    /// bound to the `Frame`, not to a page number.
     pub(super) latch: PageLatch,
 }
 
@@ -212,12 +213,33 @@ impl Frame {
     }
 }
 
-fn has_live_committed_head(frame: &Frame) -> bool {
-    frame.deltas.values().any(|chain| {
-        chain.iter().any(|entry| {
-            !matches!(entry.state, VersionState::Pending { .. }) && entry.stop_ts == Ts::MAX
+/// True when any resident chain on `frame` holds a live entry. This is
+/// the reconcile-aware eviction blocking predicate.
+///
+/// Liveness is the canonical [`VersionEntry::is_live_head`] definition
+/// (`stop_ts == Ts::MAX && !Aborted`): `Pending` heads count — evicting
+/// one inside the commit envelope's install→flip window would make the
+/// post-durable flip a silent no-op and lose the committed write —
+/// while `Aborted` residue never counts.
+fn has_live_delta_entry(frame: &Frame) -> bool {
+    frame
+        .deltas
+        .values()
+        .any(|chain| chain.iter().any(VersionEntry::is_live_head))
+}
+
+/// Horizon-free evictability for the plain `pin_page` miss path: with
+/// no `oldest_required_ts` snapshot available, a superseded committed
+/// entry (`stop_ts != Ts::MAX`) may still be needed by an old reader,
+/// so the only frames safe to destroy are those whose chains are empty
+/// or hold nothing but dead aborted residue.
+fn deltas_droppable_without_horizon(frame: &Frame) -> bool {
+    frame.deltas.is_empty()
+        || frame.deltas.values().all(|chain| {
+            chain
+                .iter()
+                .all(|entry| matches!(entry.state, VersionState::Aborted))
         })
-    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -267,7 +289,25 @@ impl Partition {
     ///
     /// Scans at most `2 * capacity` frames (two full sweeps) before giving up.
     /// Returns `None` if all frames are pinned.
+    ///
+    /// Reconcile-aware callers (`pin_page_reconciling`) apply their own
+    /// per-victim delta guard plus horizon prune, so this entry point
+    /// does not filter delta-bearing frames.
     fn find_victim(&mut self, durable_lsn: u64) -> Option<usize> {
+        self.find_victim_filtered(durable_lsn, false)
+    }
+
+    /// CLOCK sweep with an optional horizon-free delta guard: when
+    /// `require_droppable_deltas` is set, frames whose chains hold
+    /// anything other than dead aborted residue are skipped (hard skip,
+    /// like the pin/latch checks — no second-chance interaction). Used
+    /// by the plain `pin_page` miss path, which has no reconcile horizon
+    /// and therefore cannot safely drop any chain beyond dead residue.
+    fn find_victim_filtered(
+        &mut self,
+        durable_lsn: u64,
+        require_droppable_deltas: bool,
+    ) -> Option<usize> {
         let n = self.capacity;
         for _ in 0..(2 * n) {
             let idx = self.clock_hand;
@@ -285,6 +325,9 @@ impl Partition {
                     if !frame.can_flush_at(durable_lsn) {
                         continue;
                     }
+                    if require_droppable_deltas && !deltas_droppable_without_horizon(frame) {
+                        continue;
+                    }
                     if frame.ref_bit {
                         frame.ref_bit = false;
                         continue;
@@ -296,15 +339,37 @@ impl Partition {
         None
     }
 
+    /// Cold-path classifier for a failed horizon-free sweep: report
+    /// `DeltaBearingFrames` when at least one unpinned, unlatched frame
+    /// was refused because of its resident deltas.
+    ///
+    /// R-attrib: flushability is deliberately NOT consulted — a frame
+    /// blocked by both unflushable dirty bytes and resident deltas is
+    /// still delta-bearing, and `DeltaBearingFrames` steers the operator
+    /// to checkpoint (which reconciles AND flushes) rather than resize.
+    fn horizon_free_exhaustion_reason(&self) -> PoolExhaustedReason {
+        let delta_blocked = self.frames.iter().flatten().any(|frame| {
+            frame.pin_count == 0
+                && !frame.latch.is_exclusively_held()
+                && !deltas_droppable_without_horizon(frame)
+        });
+        if delta_blocked {
+            PoolExhaustedReason::DeltaBearingFrames
+        } else {
+            PoolExhaustedReason::AllFramesPinned
+        }
+    }
+
     /// Evict the frame at `idx`, flushing to disk if dirty.
     ///
-    /// Lock-order note (T6): any caller that reaches this method along a
+    /// Lock-order note: any caller that reaches this method along a
     /// reconciliation path MUST have snapshotted
     /// `ReadViewRegistry::oldest_required_ts()` *before* acquiring the
     /// partition mutex and before any page latch (see
-    /// `BufferPool::reconcile`). Registry (position 5) is below the
-    /// partition mutex / page-latch positions (3/3a/3b) in the total order,
-    /// so re-acquiring it while holding those locks is forbidden.
+    /// `BufferPool::reconcile`). The registry mutex (position 5) is below
+    /// the partition mutex / page-latch positions (3/3a/3b) in the
+    /// database-wide lock order, so re-acquiring it while holding those
+    /// locks would invert the order and risk deadlock.
     fn evict_frame(
         &mut self,
         idx: usize,
@@ -335,6 +400,55 @@ impl Partition {
         Ok(())
     }
 
+    /// Evict the chosen victim at `idx` and install a freshly read page
+    /// for `page_number` into that slot.
+    ///
+    /// This is the shared cache-miss install tail for `pin_page` and
+    /// `pin_page_reconciling`. Both variants run their own victim
+    /// selection and eviction-guard checks first (the plain path filters
+    /// delta-bearing victims at sweep time; the reconciling path prunes
+    /// the victim's chains against the reader horizon and refuses victims
+    /// that still hold live or above-horizon committed versions) and then
+    /// reach this byte-identical sequence: evict the prior occupant, clear
+    /// the slot so a failed read cannot strand a ghost frame, read the new
+    /// page from disk, install a fresh pinned `Frame`, and link it into
+    /// `page_map`. Keeping this in one helper guarantees the two miss
+    /// paths cannot drift in evict/clear/read/install effect ordering.
+    fn install_missing_page(
+        &mut self,
+        idx: usize,
+        page_number: u32,
+        io: &dyn PageSource,
+        size: PageSize,
+        durable_lsn: u64,
+    ) -> Result<()> {
+        // Evict current occupant (if any)
+        self.evict_frame(idx, io, size, durable_lsn)?;
+        // The victim is now unlinked from `page_map`; clear the slot so a
+        // failed read below cannot strand the stale frame as a ghost
+        // (an occupied slot unreachable from `page_map`).
+        self.frames[idx] = None;
+
+        // Load from disk
+        let mut data = vec![0u8; self.page_size];
+        io.read_page(page_number, size, &mut data)?;
+
+        self.frames[idx] = Some(Frame {
+            page_number,
+            data: ArcSwap::from_pointee(data),
+            pin_count: 1,
+            dirty_lsn: Frame::clean_dirty_lsn(),
+            ref_bit: true,
+            deltas: BTreeMap::new(),
+            // Leaf-budget cache lifecycle: empty `deltas` ↔ running sum = 0.
+            live_delta_payload_bytes: AtomicU64::new(0),
+            latch: PageLatch::new(),
+        });
+        self.page_map.insert(page_number, idx);
+
+        Ok(())
+    }
+
     /// Pin `page_number`.  Returns the frame slot index.
     pub(super) fn pin_page(
         &mut self,
@@ -353,30 +467,19 @@ impl Partition {
             return Ok(idx);
         }
 
-        // Cache miss — find a victim
-        let idx = self.find_victim(durable_lsn).ok_or(Error::PoolExhausted {
-            reason: PoolExhaustedReason::AllFramesPinned,
-        })?;
+        // Cache miss — find a victim. This path has no reconcile horizon,
+        // so the sweep refuses frames whose deltas could still be needed
+        // by any reader or committer (anything beyond dead aborted
+        // residue) — see `deltas_droppable_without_horizon`. Without the
+        // horizon we cannot prove a version is unreachable, so we must not
+        // drop it.
+        let idx = self
+            .find_victim_filtered(durable_lsn, true)
+            .ok_or_else(|| Error::PoolExhausted {
+                reason: self.horizon_free_exhaustion_reason(),
+            })?;
 
-        // Evict current occupant (if any)
-        self.evict_frame(idx, io, size, durable_lsn)?;
-
-        // Load from disk
-        let mut data = vec![0u8; self.page_size];
-        io.read_page(page_number, size, &mut data)?;
-
-        self.frames[idx] = Some(Frame {
-            page_number,
-            data: ArcSwap::from_pointee(data),
-            pin_count: 1,
-            dirty_lsn: Frame::clean_dirty_lsn(),
-            ref_bit: true,
-            deltas: BTreeMap::new(),
-            // PR2 lifecycle invariant: empty `deltas` ↔ cache = 0.
-            live_delta_payload_bytes: AtomicU64::new(0),
-            latch: PageLatch::new(),
-        });
-        self.page_map.insert(page_number, idx);
+        self.install_missing_page(idx, page_number, io, size, durable_lsn)?;
 
         Ok(idx)
     }
@@ -409,8 +512,11 @@ impl Partition {
             reason: PoolExhaustedReason::AllFramesPinned,
         })?;
 
+        // Unified live-entry guard: block on ANY live entry — Pending
+        // heads included (evicting one in the install→flip window loses
+        // the committed write) — while aborted residue never blocks.
         if let Some(frame_ref) = self.frames[idx].as_ref() {
-            if has_live_committed_head(frame_ref) {
+            if has_live_delta_entry(frame_ref) {
                 return Err(Error::BufferPoolEvictionBlocked {
                     page: frame_ref.page_number,
                     reason: "delta-bearing frame; Phase 4 reconcile not yet available",
@@ -419,30 +525,30 @@ impl Partition {
         }
 
         // Prune the victim's chains against the snapshotted horizon before
-        // it is evicted. Entries with `stop_ts <= ort && stop_ts < Ts::MAX`
-        // are invisible to every live reader; retain only the live head
-        // and committed-replaced entries above the horizon.
+        // it is evicted. Aborted residue and entries with `stop_ts <= ort
+        // && stop_ts < Ts::MAX` are invisible to every live reader; retain
+        // only the live head and committed-replaced entries above the
+        // horizon.
         let dropped = self.reconcile_frame_at(idx, ort);
 
-        // Evict current occupant (if any)
-        self.evict_frame(idx, io, size, durable_lsn)?;
+        // The prune may RETAIN committed entries that are superseded
+        // but still above the horizon (`ort < stop_ts < Ts::MAX`) — they
+        // slipped past `has_live_delta_entry` (stop_ts != MAX) yet a live
+        // reader below their stop_ts still needs them. Destroying them
+        // with the frame would silently violate snapshot isolation, so
+        // refuse the victim instead (all-or-nothing, like the plain
+        // path). Self-relieving: once `ort` advances past the stop_ts the
+        // prune drops the entries and eviction proceeds.
+        if let Some(frame_ref) = self.frames[idx].as_ref() {
+            if !frame_ref.deltas.is_empty() {
+                return Err(Error::BufferPoolEvictionBlocked {
+                    page: frame_ref.page_number,
+                    reason: "above-horizon committed versions retained by reconcile",
+                });
+            }
+        }
 
-        // Load from disk
-        let mut data = vec![0u8; self.page_size];
-        io.read_page(page_number, size, &mut data)?;
-
-        self.frames[idx] = Some(Frame {
-            page_number,
-            data: ArcSwap::from_pointee(data),
-            pin_count: 1,
-            dirty_lsn: Frame::clean_dirty_lsn(),
-            ref_bit: true,
-            deltas: BTreeMap::new(),
-            // PR2 lifecycle invariant: empty `deltas` ↔ cache = 0.
-            live_delta_payload_bytes: AtomicU64::new(0),
-            latch: PageLatch::new(),
-        });
-        self.page_map.insert(page_number, idx);
+        self.install_missing_page(idx, page_number, io, size, durable_lsn)?;
 
         Ok((idx, dropped))
     }
@@ -451,13 +557,14 @@ impl Partition {
     /// Returns the number of `VersionEntry` objects dropped. No-op if the
     /// slot is empty.
     ///
-    /// PR2 cache invariant: this is the only `frame.deltas` mutator that
-    /// bypasses the page-local exclusive latch (it runs under the
-    /// partition mutex during eviction-prep). The running-sum cache is
-    /// recomputed inline during the same retain pass so the function
-    /// remains self-correcting — even though every current caller
-    /// (`pin_page_reconciling`) immediately replaces the frame, a
-    /// future caller that retains the frame would see a correct cache.
+    /// Leaf-budget cache invariant: this is the only `frame.deltas`
+    /// mutator that bypasses the page-local exclusive latch (it runs under
+    /// the partition mutex during eviction-prep, where no page latch is
+    /// held). The running-sum cache is recomputed inline during the same
+    /// retain pass so the function remains self-correcting — load-bearing
+    /// for the eviction-blocked path in `pin_page_reconciling`, which
+    /// RETAINS the pruned frame when its chains still hold above-horizon
+    /// committed versions.
     fn reconcile_frame_at(&mut self, idx: usize, ort: Ts) -> usize {
         let Some(frame) = self.frames[idx].as_mut() else {
             return 0;
@@ -467,7 +574,15 @@ impl Partition {
         frame.deltas.retain(|key, chain_arc| {
             let before = chain_arc.len();
             let chain_mut = Arc::make_mut(chain_arc);
-            chain_mut.retain(|e| e.stop_ts == Ts::MAX || e.stop_ts > ort);
+            chain_mut.retain(|e| {
+                // Aborted residue is invisible to every reader — drop it
+                // regardless of stop_ts (an aborted first write leaves
+                // `[Aborted, stop_ts=Ts::MAX]` behind). Other
+                // entries are kept while live (stop_ts == MAX) or still
+                // above the horizon.
+                !matches!(e.state, VersionState::Aborted)
+                    && (e.stop_ts == Ts::MAX || e.stop_ts > ort)
+            });
             let after = chain_arc.len();
             dropped += before - after;
             let keep = !chain_arc.is_empty();
@@ -602,7 +717,12 @@ impl Partition {
             if frame.pin_count > 0 {
                 snapshot.pinned_frames += 1;
             }
-            if has_live_committed_head(frame) {
+            // R-metric: mirror the eviction-blocking predicate so the
+            // gauge reports the same saturation that produces
+            // `PoolExhausted { DeltaBearingFrames }` — Pending-only
+            // frames count (they block eviction in the install→flip
+            // window), dead Aborted residue does not.
+            if has_live_delta_entry(frame) {
                 snapshot.delta_bearing_frames += 1;
             }
         }

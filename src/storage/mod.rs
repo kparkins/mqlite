@@ -8,6 +8,9 @@ pub(crate) mod btree;
 pub(crate) mod btree_store;
 pub(crate) mod buffer_pool;
 pub(crate) mod catalog;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "tests/close_quadratic_probe.rs"]
+pub(crate) mod close_quadratic_probe;
 pub(crate) mod file_io;
 pub(crate) mod handle;
 pub(crate) mod header;

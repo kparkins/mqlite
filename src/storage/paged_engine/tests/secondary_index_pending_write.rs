@@ -8,9 +8,8 @@ use crate::error::Result;
 use crate::index::IndexModel;
 use crate::keys::{encode_compound_key, encode_key};
 use crate::mvcc::transaction::Ns;
-use crate::mvcc::{
-    PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite, Ts, VersionData, VersionEntry, VersionState,
-};
+use crate::mvcc::transaction::{PrimaryOp, PrimaryWrite, SecIndexOp, SecIndexWrite};
+use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::options::{FindOptions, IndexOptions};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;

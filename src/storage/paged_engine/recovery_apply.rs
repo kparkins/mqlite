@@ -9,8 +9,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::journal::log_file::{LogicalOp, LogicalOpKind, LogicalTxnFrame};
+use crate::journal::wire::{LogicalOp, LogicalOpKind, LogicalTxnFrame};
 use crate::journal::ParsedLogicalFrames;
+use crate::mvcc::metrics::{
+    record_logical_txn_pass2_resolved_op, record_logical_txn_pass2_unresolved_op,
+};
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
@@ -71,6 +74,101 @@ pub(crate) fn install_recovered_published_epoch(
         .test_hooks
         .recovery_open_published_store_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Phase 2 §5.2 Pass 2 — validate `ParsedLogicalFrames` against the live
+/// catalog without mutating any durable state.
+///
+/// Per-op resolution taxonomy:
+///   - `PrimaryInsert|PrimaryUpdate|PrimaryDelete` → `ns_id` must resolve
+///     via `Catalog::find_collection_by_id`; a miss ticks the unresolved
+///     counter.
+///   - `SecondaryInsert|SecondaryDelete` → `index_id` must resolve via
+///     `Catalog::find_index_by_id`; a miss ticks the unresolved counter.
+///
+/// Per-frame invariant: op ordinals MUST be dense `0..op_count-1` with
+/// no gaps or duplicates. A violation is a Phase 2 invariant error
+/// (Pass 1 should have already enforced this via the decoder, so
+/// reaching this arm implies recovery-plus-catalog corruption).
+///
+/// Contract: the `&Catalog` receiver is the only durable-state access.
+/// No mutation of the catalog tree, buffer pool, journal, HLC oracle,
+/// or history store — the only observable side-effect is the Phase 2
+/// `logical_txn_pass2_{resolved,unresolved}_ops_total` counters.
+pub(super) fn validate_parsed_logical_frames_against_catalog<S>(
+    catalog: &Catalog<S>,
+    parsed: &ParsedLogicalFrames,
+) -> Result<()>
+where
+    S: crate::storage::btree::BTreePageStore,
+{
+    for (_offset, frame) in &parsed.frames {
+        validate_frame_ordinals_dense(frame)?;
+        for op in &frame.ops {
+            match &op.kind {
+                LogicalOpKind::PrimaryInsert { ns_id, .. }
+                | LogicalOpKind::PrimaryUpdate { ns_id, .. }
+                | LogicalOpKind::PrimaryDelete { ns_id, .. } => {
+                    if catalog.find_collection_by_id(*ns_id)?.is_some() {
+                        record_logical_txn_pass2_resolved_op();
+                    } else {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            target: "mqlite",
+                            ns_id = *ns_id,
+                            commit_ts = ?frame.commit_ts,
+                            "Pass 2: unresolved ns_id (Phase 2 tolerance — log-and-proceed; \
+                             Phase 4 §8.13 hard-errors this)"
+                        );
+                        record_logical_txn_pass2_unresolved_op();
+                    }
+                }
+                LogicalOpKind::SecondaryInsert { index_id, .. }
+                | LogicalOpKind::SecondaryDelete { index_id, .. } => {
+                    if catalog.find_index_by_id(*index_id)?.is_some() {
+                        record_logical_txn_pass2_resolved_op();
+                    } else {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            target: "mqlite",
+                            index_id = *index_id,
+                            commit_ts = ?frame.commit_ts,
+                            "Pass 2: unresolved index_id (Phase 2 tolerance — \
+                             log-and-proceed; Phase 4 §8.13 hard-errors this)"
+                        );
+                        record_logical_txn_pass2_unresolved_op();
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §3.4 invariant: op_ordinal values form a dense sequence
+/// `0..ops.len()-1` with no gaps and no duplicates. Pass 1 should
+/// already have enforced this via `LogicalTxnFrame::decode`; we re-check
+/// here because Pass 2 is the last gate before published-state open.
+pub(super) fn validate_frame_ordinals_dense(frame: &LogicalTxnFrame) -> Result<()> {
+    let n = frame.ops.len();
+    let mut seen = vec![false; n];
+    for op in &frame.ops {
+        let ord = op.op_ordinal as usize;
+        if ord >= n {
+            return Err(Error::Internal(format!(
+                "Pass 2: op_ordinal {} out of range 0..{} (commit_ts {:?})",
+                op.op_ordinal, n, frame.commit_ts
+            )));
+        }
+        if seen[ord] {
+            return Err(Error::Internal(format!(
+                "Pass 2: duplicate op_ordinal {} (commit_ts {:?})",
+                op.op_ordinal, frame.commit_ts
+            )));
+        }
+        seen[ord] = true;
+    }
     Ok(())
 }
 

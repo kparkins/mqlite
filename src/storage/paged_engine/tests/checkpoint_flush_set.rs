@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::journal::log_file::PageId;
+use crate::journal::wire::PageId;
 use crate::journal::{CheckpointFlushSet, JournalManager};
 use crate::mvcc::Ts;
 use crate::storage::buffer_pool::{default_sizes, BufferPool, PageSize};

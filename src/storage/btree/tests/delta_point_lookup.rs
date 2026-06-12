@@ -94,7 +94,7 @@ fn test_delta_only_point_lookup_returns_visible_value() -> Result<()> {
         [live_entry(T_CREATE, Ts::MAX, b"delta-value")],
     )?;
 
-    let view = ReadView::new(T_AFTER_DELETE, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_AFTER_DELETE, READER_TXN_ID);
 
     assert_eq!(
         tree.get_mvcc(b"delta-only", &view, None)?.as_deref(),
@@ -113,7 +113,7 @@ fn test_point_lookup_falls_back_to_base_after_future_chain_miss() -> Result<()> 
         [live_entry(T_FUTURE_UPDATE, Ts::MAX, b"future-value")],
     )?;
     let history = EmptyHistoryProbe;
-    let view = ReadView::new(T_BEFORE_CREATE, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_BEFORE_CREATE, READER_TXN_ID);
 
     assert_eq!(
         tree.get_mvcc(b"base-key", &view, Some(&history))?
@@ -134,7 +134,7 @@ fn test_delta_only_tombstone_visible_after_delete_ts() -> Result<()> {
             live_entry(T_CREATE, T_DELETE, b"old-value"),
         ],
     )?;
-    let view = ReadView::new(T_AFTER_DELETE, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_AFTER_DELETE, READER_TXN_ID);
 
     assert_eq!(tree.get_mvcc(b"deleted-key", &view, None)?, None);
     Ok(())
@@ -151,7 +151,7 @@ fn test_delta_only_tombstone_preserves_pre_delete_view() -> Result<()> {
             live_entry(T_CREATE, T_DELETE, b"old-value"),
         ],
     )?;
-    let view = ReadView::new(T_BEFORE_DELETE, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_BEFORE_DELETE, READER_TXN_ID);
 
     assert_eq!(
         tree.get_mvcc(b"deleted-key", &view, None)?.as_deref(),
@@ -171,7 +171,7 @@ fn test_delta_only_tombstone_boundary_read_ts_equals_delete_ts() -> Result<()> {
             live_entry(T_CREATE, T_DELETE, b"old-value"),
         ],
     )?;
-    let view = ReadView::new(T_DELETE, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_DELETE, READER_TXN_ID);
 
     assert_eq!(tree.get_mvcc(b"deleted-key", &view, None)?, None);
     Ok(())
@@ -187,7 +187,7 @@ fn test_delta_only_tombstone_after_reconcile_prunes_chain() -> Result<()> {
     )?;
     remove_chain(&mut tree, b"deleted-key")?;
     let history = EmptyHistoryProbe;
-    let view = ReadView::new(T_AFTER_DELETE, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_AFTER_DELETE, READER_TXN_ID);
 
     assert_eq!(tree.get_mvcc(b"deleted-key", &view, Some(&history))?, None);
     Ok(())

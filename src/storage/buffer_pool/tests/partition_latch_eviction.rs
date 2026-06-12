@@ -82,6 +82,9 @@ fn eviction_exclusive_latch_probe_is_guardless_source_audit() {
     let latch_body = std::fs::read_to_string(&latch_path).unwrap_or_else(|e| {
         panic!("cannot read {}: {e}", latch_path.display());
     });
+    // Normalize CRLF so the structural probes below match on Windows
+    // checkouts (git autocrlf) exactly as they do on LF checkouts.
+    let latch_body = latch_body.replace("\r\n", "\n");
     let probe_start = latch_body
         .find("pub(crate) fn is_exclusively_held(")
         .expect("PageLatch::is_exclusively_held must exist");

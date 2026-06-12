@@ -78,6 +78,85 @@ fn version_data_clone_preserves_refcount_invariant() {
     assert_eq!(alloc.overflow_refcount(7), 0);
 }
 
+/// Pinning test for the canonical [`VersionEntry::is_live_head`]
+/// predicate that the live-head call sites
+/// (`partition::has_live_delta_entry`, `chains::chain_live_head_bytes`,
+/// `LatchedPinnedPage::live_head`,
+/// `LatchedPinnedPage::has_live_delta_key_in_range`, and the
+/// `paged_engine::pending_install` head lookups) were consolidated onto.
+///
+/// It enumerates every `VersionState × stop_ts` combination and asserts
+/// `is_live_head` returns the expected verdict, then asserts the exact
+/// boolean expression the four sites previously open-coded
+/// (`stop_ts == Ts::MAX && !Aborted`) agrees with the helper for every
+/// case. If any wrapper ever drifts from the canonical definition, this
+/// test (plus the `running_sum` / `eviction_bug_suspects` regressions)
+/// will catch the divergence.
+#[test]
+fn is_live_head_matches_open_coded_predicate_across_all_states() {
+    fn entry(state: VersionState, stop_ts: Ts) -> VersionEntry {
+        VersionEntry {
+            start_ts: Ts {
+                physical_ms: 1,
+                logical: 0,
+            },
+            stop_ts,
+            txn_id: 7,
+            state,
+            data: VersionData::Inline(vec![1, 2, 3]),
+            is_tombstone: false,
+        }
+    }
+
+    let superseded = Ts {
+        physical_ms: 100,
+        logical: 0,
+    };
+    let states = [
+        VersionState::Pending { txn_id: 7 },
+        VersionState::Committed,
+        VersionState::Aborted,
+    ];
+    let stops = [Ts::MAX, superseded];
+
+    for state in states {
+        for stop_ts in stops {
+            let e = entry(state, stop_ts);
+            // The canonical helper.
+            let got = e.is_live_head();
+            // The exact boolean the four call sites used before
+            // consolidation — the pinning oracle.
+            let open_coded = e.stop_ts == Ts::MAX && !matches!(e.state, VersionState::Aborted);
+            assert_eq!(
+                got,
+                open_coded,
+                "is_live_head disagrees with open-coded predicate for \
+                 state={:?} stop_ts==MAX? {}",
+                e.state,
+                e.stop_ts == Ts::MAX
+            );
+
+            // Spell out the expected verdict per combination so the
+            // pinning intent is explicit, not just self-referential.
+            let expected = match (state, stop_ts == Ts::MAX) {
+                // Live head iff head-positioned and not aborted.
+                (VersionState::Pending { .. }, true) => true,
+                (VersionState::Committed, true) => true,
+                (VersionState::Aborted, true) => false,
+                // Any superseded entry (stop_ts != MAX) is never a live head.
+                (_, false) => false,
+            };
+            assert_eq!(
+                got,
+                expected,
+                "is_live_head verdict wrong for state={:?} stop_ts==MAX? {}",
+                e.state,
+                e.stop_ts == Ts::MAX
+            );
+        }
+    }
+}
+
 #[test]
 fn version_entry_clone_works() {
     let alloc = fresh_allocator();

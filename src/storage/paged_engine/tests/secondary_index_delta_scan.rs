@@ -210,19 +210,16 @@ fn test_index_scan_and_collscan_agree_on_delta_only_entry() {
     let filter = doc! { "email": "agree@example.test" };
     let (index_docs, explain) = engine.find(NS, &filter, &FindOptions::default()).unwrap();
 
-    let epoch = engine.shared.load_published();
+    let view = super::snapshot_ops::open_snapshot_read_view(&engine.shared)
+        .expect("open snapshot read view on the current epoch");
+    let epoch = view.published_epoch();
     let ns_snap = epoch
         .catalog
         .get_by_name(NS)
         .expect("namespace snapshot exists");
-    let (_, collscan_pairs) = super::snapshot_ops::plan_and_collect_snapshot_pairs(
-        &engine.shared,
-        ns_snap,
-        &filter,
-        Arc::clone(&epoch),
-        false,
-    )
-    .unwrap();
+    let (_, collscan_pairs) =
+        super::snapshot_ops::plan_and_collect_snapshot_pairs(&engine.shared, ns_snap, &filter, &view, false)
+            .unwrap();
     let collscan_docs: Vec<Document> = collscan_pairs.into_iter().map(|(_, doc)| doc).collect();
 
     assert_eq!(explain.index_used.as_deref(), Some(EMAIL_INDEX));

@@ -97,7 +97,7 @@ fn all_three_chain_entries_share_commit_ts() {
     let snap = snap_after_commit(commit_ts, pre_commit);
 
     // Reader AFTER commit sees the post-update state for ALL three chains.
-    let reader_after = ReadView::new(
+    let reader_after = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 1_500,
             logical: 0,
@@ -148,7 +148,7 @@ fn reader_below_commit_ts_sees_pre_update_everywhere() {
     let snap = snap_after_commit(commit_ts, pre_commit);
 
     // Reader strictly between pre_commit and commit_ts observes v1.
-    let reader_before = ReadView::new(
+    let reader_before = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 750,
             logical: 0,
@@ -195,7 +195,7 @@ fn no_read_ts_witnesses_partial_commit() {
 
     let sample_points: Vec<u64> = (0..=20).map(|i| 900 + i * 10).collect();
     for ts_ms in sample_points {
-        let rv = ReadView::new(
+        let rv = ReadView::new_frontier_pinned_for_tests(
             Ts {
                 physical_ms: ts_ms,
                 logical: 0,

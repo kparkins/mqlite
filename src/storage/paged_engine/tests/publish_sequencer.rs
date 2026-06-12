@@ -56,16 +56,25 @@ fn test_no_split_oracle_commit_then_register_call_sites() {
     use std::path::Path;
 
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // R7 split: index_build.rs → index_ddl.rs and index_maint.rs split into
+    // pending_install/index_write_maint/index_read_helpers/checkpoint_materialize.
+    // Extend (never shrink) the register-call scan basis to all new files.
     let targets = [
         "src/storage/paged_engine.rs",
-        "src/storage/paged_engine/index_build.rs",
+        "src/storage/paged_engine/commit_envelope.rs",
+        "src/storage/paged_engine/ns_ddl.rs",
+        "src/storage/paged_engine/index_ddl.rs",
         "src/storage/paged_engine/index_maint.rs",
+        "src/storage/paged_engine/pending_install.rs",
+        "src/storage/paged_engine/index_write_maint.rs",
+        "src/storage/paged_engine/index_read_helpers.rs",
+        "src/storage/paged_engine/checkpoint_materialize.rs",
     ];
 
     for rel in targets {
         let path = project_root.join(rel);
         if !path.exists() {
-            // Phase 5 may not have introduced index_build/index_maint
+            // Phase 5 may not have introduced the index DDL/maint files
             // yet; skip missing files rather than fail the gate.
             continue;
         }

@@ -149,6 +149,14 @@ Median throughput:
 treated as noisy. The raw sidecar keeps `min_dps`, `max_dps`, `envelope`, and
 `raw_dps` for every row.
 
+A second-platform sidecar,
+[`2026-06-11-ryzen-7800x3d-windows-interval.json`](perf-baselines/2026-06-11-ryzen-7800x3d-windows-interval.json),
+covers the default `interval-50ms` profile only (AMD Ryzen 7 7800X3D, 8c/16t,
+Windows 11, NVMe; same 11-run median methodology). The `full-sync` column is
+omitted there: Windows `FlushFileBuffers` latency makes fsync-bound rows
+impractically slow to collect at the canonical document counts, and the
+numbers would measure the platform's fsync cost more than the engine.
+
 ## Specialized Criterion Benches
 
 Criterion benches answer subsystem questions. They are not the canonical write

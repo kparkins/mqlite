@@ -7,8 +7,8 @@ use bson::{doc, Bson, Document};
 use super::doc_helpers::check_unique_constraints_mvcc;
 use crate::error::{Error, Result};
 use crate::keys::encode_key;
-use crate::mvcc::transaction::Ns;
-use crate::mvcc::{PrimaryOp, PrimaryWrite, ReadView, Ts, VersionData, VersionEntry, VersionState};
+use crate::mvcc::transaction::{Ns, PrimaryOp, PrimaryWrite};
+use crate::mvcc::{ReadView, Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::btree::{BTree, BTreePageStore, MemPageStore};
 use crate::storage::buffer_pool::LatchMode;
 
@@ -90,7 +90,7 @@ fn pending_insert(ns: &str, doc: &Document) -> Result<PrimaryWrite> {
 }
 
 fn read_view() -> ReadView {
-    ReadView::new(READ_TS, READER_TXN_ID)
+    ReadView::new_frontier_pinned_for_tests(READ_TS, READER_TXN_ID)
 }
 
 fn assert_duplicate(result: Result<()>) {

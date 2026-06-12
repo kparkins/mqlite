@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::mvcc::read_view::{ChainSnapshot, ReadView};
+use crate::mvcc::chain_snapshot::ChainSnapshot;
+use crate::mvcc::read_view::ReadView;
 
 use super::BufferPool;
 

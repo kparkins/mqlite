@@ -5,7 +5,8 @@ use crate::mvcc::version::{VersionData, VersionEntry, VersionState};
 use crate::storage::paged_engine::publish_sequencer::PublishSequencer;
 use crate::storage::root_snapshot::{PublishedCatalog, PublishedEpoch};
 
-use super::{ChainSnapshot, ReadView};
+use super::ChainSnapshot;
+use crate::mvcc::read_view::ReadView;
 
 const KEY: &[u8] = b"k";
 const WRITER_TXN_ID: u64 = 11;

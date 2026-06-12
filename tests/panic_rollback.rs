@@ -46,7 +46,7 @@ fn read_view_unregisters_across_panic() {
     };
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let view = ReadView::open(registry.clone(), ts, 1);
+        let view = ReadView::open_frontier_pinned_for_tests(registry.clone(), ts, 1);
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.oldest_required_ts(), ts);
         // Panic in the middle of "work" — view is still alive, registry
@@ -127,11 +127,11 @@ fn multiple_views_survive_panic_unwind_horizon_coherent() {
 
     // Keep v200 alive across the panic — simulates a sibling reader
     // that shouldn't be affected by the failing writer.
-    let v200 = ReadView::open(registry.clone(), ts200, 2);
+    let v200 = ReadView::open_frontier_pinned_for_tests(registry.clone(), ts200, 2);
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let _v100 = ReadView::open(registry.clone(), ts100, 1);
-        let _v300 = ReadView::open(registry.clone(), ts300, 3);
+        let _v100 = ReadView::open_frontier_pinned_for_tests(registry.clone(), ts100, 1);
+        let _v300 = ReadView::open_frontier_pinned_for_tests(registry.clone(), ts300, 3);
         assert_eq!(registry.len(), 3);
         assert_eq!(registry.oldest_required_ts(), ts100);
         panic!("force unwind");

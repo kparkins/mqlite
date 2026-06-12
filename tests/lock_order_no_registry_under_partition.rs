@@ -30,6 +30,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Read a source file for auditing, normalizing CRLF so the structural
+/// probes match on Windows checkouts (git autocrlf) exactly as on LF ones.
+fn read_source_normalized(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
 /// Surrogate for `ReadViewRegistry::inner` — position 5.
 #[derive(Default)]
 struct Registry {
@@ -92,9 +100,7 @@ fn reconcile_snapshots_registry_before_partition_lock() {
         .join("storage")
         .join("buffer_pool")
         .join("mod.rs");
-    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("cannot read {}: {e}", path.display());
-    });
+    let body = read_source_normalized(&path);
 
     let fn_start = body
         .find("pub(crate) fn pin_with_reconcile")
@@ -128,9 +134,7 @@ fn test_pin_before_latch_no_partition_under_page_latch() {
         .join("storage")
         .join("buffer_pool")
         .join("mod.rs");
-    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("cannot read {}: {e}", path.display());
-    });
+    let body = read_source_normalized(&path);
 
     let fn_start = body
         .find("pub(super) fn pin_then_latch(")
@@ -161,9 +165,7 @@ fn test_pin_before_latch_no_partition_under_page_latch() {
 fn test_lock_order_publish_sequencer_below_registry() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = manifest_dir.join("src").join("mvcc").join("read_view.rs");
-    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("cannot read {}: {e}", path.display());
-    });
+    let body = read_source_normalized(&path);
 
     let history = body
         .find("1.   history-store partition mutex")

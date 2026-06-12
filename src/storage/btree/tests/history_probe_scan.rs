@@ -92,7 +92,7 @@ fn test_merged_scan_history_probe_fires_when_predicate_matches() {
     )
     .unwrap();
 
-    let view = ReadView::new(ts(100), 99);
+    let view = ReadView::new_frontier_pinned_for_tests(ts(100), 99);
     let history = RecordingHistoryProbe::new();
     let _rows = tree
         .range_scan_mvcc(None, None, &view, Some(&history))

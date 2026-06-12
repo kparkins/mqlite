@@ -77,6 +77,21 @@ fn readme_typed_struct_example() {
     assert_eq!(theme.value, "dark");
 }
 
+/// README intro snippet: chained `database(..).collection(..)` access.
+#[test]
+fn readme_intro_example() {
+    let _tempdir = TempDir::new().expect("tempdir");
+    let client = Client::open(_tempdir.path().join("db.mqlite")).expect("open");
+    let users = client
+        .database("myapp")
+        .collection::<mqlite::Document>("users");
+    users
+        .insert_one(&doc! { "name": "alice", "role": "admin" })
+        .expect("insert_one");
+    let admin = users.find_one(doc! { "role": "admin" }).expect("find_one");
+    assert!(admin.is_some(), "should find the admin document");
+}
+
 /// Verify that cargo add directions work: the macro, open, insert, find are
 /// all importable from the crate root without a direct `bson` dependency.
 #[test]

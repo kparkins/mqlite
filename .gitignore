@@ -69,3 +69,6 @@ progress.txt
 .plan-reviews/
 .prd-reviews/
 .runtime/
+
+# Python bytecode
+__pycache__/

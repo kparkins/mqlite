@@ -95,7 +95,7 @@ fn test_read_fallthrough_uses_history_when_resident_chain_misses() -> Result<()>
 
     let history =
         StaticHistoryProbe::returning(Some(live_entry(T_VISIBLE, T_FUTURE, b"history-value")));
-    let view = ReadView::new(T_READ, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_READ, READER_TXN_ID);
 
     assert_eq!(
         tree.get_mvcc(b"doc", &view, Some(&history))?.as_deref(),
@@ -117,7 +117,7 @@ fn test_resident_visible_chain_value_wins_without_history_probe() -> Result<()> 
 
     let history =
         StaticHistoryProbe::returning(Some(live_entry(T_VISIBLE, Ts::MAX, b"history-value")));
-    let view = ReadView::new(T_READ, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_READ, READER_TXN_ID);
 
     assert_eq!(
         tree.get_mvcc(b"doc", &view, Some(&history))?.as_deref(),
@@ -133,7 +133,7 @@ fn test_history_tombstone_hides_base_after_chain_miss() -> Result<()> {
     tree.insert(b"doc", b"base-value")?;
 
     let history = StaticHistoryProbe::returning(Some(tombstone_entry(T_VISIBLE, Ts::MAX)));
-    let view = ReadView::new(T_READ, READER_TXN_ID);
+    let view = ReadView::new_frontier_pinned_for_tests(T_READ, READER_TXN_ID);
 
     assert!(tree.get_mvcc(b"doc", &view, Some(&history))?.is_none());
     assert_eq!(history.calls(), vec![b"doc".to_vec()]);

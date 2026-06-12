@@ -60,6 +60,14 @@ fn fresh_header() -> FileHeader {
     FileHeader::new(0, 0, 0)
 }
 
+/// A page-sized scratch buffer for the [`PageAllocator`] free-list link I/O.
+///
+/// Production code owns this on `AllocatorState` and reuses it across calls;
+/// these direct-construction unit tests allocate a fresh one per `PageAllocator`.
+fn link_scratch() -> Vec<u8> {
+    vec![0u8; PageSize::Large32k.bytes()]
+}
+
 // -----------------------------------------------------------------------
 // Allocate — empty free list (extend file)
 // -----------------------------------------------------------------------
@@ -68,7 +76,8 @@ fn fresh_header() -> FileHeader {
 fn allocate_4k_from_empty_freelist_returns_page_1() {
     let io = MockIo::new();
     let mut hdr = fresh_header();
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
 
     let pn = alloc.allocate_4k().expect("should allocate");
     assert_eq!(pn, 1, "first allocated page must be 1");
@@ -78,7 +87,8 @@ fn allocate_4k_from_empty_freelist_returns_page_1() {
 fn allocate_32k_from_empty_freelist_returns_page_1() {
     let io = MockIo::new();
     let mut hdr = fresh_header();
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
 
     let pn = alloc.allocate_32k().expect("should allocate");
     assert_eq!(pn, 1);
@@ -91,7 +101,8 @@ fn allocate_extends_total_page_count() {
     assert_eq!(hdr.total_page_count, 1);
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.allocate_4k().unwrap();
         alloc.allocate_32k().unwrap();
         alloc.allocate_4k().unwrap();
@@ -104,7 +115,8 @@ fn allocate_extends_total_page_count() {
 fn sequential_allocations_return_consecutive_page_numbers() {
     let io = MockIo::new();
     let mut hdr = fresh_header();
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
 
     let a = alloc.allocate_4k().unwrap();
     let b = alloc.allocate_4k().unwrap();
@@ -126,7 +138,8 @@ fn free_4k_updates_header_fields() {
     hdr.total_page_count = 3; // pretend pages 1 and 2 exist
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_4k(1).unwrap();
     }
 
@@ -142,7 +155,8 @@ fn free_32k_updates_header_fields() {
     hdr.total_page_count = 3;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_32k(2).unwrap();
     }
 
@@ -160,7 +174,8 @@ fn freed_page_stores_next_pointer_in_first_4_bytes_as_zero() {
     hdr.total_page_count = 2;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_4k(1).unwrap();
     }
 
@@ -182,7 +197,8 @@ fn freed_page_stores_next_pointer_when_list_nonempty() {
     hdr.total_page_count = 3;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_4k(1).unwrap();
         alloc.free_4k(2).unwrap();
     }
@@ -207,7 +223,8 @@ fn free_then_alloc_recycles_page_4k() {
     hdr.total_page_count = 2;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_4k(1).unwrap();
         let recycled = alloc.allocate_4k().unwrap();
         assert_eq!(recycled, 1, "must reuse freed page");
@@ -226,7 +243,8 @@ fn free_then_alloc_recycles_page_32k() {
     hdr.total_page_count = 2;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_32k(1).unwrap();
         let recycled = alloc.allocate_32k().unwrap();
         assert_eq!(recycled, 1);
@@ -244,7 +262,8 @@ fn alloc_from_freelist_is_lifo_4k() {
     hdr.total_page_count = 4;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_4k(1).unwrap();
         alloc.free_4k(2).unwrap();
         alloc.free_4k(3).unwrap();
@@ -267,7 +286,8 @@ fn alloc_from_freelist_is_lifo_32k() {
     hdr.total_page_count = 3;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_32k(1).unwrap();
         alloc.free_32k(2).unwrap();
 
@@ -283,7 +303,8 @@ fn free_and_alloc_many_pages_no_leak_4k() {
 
     // Allocate 10 pages.
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         for _ in 1..=10 {
             alloc.allocate_4k().unwrap();
         }
@@ -292,7 +313,8 @@ fn free_and_alloc_many_pages_no_leak_4k() {
 
     // Free all 10 pages.
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         for pn in 1..=10 {
             alloc.free_4k(pn).unwrap();
         }
@@ -302,7 +324,8 @@ fn free_and_alloc_many_pages_no_leak_4k() {
     // Reallocate all 10; they must come from the free list, not extend
     // the file.
     let reclaimed = {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         let mut pages = Vec::new();
         for _ in 0..10 {
             pages.push(alloc.allocate_4k().unwrap());
@@ -331,7 +354,8 @@ fn free_page_0_returns_error() {
     let mut hdr = fresh_header();
     hdr.total_page_count = 2;
 
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
     let result = alloc.free_4k(0);
     assert!(result.is_err(), "freeing page 0 must fail");
 }
@@ -342,7 +366,8 @@ fn free_page_0_returns_error_32k() {
     let mut hdr = fresh_header();
     hdr.total_page_count = 2;
 
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
     let result = alloc.free_32k(0);
     assert!(result.is_err(), "freeing page 0 (32k) must fail");
 }
@@ -353,7 +378,8 @@ fn free_page_beyond_file_returns_error_4k() {
     let mut hdr = fresh_header();
     hdr.total_page_count = 2; // pages 0 and 1 exist
 
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
     // Page 5 does not exist.
     let result = alloc.free_4k(5);
     assert!(result.is_err(), "freeing out-of-bounds page must fail");
@@ -365,7 +391,8 @@ fn free_page_beyond_file_returns_error_32k() {
     let mut hdr = fresh_header();
     hdr.total_page_count = 2;
 
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
     let result = alloc.free_32k(99);
     assert!(result.is_err());
 }
@@ -376,7 +403,8 @@ fn allocate_overflow_returns_disk_full() {
     let mut hdr = fresh_header();
     hdr.total_page_count = u32::MAX; // one short of overflow
 
-    let mut alloc = PageAllocator::new(&mut hdr, &io);
+    let mut scratch = link_scratch();
+    let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
     // Allocating would push total_page_count past u32::MAX.
     let result = alloc.allocate_4k();
     assert!(
@@ -402,7 +430,8 @@ fn lists_are_independent() {
     hdr.total_page_count = 3;
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_4k(1).unwrap();
         alloc.free_32k(2).unwrap();
     }
@@ -413,7 +442,8 @@ fn lists_are_independent() {
     assert_eq!(hdr.free_page_count_32k, 1);
 
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         // Allocating 32k should not touch the 4k list.
         let p = alloc.allocate_32k().unwrap();
         assert_eq!(p, 2);
@@ -432,15 +462,18 @@ fn roundtrip_single_4k() {
     let mut hdr = fresh_header();
 
     let page_number = {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.allocate_4k().unwrap()
     };
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_4k(page_number).unwrap();
     }
     let recycled = {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.allocate_4k().unwrap()
     };
     assert_eq!(recycled, page_number);
@@ -452,15 +485,18 @@ fn roundtrip_single_32k() {
     let mut hdr = fresh_header();
 
     let page_number = {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.allocate_32k().unwrap()
     };
     {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.free_32k(page_number).unwrap();
     }
     let recycled = {
-        let mut alloc = PageAllocator::new(&mut hdr, &io);
+        let mut scratch = link_scratch();
+        let mut alloc = PageAllocator::new(&mut hdr, &io, &mut scratch);
         alloc.allocate_32k().unwrap()
     };
     assert_eq!(recycled, page_number);

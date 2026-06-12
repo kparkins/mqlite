@@ -576,7 +576,7 @@ fn test_read_view_horizon_pins_old_versions() {
         logical,
     };
     let registry = client.__read_view_registry().expect("read-view registry");
-    let view = ReadView::open(Arc::clone(&registry), read_ts, 19);
+    let view = ReadView::open_frontier_pinned_for_tests(Arc::clone(&registry), read_ts, 19);
 
     set_us019_mark(&client, 0, 41).expect("first update");
     set_us019_mark(&client, 0, 42).expect("second update");

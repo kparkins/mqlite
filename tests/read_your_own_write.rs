@@ -57,7 +57,7 @@ fn snap_with(entries: Vec<VersionEntry>) -> ChainSnapshot {
 fn writer_sees_own_pending_insert() {
     let snap = snap_with(vec![pending_entry(b"new-value")]);
 
-    let writer_view = ReadView::new(
+    let writer_view = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 500,
             logical: 0,
@@ -78,7 +78,7 @@ fn writer_sees_own_pending_insert() {
 fn pending_insert_hidden_from_other_txn() {
     let snap = snap_with(vec![pending_entry(b"new-value")]);
 
-    let other_reader = ReadView::new(
+    let other_reader = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 500,
             logical: 0,
@@ -109,7 +109,7 @@ fn writer_sees_own_pending_over_older_committed() {
     let snap = snap_with(vec![pending_entry(b"new"), prior]);
 
     // Writer reads its own new value.
-    let writer_view = ReadView::new(
+    let writer_view = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 150,
             logical: 0,
@@ -122,7 +122,7 @@ fn writer_sees_own_pending_over_older_committed() {
     assert_eq!(seen.txn_id, WRITER_TXN_ID);
 
     // Concurrent reader ignores the pending head and falls through to "old".
-    let concurrent = ReadView::new(
+    let concurrent = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 150,
             logical: 0,

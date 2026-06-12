@@ -1,22 +1,21 @@
 //! MVCC per-frame delta-chain helpers on [`BufferPool`].
 //!
 //! The per-key delta chains live on the 32 KB leaf partition's frames.
-//! After PR0.5 the only mutator surface is `with_chain_under_latch` /
+//! The only chain-mutation surface is `with_chain_under_latch` /
 //! `with_all_chains_under_latch` (on `BufferPool` and the
 //! `BTreePageStore` trait); this module retains only the read-only
 //! `chains_empty` inspector used by structural-cleanup guards.
-//! Phase 5 reconcile and CRUD callers that already hold a page latch
-//! must use [`super::LatchedPinnedPage`] helpers (`with_chain` /
-//! `with_all_chains`) instead — resident chain mutation requires
-//! `PageLatch::Exclusive`, while snapshots require
-//! `LatchedPinnedPage::Shared` and copy/clone only.
+//! Reconcile and CRUD callers that already hold a page latch must use
+//! [`super::LatchedPinnedPage`] helpers (`with_chain` / `with_all_chains`)
+//! instead — resident chain mutation requires `PageLatch::Exclusive`,
+//! while snapshots require `LatchedPinnedPage::Shared` and copy/clone
+//! only (a shared latch lets readers clone without blocking writers).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::mvcc::version::{VersionData, VersionEntry, VersionState};
-use crate::mvcc::Ts;
+use crate::mvcc::version::{VersionData, VersionEntry};
 use crate::storage::btree::reconcile::{
     CELL_INLINE_LEN_BYTES, CELL_KEY_LEN_BYTES, CELL_OVERFLOW_REF_BYTES, CELL_VALUE_TYPE_BYTES,
     SLOT_POINTER_BYTES,
@@ -26,13 +25,12 @@ use crate::storage::btree::OVERFLOW_THRESHOLD;
 use super::BufferPool;
 
 // ---------------------------------------------------------------------------
-// PR1 perf counters (gated by `perf-counters` cargo feature)
+// Commit-flip perf counters (gated by `perf-counters` cargo feature)
 //
 // Counters are `pub(crate) static` (NOT `pub(super)`) so the read-side
-// helpers in `super::metrics_perf` can name them. Visibility per
-// `.omc/plans/mwmr-page-latch.md` rev 4 PR1 §AC and team-lead PR1
-// numbered reminder #5. Gate via `#[cfg(feature = "perf-counters")]`
-// keeps release builds without the feature at zero overhead.
+// helpers in `super::metrics_perf` can name them. The
+// `#[cfg(feature = "perf-counters")]` gate keeps release builds without
+// the feature at zero overhead.
 // ---------------------------------------------------------------------------
 
 /// Total number of `flip_pending_to_committed_for` /
@@ -43,8 +41,8 @@ pub(crate) static FLIP_TXN_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Total number of bounded-retry attempts that observed an `Arc::ptr_eq`
-/// mismatch in Phase B and re-entered Phase A. Numerator for
-/// [`super::metrics_perf::flip_retry_rate`].
+/// mismatch in the install phase and re-entered the off-latch prepare
+/// phase. Numerator for [`super::metrics_perf::flip_retry_rate`].
 #[cfg(feature = "perf-counters")]
 pub(crate) static FLIP_RETRY_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -52,28 +50,29 @@ pub(crate) static FLIP_RETRY_TOTAL: std::sync::atomic::AtomicU64 =
 /// Total number of pages where the bounded retry budget exhausted (3
 /// attempts) without converging. Each increment indicates the engine
 /// was poisoned via `EngineFatal { PostDurablePendingFlipFailure }`.
-/// Read by [`super::metrics_perf::flip_retry_exhausted_count`]. AC
-/// requires `== 0` over the perf workload — any exhaustion = revert.
+/// Read by [`super::metrics_perf::flip_retry_exhausted_count`]. This
+/// should stay at 0: a non-zero value means a commit could not install
+/// its flip after durability, which is unrecoverable.
 #[cfg(feature = "perf-counters")]
 pub(crate) static FLIP_RETRY_EXHAUSTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
-// PR2 per-write install critical-section hold-time counters
+// Per-write install critical-section hold-time counters
 //
-// Two counter pairs measure the PR2 cache replacement at different
-// granularities:
+// Two counter pairs measure the exclusive-latch hold time at different
+// granularities, so a regression in the running-sum cache vs. a
+// full-frame rescan can be told apart:
 //
 //   INSTALL_HOLD_NS_TOTAL / INSTALL_WRITES
-//     Macro: the per-write SmoLatchSet exclusive-latch critical
-//     section in `index_maint.rs` (the `with_chain` install + the
-//     `live_delta_payload_exceeds_leaf_budget` check). PR2's
-//     structural verdict — must drop >= 30% from PR1 baseline.
+//     Macro: the per-write exclusive-latch critical section in
+//     `index_maint.rs` (the `with_chain` install plus the
+//     `live_delta_payload_exceeds_leaf_budget` check).
 //
 //   LIVE_DELTA_CHECK_NS_TOTAL / LIVE_DELTA_CHECK_CALLS
-//     Micro: just the `live_delta_payload_exceeds_leaf_budget` call.
-//     Pre-PR2 was an O(N) walk of `frame.deltas`; post-PR2 is an
-//     O(1) Acquire load. Falsifies / confirms the Amdahl theory.
+//     Micro: just the `live_delta_payload_exceeds_leaf_budget` call,
+//     which is an O(1) Acquire load on the running-sum cache rather
+//     than an O(N) walk of `frame.deltas`.
 // ---------------------------------------------------------------------------
 
 /// Cumulative wall-clock nanoseconds spent inside the per-write
@@ -92,9 +91,9 @@ pub(crate) static INSTALL_WRITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Cumulative wall-clock nanoseconds spent inside
-/// `live_delta_payload_exceeds_leaf_budget`. Pre-PR2 this was an
-/// O(N) walk; post-PR2 it is an O(1) Acquire load on the running-sum
-/// cache. Numerator for
+/// `live_delta_payload_exceeds_leaf_budget`, which is an O(1) Acquire
+/// load on the per-frame running-sum cache rather than an O(N) walk of
+/// the frame's chains. Numerator for
 /// [`super::metrics_perf::live_delta_check_mean_hold_ns`].
 #[cfg(feature = "perf-counters")]
 pub(crate) static LIVE_DELTA_CHECK_NS_TOTAL: std::sync::atomic::AtomicU64 =
@@ -109,15 +108,13 @@ pub(crate) static LIVE_DELTA_CHECK_CALLS: std::sync::atomic::AtomicU64 =
 
 /// Per-chain contribution to the leaf-budget running sum.
 ///
-/// Mirrors the byte formula in the legacy
-/// `LatchedPinnedPage::live_delta_payload_exceeds_leaf_budget` scanner
-/// EXACTLY. The legacy scanner walked every chain, computed this
-/// per-chain value inline, and summed. PR2 promotes the inline
-/// formula to this single helper so the running-sum maintenance path
-/// (in `with_chain` / `with_all_chains` / `replace_leaf_and_chains` /
-/// `reconcile_frame_at`) and any fresh recompute (in the cache
-/// invariant test) agree byte-for-byte. The function is the SINGLE
-/// SOURCE OF TRUTH for the live-head byte cost — never duplicate it.
+/// This is the single source of truth for the per-chain live-head byte
+/// cost: the running-sum maintenance path (in `with_chain` /
+/// `with_all_chains` / `replace_leaf_and_chains` / `reconcile_frame_at`)
+/// and any fresh full recompute (in the cache-invariant test) both call
+/// it, so the incrementally maintained running sum can never drift from a
+/// from-scratch sum. Duplicating this formula elsewhere would reintroduce
+/// exactly that drift, so never inline it.
 ///
 /// Returns 0 when:
 ///   - the chain is empty,
@@ -133,10 +130,7 @@ pub(crate) static LIVE_DELTA_CHECK_CALLS: std::sync::atomic::AtomicU64 =
 ///   - inline payload > OVERFLOW_THRESHOLD:  CELL_OVERFLOW_REF_BYTES
 ///   - overflow:                              CELL_OVERFLOW_REF_BYTES
 pub(crate) fn chain_live_head_bytes(key: &[u8], chain: &VecDeque<VersionEntry>) -> u64 {
-    let Some(entry) = chain
-        .iter()
-        .find(|entry| entry.stop_ts == Ts::MAX && !matches!(entry.state, VersionState::Aborted))
-    else {
+    let Some(entry) = chain.iter().find(|entry| entry.is_live_head()) else {
         return 0;
     };
     if entry.is_tombstone {

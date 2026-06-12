@@ -63,11 +63,33 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::mvcc::timestamp::Ts;
-use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState};
+use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry};
+// Re-exported for the `#[path]`-included test modules that build `VersionEntry`
+// values via `use super::*` (the body no longer constructs `VersionState`
+// directly — that moved into `codec::decode_version_entry_value`).
+#[cfg(test)]
+use crate::mvcc::version::VersionState;
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::btree::{BTree, BTreePageStore};
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::reconcile::driver::{TreeIdent, TreeKind};
+
+mod codec;
+
+// Re-export the codec surface at the historical `history_store::` paths so
+// existing callers and the `#[path]`-included test modules (`use super::*`)
+// resolve every key/value codec symbol unchanged after the extraction.
+pub(crate) use codec::{
+    decode_version_entry_value, encode_history_key, encode_version_entry_value,
+};
+// `decode_history_key` and the tree-kind tags are only read by the
+// `#[path]`-included test modules via `use super::*`; gate the re-exports so
+// non-test builds do not warn on an unused import.
+#[cfg(test)]
+pub(crate) use codec::{decode_history_key, HISTORY_TREE_KIND_PRIMARY, HISTORY_TREE_KIND_SECONDARY};
+use codec::{
+    decode_overflow_payload, decode_value_header, probe_prefix, DATA_KIND_OVERFLOW,
+};
 
 // ---------------------------------------------------------------------------
 // Thread-local non-recursion sentinel
@@ -104,17 +126,6 @@ impl Drop for HistoryStoreGuard {
         HISTORY_STORE_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
     }
 }
-
-/// History key tree-kind tag for primary collection data.
-pub(crate) const HISTORY_TREE_KIND_PRIMARY: u8 = 0x00;
-
-/// History key tree-kind tag for secondary index data.
-pub(crate) const HISTORY_TREE_KIND_SECONDARY: u8 = 0x01;
-
-const HISTORY_PRIMARY_INDEX_ID: i64 = 0;
-const HISTORY_KEY_FIXED_PREFIX_LEN: usize = 8 + 1 + 8 + 4;
-const HISTORY_KEY_TS_LEN: usize = 12;
-const HISTORY_KEY_COUNTER_LEN: usize = 4;
 
 /// In-memory batch of history-store writes for one folded-leaf install.
 ///
@@ -170,216 +181,6 @@ struct StagedHistorySpill {
     key_bytes: Vec<u8>,
     entry: VersionEntry,
     counter: u32,
-}
-
-fn ts_from_le_slice(bytes: &[u8]) -> Ts {
-    let mut out = [0u8; 12];
-    out.copy_from_slice(bytes);
-    Ts::from_le_bytes(out)
-}
-
-fn u32_from_le_slice(bytes: &[u8]) -> u32 {
-    let mut out = [0u8; 4];
-    out.copy_from_slice(bytes);
-    u32::from_le_bytes(out)
-}
-
-fn u64_from_le_slice(bytes: &[u8]) -> u64 {
-    let mut out = [0u8; 8];
-    out.copy_from_slice(bytes);
-    u64::from_le_bytes(out)
-}
-
-// ---------------------------------------------------------------------------
-// Key encoding / decoding
-// ---------------------------------------------------------------------------
-
-/// Encode a history-store key per the Phase 4 schema.
-///
-/// Layout:
-/// `(collection_id BE 8)(tree_kind 1)(index_id BE 8)(key_len BE 4)`
-/// `(key_bytes)(start_ts BE 12)(counter BE 4)`.
-pub(crate) fn encode_history_key(
-    ident: &TreeIdent,
-    key_bytes: &[u8],
-    start_ts: Ts,
-    counter: u32,
-) -> Vec<u8> {
-    let (tree_kind, index_id) = history_tree_parts(ident);
-    let mut out = Vec::with_capacity(
-        HISTORY_KEY_FIXED_PREFIX_LEN
-            + key_bytes.len()
-            + HISTORY_KEY_TS_LEN
-            + HISTORY_KEY_COUNTER_LEN,
-    );
-    out.extend_from_slice(&ident.collection_id.to_be_bytes());
-    out.push(tree_kind);
-    out.extend_from_slice(&index_id.to_be_bytes());
-    out.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(key_bytes);
-    out.extend_from_slice(&start_ts.to_be_bytes());
-    out.extend_from_slice(&counter.to_be_bytes());
-    out
-}
-
-/// Inverse of [`encode_history_key`]. Returns `None` when `bytes` is too
-/// short to carry a valid header/footer.
-#[cfg(test)]
-pub(crate) fn decode_history_key(bytes: &[u8]) -> Option<(TreeIdent, &[u8], Ts, u32)> {
-    if bytes.len() < HISTORY_KEY_FIXED_PREFIX_LEN + HISTORY_KEY_TS_LEN + HISTORY_KEY_COUNTER_LEN {
-        return None;
-    }
-    let collection_id = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
-    let tree_kind = bytes[8];
-    let index_id = i64::from_be_bytes(bytes[9..17].try_into().ok()?);
-    let key_len = u32::from_be_bytes(bytes[17..21].try_into().ok()?) as usize;
-    let key_start = HISTORY_KEY_FIXED_PREFIX_LEN;
-    let key_end = key_start.checked_add(key_len)?;
-    let ts_end = key_end.checked_add(HISTORY_KEY_TS_LEN)?;
-    let counter_end = ts_end.checked_add(HISTORY_KEY_COUNTER_LEN)?;
-    if bytes.len() != counter_end {
-        return None;
-    }
-    let ident = history_ident_from_parts(collection_id, tree_kind, index_id)?;
-    let key_bytes = &bytes[key_start..key_end];
-    let mut ts_buf = [0u8; 12];
-    ts_buf.copy_from_slice(&bytes[key_end..ts_end]);
-    let start_ts = Ts::from_be_bytes(ts_buf);
-    let counter = u32::from_be_bytes(bytes[ts_end..counter_end].try_into().ok()?);
-    Some((ident, key_bytes, start_ts, counter))
-}
-
-fn history_tree_parts(ident: &TreeIdent) -> (u8, i64) {
-    match ident.kind {
-        TreeKind::Primary => (HISTORY_TREE_KIND_PRIMARY, HISTORY_PRIMARY_INDEX_ID),
-        TreeKind::Secondary { index_id } => (HISTORY_TREE_KIND_SECONDARY, index_id),
-    }
-}
-
-#[cfg(test)]
-fn history_ident_from_parts(collection_id: i64, tree_kind: u8, index_id: i64) -> Option<TreeIdent> {
-    let kind = match tree_kind {
-        HISTORY_TREE_KIND_PRIMARY if index_id == HISTORY_PRIMARY_INDEX_ID => TreeKind::Primary,
-        HISTORY_TREE_KIND_SECONDARY => TreeKind::Secondary { index_id },
-        _ => return None,
-    };
-    Some(TreeIdent {
-        collection_id,
-        kind,
-    })
-}
-
-/// Build the prefix that every entry for `(TreeIdent, key_bytes)` shares.
-fn probe_prefix(ident: &TreeIdent, key_bytes: &[u8]) -> Vec<u8> {
-    let (tree_kind, index_id) = history_tree_parts(ident);
-    let mut out = Vec::with_capacity(HISTORY_KEY_FIXED_PREFIX_LEN + key_bytes.len());
-    out.extend_from_slice(&ident.collection_id.to_be_bytes());
-    out.push(tree_kind);
-    out.extend_from_slice(&index_id.to_be_bytes());
-    out.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(key_bytes);
-    out
-}
-
-// ---------------------------------------------------------------------------
-// VersionEntry value serialization
-// ---------------------------------------------------------------------------
-
-const DATA_KIND_INLINE: u8 = 0;
-const DATA_KIND_OVERFLOW: u8 = 1;
-
-/// Serialize a `VersionEntry` to the history-store value layout.
-pub(crate) fn encode_version_entry_value(entry: &VersionEntry) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12 + 12 + 8 + 1 + 1 + 16);
-    out.extend_from_slice(&entry.start_ts.to_le_bytes());
-    out.extend_from_slice(&entry.stop_ts.to_le_bytes());
-    out.extend_from_slice(&entry.txn_id.to_le_bytes());
-    out.push(u8::from(entry.is_tombstone));
-    match &entry.data {
-        VersionData::Inline(bytes) => {
-            out.push(DATA_KIND_INLINE);
-            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            out.extend_from_slice(bytes);
-        }
-        VersionData::Overflow(oref) => {
-            out.push(DATA_KIND_OVERFLOW);
-            out.extend_from_slice(&oref.first_page().to_le_bytes());
-            out.extend_from_slice(&oref.total_length().to_le_bytes());
-        }
-    }
-    out
-}
-
-/// Deserialize a `VersionEntry` from the history-store value layout.
-///
-/// Overflow entries require an `allocator` so `OverflowRef::new_owned` can
-/// bump the refcount. Passing `None` rehydrates overflow payloads as an
-/// error — callers on a pure probe path that only need metadata (or that
-/// reject overflow entries in tests) can opt out of the allocator bump.
-pub(crate) fn decode_version_entry_value(
-    bytes: &[u8],
-    allocator: Option<&AllocatorHandle>,
-) -> Result<VersionEntry> {
-    if bytes.len() < 12 + 12 + 8 + 1 + 1 {
-        return Err(Error::Internal(
-            "history_store: value buffer truncated before fixed header".into(),
-        ));
-    }
-    let start_ts = ts_from_le_slice(&bytes[0..12]);
-    let stop_ts = ts_from_le_slice(&bytes[12..24]);
-    let txn_id = u64_from_le_slice(&bytes[24..32]);
-    let is_tombstone = bytes[32] != 0;
-    let data_kind = bytes[33];
-    let data = match data_kind {
-        DATA_KIND_INLINE => {
-            if bytes.len() < 34 + 4 {
-                return Err(Error::Internal(
-                    "history_store: inline value missing length prefix".into(),
-                ));
-            }
-            let len = u32_from_le_slice(&bytes[34..38]) as usize;
-            let start = 38usize;
-            let end = start
-                .checked_add(len)
-                .ok_or_else(|| Error::Internal("history_store: inline length overflow".into()))?;
-            if bytes.len() < end {
-                return Err(Error::Internal(
-                    "history_store: inline payload truncated".into(),
-                ));
-            }
-            VersionData::Inline(bytes[start..end].to_vec())
-        }
-        DATA_KIND_OVERFLOW => {
-            if bytes.len() < 34 + 4 + 8 {
-                return Err(Error::Internal(
-                    "history_store: overflow value truncated".into(),
-                ));
-            }
-            let first_page = u32_from_le_slice(&bytes[34..38]);
-            let total_length = u64_from_le_slice(&bytes[38..46]);
-            let alloc = allocator.ok_or_else(|| {
-                Error::Internal("history_store: overflow entry requires allocator handle".into())
-            })?;
-            VersionData::Overflow(OverflowRef::new_owned(
-                first_page,
-                total_length,
-                alloc.clone(),
-            )?)
-        }
-        _ => {
-            return Err(Error::Internal(format!(
-                "history_store: unknown data_kind {data_kind}"
-            )));
-        }
-    };
-    Ok(VersionEntry {
-        start_ts,
-        stop_ts,
-        txn_id,
-        state: VersionState::Committed,
-        data,
-        is_tombstone,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -631,8 +432,15 @@ impl HistoryStore<BufferPoolPageStore> {
     ///
     /// The history B-tree root is persisted to the file header after the batch
     /// is applied because inserting the staged versions can split the history
-    /// root. The subsequent handle flush writes the history pool and updated
-    /// header before the caller proceeds with main-leaf installation.
+    /// root. The subsequent handle flush stamps the spill's `Unflushable`
+    /// history frames at the current journal-durable LSN and writes the
+    /// history pool to the backing store before the header write is issued,
+    /// so when this returns the aged versions reach the backing store ahead
+    /// of both the header write that references them and the folded main leaf
+    /// the caller installs next (history-before-leaf WAL ordering). That
+    /// ordering is OS-page-cache write order only — no fsync runs between the
+    /// history pass and the header write; the checkpoint boundary-record
+    /// fsync is the durable barrier.
     ///
     /// # Errors
     ///
@@ -697,21 +505,22 @@ impl<S: BTreePageStore> HistoryStore<S> {
         let mut victims: Vec<Victim> = Vec::with_capacity(rows.len());
         for (key, cell_value) in rows {
             let value_bytes = cell_value_bytes(cell_value)?;
-            if value_bytes.len() < 34 {
+            // Reuse the codec's fixed-header decode rather than reparsing raw
+            // offsets here — keeps GC's `stop_ts`/`data_kind` view byte-for-byte
+            // identical to `decode_version_entry_value`. A short buffer that the
+            // full decoder would reject is skipped (matches the prior
+            // `len < 34` / `len < 46` `continue` guards).
+            let Ok(header) = decode_value_header(&value_bytes) else {
+                continue;
+            };
+            if header.stop_ts == Ts::MAX || header.stop_ts > ort {
                 continue;
             }
-            let stop_ts = ts_from_le_slice(&value_bytes[12..24]);
-            if stop_ts == Ts::MAX || stop_ts > ort {
-                continue;
-            }
-            let data_kind = value_bytes[33];
-            let overflow = if data_kind == DATA_KIND_OVERFLOW {
-                if value_bytes.len() < 46 {
-                    continue;
+            let overflow = if header.data_kind == DATA_KIND_OVERFLOW {
+                match decode_overflow_payload(&value_bytes) {
+                    Ok(payload) => Some(payload),
+                    Err(_) => continue,
                 }
-                let first_page = u32_from_le_slice(&value_bytes[34..38]);
-                let total_length = u64_from_le_slice(&value_bytes[38..46]);
-                Some((first_page, total_length))
             } else {
                 None
             };
@@ -757,6 +566,15 @@ fn cell_value_bytes(value: crate::storage::btree::CellValue) -> Result<Vec<u8>> 
     }
 }
 
+/// Leak the producer's `OverflowRef` after a history record is durably
+/// inserted, so the chain's "persisted history record owns +1 refcount"
+/// charge stays attached to the persisted cell rather than the transient
+/// in-flight handle.
+///
+/// The full persisted-history refcount lifecycle (spill bump → persisted +1 →
+/// GC decref via `OverflowRef::Drop`) now lives with the refcount machinery in
+/// `crate::storage::allocator::overflow`; see that module's
+/// "Persisted-history refcount lifecycle" note.
 fn forget_history_record_overflow_ref(entry: VersionEntry) {
     if let VersionData::Overflow(oref) = entry.data {
         std::mem::forget(oref);
@@ -782,3 +600,7 @@ mod history_store_visibility_probe;
 #[cfg(test)]
 #[path = "tests/history_store_overflow_transfer.rs"]
 mod history_store_overflow_transfer;
+
+#[cfg(test)]
+#[path = "tests/history_store_spill_durability.rs"]
+mod history_store_spill_durability;

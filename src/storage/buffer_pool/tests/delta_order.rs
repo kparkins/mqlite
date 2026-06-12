@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::test_support::ZeroIo;

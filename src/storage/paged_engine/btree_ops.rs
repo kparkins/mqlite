@@ -7,7 +7,7 @@ use bson::{Bson, Document};
 use crate::error::{Error, Result};
 use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
-use crate::mvcc::PrimaryWrite;
+use crate::mvcc::transaction::PrimaryWrite;
 use crate::query::eval_filter;
 use crate::storage::btree::{BTree, BTreePageStore, HistoryProbe};
 use crate::validation::validate_document;

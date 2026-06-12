@@ -391,7 +391,7 @@ fn assert_post_register_cleanup_with_options(
 #[test]
 fn test_pending_delta_visible_to_own_txn() {
     let snap = snapshot_for(pending_entry(TXN_ID));
-    let own_view = ReadView::new(READ_TS, TXN_ID);
+    let own_view = ReadView::new_frontier_pinned_for_tests(READ_TS, TXN_ID);
 
     let visible = snap.visible_at(b"k", &own_view);
 
@@ -605,6 +605,97 @@ mod post_register {
             Us026PostRegisterFailpoint::BeforeLogReservation,
             "us026-before-log-reservation.mqlite",
         );
+    }
+}
+
+/// Abort-flip-failure escalation: when the pre-durable cleanup flip from
+/// `Pending`→`Aborted` itself fails, the publish slot must NOT be marked
+/// aborted (which would advance the published frontier past it). A foreign
+/// reader must never observe the unflipped-Pending-below-frontier head as
+/// committed (the frontier-passage rule treats foreign Pending entries below
+/// the published frontier as committed). The engine poisons instead and the
+/// reader sees no dirty document.
+///
+/// Pre-fix this test fails: `cleanup_registered_pre_durable_failure` swallows
+/// the flip `Err`, calls `mark_aborted(slot)` so the frontier advances past
+/// the never-committed slot, and the foreign reader observes the aborted
+/// document — a dirty read of data that was never committed.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_abort_flip_failure_escalates_engine_fatal_no_dirty_read() {
+    use mqlite::error::EngineFatalReason;
+
+    let (_dir, client) = open_client("abort-flip-failure-no-dirty-read.mqlite");
+    client
+        .database("db")
+        .create_collection("c")
+        .expect("create collection");
+    let coll = client.database("db").collection::<Document>("c");
+
+    // Arm both: (1) a pre-durable failure AFTER both primary and secondary
+    // Pending deltas are installed (so resident Pending chain entries exist
+    // when cleanup runs), and (2) a forced failure inside the abort flip so
+    // those Pending heads are left unflipped.
+    client.__arm_abort_flip_failure();
+    client.__us026_arm_post_register_failpoint(Us026PostRegisterFailpoint::BeforeLogReservation);
+
+    let writer_result = coll.insert_one(&test_doc(1, "dirty@example.com"));
+
+    // The writer's insert must fail. With the fix it fails as EngineFatal
+    // (the poison escalation); the injected pre-reservation Internal error is
+    // never surfaced because the flip failed first.
+    assert!(
+        matches!(writer_result, Err(Error::EngineFatal { .. })),
+        "writer insert must escalate to EngineFatal when the abort flip fails, got {writer_result:?}"
+    );
+
+    // The engine must be poisoned with the dedicated pre-durable reason.
+    assert_eq!(
+        client.__us036_poisoned_reason(),
+        Some(EngineFatalReason::PreDurableAbortFlipFailure),
+        "engine must be poisoned after a failed pre-durable abort flip"
+    );
+
+    // The leaked Pending head may legitimately remain resident in memory (the
+    // flip genuinely failed). That is safe under the fix: the engine is
+    // poisoned, so no reader can ever publish past the slot, and reopen
+    // recovery discards the never-durable txn wholesale — the resident Pending
+    // head dies with the process. What must hold is that no live reader sees
+    // it as committed, asserted below.
+
+    // A successor commit would, pre-fix, advance the published frontier past
+    // the leaked head's commit_ts and expose it via the frontier-passage rule.
+    // Post-fix the poisoned engine fails this closed, so the frontier never
+    // advances past the never-committed slot.
+    let successor = client
+        .database("db")
+        .collection::<Document>("c")
+        .insert_one(&test_doc(2, "successor@example.com"));
+    assert!(
+        matches!(successor, Err(Error::EngineFatal { .. })),
+        "successor commit must fail closed against a poisoned engine, got {successor:?}"
+    );
+
+    // A SECOND foreign client handle (its own thread) reads the leaked key.
+    // It must NEVER see the aborted document. Acceptable outcomes: EngineFatal
+    // (poison propagated), CollectionNotFound, or key-absent (Ok(None)). A
+    // dirty read returning the document is the bug under test and must not
+    // occur.
+    let read_result = thread::spawn(move || {
+        client
+            .database("db")
+            .collection::<Document>("c")
+            .find_one(doc! { "_id": 1 })
+    })
+    .join()
+    .expect("foreign reader thread");
+    match read_result {
+        Err(Error::EngineFatal { .. }) | Err(Error::CollectionNotFound { .. }) => {}
+        Ok(None) => {}
+        Ok(Some(found)) => panic!(
+            "DIRTY READ: foreign reader observed never-committed aborted document: {found:?}"
+        ),
+        Err(other) => panic!("unexpected reader error: {other:?}"),
     }
 }
 

@@ -13,10 +13,26 @@
 //! - **Sibling pointers**: leaf pages form a doubly-linked list enabling `O(1)` range
 //!   scan advancement.
 //!
+//! ## Module layout (R14)
+//!
+//! - [`store`] — the [`BTreePageStore`] trait, [`LeafPageImage`], and the
+//!   reader-path [`HistoryProbe`] trait.
+//! - [`layout`] — leaf-cell layout constants and the canonical cell-size
+//!   arithmetic shared by every fit/split-classification site.
+//! - [`internal_node`] / [`leaf_node`] — parsed page representations (the
+//!   [`node`] facade re-exports them under the historical path).
+//! - [`overflow`] — overflow-chain read/write/free/collect plus version-data
+//!   resolution.
+//! - [`chain_migration`] — atomic MVCC delta-chain migration across splits,
+//!   merges, and redistributions.
+//! - [`classify`] — SMO leaf-shape classifiers (consumed only by `smo_latch`).
+//! - `insert` / `delete` / `scan` / `chain` — the CRUD and traversal paths.
+//!
 //! ## Page access abstraction
 //!
-//! The [`BTreePageStore`] trait decouples the B+ tree logic from the concrete page I/O
-//! (buffer pool + allocator). Tests mount an in-memory store from the test module tree.
+//! The [`BTreePageStore`] trait decouples the B+ tree logic from the concrete
+//! page I/O (buffer pool + allocator). Tests mount an in-memory store from the
+//! test module tree.
 //!
 //! ## Root tracking
 //!
@@ -24,99 +40,93 @@
 //! `root_level: u8` (0 = leaf, > 0 = internal at that level).  A root split increments
 //! `root_level` and updates `root_page`; callers must persist the new root page number
 //! (e.g. into the catalog or file header) if durability is required.
-
-use std::collections::{BTreeMap, VecDeque};
-use std::ops::Deref;
-use std::sync::Arc;
+//!
+//! ## Structural-mutation exclusivity contract
+//!
+//! Per-page latches alone do NOT make a structural mutation safe. A reader
+//! descends the tree holding at most a short shared latch on the page it is
+//! crabbing through and otherwise relies on copy-on-write page-image
+//! snapshots — it never latches the whole root-to-leaf path. A structural
+//! mutation (a leaf or internal split, a leaf merge / redistribute, a page
+//! free, or an overflow-chain migration) rewrites pages OTHER than the one a
+//! crabbing reader currently holds: it moves cells between siblings, promotes
+//! or demotes separators in parents, and recycles freed page numbers. If such
+//! a mutation ran concurrently with a reader holding only a single per-page
+//! latch, the reader could follow a child pointer into a page that has already
+//! been emptied, merged away, or repurposed — observing a torn or vanished
+//! subtree.
+//!
+//! The invariant that prevents this: structural mutation is only safe under
+//! engine-level exclusivity over the entire affected path, NOT under per-call
+//! page latches. In production the write path establishes this two ways. (1)
+//! Ordinary CRUD that turns out to be structural escalates from a per-leaf
+//! latch to exclusive latches over every page on the root-to-leaf path (the
+//! SMO-latch set in `paged_engine::smo_latch`); a write classified as
+//! root-neutral takes only the target-leaf latch, so the escalation is what
+//! buys structural safety. (2) Whole-tree operations establish exclusivity by
+//! making the tree unreachable first: checkpoint materialization runs under
+//! the engine's `metadata.write()` fence, while the index-rebuild path frees
+//! an old derived tree ([`BTree::free_all_pages`]) only after the rebuild's
+//! unpublished structural batch has replaced every reference to it — no
+//! reader can hold a root pointer into the freed subtree, which is the same
+//! guarantee by a different mechanism. Both paths take `&mut self`
+//! on the [`BTree`], so the Rust borrow checker also forbids a second
+//! concurrent mutator of the same tree wrapper. Calling a mutating method
+//! while only a per-page latch (or no engine-level exclusivity) is held is a
+//! correctness bug, not merely a performance one: it races readers that the
+//! page latch was never designed to exclude.
 
 use crate::error::Result;
-use crate::mvcc::read_view::ChainSnapshot;
-use crate::mvcc::version::VersionEntry;
-use crate::storage::buffer_pool::{LatchMode, PageSize};
 
-/// Reader-path history fallthrough.
-///
-/// Bound to a specific durable tree identity at the call site — the BTree
-/// layer only sees an opaque probe object and walks `(key, read_ts)`.
-/// A `None` return means "no visible history entry"; a `Some(entry)` return
-/// means the probe found the newest history version visible at `read_ts`
-/// (tombstones included — the caller treats tombstones as "key absent").
-pub(crate) trait HistoryProbe {
-    fn probe_visible_version(
-        &self,
-        key: &[u8],
-        read_ts: crate::mvcc::timestamp::Ts,
-    ) -> Result<Option<VersionEntry>>;
-}
-use crate::storage::page::{OVERFLOW_HEADER_SIZE, PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
-
-/// Immutable 32 KiB leaf page image returned by reader paths.
-///
-/// Buffer-pool readers can hold the existing published `ArcSwap<Vec<u8>>`
-/// snapshot without cloning the page bytes. Structural staged writes still
-/// return owned images so mutable paths never edit shared frame snapshots in
-/// place.
-#[derive(Clone)]
-pub(crate) enum LeafPageImage {
-    Shared(Arc<Vec<u8>>),
-    Owned(Box<[u8; PAGE_SIZE_LEAF as usize]>),
-}
-
-impl LeafPageImage {
-    pub(crate) fn shared(data: Arc<Vec<u8>>) -> Result<Self> {
-        if data.len() != PAGE_SIZE_LEAF as usize {
-            return Err(crate::error::Error::Internal(format!(
-                "leaf page image has {} bytes, expected {}",
-                data.len(),
-                PAGE_SIZE_LEAF
-            )));
-        }
-        Ok(Self::Shared(data))
-    }
-
-    pub(crate) fn owned(data: Box<[u8; PAGE_SIZE_LEAF as usize]>) -> Self {
-        Self::Owned(data)
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Shared(data) => data.as_slice(),
-            Self::Owned(data) => data.as_slice(),
-        }
-    }
-}
-
-impl Deref for LeafPageImage {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
+use node::{InternalNode, LeafNode};
 
 // ---------------------------------------------------------------------------
-// Constants
+// Submodules
 // ---------------------------------------------------------------------------
 
-/// Values larger than this (in bytes) are stored in an overflow chain.
-///
-/// Chosen to leave room for a reasonable key and cell-pointer overhead in
-/// the 32 KB leaf page.  Documents ≤ 30 KB are stored inline.
-pub(crate) const OVERFLOW_THRESHOLD: usize = 30 * 1024;
+mod chain;
+mod chain_migration;
+mod classify;
+mod internal_node;
+mod layout;
+mod leaf_node;
+mod node;
+mod overflow;
+mod store;
 
-/// Usable payload bytes per overflow page.
-pub(super) const OVERFLOW_PAGE_DATA: usize = PAGE_SIZE_LEAF as usize - OVERFLOW_HEADER_SIZE;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "tests/range_scan_latch_scope.rs"]
+pub mod range_scan_latch_scope;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "tests/reader_crabbing_observations.rs"]
+pub mod reader_crabbing_observations;
+pub(crate) mod reconcile;
 
-/// A leaf with fewer than this many cells after a deletion triggers a
-/// merge-or-redistribute operation.
-pub(super) const MIN_LEAF_CELLS: usize = 4;
+mod delete;
+mod insert;
+mod scan;
 
-/// Non-root leaves also try to stay at least half full by bytes.
-///
-/// Leaf cells are variable-sized, so count-only balancing can choose a merge
-/// that overflows the 32 KB page even though the sibling pair could be safely
-/// redistributed.
-pub(super) const MIN_LEAF_BYTES: usize = PAGE_SIZE_LEAF as usize / 2;
+use chain::{collect_subtree_pages, free_subtree};
+
+// ---------------------------------------------------------------------------
+// Re-exports — every historical `btree::` path must resolve unchanged.
+// ---------------------------------------------------------------------------
+
+pub(crate) use classify::{leaf_can_insert_value, leaf_needs_rebalance_after_delete};
+pub(crate) use layout::{page_size_for_level, OVERFLOW_THRESHOLD};
+pub(crate) use node::CellValue;
+pub(crate) use overflow::read_overflow_chain;
+pub(crate) use store::{BTreePageStore, HistoryProbe, LeafPageImage};
+
+#[cfg(test)]
+#[path = "tests/mem_page_store.rs"]
+mod mem_page_store;
+#[cfg(test)]
+pub(crate) use mem_page_store::MemPageStore;
+
+// ---------------------------------------------------------------------------
+// Path step
+// ---------------------------------------------------------------------------
 
 /// One page on a root-to-leaf B-tree traversal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,22 +142,8 @@ pub(crate) struct BTreePathStep {
 }
 
 // ---------------------------------------------------------------------------
-// Submodules
+// Leaf-range inspectors (consumed by index_maint + smo_latch)
 // ---------------------------------------------------------------------------
-
-mod chain;
-mod node;
-#[cfg(any(test, feature = "test-hooks"))]
-#[path = "tests/range_scan_latch_scope.rs"]
-pub mod range_scan_latch_scope;
-#[cfg(any(test, feature = "test-hooks"))]
-#[path = "tests/reader_crabbing_observations.rs"]
-pub mod reader_crabbing_observations;
-pub(crate) mod reconcile;
-
-use chain::{collect_subtree_pages, free_subtree};
-pub(crate) use node::CellValue;
-use node::{InternalNode, LeafNode};
 
 /// Return true when the encoded leaf contains a base cell in `[start, end)`.
 pub(crate) fn leaf_contains_key_in_range(
@@ -197,157 +193,6 @@ pub(crate) fn leaf_unique_prefix_sibling_pages(
 }
 
 // ---------------------------------------------------------------------------
-// Page store abstraction
-// ---------------------------------------------------------------------------
-
-/// Abstraction for reading, writing, allocating, and freeing B+ tree pages.
-///
-/// Implementors can back the store with the buffer pool + page allocator for
-/// production use, or with an in-memory hash map for unit tests.
-pub(crate) trait BTreePageStore {
-    /// Shared page guard held by reader traversal.
-    type SharedReadGuard<'a>
-    where
-        Self: 'a;
-
-    /// Read a 4 KB internal page into a heap-allocated buffer.
-    fn read_internal(&self, page: u32) -> Result<Box<[u8; PAGE_SIZE_INTERNAL as usize]>>;
-
-    /// Read a 32 KB leaf (or overflow) page into a heap-allocated buffer,
-    /// returning an optional [`ChainSnapshot`] pinning every per-key MVCC
-    /// version chain on the frame.
-    ///
-    /// The returned snapshot deep-clones each `VersionEntry`, running
-    /// `OverflowRef::Clone` (CAS-loop incref) so every overflow page
-    /// referenced from the chain is pinned for the snapshot's lifetime.
-    /// Callers that do not need chain visibility can ignore the second
-    /// tuple element — dropping the snapshot RAII-decrefs every bumped
-    /// refcount.
-    ///
-    /// `None` is returned when the backing implementation has no MVCC
-    /// chains for `page` (e.g. overflow pages read through the same API,
-    /// or a buffer pool frame that is not currently resident).
-    fn read_leaf(&self, page: u32) -> Result<(LeafPageImage, Option<ChainSnapshot>)>;
-
-    /// Pin `page` and acquire the reader-side shared page latch.
-    ///
-    /// Implementations without page-local latches may return a no-op guard.
-    fn pin_shared_for_read<'a>(
-        &'a self,
-        page: u32,
-        size: PageSize,
-    ) -> Result<Self::SharedReadGuard<'a>>;
-
-    /// Read an internal page while its reader guard is still live.
-    fn read_internal_guarded(
-        &self,
-        page: u32,
-        _guard: &Self::SharedReadGuard<'_>,
-    ) -> Result<Box<[u8; PAGE_SIZE_INTERNAL as usize]>> {
-        self.read_internal(page)
-    }
-
-    /// Read a leaf page while its reader guard is still live.
-    fn read_leaf_guarded(
-        &self,
-        page: u32,
-        _guard: &Self::SharedReadGuard<'_>,
-    ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
-        self.read_leaf(page)
-    }
-
-    /// Read a point-lookup leaf while its reader guard is still live.
-    fn read_leaf_for_key_guarded(
-        &self,
-        page: u32,
-        guard: &Self::SharedReadGuard<'_>,
-        key: &[u8],
-    ) -> Result<(LeafPageImage, Option<ChainSnapshot>)> {
-        let _ = key;
-        self.read_leaf_guarded(page, guard)
-    }
-
-    /// Write a 4 KB internal page.
-    fn write_internal(&mut self, page: u32, data: &[u8; PAGE_SIZE_INTERNAL as usize])
-        -> Result<()>;
-
-    /// Write a 32 KB leaf (or overflow) page.
-    fn write_leaf_structural(
-        &mut self,
-        page: u32,
-        data: &[u8; PAGE_SIZE_LEAF as usize],
-    ) -> Result<()>;
-
-    /// Allocate a new 4 KB internal page.  Returns the page number.
-    fn alloc_internal(&mut self) -> Result<u32>;
-
-    /// Allocate a new 32 KB leaf page.  Returns the page number.
-    fn alloc_leaf(&mut self) -> Result<u32>;
-
-    /// Return a 4 KB internal page to the free pool.
-    fn free_internal(&mut self, page: u32) -> Result<()>;
-
-    /// Return a 32 KB leaf page to the free pool.
-    fn free_leaf(&mut self, page: u32) -> Result<()>;
-
-    // -----------------------------------------------------------------------
-    // MVCC version-chain accessors (T3.5 → PR0.5)
-    //
-    // Leaf frames own per-key MVCC version chains. Split / merge operations
-    // migrate these chains alongside the cells that own them; the `free_leaf`
-    // call sites in the merge path are guarded by `chains_empty` to fail
-    // loudly if migration is ever skipped.
-    //
-    // PR0.5 unifies every mutation behind `with_chain_under_latch` /
-    // `with_all_chains_under_latch`. Both pin the leaf and acquire the
-    // per-page latch before invoking the caller's closure, so concurrent
-    // CRUD writers serialize on `frame.deltas` instead of racing through
-    // the buffer-pool partition mutex. PR1's selective CoW and PR2's
-    // running-sum cache hang off this single choke point.
-    // -----------------------------------------------------------------------
-
-    /// True iff no delta chains are attached to leaf `page`. Read-only
-    /// inspector used by structural-cleanup guards (e.g. the
-    /// `free_leaf`-path `chains_empty` check). Implementations may use a
-    /// shared latch or no latch at all; mutation is forbidden.
-    fn chains_empty(&self, page: u32) -> Result<bool>;
-
-    /// Pin leaf `page` under `mode`, run `f` against the chain slot for
-    /// `key`, and release the pin+latch.
-    ///
-    /// The closure receives `&mut Option<Arc<...>>` — `None` when the
-    /// frame currently has no chain for `key`. After it returns, the
-    /// slot is written back to the frame's `deltas` map: `Some` is
-    /// inserted, `None` leaves the slot absent.
-    ///
-    /// `mode` must be [`LatchMode::Exclusive`] for chain mutation;
-    /// shared callers should use `pin_shared_for_read` and the snapshot
-    /// helpers on `LatchedPinnedPage` instead.
-    fn with_chain_under_latch<R, F>(
-        &mut self,
-        page: u32,
-        key: &[u8],
-        mode: LatchMode,
-        f: F,
-    ) -> Result<R>
-    where
-        F: FnOnce(&mut Option<Arc<VecDeque<VersionEntry>>>) -> R;
-
-    /// Pin leaf `page` under `mode`, run `f` against the entire chain
-    /// map, and release the pin+latch. Used by leaf-merge migration
-    /// (drain) and overflow-page repurpose (clear).
-    fn with_all_chains_under_latch<R, F>(&mut self, page: u32, mode: LatchMode, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>) -> R;
-}
-
-#[cfg(test)]
-#[path = "tests/mem_page_store.rs"]
-mod mem_page_store;
-#[cfg(test)]
-pub(crate) use mem_page_store::MemPageStore;
-
-// ---------------------------------------------------------------------------
 // Empty-page seed helpers
 // ---------------------------------------------------------------------------
 //
@@ -367,7 +212,8 @@ pub(crate) use mem_page_store::MemPageStore;
 
 /// Build the bytes of a valid empty 32 KB leaf page (zero cells,
 /// no sibling links, no flags).
-pub(crate) fn empty_leaf_page_bytes() -> Result<[u8; PAGE_SIZE_LEAF as usize]> {
+pub(crate) fn empty_leaf_page_bytes() -> Result<[u8; crate::storage::page::PAGE_SIZE_LEAF as usize]>
+{
     let node = LeafNode {
         flags: 0,
         next_leaf_page: 0,
@@ -379,7 +225,8 @@ pub(crate) fn empty_leaf_page_bytes() -> Result<[u8; PAGE_SIZE_LEAF as usize]> {
 
 /// Build the bytes of a valid empty 4 KB internal page (level 0,
 /// zero entries, zero rightmost child).
-pub(crate) fn empty_internal_page_bytes() -> Result<[u8; PAGE_SIZE_INTERNAL as usize]> {
+pub(crate) fn empty_internal_page_bytes(
+) -> Result<[u8; crate::storage::page::PAGE_SIZE_INTERNAL as usize]> {
     let node = InternalNode {
         level: 0,
         entries: Vec::new(),
@@ -473,41 +320,12 @@ impl<S: BTreePageStore> BTree<S> {
     /// The list includes internal, leaf, and overflow pages. Callers that need
     /// deterministic multi-page latch ordering should sort the returned vector
     /// by page id before acquiring latches.
-    pub(crate) fn collect_pages_by_size(&mut self) -> Result<Vec<(u32, PageSize)>> {
+    pub(crate) fn collect_pages_by_size(&mut self) -> Result<Vec<(u32, crate::storage::buffer_pool::PageSize)>> {
         let mut pages = Vec::new();
         collect_subtree_pages(&self.store, self.root_page, self.root_level, &mut pages)?;
         Ok(pages)
     }
 }
-
-/// Return whether `data` has room for an inserted leaf cell.
-pub(crate) fn leaf_can_insert_value(data: &[u8], key_len: usize, value_len: usize) -> Result<bool> {
-    let node = LeafNode::parse(data)?;
-    Ok(node.can_insert(encoded_leaf_cell_size(key_len, value_len)))
-}
-
-/// Return whether deleting `key` from `data` would make a non-root leaf rebalance.
-pub(crate) fn leaf_needs_rebalance_after_delete(data: &[u8], key: &[u8]) -> Result<bool> {
-    let mut node = LeafNode::parse(data)?;
-    if let Ok(idx) = node.binary_search(key) {
-        node.cells.remove(idx);
-    }
-    Ok(node.needs_rebalance())
-}
-
-fn encoded_leaf_cell_size(key_len: usize, value_len: usize) -> usize {
-    let value_size = if value_len > OVERFLOW_THRESHOLD {
-        8
-    } else {
-        4 + value_len
-    };
-    2 + key_len + 1 + value_size
-}
-
-mod delete;
-mod insert;
-mod scan;
-pub(crate) use scan::read_overflow_chain;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -548,3 +366,19 @@ mod split_atomicity;
 #[cfg(test)]
 #[path = "tests/leaf_cell_decode.rs"]
 mod leaf_cell_decode;
+
+#[cfg(test)]
+#[path = "tests/split_leaf_byte_budget.rs"]
+mod split_leaf_byte_budget;
+
+#[cfg(test)]
+#[path = "tests/replace_existing_overflow_leak.rs"]
+mod replace_existing_overflow_leak;
+
+#[cfg(test)]
+#[path = "tests/overflow_chain_corruption.rs"]
+mod overflow_chain_corruption;
+
+#[cfg(test)]
+#[path = "tests/bugsuspect_range_scan_history_divergence.rs"]
+mod bugsuspect_range_scan_history_divergence;

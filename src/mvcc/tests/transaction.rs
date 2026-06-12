@@ -257,7 +257,7 @@ fn stage_primary_insert_accumulates() {
 /// stage→emit→decode chain end-to-end at the unit-test layer.
 #[test]
 fn encoded_logical_txn_frame_round_trips_stage_time_ids() {
-    use crate::journal::log_file::{
+    use crate::journal::wire::{
         DecodeCtx, LogicalOp, LogicalOpKind, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
     };
     use crate::mvcc::timestamp::Ts;

@@ -8,7 +8,7 @@ use bson::{Bson, Document};
 use crate::error::{Error, Result};
 use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
-use crate::mvcc::{PrimaryOp, PrimaryWrite};
+use crate::mvcc::transaction::{PrimaryOp, PrimaryWrite};
 use crate::query::get_nested_field;
 use crate::storage::btree::{BTree, BTreePageStore, HistoryProbe};
 use crate::storage::oid::ObjectIdGenerator;

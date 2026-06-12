@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::{EngineFatalReason, Error, Result};
-use crate::mvcc::{TimestampOracle, Ts};
+use crate::mvcc::timestamp::{TimestampOracle, Ts};
 
 use super::publish_sequencer::{PublishSequencer, PublishSlotGuard};
 use super::writer_registry::{NsWriteTicket, NsWriterRegistry};

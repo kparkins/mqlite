@@ -1,44 +1,13 @@
 use crate::error::Result;
-use crate::storage::buffer_pool::{LatchMode, PageSize};
-use crate::storage::page::OverflowPageHeader;
+use crate::storage::buffer_pool::PageSize;
 
-use super::{BTreePageStore, CellValue, LeafNode};
+use super::overflow::{collect_overflow_pages, free_overflow_chain};
+use super::store::BTreePageStore;
+use super::{CellValue, LeafNode};
 
 // ---------------------------------------------------------------------------
-// Overflow chain helpers
+// Subtree page walks (free / collect)
 // ---------------------------------------------------------------------------
-
-pub(super) fn free_overflow_chain<S: BTreePageStore>(store: &mut S, first_page: u32) -> Result<()> {
-    let mut cur = first_page;
-    while cur != 0 {
-        let (buf, _) = store.read_leaf(cur)?;
-        let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
-        let next = hdr.next_overflow_page;
-        // Overflow pages carry no MVCC data; clear any stale chain
-        // remnants from a prior data-leaf life of this page number so
-        // the T3.5 `chains_empty` guard inside `free_leaf` paths does
-        // not trip. The frame may not be resident — that's a no-op.
-        store.with_all_chains_under_latch(cur, LatchMode::Exclusive, |chains| chains.clear())?;
-        store.free_leaf(cur)?;
-        cur = next;
-    }
-    Ok(())
-}
-
-pub(super) fn collect_overflow_pages<S: BTreePageStore>(
-    store: &S,
-    first_page: u32,
-    pages: &mut Vec<(u32, PageSize)>,
-) -> Result<()> {
-    let mut cur = first_page;
-    while cur != 0 {
-        let (buf, _) = store.read_leaf(cur)?;
-        let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
-        pages.push((cur, PageSize::Large32k));
-        cur = hdr.next_overflow_page;
-    }
-    Ok(())
-}
 
 pub(super) fn collect_subtree_pages<S: BTreePageStore>(
     store: &S,

@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use super::log_file::{JournalPageSize, JOURNAL_HEADER_SIZE};
+use super::wire::{JournalPageSize, JOURNAL_HEADER_SIZE};
 use super::*;
 use crate::mvcc::Ts;
 use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};

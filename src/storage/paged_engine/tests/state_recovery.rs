@@ -9,9 +9,11 @@
 
 use bson::doc;
 
-use super::{validate_frame_ordinals_dense, validate_parsed_logical_frames_against_catalog};
+use super::super::recovery_apply::{
+    validate_frame_ordinals_dense, validate_parsed_logical_frames_against_catalog,
+};
 use crate::index::IndexModel;
-use crate::journal::log_file::{
+use crate::journal::wire::{
     LogicalOp, LogicalOpKind, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
 };
 use crate::journal::ParsedLogicalFrames;
@@ -113,7 +115,7 @@ fn synthetic_uncheckpointed_ts(header: &crate::storage::header::FileHeader, requ
 }
 
 fn append_durable_logical_insert(db_path: &Path, ns_id: i64, commit_ts: Ts) {
-    use crate::journal::log_file::{ChainCommitFrame, LogRecordDraft};
+    use crate::journal::wire::{ChainCommitFrame, LogRecordDraft};
     use crate::journal::JournalManager;
     use crate::storage::header::{FileHeader, HEADER_PAGE_SIZE};
     use std::fs::OpenOptions;

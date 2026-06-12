@@ -28,7 +28,7 @@ use mqlite::mvcc::ReadView;
 fn force_expire_ticks_counter_exactly_once_per_call() {
     reset_read_views_force_expired();
 
-    let rv = ReadView::new(
+    let rv = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 100,
             logical: 0,

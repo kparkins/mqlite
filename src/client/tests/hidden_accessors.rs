@@ -89,16 +89,16 @@ pub struct JournalLogRecordSummary {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn journal_log_record_kind(kind: crate::journal::log_file::LogRecordKind) -> JournalLogRecordKind {
+fn journal_log_record_kind(kind: crate::journal::wire::LogRecordKind) -> JournalLogRecordKind {
     match kind {
-        crate::journal::log_file::LogRecordKind::CrudCommit => JournalLogRecordKind::CrudCommit,
-        crate::journal::log_file::LogRecordKind::CatalogCommit => {
+        crate::journal::wire::LogRecordKind::CrudCommit => JournalLogRecordKind::CrudCommit,
+        crate::journal::wire::LogRecordKind::CatalogCommit => {
             JournalLogRecordKind::CatalogCommit
         }
-        crate::journal::log_file::LogRecordKind::CheckpointBoundary => {
+        crate::journal::wire::LogRecordKind::CheckpointBoundary => {
             JournalLogRecordKind::CheckpointBoundary
         }
-        crate::journal::log_file::LogRecordKind::CheckpointPageFrame => {
+        crate::journal::wire::LogRecordKind::CheckpointPageFrame => {
             JournalLogRecordKind::CheckpointPageFrame
         }
     }
@@ -106,28 +106,28 @@ fn journal_log_record_kind(kind: crate::journal::log_file::LogRecordKind) -> Jou
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn journal_catalog_kind(
-    kind: crate::journal::log_file::CatalogCommitKind,
+    kind: crate::journal::wire::CatalogCommitKind,
 ) -> JournalCatalogCommitKind {
     match kind {
-        crate::journal::log_file::CatalogCommitKind::NamespaceCreate => {
+        crate::journal::wire::CatalogCommitKind::NamespaceCreate => {
             JournalCatalogCommitKind::NamespaceCreate
         }
-        crate::journal::log_file::CatalogCommitKind::NamespaceDrop => {
+        crate::journal::wire::CatalogCommitKind::NamespaceDrop => {
             JournalCatalogCommitKind::NamespaceDrop
         }
-        crate::journal::log_file::CatalogCommitKind::IndexReserve => {
+        crate::journal::wire::CatalogCommitKind::IndexReserve => {
             JournalCatalogCommitKind::IndexReserve
         }
-        crate::journal::log_file::CatalogCommitKind::IndexBuild => {
+        crate::journal::wire::CatalogCommitKind::IndexBuild => {
             JournalCatalogCommitKind::IndexBuild
         }
-        crate::journal::log_file::CatalogCommitKind::IndexBuildCommit => {
+        crate::journal::wire::CatalogCommitKind::IndexBuildCommit => {
             JournalCatalogCommitKind::IndexBuildCommit
         }
-        crate::journal::log_file::CatalogCommitKind::IndexCleanup => {
+        crate::journal::wire::CatalogCommitKind::IndexCleanup => {
             JournalCatalogCommitKind::IndexCleanup
         }
-        crate::journal::log_file::CatalogCommitKind::IndexDrop => {
+        crate::journal::wire::CatalogCommitKind::IndexDrop => {
             JournalCatalogCommitKind::IndexDrop
         }
     }
@@ -135,7 +135,7 @@ fn journal_catalog_kind(
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn journal_log_record_summary(
-    record: crate::journal::log_file::LogRecord,
+    record: crate::journal::wire::LogRecord,
 ) -> crate::error::Result<JournalLogRecordSummary> {
     let mut catalog_kind = None;
     let mut catalog_generation_before = None;
@@ -145,23 +145,23 @@ fn journal_log_record_summary(
     let mut checkpoint_last_ts = None;
 
     match &record.payload {
-        crate::journal::log_file::LogRecordPayload::CatalogCommit(payload) => {
-            let payload = crate::journal::log_file::CatalogCommitPayload::decode(payload)?;
+        crate::journal::wire::LogRecordPayload::CatalogCommit(payload) => {
+            let payload = crate::journal::wire::CatalogCommitPayload::decode(payload)?;
             catalog_kind = Some(journal_catalog_kind(payload.kind));
             catalog_generation_before = Some(payload.catalog_generation_before);
             catalog_generation_after = Some(payload.catalog_generation_after);
             catalog_header_checkpoint_applied_lsn = Some(payload.header.checkpoint_applied_lsn);
         }
-        crate::journal::log_file::LogRecordPayload::CheckpointBoundary(payload) => {
-            let payload = crate::journal::log_file::CheckpointBoundaryPayload::decode(payload)?;
+        crate::journal::wire::LogRecordPayload::CheckpointBoundary(payload) => {
+            let payload = crate::journal::wire::CheckpointBoundaryPayload::decode(payload)?;
             checkpoint_applied_lsn = Some(payload.checkpoint_applied_lsn);
             checkpoint_last_ts = Some((
                 payload.header.last_checkpoint_ts.physical_ms,
                 payload.header.last_checkpoint_ts.logical,
             ));
         }
-        crate::journal::log_file::LogRecordPayload::CrudCommit { .. } => {}
-        crate::journal::log_file::LogRecordPayload::CheckpointPageFrame(_) => {}
+        crate::journal::wire::LogRecordPayload::CrudCommit { .. } => {}
+        crate::journal::wire::LogRecordPayload::CheckpointPageFrame(_) => {}
     }
 
     Ok(JournalLogRecordSummary {
@@ -184,7 +184,7 @@ fn journal_log_record_summary(
 fn read_journal_log_records(
     path: &std::path::Path,
 ) -> crate::error::Result<Vec<JournalLogRecordSummary>> {
-    use crate::journal::log_file::{
+    use crate::journal::wire::{
         LogRecord, JOURNAL_HEADER_SIZE, LOG_RECORD_HEADER_LEN, LOG_RECORD_TOTAL_LEN_OFFSET,
         MAX_LOG_RECORD_BYTES,
     };
@@ -513,6 +513,14 @@ impl Client {
         self.inner
             .engine
             .us026_arm_post_register_failpoint(failpoint);
+    }
+
+    /// Test-only hook: force the next pre-durable `Pending`→`Aborted` flip
+    /// (`flip_pending_to_aborted_for`) to fail, exercising the flip-Err arm of
+    /// `cleanup_registered_pre_durable_failure`.
+    #[doc(hidden)]
+    pub fn __arm_abort_flip_failure(&self) {
+        self.inner.engine.arm_abort_flip_failure();
     }
 
     /// Test-only Phase 8 hook: snapshot `(next_lsn, ready_lsn, durable_lsn)`.

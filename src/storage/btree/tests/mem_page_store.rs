@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::mvcc::read_view::ChainSnapshot;
+use crate::mvcc::chain_snapshot::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::buffer_pool::{LatchMode, PageSize};
 use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};

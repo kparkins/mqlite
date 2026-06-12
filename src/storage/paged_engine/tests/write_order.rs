@@ -21,8 +21,9 @@ const LIVE_READER_NS: &str = "test.us012.live_reader";
 const SPIN_LIMIT: usize = 10_000;
 
 fn paged_engine_source() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/paged_engine.rs");
-    std::fs::read_to_string(path).expect("read paged_engine.rs")
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/storage/paged_engine/commit_envelope.rs");
+    std::fs::read_to_string(path).expect("read commit_envelope.rs")
 }
 
 fn run_write_commit_envelope_source(source: &str) -> &str {
@@ -30,7 +31,7 @@ fn run_write_commit_envelope_source(source: &str) -> &str {
         .find("fn run_write_commit_envelope")
         .expect("run_write_commit_envelope exists");
     let end = source[start..]
-        .find("\n    fn register_ordinary_crud_slot")
+        .find("\n    pub(super) fn register_ordinary_crud_slot")
         .expect("register_ordinary_crud_slot follows run_write_commit_envelope");
     &source[start..start + end]
 }
@@ -131,11 +132,11 @@ fn test_run_write_commit_envelope_has_no_ordinary_crud_legacy_authority() {
 
     assert!(
         !source.contains("lane_for"),
-        "US-012 removes lane_for from src/storage/paged_engine.rs"
+        "US-012 removes lane_for from src/storage/paged_engine/commit_envelope.rs"
     );
     assert!(
         !source.contains("acquire_lane"),
-        "US-012 removes acquire_lane from src/storage/paged_engine.rs"
+        "US-012 removes acquire_lane from src/storage/paged_engine/commit_envelope.rs"
     );
     assert!(
         !source.contains(&format!("{retired_field}: Mutex"))

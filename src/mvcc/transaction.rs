@@ -7,10 +7,10 @@
 //!    drops are returned to the free list before the new commit allocates.
 //! 2. Accumulates pending overflow-chain pins in `self.pending` (RAII
 //!    decref on abort — pages enqueue for deferred-free on Drop).
-//! 3. On the Phase 8 commit path: the caller drains the staged chain payload
-//!    into one self-contained log record and transfers ownership of the
-//!    pending `OverflowRef`s into installed version chains. Durability sync is
-//!    owned by the caller's LSN group-commit boundary.
+//! 3. On commit: the caller drains the staged chain payload into one
+//!    self-contained log record and transfers ownership of the pending
+//!    `OverflowRef`s into installed version chains. Durability sync is owned
+//!    by the caller's LSN group-commit boundary, not by `WriteTxn`.
 //! 4. On `Drop`: pending `OverflowRef`s decref via RAII.
 //!
 //! ## Lock ownership
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::error::Result;
-use crate::journal::log_file::ChainPageWrite;
+use crate::journal::wire::ChainPageWrite;
 use crate::mvcc::timestamp::{TimestampOracle, Ts};
 use crate::mvcc::version::OverflowRef;
 use crate::storage::allocator::AllocatorHandle;
@@ -41,7 +41,7 @@ pub(crate) struct PreparedChainCommit {
     pub(crate) pending: Vec<OverflowRef>,
     /// Secondary-index writes drained from the transaction.
     pub(crate) pending_sec_index: Vec<SecIndexWrite>,
-    /// Encoded ChainCommit frame bytes for the Phase 8 CRUD log record.
+    /// Encoded ChainCommit frame bytes for the CRUD commit log record.
     pub(crate) payload: Vec<u8>,
 }
 
@@ -118,9 +118,10 @@ impl std::ops::Deref for Ns {
 #[derive(Debug, Clone)]
 pub(crate) struct SecIndexWrite {
     /// Durable index identifier resolved at stage time from the live
-    /// `IndexEntry.id` (Phase 2 §3.1a). Stable across root moves and any
-    /// hypothetical post-stage rename of the owning index. Carried into
-    /// the Phase 2 logical frame without re-resolving at emit time.
+    /// `IndexEntry.id`. The durable id (not the root page or name) is
+    /// captured because it stays stable across root-page moves and any
+    /// post-stage rename of the owning index, so the logical commit frame
+    /// can be built later without re-resolving the index.
     pub(crate) index_id: i64,
     /// Root page of the target secondary-index B+ tree. The install pass
     /// uses this to locate the tree at commit time.
@@ -162,10 +163,10 @@ pub(crate) enum SecIndexOp {
 #[derive(Debug, Clone)]
 pub(crate) struct PrimaryWrite {
     /// Durable namespace identifier resolved at stage time from the live
-    /// `CollectionEntry.id` (Phase 2 §3.1a). Stable across `data_root_page`
-    /// moves and any hypothetical post-stage rename of the namespace.
-    /// Carried into the Phase 2 logical frame without re-resolving at
-    /// emit time.
+    /// `CollectionEntry.id`. The durable id (not the root page or name) is
+    /// captured because it stays stable across `data_root_page` moves and
+    /// any post-stage rename of the namespace, so the logical commit frame
+    /// can be built later without re-resolving the namespace.
     pub(crate) ns_id: i64,
     /// Target data-tree namespace retained for diagnostics and logical frames.
     pub(crate) ns: Ns,
@@ -224,26 +225,27 @@ pub(crate) enum PrimaryOp {
 ///   the chain refcount and enqueues the page for deferred-free; on commit
 ///   ownership transfers into the installed version chain so the refcount
 ///   stays at ≥ 1 post-commit.
-/// - `commit_ts` Cell is `None` until `allocate_commit_ts` runs or
-///   `commit()` lazily allocates; after allocation it carries the
-///   oracle-issued commit timestamp. Phase 2 §3.7's
-///   `emit_logical_txn_frame` helper consumes the Cell exactly once via
-///   take-once semantics (reads, then sets back to `None`) so any double
-///   emit panics loudly.
+/// - `commit_ts` Cell is `None` until `allocate_commit_ts` runs; after
+///   allocation it carries the oracle-issued commit timestamp.
+///   `build_logical_txn_frame` consumes the Cell exactly once via
+///   take-once semantics (reads, then sets it back to `None`), so building
+///   the logical frame twice for the same transaction panics loudly rather
+///   than silently emitting a duplicate.
 #[derive(Debug)]
 pub(crate) struct WriteTxn {
     /// Per-oracle transaction identifier used for self-visibility on
     /// pending entries.
     pub(crate) txn_id: u64,
-    /// Phase 2 §3.7 commit-envelope commit_ts. `None` until
-    /// [`allocate_commit_ts`](Self::allocate_commit_ts) runs; stamped with
-    /// `Some(ts)` at stage-S4 so [`emit_logical_txn_frame`](Self::
-    /// emit_logical_txn_frame) can consume it at S5. Take-once semantics:
-    /// emit panics if it ever finds `None` and clears the Cell after
-    /// reading so a second emit on the same txn is a programming error.
-    /// `Cell` gives single-threaded interior mutability without adding a
-    /// `Mutex` (§11 #10 and §3.7 mandate no new Mutex/Arc on this path);
-    /// `WriteTxn` is not `Send` because of this field.
+    /// Commit-envelope commit timestamp. `None` until
+    /// [`allocate_commit_ts`](Self::allocate_commit_ts) runs; once stamped
+    /// with `Some(ts)`, [`build_logical_txn_frame`](Self::build_logical_txn_frame)
+    /// consumes it when building the logical commit frame. Take-once
+    /// semantics: building the frame panics if it finds `None` (frame built
+    /// before the timestamp was allocated, a commit-order violation) and
+    /// clears the Cell after reading so a second build on the same txn is
+    /// caught as a programming error. `Cell` gives single-threaded interior
+    /// mutability without a `Mutex` or `Arc` on this hot path; `WriteTxn` is
+    /// therefore not `Send`.
     pub(crate) commit_ts: Cell<Option<Ts>>,
     /// Overflow chains staged by this transaction. Each `OverflowRef`
     /// holds one refcount; drop order is irrelevant (atomic decref +
@@ -270,10 +272,11 @@ pub(crate) struct WriteTxn {
     /// the head of each key's version chain on the owning leaf frame,
     /// advancing the prior head's `stop_ts` to `commit_ts`.
     pub(crate) pending_primary: SmallVec<[PrimaryWrite; 2]>,
-    /// Phase 1 publish-decision dirty state. Set at mutation sites
-    /// (CRUD helpers and DDL publish sites) per §10.3; consumed once at
-    /// the publish step by `publish_commit`. Discarded with the rest of
-    /// the staged state on abort (§10.9 "Failed commit path"). See
+    /// Publish-decision dirty state. Set at mutation sites (CRUD helpers
+    /// and DDL publish sites) to record what this txn changed, then
+    /// consumed exactly once at the publish step by `publish_commit` to
+    /// decide what to republish. Discarded with the rest of the staged
+    /// state when the commit fails and the txn aborts. See
     /// `src/storage/paged_engine/publish.rs`.
     pub(crate) publish_dirty: PublishDirty,
 }
@@ -304,9 +307,11 @@ impl WriteTxn {
     ///    `MutexGuard<'_, BpBackend>` from `PagedEngine::inner`). This
     ///    function does not acquire it — ownership is external to keep
     ///    `WriteTxn` lifetime-parameter-free.
-    /// 2. Drain checkpoint-eligible page-lifetime entries. Any refcount-0
-    ///    pages whose enqueue fence is older than the checkpoint fence return
-    ///    to the free list before the new commit allocates.
+    /// 2. Drain checkpoint-eligible overflow page-lifetime entries. Any
+    ///    refcount-0 pages whose enqueue fence is older than the checkpoint
+    ///    fence return to the free list before the new commit allocates.
+    ///    Dropped trees' `RetiredTree*` entries are checkpoint-owned and
+    ///    never released (or even scanned) on this hot path.
     /// 3. Initialize empty `pending` / `page_writes` / `refcount_deltas`.
     pub(crate) fn begin(
         txn_id: u64,
@@ -453,40 +458,33 @@ impl WriteTxn {
         Ok(ts)
     }
 
-    /// Emit a Phase 2 [`LogicalTxnFrame`] for this transaction (§3.7, §6.2).
+    /// Build this transaction's logical commit frame, consuming the
+    /// pre-allocated `commit_ts`.
     ///
-    /// Called at S5 of the commit envelope — after `allocate_commit_ts`
-    /// (S4) sets the `commit_ts` Cell and before the `ChainCommit` frame
-    /// (S7) is appended. Walks `sec_writes` first, then `primary_writes`
-    /// (§3.6 emit-side convention), assigning `op_ordinal` from a 0-based
-    /// `u32` counter that is dense across the whole batch.
+    /// This is frame construction only — it does NO journal I/O. The caller
+    /// (`run_write_commit_envelope`) appends the returned frame inside the
+    /// durable journal envelope, so keeping construction separate from the
+    /// append lets rollback handling tell a frame-build failure apart from a
+    /// durability failure.
+    ///
+    /// The frame walks `sec_writes` first, then `primary_writes`, assigning
+    /// each operation an `op_ordinal` from a 0-based counter that is dense
+    /// across the whole batch (so recovery can replay the operations in the
+    /// exact order they were staged).
     ///
     /// Take-once semantics on `commit_ts`:
-    /// - Reads the Cell exactly once.
-    /// - Panics with a clear invariant-violation message if the Cell is
-    ///   `None` — emitting before `allocate_commit_ts` ran is a programming
-    ///   error and indicates the §3.7 commit-envelope order was violated.
-    /// - Sets the Cell back to `None` after reading so a second emit on the
-    ///   same transaction panics on re-entry.
-    ///
-    /// Error behavior: propagates [`Error::JournalFrameTooLarge`] from
-    /// [`LogicalTxnFrame::encode`] unchanged, matching §3.5.
-    ///
-    /// No new `Mutex` / `Arc` — the Cell provides single-threaded interior
-    /// mutability scoped to this transaction.
-    /// Build and consume this transaction's Phase 2 `LogicalTxnFrame`.
-    ///
-    /// This is the S5-only half of [`emit_logical_txn_frame`]: it consumes
-    /// the pre-allocated `commit_ts` Cell and returns the frame without doing
-    /// journal I/O. `run_write_commit_envelope` appends the returned frame
-    /// inside the journal envelope so rollback handling can distinguish frame
-    /// construction from durability.
+    /// - Reads the Cell exactly once and clears it.
+    /// - Panics if the Cell is `None` — building the frame before
+    ///   `allocate_commit_ts` ran, or building it twice, both violate the
+    ///   commit-envelope ordering and are programming errors, so they fail
+    ///   loudly rather than producing a frame with a wrong or duplicate
+    ///   timestamp.
     pub(crate) fn build_logical_txn_frame(
         &self,
         journal: &BufferPoolHandle,
         primary_writes: &[PrimaryWrite],
         sec_writes: &[SecIndexWrite],
-    ) -> crate::journal::log_file::LogicalTxnFrame {
+    ) -> crate::journal::wire::LogicalTxnFrame {
         #[allow(clippy::expect_used)]
         let commit_ts = self.commit_ts.get().expect(
             "§3.7 invariant violation: emit_logical_txn_frame called before \
@@ -495,7 +493,7 @@ impl WriteTxn {
         self.commit_ts.set(None);
 
         let (salt1, salt2) = journal.journal_salts().unwrap_or((0, 0));
-        build_logical_txn_frame(
+        crate::journal::wire::build_logical_txn_frame(
             self.txn_id,
             commit_ts,
             salt1,
@@ -505,24 +503,21 @@ impl WriteTxn {
         )
     }
 
-    /// Finalize the transaction.
+    /// Encode this transaction's `ChainCommit` payload and drain its
+    /// staged ownership, consuming `self`.
     ///
-    /// Protocol:
-    /// 1. Allocate `commit_ts` from the oracle (skipped if
-    ///    `allocate_commit_ts` was already called).
-    /// 2. Emit a single `ChainCommit` journal frame carrying
-    ///    `commit_ts`, `refcount_deltas`, and `page_writes`.
-    /// 3. Take ownership of `pending` out of `self` — ownership transfers
-    ///    to the caller, who installs each `OverflowRef` into its version
-    ///    chain. The returned `Vec<OverflowRef>` must be consumed by the
-    ///    caller; otherwise the refcounts decref on vec drop and the newly
-    ///    committed chain becomes dangling.
+    /// Encodes (but does NOT append) a single `ChainCommit` frame carrying
+    /// the caller-provided `commit_ts`, `refcount_deltas`, and
+    /// `page_writes`; the caller appends the returned `payload` inside the
+    /// durable journal envelope. The returned [`PreparedChainCommit`] also
+    /// carries the drained `pending` overflow refs and `pending_sec_index`.
     ///
-    /// Returns `(commit_ts, pending, pending_sec_index)`. Callers that
-    /// stage no overflow data may drop the returned vecs, which runs
-    /// `OverflowRef::Drop` on every entry - correct for no-op commits.
-    ///
-    /// Build and drain the ChainCommit payload without appending it.
+    /// Ownership note: `pending` is moved out of `self`, so the caller now
+    /// owns one `OverflowRef` per newly committed chain and MUST install
+    /// each into its version chain. If the returned `pending` vec is dropped
+    /// without being consumed, every `OverflowRef::Drop` decrefs and the
+    /// just-committed chain's backing pages dangle — correct only for a
+    /// no-op commit that staged no overflow data.
     pub(crate) fn prepare_chain_commit_payload(
         mut self,
         journal: &BufferPoolHandle,
@@ -533,95 +528,19 @@ impl WriteTxn {
         let refcount_deltas = std::mem::take(&mut self.refcount_deltas).into_vec();
         let pending_sec_index = std::mem::take(&mut self.pending_sec_index).into_vec();
         let (salt1, salt2) = journal.journal_salts().unwrap_or((0, 0));
-        let payload = crate::journal::log_file::ChainCommitFrame {
+        let payload = crate::journal::wire::ChainCommitFrame::build_payload(
             salt1,
             salt2,
             commit_ts,
             refcount_deltas,
             page_writes,
-        }
-        .encode()?;
+        )?;
 
         Ok(PreparedChainCommit {
             pending,
             pending_sec_index,
             payload,
         })
-    }
-}
-
-/// Build a [`LogicalTxnFrame`] from staged `sec_writes` + `primary_writes`
-/// in §3.6 emit-side order (secondaries first, primaries second) with a
-/// dense `0..N` `op_ordinal` counter. Keeps frame-construction pure — no
-/// `Cell` consumption, no journal I/O — so it can be exercised directly
-/// from unit tests without also driving `append_logical_txn`.
-fn build_logical_txn_frame(
-    txn_id: u64,
-    commit_ts: Ts,
-    salt1: u32,
-    salt2: u32,
-    primary_writes: &[PrimaryWrite],
-    sec_writes: &[SecIndexWrite],
-) -> crate::journal::log_file::LogicalTxnFrame {
-    use crate::journal::log_file::{LogicalOp, LogicalOpKind, LogicalTxnFrame};
-
-    let total = sec_writes.len().saturating_add(primary_writes.len());
-    let mut ops: Vec<LogicalOp> = Vec::with_capacity(total);
-    let mut ordinal: u32 = 0;
-
-    for sw in sec_writes {
-        let kind = match &sw.op {
-            SecIndexOp::Insert { id_bytes } => LogicalOpKind::SecondaryInsert {
-                index_id: sw.index_id,
-                key: sw.key.clone(),
-                id_bytes: id_bytes.clone(),
-            },
-            SecIndexOp::Delete => LogicalOpKind::SecondaryDelete {
-                index_id: sw.index_id,
-                key: sw.key.clone(),
-            },
-        };
-        ops.push(LogicalOp {
-            op_ordinal: ordinal,
-            kind,
-        });
-        ordinal = ordinal.saturating_add(1);
-    }
-
-    for pw in primary_writes {
-        let kind = match &pw.op {
-            PrimaryOp::Insert { data } => LogicalOpKind::PrimaryInsert {
-                ns_id: pw.ns_id,
-                key: pw.key.clone(),
-                value: data.clone(),
-                overflow: None,
-            },
-            PrimaryOp::Update { data } => LogicalOpKind::PrimaryUpdate {
-                ns_id: pw.ns_id,
-                key: pw.key.clone(),
-                value: data.clone(),
-                overflow: None,
-            },
-            PrimaryOp::Delete => LogicalOpKind::PrimaryDelete {
-                ns_id: pw.ns_id,
-                key: pw.key.clone(),
-            },
-        };
-        ops.push(LogicalOp {
-            op_ordinal: ordinal,
-            kind,
-        });
-        ordinal = ordinal.saturating_add(1);
-    }
-
-    LogicalTxnFrame {
-        salt1,
-        salt2,
-        commit_ts,
-        diagnostic_txn_id: txn_id,
-        format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
-        flags: 0,
-        ops,
     }
 }
 

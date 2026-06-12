@@ -28,8 +28,12 @@
 //! [`select_plan`]: crate::query::planner::select_plan
 
 mod btree_ops;
+mod checkpoint_gate;
+mod commit_envelope;
 mod doc_helpers;
 mod doc_ops;
+mod durability;
+mod ns_ddl;
 /// Test-only engine-fatal probe — engine-fatal poison + sequencer + writer
 /// admission handles. Kept in a separate module so intrusive test plumbing
 /// stays out of production paths.
@@ -45,8 +49,12 @@ pub mod group_commit_observations;
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "paged_engine/tests/hidden_accessors.rs"]
 pub(crate) mod hidden_accessors;
-mod index_build;
+mod checkpoint_materialize;
+mod index_ddl;
 mod index_maint;
+mod index_read_helpers;
+mod index_write_maint;
+mod pending_install;
 pub(crate) mod publish;
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "paged_engine/tests/publish_registry_harness.rs"]
@@ -69,8 +77,29 @@ pub(crate) mod writer_registry;
 #[path = "paged_engine/tests/allocator_freeze_boundary.rs"]
 mod allocator_freeze_boundary;
 #[cfg(test)]
+#[path = "paged_engine/tests/bug5_drop_namespace_stale_epoch_read.rs"]
+mod bug5_drop_namespace_stale_epoch_read;
+#[cfg(test)]
+#[path = "paged_engine/tests/bug5_retired_free_pool_coherence.rs"]
+mod bug5_retired_free_pool_coherence;
+#[cfg(test)]
+#[path = "paged_engine/tests/bug5_retired_refcount_reader_fence.rs"]
+mod bug5_retired_refcount_reader_fence;
+#[cfg(test)]
+#[path = "paged_engine/tests/bug6_ddl_torn_catalog_commit.rs"]
+mod bug6_ddl_torn_catalog_commit;
+#[cfg(test)]
+#[path = "paged_engine/tests/bug6_ddl_torn_drop_commit.rs"]
+mod bug6_ddl_torn_drop_commit;
+#[cfg(test)]
+#[path = "paged_engine/tests/bug7_checkpoint_snapshot_isolation.rs"]
+mod bug7_checkpoint_snapshot_isolation;
+#[cfg(test)]
 #[path = "paged_engine/tests/checkpoint_boundary_replay.rs"]
 mod checkpoint_boundary_replay;
+#[cfg(test)]
+#[path = "paged_engine/tests/close_quadratic_probe_harness.rs"]
+mod close_quadratic_probe_harness;
 #[cfg(test)]
 #[path = "paged_engine/tests/checkpoint_dirty_leaf_reconcile.rs"]
 mod checkpoint_dirty_leaf_reconcile;
@@ -79,10 +108,13 @@ mod checkpoint_dirty_leaf_reconcile;
 mod checkpoint_flush_set;
 #[cfg(test)]
 #[path = "paged_engine/tests/checkpoint_gate.rs"]
-mod checkpoint_gate;
+mod checkpoint_gate_tests;
 #[cfg(test)]
 #[path = "paged_engine/tests/checkpoint_incomplete_metrics.rs"]
 mod checkpoint_incomplete_metrics;
+#[cfg(test)]
+#[path = "paged_engine/tests/checkpoint_pool_saturation.rs"]
+mod checkpoint_pool_saturation;
 #[cfg(test)]
 #[path = "paged_engine/tests/checkpoint_reconcile_plan.rs"]
 mod checkpoint_reconcile_plan;
@@ -95,6 +127,12 @@ mod flip_committed_concurrent_observers;
 #[cfg(test)]
 #[path = "paged_engine/tests/index_build_recovery.rs"]
 mod index_build_recovery;
+#[cfg(test)]
+#[path = "paged_engine/tests/bugsuspect_resume_building_index_brick.rs"]
+mod bugsuspect_resume_building_index_brick;
+#[cfg(test)]
+#[path = "paged_engine/tests/bugsuspect_readview_prune_race.rs"]
+mod bugsuspect_readview_prune_race;
 #[cfg(test)]
 #[path = "paged_engine/tests/logical_replay_frontier.rs"]
 mod logical_replay_frontier;
@@ -125,49 +163,29 @@ mod write_order;
 #[path = "paged_engine/tests/write_visibility_epoch.rs"]
 mod write_visibility_epoch;
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-#[cfg(any(test, feature = "test-hooks"))]
-use self::hidden_accessors::{LegacyCommitFailpoint, Us026PostRegisterFailpoint};
 use crate::options::BusyHandler;
 
 use bson::{Bson, Document};
 
-use crate::error::{Error, Result, WriteConflictReason};
+use crate::error::{Error, Result};
 use crate::index::{IndexInfo, IndexModel};
-use crate::journal::log_file::{
-    CatalogCommitKind, CatalogCommitPage, CatalogCommitPayload, JournalPageSize, LogRecordDraft,
-    PageId,
-};
-use crate::keys::encode_key;
-use crate::mvcc::transaction::WriteTxn;
 use crate::options::{
     DurabilityMode, FindOneAndDeleteOptions, FindOneAndReplaceOptions, FindOneAndUpdateOptions,
     FindOptions, UpdateOptions,
 };
 use crate::results::{DeleteResult, UpdateResult};
-use crate::storage::btree::{BTree, BTreePageStore};
+use crate::storage::btree::BTree;
 use crate::storage::buffer_pool::PageSize;
 use crate::storage::handle::BufferPoolHandle;
-use crate::storage::root_snapshot::PublishedCatalog;
-use crate::storage::structural_page_batch::StructuralPageBatch;
-use crate::validation::validate_document;
 
-use self::doc_helpers::{ensure_id, now_millis};
-use self::index_maint::{
-    flip_pending_to_aborted_for, flip_pending_to_committed_for, install_pending_primary,
-    install_pending_sec_index,
-};
-use self::publish::PublishDirty;
-use self::publish::{rebuild_and_publish, sync_catalog_root_structural};
-use self::publish_sequencer::PublishSlotGuard;
 use self::state::{MetadataState, SharedState};
-use self::visibility::WriteVisibility;
 use crate::storage::catalog::IndexState;
+
+pub(crate) use self::commit_envelope::InsertManyBatchError;
 
 // ---------------------------------------------------------------------------
 // PagedEngine — public struct
@@ -209,24 +227,14 @@ pub(crate) struct PagedEngine {
     next_interval_sync_ms: AtomicU64,
 }
 
-/// Internal result class for the batched insert-many fast path.
-pub(crate) enum InsertManyBatchError {
-    /// Staging failed before any journal reservation; caller may retry the
-    /// valid prefix or remaining batch without duplicating any durable writes.
-    Staging { index: usize, error: Error },
-    /// The commit envelope or namespace bootstrap failed; caller must surface
-    /// this error because durable state may have been reserved or written.
-    Commit(Error),
-}
-
 #[derive(Clone, Debug, PartialEq)]
-struct NamespaceCatalogIdentity {
+pub(super) struct NamespaceCatalogIdentity {
     ns_id: i64,
     indexes: Vec<IndexCatalogIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct IndexCatalogIdentity {
+pub(super) struct IndexCatalogIdentity {
     id: i64,
     name: String,
     key_pattern: Document,
@@ -235,65 +243,15 @@ struct IndexCatalogIdentity {
     state: IndexState,
 }
 
-fn duration_millis_saturating(duration: Duration) -> u64 {
+pub(super) fn duration_millis_saturating(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn duplicate_primary_key_error() -> Error {
-    Error::DuplicateKey {
-        detail: "document with _id already exists".to_owned(),
-    }
-}
-
-fn preflight_insert_many_primary_keys(
-    docs: &mut [Document],
-) -> std::result::Result<(), InsertManyBatchError> {
-    let mut keys = HashSet::with_capacity(docs.len());
-    for (index, doc) in docs.iter_mut().enumerate() {
-        if let Err(error) = validate_document(doc) {
-            return Err(InsertManyBatchError::Staging { index, error });
-        }
-        let id = ensure_id(doc);
-        if !keys.insert(encode_key(&id)) {
-            return Err(InsertManyBatchError::Staging {
-                index,
-                error: duplicate_primary_key_error(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// RAII guard that records the logical-frame-append duration sample and
-/// recomputes the percentile gauges (p50/p95/p99) from the ring buffer.
-///
-/// The recorded duration now spans Phase 8 draft construction, reservation,
-/// positioned write, and ready marking. It is still a coarse append-envelope
-/// sample; percentile recomputation happens on drop after the hot write work.
-struct LogicalTxnAppendPercentileRefresh {
-    start: Instant,
-}
-
-impl LogicalTxnAppendPercentileRefresh {
-    fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
-    }
-}
-
-impl Drop for LogicalTxnAppendPercentileRefresh {
-    fn drop(&mut self) {
-        let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        crate::mvcc::metrics::record_logical_txn_append_duration_ms_and_maybe_recompute(elapsed_ms);
-    }
 }
 
 impl PagedEngine {
     /// Escalate a post-durable failure to engine-fatal poison. Routes through
     /// [`state::poison_after_durable_commit`] so the live sequencer's blocked
     /// successors wake with `Error::EngineFatal`.
-    fn engine_fatal(&self, reason: crate::error::EngineFatalReason) -> Error {
+    pub(super) fn engine_fatal(&self, reason: crate::error::EngineFatalReason) -> Error {
         state::poison_after_durable_commit(&self.shared, reason)
     }
 
@@ -328,6 +286,18 @@ impl PagedEngine {
         smo_classification_retry_cap: u32,
         durability_mode: DurabilityMode,
     ) -> Result<Self> {
+        // R5b: wire the live reader low-water into the allocator so
+        // page-lifetime drains can gate `RetiredTree*` releases on
+        // `oldest_required_ts()` — a dropped tree's pages stay un-reusable
+        // while any live ReadView still predates the drop.
+        {
+            let read_view_registry = Arc::clone(handle.read_view_registry());
+            handle
+                .allocator()
+                .install_retired_page_reader_floor(move || {
+                    read_view_registry.oldest_required_ts()
+                })?;
+        }
         let (md, shared) = MetadataState::new(
             handle,
             catalog_root_page,
@@ -350,760 +320,6 @@ impl PagedEngine {
         engine.resume_building_indexes_after_open()?;
         Ok(engine)
     }
-
-    fn poison_after_log_manager_failure(&self, error: Error) -> Error {
-        if let Error::EngineFatal { reason } = error {
-            return state::poison_after_durable_commit(&self.shared, reason);
-        }
-        error
-    }
-
-    fn poison_after_reserved_log_failure(
-        &self,
-        reserved: &crate::journal::ReservedLogRecord,
-        error: Error,
-    ) -> Error {
-        if !reserved.is_journaled() {
-            return error;
-        }
-        let fatal = reserved.poison_slot(error);
-        self.poison_after_log_manager_failure(fatal)
-    }
-
-    fn wait_for_commit_durability(&self, end_lsn: u64) -> Result<()> {
-        let start = Instant::now();
-        let (stage, result) = match self.durability_mode {
-            DurabilityMode::FullSync => (
-                crate::mvcc::metrics::CommitEnvelopeStage::JournalDurableWait,
-                self.shared.handle.wait_journal_durable(end_lsn),
-            ),
-            DurabilityMode::Interval(_) | DurabilityMode::None => (
-                crate::mvcc::metrics::CommitEnvelopeStage::JournalReadyWait,
-                self.shared.handle.wait_journal_ready(end_lsn),
-            ),
-        };
-        crate::mvcc::metrics::record_commit_envelope_stage_duration(stage, start.elapsed());
-        result.map_err(|error| self.poison_after_log_manager_failure(error))
-    }
-
-    pub(super) fn commit_catalog_batch_to_log(
-        &self,
-        kind: CatalogCommitKind,
-        catalog_generation_before: u64,
-        catalog_generation_after: u64,
-        slot: &PublishSlotGuard,
-        batch: StructuralPageBatch,
-    ) -> Result<()> {
-        let (payload, direct_dirty_pages) = self.catalog_commit_payload(
-            kind,
-            catalog_generation_before,
-            catalog_generation_after,
-            &batch,
-        )?;
-        let draft = LogRecordDraft::catalog(0, slot.publish_seq(), slot.commit_ts(), payload);
-        let reserved = self.shared.handle.reserve_log_record(draft)?;
-        let commit_end_lsn = reserved.end_lsn();
-
-        let mut base_store = self.shared.new_btree_store();
-        if let Err(error) =
-            batch.commit_lsn_fenced(&mut base_store, &self.shared.handle, commit_end_lsn)
-        {
-            return Err(self.poison_after_reserved_log_failure(&reserved, error));
-        }
-        if let Err(error) = self
-            .shared
-            .handle
-            .stamp_dirty_pages_lsn_all_pools(&direct_dirty_pages, commit_end_lsn)
-        {
-            return Err(self.poison_after_reserved_log_failure(&reserved, error));
-        }
-        let written_end_lsn = reserved
-            .write_and_mark()
-            .map_err(|error| self.poison_after_log_manager_failure(error))?;
-        debug_assert_eq!(written_end_lsn, commit_end_lsn);
-        self.wait_for_commit_durability(commit_end_lsn)?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        if self::hidden_accessors::us026_fail_if_armed(
-            &self.shared,
-            Us026PostRegisterFailpoint::Flush,
-        )
-        .is_err()
-        {
-            return Err(
-                self.engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure)
-            );
-        }
-        Ok(())
-    }
-
-    fn catalog_commit_payload(
-        &self,
-        kind: CatalogCommitKind,
-        catalog_generation_before: u64,
-        catalog_generation_after: u64,
-        batch: &StructuralPageBatch,
-    ) -> Result<(Vec<u8>, Vec<u32>)> {
-        let header = self.shared.handle.allocator().with_header(Clone::clone)?;
-        let mut catalog_page_ids: BTreeSet<PageId> = {
-            let mut cat = self.metadata_state.catalog_lock();
-            cat.collect_pages_by_size()?
-                .into_iter()
-                .map(|(page, _size)| PageId(page))
-                .collect()
-        };
-        if header.catalog_root_page != 0 {
-            catalog_page_ids.insert(PageId(header.catalog_root_page));
-        }
-        if header.catalog_root_backup != 0 {
-            catalog_page_ids.insert(PageId(header.catalog_root_backup));
-        }
-        if header.history_store_root_page != 0 {
-            catalog_page_ids.insert(PageId(header.history_store_root_page));
-        }
-
-        let direct_dirty = self
-            .shared
-            .handle
-            .dirty_frame_snapshots_for_pages(&catalog_page_ids)?;
-        let direct_dirty_pages: Vec<u32> = direct_dirty
-            .iter()
-            .map(|(page, _size, _data)| *page)
-            .collect();
-        let mut pages_by_key: BTreeMap<(u32, u8), CatalogCommitPage> = BTreeMap::new();
-        for (page_number, page_size, data) in direct_dirty {
-            let page_size = match page_size {
-                PageSize::Small4k => JournalPageSize::Small4k,
-                PageSize::Large32k => JournalPageSize::Large32k,
-            };
-            let size_order = match page_size {
-                JournalPageSize::Small4k => 0,
-                JournalPageSize::Large32k => 1,
-            };
-            pages_by_key.insert(
-                (page_number, size_order),
-                CatalogCommitPage {
-                    page_number,
-                    page_size,
-                    data,
-                },
-            );
-        }
-        for page in batch.page_images() {
-            let page_size = match page.page_size {
-                PageSize::Small4k => JournalPageSize::Small4k,
-                PageSize::Large32k => JournalPageSize::Large32k,
-            };
-            let size_order = match page_size {
-                JournalPageSize::Small4k => 0,
-                JournalPageSize::Large32k => 1,
-            };
-            pages_by_key.insert(
-                (page.page_number, size_order),
-                CatalogCommitPage {
-                    page_number: page.page_number,
-                    page_size,
-                    data: page.data,
-                },
-            );
-        }
-        let pages = pages_by_key.into_values().collect();
-        let payload = CatalogCommitPayload {
-            kind,
-            catalog_generation_before,
-            catalog_generation_after,
-            header,
-            pages,
-        }
-        .encode()?;
-        Ok((payload, direct_dirty_pages))
-    }
-
-    pub(super) fn maybe_sync_interval_after_publish(&self) -> Result<()> {
-        let DurabilityMode::Interval(interval) = self.durability_mode else {
-            return Ok(());
-        };
-        let interval_ms = duration_millis_saturating(interval);
-        if interval_ms > 0 {
-            let now_ms = duration_millis_saturating(self.interval_sync_origin.elapsed());
-            let mut next_due = self.next_interval_sync_ms.load(Ordering::Acquire);
-            loop {
-                if now_ms < next_due {
-                    return Ok(());
-                }
-                let next = now_ms.saturating_add(interval_ms);
-                match self.next_interval_sync_ms.compare_exchange(
-                    next_due,
-                    next,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => next_due = actual,
-                }
-            }
-        }
-        let sync_start = Instant::now();
-        let result = self.shared.handle.sync_journal_ready_prefix();
-        crate::mvcc::metrics::record_commit_envelope_stage_duration(
-            crate::mvcc::metrics::CommitEnvelopeStage::IntervalSync,
-            sync_start.elapsed(),
-        );
-        result.map_err(|error| self.poison_after_log_manager_failure(error))
-    }
-
-    fn namespace_catalog_identity(
-        md: &MetadataState,
-        ns: &str,
-    ) -> Result<Option<NamespaceCatalogIdentity>> {
-        let cat = md.catalog_lock();
-        let Some(collection) = cat.get_collection(ns)? else {
-            return Ok(None);
-        };
-        let indexes = cat
-            .list_indexes(ns)?
-            .into_iter()
-            .map(|index| IndexCatalogIdentity {
-                id: index.id,
-                name: index.name,
-                key_pattern: index.key_pattern,
-                unique: index.unique,
-                sparse: index.sparse,
-                state: index.state,
-            })
-            .collect();
-        Ok(Some(NamespaceCatalogIdentity {
-            ns_id: collection.id,
-            indexes,
-        }))
-    }
-
-    fn namespace_catalog_identity_from_published(
-        catalog: &PublishedCatalog,
-        ns: &str,
-    ) -> Option<NamespaceCatalogIdentity> {
-        let snapshot = catalog.get_by_name(ns)?;
-        let indexes = snapshot
-            .indexes
-            .iter()
-            .map(|index| IndexCatalogIdentity {
-                id: index.id,
-                name: index.name.clone(),
-                key_pattern: index.key_pattern.clone(),
-                unique: index.unique,
-                sparse: index.sparse,
-                state: index.state,
-            })
-            .collect();
-        Some(NamespaceCatalogIdentity {
-            ns_id: snapshot.id,
-            indexes,
-        })
-    }
-
-    /// Bootstrap a collection if it does not exist yet and return its
-    /// durable namespace id.
-    ///
-    /// Called from CRUD paths that may be invoked with an unknown ns.
-    /// Acquires `metadata.write()` through the namespace-create DDL
-    /// envelope so the namespace is both visible in the catalog AND
-    /// reflected in the published snapshot before the caller admits a
-    /// writer ticket on the returned id.
-    fn bootstrap_namespace(&self, ns: &str) -> Result<i64> {
-        // §10.1.1 F5 retirement: the legacy name-keyed drop tombstone has been
-        // retired. Durable monotonic ids (Phase 1 §10.7) are the resurrection
-        // barrier; a freshly-bootstrapped collection of a previously-dropped
-        // name receives a fresh `CollectionEntry.id`.
-        self.run_namespace_create_ddl(|shared, md, batch| {
-            let data_root = {
-                let mut cat = md.catalog_lock();
-                if let Some(entry) = cat.get_collection(ns)? {
-                    return Ok(entry.id);
-                }
-                // Phase 1 §10.7 — allocate durable namespace id from the
-                // header counter atomically with the catalog commit.
-                let id = cat.allocate_namespace_id();
-                let data_root = cat.create_collection(ns, id, bson::doc! {}, now_millis())?;
-                (id, data_root)
-            };
-            sync_catalog_root_structural(shared, md, batch)?;
-            let _ = BTree::create_at(shared.new_structural_store(batch), data_root.1)?;
-            Ok(data_root.0)
-        })
-    }
-
-    /// CRUD write lifecycle.
-    ///
-    /// Drives: metadata.read() → bootstrap-if-missing → private logical
-    /// WriteTxn setup → body → install Pending deltas → Phase 8 LogRecord
-    /// reservation/write/durability gate → flip Pending to Committed →
-    /// ordered publish.
-    fn run_write<F, R>(&self, ns: &str, f: F) -> Result<R>
-    where
-        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
-    {
-        self.shared.check_engine_not_poisoned()?;
-        let published = self.shared.published.load_full();
-        if let Some(snapshot) = published.catalog.get_by_name(ns) {
-            let ns_id = snapshot.id;
-            drop(published);
-            return self.run_write_commit_envelope(ns, Some(ns_id), f);
-        }
-        drop(published);
-
-        // Take a read guard to decide whether this write must bootstrap the
-        // namespace before entering the ordinary commit envelope.
-        let md_read = self
-            .metadata
-            .read()
-            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        let ns_missing = self
-            .metadata_state
-            .catalog_lock()
-            .get_collection(ns)?
-            .is_none();
-        if ns_missing {
-            drop(md_read);
-            let ns_id = self.bootstrap_namespace(ns)?;
-            return self.run_write_commit_envelope(ns, Some(ns_id), f);
-        }
-        drop(md_read);
-        self.run_write_commit_envelope(ns, None, f)
-    }
-
-    /// Ordinary CRUD commit envelope after namespace bootstrap has been settled.
-    ///
-    /// Metadata-guard protocol: there is exactly one `metadata.read()`
-    /// acquisition in this function. It is held across ordinary CRUD's full
-    /// private-logical lifecycle so DDL cannot mutate the catalog identity
-    /// while the writer installs resident Pending deltas, appends logical
-    /// durability records, and publishes through the sequencer.
-    /// `NsWriterRegistry` is no longer ordinary CRUD's same-namespace
-    /// serialization authority.
-    ///
-    /// AC #4 captured-identity gate (§10.17.1): immediately before the
-    /// durable journal envelope this function compares the
-    /// `catalog_generation` captured in the S1 scope against the current
-    /// published catalog generation. A mismatch triggers a target-namespace
-    /// identity revalidation; if that namespace/index identity changed, the
-    /// writer returns `WriteConflict { CatalogGenerationChanged }` while
-    /// rollback is still purely in-memory. Catalog DDL on unrelated
-    /// namespaces does not invalidate the writer's captured identity.
-    fn run_write_commit_envelope<F, R>(
-        &self,
-        ns: &str,
-        bootstrapped_ns_id: Option<i64>,
-        f: F,
-    ) -> Result<R>
-    where
-        F: FnOnce(&SharedState, &MetadataState, &mut WriteTxn, &WriteVisibility<'_>) -> Result<R>,
-    {
-        self.shared.check_engine_not_poisoned()?;
-        let _checkpoint_writer_admission = self.shared.checkpoint_admission.admit_writer()?;
-        let _crud_read = self
-            .metadata
-            .read()
-            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        let captured_epoch = self.shared.published.load_full();
-        let (captured_ns_id, captured_catalog_gen, captured_catalog_identity) =
-            if let Some(ns_id) = bootstrapped_ns_id {
-                let captured_identity = match Self::namespace_catalog_identity_from_published(
-                    &captured_epoch.catalog,
-                    ns,
-                ) {
-                    Some(identity) => Some(identity),
-                    None => Self::namespace_catalog_identity(&self.metadata_state, ns)?,
-                };
-                if captured_identity.is_none() {
-                    return Err(Error::WriteConflict {
-                        reason: WriteConflictReason::CatalogGenerationChanged,
-                    });
-                }
-                (
-                    Some(ns_id),
-                    captured_epoch.catalog_generation,
-                    captured_identity,
-                )
-            } else {
-                let captured_identity = match Self::namespace_catalog_identity_from_published(
-                    &captured_epoch.catalog,
-                    ns,
-                ) {
-                    Some(identity) => Some(identity),
-                    None => Self::namespace_catalog_identity(&self.metadata_state, ns)?,
-                };
-                let captured_ns_id_opt = captured_identity.as_ref().map(|identity| identity.ns_id);
-                // §10.17.1 — published `catalog_generation` is the cheap
-                // dirty bit for catalog DDL. CRUD never advances it; only
-                // DDL does through the `next_catalog_gen` reservation. If it
-                // changes before the AC #4 gate, we revalidate the captured
-                // target namespace/index identity before deciding whether
-                // this writer is stale. Use `published.load_full()` directly
-                // because the §10.5 single-load gate is scoped to reads.
-                (
-                    captured_ns_id_opt,
-                    captured_epoch.catalog_generation,
-                    captured_identity,
-                )
-            };
-        drop(captured_epoch);
-        // S2: create the writer visibility context held through S12.
-        // COMMIT-ENVELOPE-RESIDUE: A (visibility setup fails before journal append).
-        let vis = self.write_visibility_after_capture(ns, captured_ns_id)?;
-
-        // Setup private logical write state. Pre-reservation failures are
-        // cleaned up without touching the log; post-reservation failures
-        // poison the reserved LSN slot.
-        let txn_id = vis.read_view.txn_id;
-        let mut txn = WriteTxn::new(txn_id);
-
-        // S3: execute the write body under the CRUD metadata read guard. The
-        // catalog itself is behind `Mutex<Catalog>`, while page latches and
-        // expected-head checks serialize resident chain mutation.
-        #[cfg(any(test, feature = "test-hooks"))]
-        self::hidden_accessors::write_body_entry_if_installed(&self.shared, ns);
-        let body_result = f(&self.shared, &self.metadata_state, &mut txn, &vis);
-
-        match body_result {
-            Ok(value) => {
-                // Root-neutral vs root-changing classification. Header sync
-                // still captures catalog-root movement; logical-chain installs
-                // can also make primary B-tree structural progress without
-                // forcing a fresh catalog header.
-                let mut root_changing = false;
-
-                // Refresh the logical-txn append-duration percentiles after
-                // the Phase 8 log append envelope completes.
-                let _logical_txn_append_pct_refresh = LogicalTxnAppendPercentileRefresh::new();
-
-                let sec_writes = std::mem::take(&mut txn.pending_sec_index);
-                let primary_writes = std::mem::take(&mut txn.pending_primary);
-
-                // S3.5 captured-identity gate. Compare the
-                // `catalog_generation` we snapshotted in the S1 metadata-read
-                // scope against the live published generation. A DDL that
-                // completed between capture and now
-                // bumped `PublishedEpoch.catalog_generation` via the
-                // `next_catalog_gen` reservation; ordinary CRUD never
-                // bumps it. Because the generation is global, a mismatch is
-                // only a signal to revalidate the target namespace/index
-                // identity, not an automatic conflict for unrelated DDL.
-                //
-                // This gate runs before `register_with_oracle`, before any
-                // Pending install, and before log reservation. Rollback is
-                // purely in-memory.
-                {
-                    // Write-path direct load (§10.5 single-load gate is
-                    // read-path only); see the matching note at the S1
-                    // capture above.
-                    let current_epoch = self.shared.published.load_full();
-                    let current_gen = current_epoch.catalog_generation;
-                    let current_identity = match Self::namespace_catalog_identity_from_published(
-                        &current_epoch.catalog,
-                        ns,
-                    ) {
-                        Some(identity) => Some(identity),
-                        None => Self::namespace_catalog_identity(&self.metadata_state, ns)?,
-                    };
-                    if current_gen != captured_catalog_gen
-                        && current_identity != captured_catalog_identity
-                    {
-                        drop(txn);
-                        return Err(Error::WriteConflict {
-                            reason: WriteConflictReason::CatalogGenerationChanged,
-                        });
-                    }
-                }
-
-                let txn_id = txn.txn_id;
-
-                let slot = match self.register_ordinary_crud_slot() {
-                    Ok(slot) => slot,
-                    Err(e) => {
-                        drop(txn);
-                        return Err(e);
-                    }
-                };
-                let commit_ts = slot.commit_ts();
-                txn.commit_ts.set(Some(commit_ts));
-                let prev_published = self.shared.published.load_full();
-                assert!(
-                    commit_ts > prev_published.visible_ts,
-                    "commit_ts must advance beyond previous PublishedEpoch"
-                );
-                drop(prev_published);
-
-                let dirty = txn.publish_dirty;
-
-                let frame =
-                    txn.build_logical_txn_frame(&self.shared.handle, &primary_writes, &sec_writes);
-
-                let logical_payload = match frame.encode() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        drop(txn);
-                        return Err(
-                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
-                        );
-                    }
-                };
-                let logical_payload_len = logical_payload.len();
-
-                let prepared =
-                    match txn.prepare_chain_commit_payload(&self.shared.handle, commit_ts) {
-                        Ok(prepared) => prepared,
-                        Err(e) => {
-                            return Err(
-                                self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
-                            );
-                        }
-                    };
-                let draft = LogRecordDraft::crud(
-                    txn_id,
-                    slot.publish_seq(),
-                    commit_ts,
-                    logical_payload,
-                    prepared.payload,
-                );
-
-                let sec_pages = match install_pending_sec_index(
-                    &self.shared,
-                    &self.metadata_state,
-                    sec_writes.into_vec(),
-                    &vis,
-                    commit_ts,
-                    txn_id,
-                ) {
-                    Ok(pages) => pages,
-                    Err(e) => {
-                        return Err(
-                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
-                        );
-                    }
-                };
-
-                #[cfg(any(test, feature = "test-hooks"))]
-                if let Err(e) =
-                    self::hidden_accessors::us019_maybe_fail_primary_install(&self.shared)
-                {
-                    return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
-                }
-                let primary_install = install_pending_primary(
-                    &self.shared,
-                    &self.metadata_state,
-                    primary_writes.into_vec(),
-                    &vis,
-                    commit_ts,
-                    txn_id,
-                );
-                let (primary_pages, primary_structural_tree_change) = match primary_install {
-                    Ok(result) => result,
-                    Err(e) => {
-                        return Err(
-                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
-                        );
-                    }
-                };
-                root_changing |= primary_structural_tree_change;
-                let mut pending_pages = sec_pages;
-                pending_pages.extend(primary_pages);
-
-                #[cfg(any(test, feature = "test-hooks"))]
-                if let Err(e) = self::hidden_accessors::us026_fail_if_armed(
-                    &self.shared,
-                    Us026PostRegisterFailpoint::BeforeLogReservation,
-                ) {
-                    return Err(self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e));
-                }
-                #[cfg(any(test, feature = "test-hooks"))]
-                self::hidden_accessors::before_log_reservation_if_installed(&self.shared);
-
-                let reserve_start = Instant::now();
-                let reserved = match self.shared.handle.reserve_log_record(draft) {
-                    Ok(reserved) => reserved,
-                    Err(e) => {
-                        crate::mvcc::metrics::record_commit_envelope_stage_duration(
-                            crate::mvcc::metrics::CommitEnvelopeStage::LogReserve,
-                            reserve_start.elapsed(),
-                        );
-                        return Err(
-                            self.cleanup_registered_pre_durable_failure(txn_id, slot, None, e)
-                        );
-                    }
-                };
-                crate::mvcc::metrics::record_commit_envelope_stage_duration(
-                    crate::mvcc::metrics::CommitEnvelopeStage::LogReserve,
-                    reserve_start.elapsed(),
-                );
-                let commit_end_lsn = reserved.end_lsn();
-
-                // §4.6 deviation: US-006 installs Pending pages as
-                // Unflushable before reservation; this post-reservation stamp
-                // is the first point where those pages become flushable by LSN.
-                #[cfg(any(test, feature = "test-hooks"))]
-                if let Err(e) = self::hidden_accessors::fail_dirty_lsn_stamp_if_armed(&self.shared)
-                {
-                    return Err(self.poison_after_reserved_log_failure(&reserved, e));
-                }
-                if let Err(e) = self
-                    .shared
-                    .handle
-                    .stamp_dirty_pages_lsn(&pending_pages, commit_end_lsn)
-                {
-                    return Err(self.poison_after_reserved_log_failure(&reserved, e));
-                }
-                #[cfg(any(test, feature = "test-hooks"))]
-                if let Err(e) =
-                    self::hidden_accessors::fail_after_dirty_lsn_stamp_if_armed(&self.shared)
-                {
-                    return Err(self.poison_after_reserved_log_failure(&reserved, e));
-                }
-                let write_ready_start = Instant::now();
-                let written_end_lsn = match reserved.write_and_mark() {
-                    Ok(end_lsn) => end_lsn,
-                    Err(e) => {
-                        crate::mvcc::metrics::record_commit_envelope_stage_duration(
-                            crate::mvcc::metrics::CommitEnvelopeStage::LogWriteReady,
-                            write_ready_start.elapsed(),
-                        );
-                        return Err(self.poison_after_log_manager_failure(e));
-                    }
-                };
-                crate::mvcc::metrics::record_commit_envelope_stage_duration(
-                    crate::mvcc::metrics::CommitEnvelopeStage::LogWriteReady,
-                    write_ready_start.elapsed(),
-                );
-                debug_assert_eq!(written_end_lsn, commit_end_lsn);
-                crate::mvcc::metrics::record_logical_txn_append_bytes(logical_payload_len as u64);
-                crate::mvcc::metrics::record_journal_chain_commit_frame();
-                self.wait_for_commit_durability(commit_end_lsn)?;
-                #[cfg(any(test, feature = "test-hooks"))]
-                if self::hidden_accessors::fail_after_durable_before_flip_if_armed(&self.shared)
-                    .is_err()
-                {
-                    return Err(self.engine_fatal(
-                        crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
-                    ));
-                }
-
-                #[cfg(test)]
-                self::hidden_accessors::publish_pause_if_installed(&self.shared);
-
-                // S9: the log record is ready/durable before the
-                // Pending-to-Committed flip. The flip runs before publish so
-                // no reader can observe the new epoch with uncommitted heads.
-                let pending_flip_start = Instant::now();
-                let pending_flip_result =
-                    flip_pending_to_committed_for(&self.shared, txn_id, commit_ts, &pending_pages)
-                        .map_err(|_| {
-                            self.engine_fatal(
-                                crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
-                            )
-                        });
-                crate::mvcc::metrics::record_commit_envelope_stage_duration(
-                    crate::mvcc::metrics::CommitEnvelopeStage::PendingFlip,
-                    pending_flip_start.elapsed(),
-                );
-                pending_flip_result?;
-                #[cfg(any(test, feature = "test-hooks"))]
-                {
-                    self::hidden_accessors::us009_record_committed_flip(&self.shared);
-                    if self::hidden_accessors::us009_fail_after_committed_flip_if_armed(
-                        &self.shared,
-                    )
-                    .is_err()
-                    {
-                        return Err(self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurablePendingFlipFailure,
-                        ));
-                    }
-                }
-
-                #[cfg(any(test, feature = "test-hooks"))]
-                self::hidden_accessors::legacy_commit_abort_if_armed(
-                    LegacyCommitFailpoint::AfterLegacyCommitBeforePublish,
-                );
-
-                let shared = Arc::clone(&self.shared);
-                let metadata_state = Arc::clone(&self.metadata_state);
-                let publish_start = Instant::now();
-                let publish_result =
-                    self.shared
-                        .publish_sequencer
-                        .mark_ready(slot, move |publish_ts| {
-                            #[cfg(any(test, feature = "test-hooks"))]
-                            self::hidden_accessors::us009_record_publish_ready(&shared);
-                            rebuild_and_publish(&shared, &metadata_state, publish_ts, dirty, None)
-                        });
-                crate::mvcc::metrics::record_commit_envelope_stage_duration(
-                    crate::mvcc::metrics::CommitEnvelopeStage::PublishReady,
-                    publish_start.elapsed(),
-                );
-                match publish_result {
-                    Ok(()) => {}
-                    Err(Error::EngineFatal { reason }) => {
-                        return Err(Error::EngineFatal { reason });
-                    }
-                    Err(_) => {
-                        return Err(self.engine_fatal(
-                            crate::error::EngineFatalReason::PostDurablePublishFailure,
-                        ));
-                    }
-                }
-
-                if root_changing {
-                    crate::mvcc::metrics::record_crud_commit_root_changing();
-                } else {
-                    crate::mvcc::metrics::record_crud_commit_root_neutral();
-                }
-                self.maybe_sync_interval_after_publish()?;
-                Ok(value)
-            }
-            Err(e) => {
-                // COMMIT-ENVELOPE-RESIDUE: A (S3 body failure before journal append).
-                drop(txn);
-                Err(e)
-            }
-        }
-    }
-
-    fn register_ordinary_crud_slot(&self) -> Result<self::publish_sequencer::PublishSlotGuard> {
-        let publish_sequencer = &self.shared.publish_sequencer;
-        publish_sequencer.register_with_oracle(&self.shared.oracle)
-    }
-
-    fn cleanup_registered_pre_durable_failure(
-        &self,
-        txn_id: u64,
-        slot: self::publish_sequencer::PublishSlotGuard,
-        _mark: Option<u64>,
-        error: Error,
-    ) -> Error {
-        if let Error::EngineFatal { reason } = error {
-            return state::poison_after_durable_commit(&self.shared, reason);
-        }
-        let _ = flip_pending_to_aborted_for(&self.shared, txn_id);
-        self.shared.publish_sequencer.mark_aborted(slot);
-        error
-    }
-
-    fn write_visibility_after_capture(
-        &self,
-        ns: &str,
-        captured_ns_id: Option<i64>,
-    ) -> Result<WriteVisibility<'_>> {
-        let start = Instant::now();
-        loop {
-            match WriteVisibility::new(&self.shared, ns) {
-                Ok(vis) => return Ok(vis),
-                Err(Error::CollectionNotFound { .. })
-                    if captured_ns_id.is_some() && start.elapsed() < self.busy_timeout =>
-                {
-                    std::thread::yield_now();
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,52 +332,6 @@ impl PagedEngine {
         self.run_write(ns, |shared, md, txn, vis| {
             doc_ops::stage_insert(shared, md, txn, vis, ns, doc)
         })
-    }
-
-    /// Insert all documents in one ordinary CRUD commit envelope.
-    ///
-    /// Staging failures are reported separately so the public `insert_many`
-    /// layer can preserve ordered/unordered bulk-write semantics without
-    /// retrying post-reservation failures.
-    pub(crate) fn insert_many_batch(
-        &self,
-        ns: &str,
-        mut docs: Vec<Document>,
-    ) -> std::result::Result<Vec<Bson>, InsertManyBatchError> {
-        self.shared
-            .check_engine_not_poisoned()
-            .map_err(InsertManyBatchError::Commit)?;
-        preflight_insert_many_primary_keys(&mut docs)?;
-
-        let body_started = Cell::new(false);
-        let body_completed = Cell::new(false);
-        let staging_error_index = Cell::new(None);
-        let result = self.run_write(ns, |shared, md, txn, vis| {
-            body_started.set(true);
-            let mut ids = Vec::with_capacity(docs.len());
-            for (index, doc) in docs.into_iter().enumerate() {
-                match doc_ops::stage_insert(shared, md, txn, vis, ns, doc) {
-                    Ok(id) => ids.push(id),
-                    Err(error) => {
-                        staging_error_index.set(Some(index));
-                        return Err(error);
-                    }
-                }
-            }
-            body_completed.set(true);
-            Ok(ids)
-        });
-
-        match result {
-            Ok(ids) => Ok(ids),
-            Err(error) if body_started.get() && !body_completed.get() => {
-                Err(InsertManyBatchError::Staging {
-                    index: staging_error_index.get().unwrap_or(0),
-                    error,
-                })
-            }
-            Err(error) => Err(InsertManyBatchError::Commit(error)),
-        }
     }
 
     pub(crate) fn find(
@@ -1249,178 +419,6 @@ impl PagedEngine {
     }
 
     // -----------------------------------------------------------------------
-    // create_namespace
-    // -----------------------------------------------------------------------
-
-    pub(crate) fn create_namespace(&self, ns: &str) -> Result<()> {
-        self.shared.check_engine_not_poisoned()?;
-        let result = self.run_namespace_create_ddl(|shared, md, batch| {
-            let data_root = {
-                let mut cat = md.catalog_lock();
-                if cat.get_collection(ns)?.is_some() {
-                    return Err(Error::DuplicateKey {
-                        detail: format!("collection '{ns}' already exists"),
-                    });
-                }
-                // Phase 1 §10.7 — allocate durable namespace id from the
-                // header counter atomically with the catalog commit.
-                let id = cat.allocate_namespace_id();
-                cat.create_collection(ns, id, bson::doc! {}, now_millis())?
-            };
-            sync_catalog_root_structural(shared, md, batch)?;
-            let store = shared.new_structural_store(batch);
-            BTree::create_at(store, data_root)?;
-            Ok(())
-        });
-        // §10.1.1 F5 retirement: no name-based drop tombstone to clear.
-        result
-    }
-
-    // -----------------------------------------------------------------------
-    // drop_namespace
-    // -----------------------------------------------------------------------
-
-    pub(crate) fn drop_namespace(&self, ns: &str) -> Result<()> {
-        self.shared.check_engine_not_poisoned()?;
-        let stale_target = || Error::WriteConflict {
-            reason: WriteConflictReason::CatalogGenerationChanged,
-        };
-
-        let _md_w = self
-            .metadata
-            .write()
-            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        let Some(target_collection) = ({
-            let cat = self.metadata_state.catalog_lock();
-            cat.get_collection(ns)?
-        }) else {
-            return Ok(());
-        };
-        let ns_id = target_collection.id;
-        let data_root = target_collection.data_root_page;
-        let data_level = target_collection.data_root_level;
-        let index_roots: Vec<(u32, u8)> = {
-            let cat = self.metadata_state.catalog_lock();
-            cat.list_indexes(ns)?
-                .into_iter()
-                .map(|entry| (entry.root_page, entry.root_level))
-                .collect()
-        };
-
-        let mut guard = self
-            .shared
-            .ns_writers
-            .close_and_drain_guard(ns_id, self.busy_timeout)?;
-        // Force-expire ALL active ReadViews globally before freeing pages.
-        self.shared.handle.read_view_registry().force_expire_all();
-
-        let catalog_generation_before = self.shared.published.load_full().catalog_generation;
-        let reserved_gen = self
-            .shared
-            .next_catalog_gen
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
-        let slot = self
-            .shared
-            .publish_sequencer
-            .register_with_oracle(&self.shared.oracle)?;
-
-        let mut batch = StructuralPageBatch::new(&self.shared.handle);
-
-        let body = (|| -> Result<()> {
-            {
-                let cat = self.metadata_state.catalog_lock();
-                let collection =
-                    cat.get_collection(ns)?
-                        .ok_or_else(|| Error::CollectionNotFound {
-                            name: ns.to_owned(),
-                        })?;
-                if collection.id != ns_id {
-                    return Err(stale_target());
-                }
-            }
-
-            self.free_tree_pages_exclusive(&mut batch, data_root, data_level)?;
-            for (root_page, root_level) in &index_roots {
-                self.free_tree_pages_exclusive(&mut batch, *root_page, *root_level)?;
-            }
-
-            {
-                let mut cat = self.metadata_state.catalog_lock();
-                let collection =
-                    cat.get_collection(ns)?
-                        .ok_or_else(|| Error::CollectionNotFound {
-                            name: ns.to_owned(),
-                        })?;
-                if collection.id != ns_id {
-                    return Err(stale_target());
-                }
-                let dropped = cat.drop_collection(ns)?;
-                if !dropped {
-                    return Err(Error::CollectionNotFound {
-                        name: ns.to_owned(),
-                    });
-                }
-            }
-            sync_catalog_root_structural(&self.shared, &self.metadata_state, &mut batch)?;
-            self.shared.clear_dirty_collection(ns_id);
-            Ok(())
-        })();
-
-        if let Err(e) = body {
-            let _ = batch.abort(&self.shared.handle);
-            self.shared.publish_sequencer.mark_aborted(slot);
-            return Err(e);
-        }
-
-        if let Err(error) = self.commit_catalog_batch_to_log(
-            CatalogCommitKind::NamespaceDrop,
-            catalog_generation_before,
-            reserved_gen,
-            &slot,
-            batch,
-        ) {
-            if !matches!(error, Error::EngineFatal { .. }) {
-                self.shared.publish_sequencer.mark_aborted(slot);
-            }
-            return Err(error);
-        }
-
-        let dirty = PublishDirty {
-            published_catalog_dirty: true,
-            catalog_header_dirty: true,
-        };
-        let shared = Arc::clone(&self.shared);
-        let metadata_state = Arc::clone(&self.metadata_state);
-        let publish_result = self
-            .shared
-            .publish_sequencer
-            .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish(
-                    &shared,
-                    &metadata_state,
-                    publish_ts,
-                    dirty,
-                    Some(reserved_gen),
-                )
-            });
-        match publish_result {
-            Ok(()) => {
-                self.maybe_sync_interval_after_publish()?;
-            }
-            Err(Error::EngineFatal { reason }) => return Err(Error::EngineFatal { reason }),
-            Err(_) => {
-                return Err(self
-                    .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure))
-            }
-        }
-        // §10.1.1 F5 retirement: durable monotonic ns_ids are the
-        // resurrection barrier; no name-based drop tombstone is inserted.
-        guard.mark_dropped();
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
     // list_namespaces
     // -----------------------------------------------------------------------
 
@@ -1441,47 +439,6 @@ impl PagedEngine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn read_view_registry(&self) -> Option<Arc<crate::mvcc::ReadViewRegistry>> {
         Some(Arc::clone(self.shared.handle.read_view_registry()))
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us039_reset_append_sync_observations(&self) {
-        crate::journal::append_sync_observations::reset();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us039_append_sync_observations(
-        &self,
-    ) -> crate::journal::append_sync_observations::Us039AppendSyncObservations {
-        crate::journal::append_sync_observations::snapshot()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us017_reset_group_commit_probe(&self) {
-        self::group_commit_observations::reset();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us017_expect_group_commit_cohort_size(&self, expected: u64) {
-        self::group_commit_observations::set_expected_cohort_size(expected);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us017_fail_next_group_commit_fsync(&self) {
-        self::group_commit_observations::fail_next_fsync();
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us017_pause_next_group_commit_after_close(
-        &self,
-    ) -> self::group_commit_observations::Us017GroupCommitPauseGuard {
-        self::group_commit_observations::install_pause_after_close()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn us017_group_commit_observations(
-        &self,
-    ) -> self::group_commit_observations::Us017GroupCommitObservations {
-        self::group_commit_observations::observations()
     }
 
     #[allow(dead_code)]
@@ -1512,124 +469,118 @@ impl PagedEngine {
 // ---------------------------------------------------------------------------
 
 impl PagedEngine {
-    /// Drive the two namespace-create paths with the bootstrap DDL envelope.
+    /// Collect every page (internals, leaves, and overflow chains referenced
+    /// by reconciled leaf cells) of the tree rooted at `root_page`.
     ///
-    /// This helper is intentionally narrower than `run_ddl`: it handles
-    /// standalone `create_namespace` and write-path bootstrap on allocated-id
-    /// publication, while existing-namespace DDL drains remain separate.
-    fn run_namespace_create_ddl<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&SharedState, &MetadataState, &mut StructuralPageBatch) -> Result<R>,
-    {
-        self.shared.check_engine_not_poisoned()?;
-        let _md_w = self
-            .metadata
-            .write()
-            .map_err(|_| Error::Internal("metadata RwLock poisoned".into()))?;
-        let catalog_generation_before = self.shared.published.load_full().catalog_generation;
-        let reserved_gen = self
-            .shared
-            .next_catalog_gen
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
-        let slot = self
-            .shared
-            .publish_sequencer
-            .register_with_oracle(&self.shared.oracle)?;
-        let publish_dirty = PublishDirty {
-            published_catalog_dirty: true,
-            catalog_header_dirty: true,
-        };
-
-        let mut batch = StructuralPageBatch::new(&self.shared.handle);
-
-        let value = match f(&self.shared, &self.metadata_state, &mut batch) {
-            Ok(value) => value,
-            Err(e) => {
-                batch.abort(&self.shared.handle)?;
-                self.shared.publish_sequencer.mark_aborted(slot);
-                return Err(e);
-            }
-        };
-
-        if let Err(error) = self.commit_catalog_batch_to_log(
-            CatalogCommitKind::NamespaceCreate,
-            catalog_generation_before,
-            reserved_gen,
-            &slot,
-            batch,
-        ) {
-            if !matches!(error, Error::EngineFatal { .. }) {
-                self.shared.publish_sequencer.mark_aborted(slot);
-            }
-            return Err(error);
-        }
-
-        let shared = Arc::clone(&self.shared);
-        let metadata_state = Arc::clone(&self.metadata_state);
-        let publish_result = self
-            .shared
-            .publish_sequencer
-            .mark_ready(slot, move |publish_ts| {
-                rebuild_and_publish(
-                    &shared,
-                    &metadata_state,
-                    publish_ts,
-                    publish_dirty,
-                    Some(reserved_gen),
-                )
-            });
-        match publish_result {
-            Ok(()) => {
-                self.maybe_sync_interval_after_publish()?;
-                Ok(value)
-            }
-            Err(Error::EngineFatal { reason }) => Err(Error::EngineFatal { reason }),
-            Err(_) => {
-                Err(self
-                    .engine_fatal(crate::error::EngineFatalReason::PostDurableDdlPublishFailure))
-            }
-        }
-    }
-
-    fn free_tree_pages_exclusive(
+    /// Read-only walk: replaces the old in-body free sweep so the pages — and
+    /// their resident version chains — stay fully intact until
+    /// `retire_dropped_tree_pages` runs after the drop has committed and
+    /// published.
+    pub(super) fn collect_tree_pages(
         &self,
-        batch: &mut StructuralPageBatch,
         root_page: u32,
         root_level: u8,
-    ) -> Result<()> {
-        let mut tree = BTree::open(
-            self.shared.new_structural_store(batch),
-            root_page,
-            root_level,
-        );
-        let mut pages = tree.collect_pages_by_size()?;
-        pages.sort_by_key(|(page_id, _)| *page_id);
-        let mut latches = pages
-            .iter()
-            .map(|(page_id, size)| {
-                self.shared
-                    .handle
-                    .pool()
-                    .pin_for_write_sized(*page_id, *size)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut store = self.shared.new_structural_store(batch);
-        // The latches above are exclusive — operate directly on the
-        // already-latched pages via `LatchedPinnedPage::with_all_chains`
-        // instead of routing through `store.with_all_chains_under_latch`,
-        // which would deadlock when it tried to re-acquire the same
-        // per-page latch via its internal `pin_then_latch`.
-        for ((page_id, size), latch) in pages.iter().zip(latches.iter_mut()) {
+    ) -> Result<Vec<(u32, PageSize)>> {
+        let mut tree = BTree::open(self.shared.new_btree_store(), root_page, root_level);
+        tree.collect_pages_by_size()
+    }
+
+    /// Retire a dropped tree's pages AFTER the drop durably committed and the
+    /// new epoch published.
+    ///
+    /// EVERY tree page — 4 KiB internals included — is routed through the
+    /// page-lifetime deferred-free queue instead of being pushed straight
+    /// onto the allocator free list: a reader that loaded the pre-drop
+    /// `PublishedEpoch` before the publish can still open a fresh
+    /// (non-poisoned) ReadView and scan the dropped tree, and an immediate
+    /// free would let those pages be reused and silently satisfy that
+    /// snapshot with empty/foreign results. Descent validates only the
+    /// one-byte page type, so a freed 4 KiB internal reused by another
+    /// tree's SMO is a valid internal again and silently routes a
+    /// stale-epoch reader into a FOREIGN subtree — there is no fence-key or
+    /// tree-identity check to fail cleanly on.
+    ///
+    /// Queue entries carry two release gates: a later checkpoint must
+    /// advance the lifetime fence AND no live ReadView may predate the drop
+    /// (`oldest_required_ts() >= reader_fence_ts`). Only the checkpoint
+    /// drain (`advance_page_lifetime_checkpoint`, pool-coherent io) frees
+    /// retired pages — hot drains skip them wholesale; reallocation
+    /// re-zeroes the frame and clears chains (`BufferPoolHandle::alloc_page`).
+    ///
+    /// 32 KiB pages whose overflow refcount is still positive are not
+    /// enqueued here: their lifetime stays owned by the `OverflowRef` RAII
+    /// discipline, whose final decref enqueues them exactly once. A pending
+    /// note (`note_retired_overflow_pending`) recorded BEFORE the refcount
+    /// probe makes that final decref inherit this drop's `reader_fence_ts`
+    /// (it enqueues `RetiredTree32k`, not a fence-less overflow entry), so
+    /// a registered pre-drop reader that can still reach the chain through
+    /// a base-leaf pointer keeps the page un-reusable. The note-then-probe
+    /// order (paired with the SeqCst fences in the allocator) guarantees a
+    /// final decref racing this walk either consumes the note or is
+    /// observed by the probe — never both, never neither — so each page is
+    /// enqueued exactly once.
+    ///
+    /// Leak honesty: the page-lifetime queue is in-memory only and there is
+    /// NO startup scavenger that rebuilds the free list. If the process
+    /// exits before an entry drains — or a drain's free fails — the page is
+    /// leaked PERMANENTLY on disk. Refcount>0 pages leak the same way if
+    /// the final decref never runs in this process lifetime. This is the
+    /// accepted cost of never reusing a page a stale snapshot may still
+    /// need.
+    pub(super) fn retire_dropped_tree_pages(&self, pages: &[(u32, PageSize)]) {
+        let allocator = self.shared.handle.allocator();
+        // Post-publish visible_ts: every reader pinned to a pre-drop epoch
+        // has read_ts strictly below it.
+        let reader_fence_ts = self.shared.published.load_full().visible_ts;
+        for (page_id, size) in pages {
             match size {
-                PageSize::Small4k => store.free_internal(*page_id)?,
+                PageSize::Small4k => {
+                    allocator.enqueue_retired_tree_page(
+                        *page_id,
+                        PageSize::Small4k,
+                        reader_fence_ts,
+                    );
+                }
                 PageSize::Large32k => {
-                    latch.with_all_chains(|chains| chains.clear())?;
-                    store.free_leaf(*page_id)?;
+                    // Record the drop's reader fence BEFORE probing the
+                    // refcount so a concurrent final decref cannot slip a
+                    // fence-less entry into the queue.
+                    allocator.note_retired_overflow_pending(*page_id, reader_fence_ts);
+                    match allocator.overflow_refcount_slot(*page_id) {
+                        // No refcount slot was ever created (plain leaf or
+                        // never-referenced page): no decref will ever
+                        // consume the note — reclaim it and enqueue here.
+                        None => {
+                            if let Some(fence_ts) =
+                                allocator.take_retired_overflow_pending(*page_id)
+                            {
+                                allocator.enqueue_retired_tree_page(
+                                    *page_id,
+                                    PageSize::Large32k,
+                                    fence_ts,
+                                );
+                            }
+                        }
+                        // Slot exists at refcount 0: the final decref's
+                        // `fetch_sub` already ran, and its enqueue either
+                        // consumed the note (RetiredTree32k queued) or
+                        // pushed its entry before the note landed. Exactly
+                        // one queue entry exists either way — do NOT add a
+                        // second; just reclaim the note if it is still ours
+                        // so it cannot mis-tag a future occupant of this
+                        // page number.
+                        Some(0) => {
+                            let _ = allocator.take_retired_overflow_pending(*page_id);
+                        }
+                        // Live refcount (base image and/or resident chain
+                        // entries): the note stays; the final decref
+                        // enqueues the page as RetiredTree32k carrying this
+                        // drop's reader fence.
+                        Some(_) => {}
+                    }
                 }
             }
         }
-        drop(latches);
-        Ok(())
     }
 }
+

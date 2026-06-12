@@ -54,7 +54,7 @@ fn test_writer_read_sees_own_pending_before_publish() {
         "US-020 relies on clone-all before visibility filtering"
     );
 
-    let writer_view = ReadView::new(READ_BEFORE_PENDING, WRITER_TXN_ID);
+    let writer_view = ReadView::new_frontier_pinned_for_tests(READ_BEFORE_PENDING, WRITER_TXN_ID);
     let writer_entry = snapshot
         .visible_at(KEY, &writer_view)
         .expect("writer must see its own Pending entry before publish");
@@ -69,7 +69,7 @@ fn test_writer_read_sees_own_pending_before_publish() {
         VersionData::Overflow(_) => panic!("US-020 fixture must keep payload inline"),
     }
 
-    let foreign_view = ReadView::new(READ_AFTER_PENDING, FOREIGN_TXN_ID);
+    let foreign_view = ReadView::new_frontier_pinned_for_tests(READ_AFTER_PENDING, FOREIGN_TXN_ID);
     assert!(
         snapshot.visible_at(KEY, &foreign_view).is_none(),
         "foreign Pending must stay hidden until sequencer_frontier reaches start_ts"

@@ -14,7 +14,7 @@
 //! harnesses can permute them.
 //
 // LOCK-ORDER:
-// Database-wide total order (Phase 5 revision). Any path acquiring two or
+// Database-wide total order. Any path acquiring two or
 // more of these MUST acquire in this order and release in reverse:
 //
 // 1.   history-store partition mutex (outermost)
@@ -55,13 +55,13 @@
 // MUST be snapshotted BEFORE any partition mutex or page latch in any
 // reconciliation path.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::ops::Bound;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::mvcc::metrics;
+use crate::mvcc::registry::ReadViewRegistry;
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicU32};
@@ -70,7 +70,6 @@ use loom::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::mvcc::timestamp::Ts;
-use crate::mvcc::version::{VersionEntry, VersionState};
 use crate::storage::paged_engine::publish_sequencer::PublishSequencer;
 use crate::storage::root_snapshot::{PublishedCatalog, PublishedEpoch};
 
@@ -104,15 +103,18 @@ pub struct ReadView {
     pub pin_ops_in_flight: AtomicU32,
     /// Registry back-pointer. When `Some`, `Drop` unregisters `txn_id` from
     /// the registry so `oldest_required_ts()` no longer considers this
-    /// view. `None` for standalone `ReadView::new(..)` callers — primarily
-    /// tests that exercise snapshot visibility without a registry.
+    /// view. `None` for standalone `new_frontier_pinned_for_tests` /
+    /// `new_for_epoch` callers — primarily tests that exercise snapshot
+    /// visibility without a registry.
     registry: Option<Arc<ReadViewRegistry>>,
     /// Published visibility tuple pinned for this view's lifetime.
     epoch: Arc<PublishedEpoch>,
     /// Live sequencer frontier provider captured from `SharedState` when
-    /// the view is opened (§10.19 C-1, US-037). The view loads the live
-    /// `published_frontier` for foreign-Pending visibility checks instead
-    /// of caching a stale snapshot inside `PublishedEpoch`.
+    /// the view is opened. The view loads the live `published_frontier`
+    /// for foreign-Pending visibility checks (see `version_visible_to`)
+    /// rather than caching a stale snapshot inside `PublishedEpoch`, so a
+    /// long-lived reader sees commits that the sequencer publishes after
+    /// the view was opened.
     publish_sequencer: Arc<PublishSequencer>,
 }
 
@@ -133,16 +135,23 @@ impl std::fmt::Debug for ReadView {
 }
 
 impl ReadView {
-    /// Construct a fresh, live `ReadView` not tracked by any registry.
-    /// Prefer `ReadViewRegistry::open` on reader paths — this constructor
-    /// exists for tests and internal snapshot fixtures.
+    /// Construct a fresh, registry-less `ReadView` whose foreign-Pending
+    /// visibility is **frontier-pinned at `Ts::default()`**.
     ///
-    /// Standalone callers receive a fresh sequencer pinned at
-    /// `Ts::default()` so foreign-Pending visibility checks default to
-    /// "frontier has not advanced". Tests that need an explicit frontier
-    /// value should use `new_with_frontier`.
+    /// # Warning — test-only semantics
+    ///
+    /// This constructor builds a brand-new `PublishSequencer` pinned at
+    /// `Ts::default()`, so [`version_visible_to`](crate::mvcc::chain_snapshot)
+    /// treats every *foreign* `Pending` entry as **not yet published** — the
+    /// live-frontier proof that production readers rely on is permanently
+    /// "frozen at zero" for this view. It is therefore ONLY correct for tests
+    /// and internal snapshot fixtures that do not exercise foreign-Pending
+    /// visibility. Production reader paths MUST route through
+    /// [`Self::new_for_epoch`] / [`Self::open_for_epoch`] with a
+    /// `PublishSequencer` captured from `SharedState`. Tests that need an
+    /// explicit frontier value should use [`Self::new_with_frontier`].
     #[must_use]
-    pub fn new(read_ts: Ts, txn_id: u64) -> Self {
+    pub fn new_frontier_pinned_for_tests(read_ts: Ts, txn_id: u64) -> Self {
         Self::new_for_epoch(
             standalone_epoch(read_ts),
             txn_id,
@@ -171,8 +180,7 @@ impl ReadView {
     /// into the view, and read all visibility metadata from this pinned
     /// value for the rest of the snapshot lifetime. The view also pins
     /// `Arc<PublishSequencer>` so foreign-Pending visibility loads the
-    /// live `published_frontier` (§10.19 C-1, US-037) instead of a
-    /// stale snapshot.
+    /// live `published_frontier` instead of a stale snapshot.
     #[must_use]
     pub(crate) fn new_for_epoch(
         epoch: Arc<PublishedEpoch>,
@@ -190,16 +198,28 @@ impl ReadView {
         }
     }
 
-    /// Open a `ReadView` that registers itself with `registry` for the
-    /// lifetime of the returned `Arc`. The last `Arc::drop` unregisters
-    /// the view's `txn_id`, bounding the duration that `read_ts` pins the
-    /// `oldest_required_ts()` horizon. The registry slot also tracks a
-    /// `Weak<ReadView>` so `force_expire_all` can iterate live views.
+    /// Open a registry-tracked `ReadView` whose foreign-Pending visibility is
+    /// **frontier-pinned at `Ts::default()`**. The view registers itself with
+    /// `registry` for the lifetime of the returned `Arc`; the last `Arc::drop`
+    /// unregisters the view's `txn_id`, bounding the duration that `read_ts`
+    /// pins the `oldest_required_ts()` horizon. The registry slot also tracks
+    /// a `Weak<ReadView>` so `force_expire_all` can iterate live views.
     ///
-    /// Standalone callers receive a fresh sequencer pinned at
-    /// `Ts::default()`; production paths must use `open_for_epoch`.
+    /// # Warning — test-only semantics
+    ///
+    /// Like [`Self::new_frontier_pinned_for_tests`], this builds a brand-new
+    /// `PublishSequencer` pinned at `Ts::default()`, so foreign-Pending
+    /// visibility is permanently frozen at zero for this view. It is correct
+    /// only for tests that exercise the registry / `oldest_required_ts`
+    /// horizon without depending on live foreign-Pending visibility.
+    /// Production reader paths MUST use [`Self::open_for_epoch`] with a
+    /// `PublishSequencer` captured from `SharedState`.
     #[must_use]
-    pub fn open(registry: Arc<ReadViewRegistry>, read_ts: Ts, txn_id: u64) -> Arc<Self> {
+    pub fn open_frontier_pinned_for_tests(
+        registry: Arc<ReadViewRegistry>,
+        read_ts: Ts,
+        txn_id: u64,
+    ) -> Arc<Self> {
         Self::open_for_epoch(
             registry,
             standalone_epoch(read_ts),
@@ -230,6 +250,82 @@ impl ReadView {
         view
     }
 
+    /// Test-only standalone variant of
+    /// [`Self::open_for_epoch_conservative_then_refine`] with a
+    /// frontier-pinned standalone epoch (no `SharedState` sequencer), used to
+    /// exercise the conservative-then-refine registry handshake in isolation.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn open_for_epoch_conservative_then_refine_for_tests(
+        registry: Arc<ReadViewRegistry>,
+        read_ts: Ts,
+        txn_id: u64,
+    ) -> Arc<Self> {
+        // Mirror the production ordering in
+        // `snapshot_ops::read_exec::open_snapshot_read_view`: pin the
+        // conservative floor FIRST (with a placeholder back-pointer), then
+        // build the view over the epoch, then attach + refine.
+        registry.register(txn_id, Ts::default(), std::sync::Weak::new());
+        Self::open_for_epoch_conservative_then_refine(
+            registry,
+            standalone_epoch(read_ts),
+            txn_id,
+            PublishSequencer::new_with_published_frontier(Ts::default()),
+        )
+    }
+
+    /// Build a registry-tracked view over an already-loaded `epoch` and a
+    /// registry slot that has ALREADY been conservatively pinned at
+    /// `Ts::default()` for `txn_id` (ITEM 1, option a).
+    ///
+    /// Ordering invariant — the conservative pin precedes the epoch load.
+    /// The caller MUST have already inserted `txn_id → Ts::default()` into
+    /// `registry` (via [`ReadViewRegistry::register`] with a placeholder
+    /// `Weak::new()`) BEFORE loading `epoch`. From that pin onward the reader
+    /// is a member of every `oldest_required_ts()` snapshot at the lowest
+    /// possible floor, so no reconcile/eviction prune can run between the pin
+    /// and now and drop a resident superseded version visible at any
+    /// `ts >= Ts::default()` — which is every version this reader could need.
+    /// (The prune drops superseded committed versions whose
+    /// `stop_ts <= oldest_required_ts()` without spilling them to the history
+    /// store; a `Ts::default()` floor protects all of them.)
+    ///
+    /// This constructor builds the `Arc<ReadView>`, then in a single registry
+    /// lock publishes the real `Weak<ReadView>` back-pointer and refines the
+    /// pinned slot up from `Ts::default()` to the view's real `read_ts` (the
+    /// view's own `read_ts` field is always the real snapshot ts — only the
+    /// registry slot starts conservative), so the reader does not over-pin the
+    /// horizon for its whole lifetime. A concurrent prune observes either the
+    /// conservative floor or the refined `read_ts`; neither lets it drop a
+    /// version this reader needs.
+    ///
+    /// Net registry-mutex ops for the open are exactly two — the caller's
+    /// conservative `register` plus this `attach_view_and_refine` — matching
+    /// the prior shape; the fix only MOVES the pin to precede the load.
+    #[must_use]
+    pub(crate) fn open_for_epoch_conservative_then_refine(
+        registry: Arc<ReadViewRegistry>,
+        epoch: Arc<PublishedEpoch>,
+        txn_id: u64,
+        publish_sequencer: Arc<PublishSequencer>,
+    ) -> Arc<Self> {
+        let read_ts = epoch.visible_ts;
+        let view = Arc::new(Self {
+            read_ts,
+            txn_id,
+            poisoned: AtomicBool::new(false),
+            pin_ops_in_flight: AtomicU32::new(0),
+            registry: Some(Arc::clone(&registry)),
+            epoch,
+            publish_sequencer,
+        });
+        // The conservative pin already happened before the epoch load. Now
+        // that the view (and its real back-pointer) exist, publish the Weak
+        // and refine the slot up to the real read_ts in one lock.
+        registry.attach_view_and_refine(txn_id, read_ts, Arc::downgrade(&view));
+        view
+    }
+
     /// Snapshot timestamp pinned by the published epoch.
     #[must_use]
     pub(crate) fn visible_ts(&self) -> Ts {
@@ -242,9 +338,10 @@ impl ReadView {
         &self.epoch
     }
 
-    /// Live sequencer frontier published by `PublishSequencer` (§10.19
-    /// C-1, US-037). Loads `publish_sequencer.published_frontier` with
-    /// `Acquire`; never reads a cached `PublishedEpoch` field.
+    /// Live sequencer frontier published by `PublishSequencer`. Loads
+    /// `publish_sequencer.published_frontier` with `Acquire`; never reads
+    /// a cached `PublishedEpoch` field, so the value reflects commits
+    /// published after this view was opened.
     #[must_use]
     pub(crate) fn sequencer_frontier(&self) -> Ts {
         self.publish_sequencer
@@ -338,7 +435,8 @@ impl ReadView {
 
 /// Test-only handle that owns an `Arc<PublishSequencer>` so integration
 /// tests can advance the live `published_frontier` after a `ReadView`
-/// is opened against the same sequencer (US-037 acceptance test).
+/// is opened against the same sequencer, exercising the contract that a
+/// view reads the live frontier rather than a frontier snapshot.
 ///
 /// Always compiled — the canonical `cargo test --release --test
 /// mwmr_timestamp_frontier read_view_uses_live_publish_sequencer_frontier`
@@ -359,7 +457,7 @@ impl TestFrontierHandle {
 
     /// Advance the live `published_frontier` to `ts`. Mirrors what
     /// `PublishSequencer::mark_ready` does after the publish closure
-    /// stores the new epoch (§10.19 C-1).
+    /// stores the new epoch.
     pub fn advance(&self, ts: Ts) {
         self.sequencer
             .published_frontier
@@ -400,341 +498,6 @@ impl Drop for ReadView {
 }
 
 // ---------------------------------------------------------------------------
-// ReadViewRegistry
-// ---------------------------------------------------------------------------
-
-/// Tracks live `ReadView`s so the writer / reconciliation path can compute
-/// `oldest_required_ts()` — the lowest `read_ts` any open reader pins, and
-/// therefore the upper bound on versions the reconciler may discard.
-///
-/// Invariants:
-/// - Every `ReadView::open(registry, …)` inserts; the matching drop removes.
-/// - Empty registry ⇒ `oldest_required_ts() == Ts::MAX` (no horizon held).
-///
-/// The internal mutex is position **5** in the global lock order documented
-/// at the top of this file. `oldest_required_ts()` must be snapshotted
-/// BEFORE any partition mutex is acquired in a reconciliation path.
-pub struct ReadViewRegistry {
-    inner: Mutex<BTreeMap<u64, RegistrySlot>>,
-}
-
-/// Registry entry: the view's `read_ts` plus a `Weak` back-pointer used
-/// by `force_expire_all` to iterate live views. `Weak` avoids keeping the
-/// view alive past the caller's last `Arc` reference.
-struct RegistrySlot {
-    read_ts: Ts,
-    view: Weak<ReadView>,
-}
-
-impl std::fmt::Debug for ReadViewRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        #[allow(clippy::unwrap_used)]
-        let guard = self.inner.lock().unwrap();
-        f.debug_struct("ReadViewRegistry")
-            .field("live_views", &guard.len())
-            .finish()
-    }
-}
-
-impl ReadViewRegistry {
-    /// Construct an empty registry.
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(BTreeMap::new()),
-        })
-    }
-
-    /// Insert `(txn_id → read_ts, Weak<ReadView>)`. Overwrites any prior
-    /// entry for the same `txn_id` (callers must keep `txn_id` unique
-    /// across concurrently live views). Refreshes
-    /// `mvcc.active_read_views` gauge.
-    pub(crate) fn register(&self, txn_id: u64, read_ts: Ts, view: Weak<ReadView>) {
-        #[allow(clippy::unwrap_used)]
-        let mut guard = self.inner.lock().unwrap();
-        guard.insert(txn_id, RegistrySlot { read_ts, view });
-        metrics::set_active_read_views(guard.len() as u64);
-    }
-
-    /// Remove `txn_id` from the registry. No-op if absent. Refreshes
-    /// `mvcc.active_read_views` gauge.
-    pub fn unregister(&self, txn_id: u64) {
-        #[allow(clippy::unwrap_used)]
-        let mut guard = self.inner.lock().unwrap();
-        guard.remove(&txn_id);
-        metrics::set_active_read_views(guard.len() as u64);
-    }
-
-    /// Smallest `read_ts` across all live views, or `Ts::MAX` if empty.
-    #[must_use]
-    pub fn oldest_required_ts(&self) -> Ts {
-        #[allow(clippy::unwrap_used)]
-        let guard = self.inner.lock().unwrap();
-        guard.values().map(|s| s.read_ts).min().unwrap_or(Ts::MAX)
-    }
-
-    /// Force-expire EVERY registered `ReadView`. Snapshots all
-    /// `Weak<ReadView>` handles under the registry mutex, releases the
-    /// mutex, then upgrades each `Weak` and calls `force_expire` on any
-    /// upgradable view — which flips `poisoned` and spins until the
-    /// view's `pin_ops_in_flight` drains to zero.
-    ///
-    /// The snapshot-then-release pattern avoids a reentrant acquisition:
-    /// `Arc::drop` of a view calls `registry.unregister` which would
-    /// re-enter this mutex. By dropping the upgraded `Arc`s outside the
-    /// mutex we guarantee no nested lock.
-    ///
-    /// Caller must hold the writer serialization mutex (position 6) to
-    /// prevent new `ReadView::open` races from observing a half-drained
-    /// state.
-    pub fn force_expire_all(&self) {
-        let views: Vec<Weak<ReadView>> = {
-            #[allow(clippy::unwrap_used)]
-            let guard = self.inner.lock().unwrap();
-            guard.values().map(|s| s.view.clone()).collect()
-        };
-        for w in views {
-            if let Some(v) = w.upgrade() {
-                v.force_expire();
-            }
-        }
-    }
-
-    /// Number of live views. Mainly for tests / observability.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        #[allow(clippy::unwrap_used)]
-        self.inner.lock().unwrap().len()
-    }
-
-    /// True iff no live views are registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        #[allow(clippy::unwrap_used)]
-        self.inner.lock().unwrap().is_empty()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ChainSnapshot — reader-path snapshot of a frame's per-key version chains
-// ---------------------------------------------------------------------------
-
-/// Reader-side snapshot of a leaf frame's per-key version chains.
-///
-/// Construction deep-clones every `VersionEntry` in every chain, which runs
-/// `OverflowRef::Clone` (CAS-loop incref) on each `VersionData::Overflow`.
-/// Every entry observed through the snapshot is therefore pinned — its
-/// backing overflow chain cannot be freed while the snapshot is live.
-///
-/// Drop follows the default Rust drop-glue: the outer map drops each
-/// `VecDeque<VersionEntry>`, which drops every contained `VersionEntry`,
-/// which in turn runs `OverflowRef::Drop` (atomic decref + deferred-free
-/// enqueue on 0).
-///
-/// **Force-expiry contract:**
-///
-/// 1. `new` checks `view.poisoned` BEFORE taking any refcount bumps. If
-///    poisoned, it returns an empty snapshot (no `fetch_add`, no clones).
-/// 2. `new` takes `pin_ops_in_flight.fetch_add(1, Release)`, performs the
-///    deep clone (each entry's refcount bumped), then re-checks
-///    `poisoned` under an `Acquire` load and decrements
-///    `pin_ops_in_flight`. If poisoned-after, the cloned chains are
-///    dropped here — RAII decrefs every bumped entry so the net refcount
-///    delta is zero.
-/// 3. No explicit `Drop` impl: ordinary drop glue suffices because
-///    `force_expire` does NOT walk snapshot pins. Every refcount bump has
-///    a matching decref through a single code path.
-pub struct ChainSnapshot {
-    /// Deep-cloned per-key chains. Each `VecDeque<VersionEntry>` is owned
-    /// exclusively by this snapshot; the `VersionEntry` values inside each
-    /// `VecDeque` were cloned from the source (running `OverflowRef::Clone`
-    /// for `VersionData::Overflow` entries).
-    chains: BTreeMap<Vec<u8>, VecDeque<VersionEntry>>,
-    /// Back-reference to the owning reader's `ReadView`, used for the
-    /// poison check during `new`. `None` for standalone callers (primarily
-    /// tests that exercise snapshot visibility without a registry).
-    view: Option<Arc<ReadView>>,
-}
-
-impl std::fmt::Debug for ChainSnapshot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChainSnapshot")
-            .field("num_keys", &self.chains.len())
-            .field("view_attached", &self.view.is_some())
-            .finish()
-    }
-}
-
-impl ChainSnapshot {
-    /// Construct a snapshot from a frame's per-key version chains.
-    ///
-    /// Deep-clones every entry (bumping overflow refcounts via
-    /// `OverflowRef::Clone`) under the atomic-handoff protocol. See
-    /// type-level docs for the poison contract.
-    #[must_use]
-    pub fn new(
-        source: &BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
-        view: Option<Arc<ReadView>>,
-    ) -> Self {
-        // Pre-check: if the owning view is already poisoned, refuse to
-        // pin any entries. The empty snapshot is the "force-expired view
-        // sees nothing" contract.
-        if let Some(v) = &view {
-            if v.poisoned.load(Ordering::Acquire) {
-                return ChainSnapshot {
-                    chains: BTreeMap::new(),
-                    view,
-                };
-            }
-            v.pin_ops_in_flight.fetch_add(1, Ordering::Release);
-        }
-
-        // Deep clone: each inner `VersionEntry::clone()` runs
-        // `OverflowRef::clone()` which is the CAS-loop incref.
-        let mut chains = BTreeMap::new();
-        for (k, chain) in source {
-            let cloned: VecDeque<VersionEntry> = chain.iter().cloned().collect();
-            chains.insert(k.clone(), cloned);
-        }
-
-        // Re-check poison AFTER the bumps. If force-expiry fired while we
-        // were cloning, drop the cloned chains here — RAII decrefs every
-        // entry we just bumped so the net refcount delta is zero.
-        if let Some(v) = &view {
-            let poisoned_after = v.poisoned.load(Ordering::Acquire);
-            v.pin_ops_in_flight.fetch_sub(1, Ordering::Release);
-            if poisoned_after {
-                return ChainSnapshot {
-                    chains: BTreeMap::new(),
-                    view,
-                };
-            }
-        }
-
-        ChainSnapshot { chains, view }
-    }
-
-    /// Construct a snapshot containing only the resident chain for `key`.
-    ///
-    /// Point reads only need the chain for the searched key. Cloning the
-    /// entire leaf's delta map on every point lookup recreates the same
-    /// per-reader allocation pressure as copying full page images.
-    #[must_use]
-    pub fn new_for_key(
-        source: &BTreeMap<Vec<u8>, Arc<VecDeque<VersionEntry>>>,
-        key: &[u8],
-        view: Option<Arc<ReadView>>,
-    ) -> Self {
-        if let Some(v) = &view {
-            if v.poisoned.load(Ordering::Acquire) {
-                return ChainSnapshot {
-                    chains: BTreeMap::new(),
-                    view,
-                };
-            }
-            v.pin_ops_in_flight.fetch_add(1, Ordering::Release);
-        }
-
-        let mut chains = BTreeMap::new();
-        if let Some(chain) = source.get(key) {
-            chains.insert(key.to_vec(), chain.iter().cloned().collect());
-        }
-
-        if let Some(v) = &view {
-            let poisoned_after = v.poisoned.load(Ordering::Acquire);
-            v.pin_ops_in_flight.fetch_sub(1, Ordering::Release);
-            if poisoned_after {
-                return ChainSnapshot {
-                    chains: BTreeMap::new(),
-                    view,
-                };
-            }
-        }
-
-        ChainSnapshot { chains, view }
-    }
-
-    /// Find the entry in the chain for `key` visible at `view.read_ts`.
-    ///
-    /// Visibility rule:
-    /// - Own pending entry: visible by matching `txn_id`.
-    /// - Foreign pending entry: same timestamp window and
-    ///   `start_ts <= view.sequencer_frontier()`.
-    /// - Committed entry: `start_ts <= read_ts < stop_ts`.
-    /// - Aborted entry: skipped.
-    #[must_use]
-    pub fn visible_at(&self, key: &[u8], view: &ReadView) -> Option<&VersionEntry> {
-        self.chains
-            .get(key)
-            .and_then(|chain| chain.iter().find(|entry| version_visible_to(entry, view)))
-    }
-
-    /// Iterate visible `(key, entry)` pairs within the supplied byte bounds.
-    ///
-    /// Uses the same visibility predicate as [`Self::visible_at`].
-    pub fn visible_range<'a>(
-        &'a self,
-        start: Bound<&'a [u8]>,
-        end: Bound<&'a [u8]>,
-        view: &'a ReadView,
-    ) -> impl Iterator<Item = (&'a [u8], &'a VersionEntry)> + 'a {
-        self.chains
-            .range::<[u8], _>((start, end))
-            .filter_map(move |(key, chain)| {
-                chain
-                    .iter()
-                    .find(|entry| version_visible_to(entry, view))
-                    .map(|entry| (key.as_slice(), entry))
-            })
-    }
-
-    /// True when history can contain a useful version for `key` at `read_ts`.
-    #[must_use]
-    pub fn history_is_candidate(&self, key: &[u8], read_ts: Ts) -> bool {
-        self.chains.get(key).map_or(true, |chain| {
-            chain.iter().all(|entry| {
-                entry.start_ts > read_ts || matches!(entry.state, VersionState::Pending { .. })
-            })
-        })
-    }
-
-    /// Number of distinct keys with chains in this snapshot.
-    #[must_use]
-    pub fn key_count(&self) -> usize {
-        self.chains.len()
-    }
-
-    /// True iff the snapshot holds no chains.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.chains.is_empty()
-    }
-
-    /// Length of the chain for `key`, or 0 if absent.
-    #[must_use]
-    pub fn chain_len(&self, key: &[u8]) -> usize {
-        self.chains.get(key).map_or(0, |c| c.len())
-    }
-}
-
-fn version_visible_to(entry: &VersionEntry, view: &ReadView) -> bool {
-    let read_ts = view.visible_ts();
-    match entry.state {
-        VersionState::Pending { txn_id } => {
-            if txn_id == view.txn_id {
-                true
-            } else {
-                entry.start_ts <= read_ts
-                    && read_ts < entry.stop_ts
-                    && entry.start_ts <= view.sequencer_frontier()
-            }
-        }
-        VersionState::Committed => entry.start_ts <= read_ts && read_ts < entry.stop_ts,
-        VersionState::Aborted => false,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -742,13 +505,3 @@ fn version_visible_to(entry: &VersionEntry, view: &ReadView) -> bool {
 #[cfg(not(loom))]
 #[path = "tests/read_view.rs"]
 mod tests;
-
-#[cfg(test)]
-#[cfg(not(loom))]
-#[path = "tests/read_view_pending_visibility.rs"]
-mod read_view_pending_visibility;
-
-#[cfg(test)]
-#[cfg(not(loom))]
-#[path = "tests/chain_snapshot_range.rs"]
-mod chain_snapshot_range;

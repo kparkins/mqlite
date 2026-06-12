@@ -5,42 +5,15 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::ops::Bound;
 
-use crate::error::{Error, Result};
-use crate::mvcc::read_view::{ChainSnapshot, ReadView};
-use crate::mvcc::version::{VersionData, VersionEntry};
-use crate::storage::buffer_pool::PageSize;
-use crate::storage::page::{OverflowPageHeader, OVERFLOW_HEADER_SIZE, PAGE_SIZE_LEAF};
+use crate::error::Result;
+use crate::mvcc::chain_snapshot::ChainSnapshot;
+use crate::mvcc::read_view::ReadView;
 
+use super::layout::page_size_for_level;
 use super::node::{InternalNode, LeafNode};
-use super::{BTree, BTreePageStore, CellValue, HistoryProbe, LeafPageImage};
-
-// ---------------------------------------------------------------------------
-// Overflow read helper
-// ---------------------------------------------------------------------------
-
-pub(crate) fn read_overflow_chain<S: BTreePageStore>(
-    store: &S,
-    first_page: u32,
-    total_length: u32,
-) -> Result<Vec<u8>> {
-    let mut result = Vec::with_capacity(total_length as usize);
-    let mut cur = first_page;
-    while cur != 0 {
-        let (buf, _) = store.read_leaf(cur)?;
-        let hdr = OverflowPageHeader::from_bytes(&buf[..])?;
-        hdr.validate_type()?;
-        let data_len = hdr.data_length as usize;
-        if OVERFLOW_HEADER_SIZE + data_len > PAGE_SIZE_LEAF as usize {
-            return Err(Error::Internal(format!(
-                "overflow page {cur}: data_length {data_len} exceeds page size"
-            )));
-        }
-        result.extend_from_slice(&buf[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + data_len]);
-        cur = hdr.next_overflow_page;
-    }
-    result.truncate(total_length as usize);
-    Ok(result)
-}
+use super::overflow::{read_overflow_chain, resolve_cell_value, resolve_version_data};
+use super::store::{BTreePageStore, HistoryProbe, LeafPageImage};
+use super::{BTree, CellValue};
 
 /// A visible delta key paired with `Some(value)` for live versions or `None`
 /// for tombstones.
@@ -67,15 +40,7 @@ impl<S: BTreePageStore> BTree<S> {
     pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.search(key)? {
             None => Ok(None),
-            Some(CellValue::Inline(v)) => Ok(Some(v)),
-            Some(CellValue::Overflow {
-                first_page,
-                total_length,
-            }) => Ok(Some(read_overflow_chain(
-                &self.store,
-                first_page,
-                total_length,
-            )?)),
+            Some(value) => Ok(Some(resolve_cell_value(&self.store, &value)?)),
         }
     }
 
@@ -102,14 +67,7 @@ impl<S: BTreePageStore> BTree<S> {
                 if entry.is_tombstone {
                     return Ok(None);
                 }
-                return Ok(Some(match &entry.data {
-                    VersionData::Inline(v) => v.clone(),
-                    VersionData::Overflow(oref) => read_overflow_chain(
-                        &self.store,
-                        oref.first_page(),
-                        oref.total_length() as u32,
-                    )?,
-                }));
+                return Ok(Some(resolve_version_data(&self.store, &entry.data)?));
             }
         }
         // History fallthrough: the chain had no entry visible at
@@ -123,27 +81,12 @@ impl<S: BTreePageStore> BTree<S> {
                     if entry.is_tombstone {
                         return Ok(None);
                     }
-                    return Ok(Some(match &entry.data {
-                        VersionData::Inline(v) => v.clone(),
-                        VersionData::Overflow(oref) => read_overflow_chain(
-                            &self.store,
-                            oref.first_page(),
-                            oref.total_length() as u32,
-                        )?,
-                    }));
+                    return Ok(Some(resolve_version_data(&self.store, &entry.data)?));
                 }
             }
         }
         match LeafNode::cell_value(&buf[..], key)? {
-            Some(CellValue::Inline(v)) => Ok(Some(v)),
-            Some(CellValue::Overflow {
-                first_page,
-                total_length,
-            }) => Ok(Some(read_overflow_chain(
-                &self.store,
-                first_page,
-                total_length,
-            )?)),
+            Some(value) => Ok(Some(resolve_cell_value(&self.store, &value)?)),
             None => Ok(None),
         }
     }
@@ -263,24 +206,10 @@ impl<S: BTreePageStore> BTree<S> {
             Bound::Unbounded => self.read_leftmost_leaf_latch_coupled()?,
         };
 
-        let resolve_entry = |entry: &VersionEntry| -> Result<Vec<u8>> {
-            match &entry.data {
-                VersionData::Inline(v) => Ok(v.clone()),
-                VersionData::Overflow(oref) => {
-                    let total_length = oref.total_length() as u32;
-                    read_overflow_chain(&self.store, oref.first_page(), total_length)
-                }
-            }
+        let resolve_entry = |entry: &crate::mvcc::version::VersionEntry| {
+            resolve_version_data(&self.store, &entry.data)
         };
-        let resolve_cell = |value: &CellValue| -> Result<Vec<u8>> {
-            match value {
-                CellValue::Inline(v) => Ok(v.clone()),
-                CellValue::Overflow {
-                    first_page,
-                    total_length,
-                } => read_overflow_chain(&self.store, *first_page, *total_length),
-            }
-        };
+        let resolve_cell = |value: &CellValue| resolve_cell_value(&self.store, value);
 
         loop {
             let (buf, snap) = leaf_read;
@@ -291,14 +220,43 @@ impl<S: BTreePageStore> BTree<S> {
             let mut chain_iter = snap
                 .as_ref()
                 .map(|snapshot| snapshot.visible_range(start, end, view).peekable());
+            // Third merge source: delta-only-but-not-visible keys that remain
+            // history candidates. `visible_range` cannot yield them (no visible
+            // entry) and they may have no base cell, so without this source the
+            // range scan drops keys `get_mvcc` would surface from history. Keys
+            // that DO have a base cell are deduped below — their probe runs in
+            // the `Base` arm, not here — so a key is never probed twice.
+            let mut history_candidate_iter = snap.as_ref().map(|snapshot| {
+                snapshot
+                    .history_candidate_keys_without_visible_entry(start, end, view, view.read_ts)
+                    .peekable()
+            });
 
             loop {
                 let base_key = base_iter.peek().map(|cell| cell.key.as_slice());
                 let chain_key = chain_iter
                     .as_mut()
                     .and_then(|iter| iter.peek().map(|(key, _)| *key));
+                let history_key = history_candidate_iter
+                    .as_mut()
+                    .and_then(|iter| iter.peek().copied());
 
-                let Some((source, source_key)) = merge_source(base_key, chain_key) else {
+                // The history-candidate source only contributes a standalone
+                // probe target when its key is strictly smaller than the base
+                // key (no base cell of its own at this position). When it ties
+                // a base key, drop it so the `Base` arm owns the single probe;
+                // when it ties a chain key it is impossible (the accessor
+                // excludes keys with a visible entry).
+                let history_key = match (base_key, history_key) {
+                    (Some(base), Some(hist)) if base == hist => {
+                        history_candidate_iter.as_mut().and_then(|iter| iter.next());
+                        None
+                    }
+                    (_, hist) => hist,
+                };
+
+                let Some((source, source_key)) = merge_source(base_key, chain_key, history_key)
+                else {
                     break;
                 };
 
@@ -357,6 +315,27 @@ impl<S: BTreePageStore> BTree<S> {
                             return Ok(());
                         }
                     }
+                    MergeSource::HistoryCandidate => {
+                        let next = history_candidate_iter.as_mut().and_then(|iter| iter.next());
+                        let Some(key) = next else {
+                            break;
+                        };
+                        // Delta-only history-candidate key with no base cell:
+                        // probe history exactly as the point-read fallthrough
+                        // does — tombstone hides the key, a live version is
+                        // surfaced, a miss yields nothing (no base cell to fall
+                        // back to).
+                        if let Some(probe) = history {
+                            if let Some(entry) = probe.probe_visible_version(key, view.read_ts)? {
+                                if !entry.is_tombstone {
+                                    let bytes = resolve_entry(&entry)?;
+                                    if !visit(key.to_vec(), bytes)? {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -387,14 +366,7 @@ impl<S: BTreePageStore> BTree<S> {
                     let value = if entry.is_tombstone {
                         None
                     } else {
-                        Some(match &entry.data {
-                            VersionData::Inline(v) => v.clone(),
-                            VersionData::Overflow(oref) => read_overflow_chain(
-                                &self.store,
-                                oref.first_page(),
-                                oref.total_length() as u32,
-                            )?,
-                        })
+                        Some(resolve_version_data(&self.store, &entry.data)?)
                     };
                     results.push((key.to_vec(), value));
                 }
@@ -519,6 +491,8 @@ impl<S: BTreePageStore> BTree<S> {
         let mut level = self.root_level;
 
         while level > 0 {
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::storage::close_quadratic_probe::record_descent_internal_reads(1);
             let buf = self.store.read_internal(page)?;
             let node = InternalNode::parse(&buf[..])?;
             page = node.find_child(key);
@@ -598,13 +572,20 @@ enum MergeSource {
     Base,
     Chain,
     Both,
+    HistoryCandidate,
 }
 
 fn merge_source<'a>(
     base: Option<&'a [u8]>,
     chain: Option<&'a [u8]>,
+    history: Option<&'a [u8]>,
 ) -> Option<(MergeSource, &'a [u8])> {
-    match (base, chain) {
+    // Resolve base vs chain first (they can tie, producing `Both`); the
+    // history-candidate source never ties either — by construction its keys
+    // have no visible entry (so they differ from every `chain` key) and the
+    // caller already dropped any history key that equals the current `base`
+    // key (so the `Base` arm owns that probe).
+    let base_chain = match (base, chain) {
         (None, None) => None,
         (Some(base), None) => Some((MergeSource::Base, base)),
         (None, Some(chain)) => Some((MergeSource::Chain, chain)),
@@ -613,6 +594,17 @@ fn merge_source<'a>(
             CmpOrdering::Equal => Some((MergeSource::Both, base)),
             CmpOrdering::Greater => Some((MergeSource::Chain, chain)),
         },
+    };
+    match (base_chain, history) {
+        (other, None) => other,
+        (None, Some(history)) => Some((MergeSource::HistoryCandidate, history)),
+        (Some((source, source_key)), Some(history)) => {
+            if history < source_key {
+                Some((MergeSource::HistoryCandidate, history))
+            } else {
+                Some((source, source_key))
+            }
+        }
     }
 }
 
@@ -632,14 +624,6 @@ fn end_excludes_key(end: Bound<&[u8]>, key: &[u8]) -> bool {
         Bound::Unbounded => false,
         Bound::Included(end_key) => key > end_key,
         Bound::Excluded(end_key) => key >= end_key,
-    }
-}
-
-fn page_size_for_level(level: u8) -> PageSize {
-    if level == 0 {
-        PageSize::Large32k
-    } else {
-        PageSize::Small4k
     }
 }
 

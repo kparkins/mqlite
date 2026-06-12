@@ -72,7 +72,7 @@ fn drop_collection_barrier() {
     // Open N=5 ReadViews directly against the registry.
     let mut views: Vec<Arc<ReadView>> = Vec::with_capacity(5);
     for i in 0..5u64 {
-        views.push(ReadView::open(
+        views.push(ReadView::open_frontier_pinned_for_tests(
             Arc::clone(&registry),
             Ts {
                 physical_ms: 1_000 + i,
@@ -309,7 +309,7 @@ fn overflow_pages_stable_under_mixed_load() {
         }
     }
 
-    let start_pages = mqlite::mvcc::overflow_pages_in_use_snapshot();
+    let start_pages = mqlite::mvcc::metrics::overflow_pages_in_use_snapshot();
 
     let stop = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -357,7 +357,7 @@ fn overflow_pages_stable_under_mixed_load() {
             .expect("registry present");
         let mut txn = 100_000u64;
         while !s_churn.load(Ordering::Relaxed) {
-            let _v = ReadView::open(
+            let _v = ReadView::open_frontier_pinned_for_tests(
                 Arc::clone(&reg),
                 Ts {
                     physical_ms: txn,
@@ -378,7 +378,7 @@ fn overflow_pages_stable_under_mixed_load() {
         h.join().unwrap();
     }
 
-    let end_pages = mqlite::mvcc::overflow_pages_in_use_snapshot();
+    let end_pages = mqlite::mvcc::metrics::overflow_pages_in_use_snapshot();
     let drift = if start_pages == 0 {
         end_pages as f64
     } else {

@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::mvcc::read_view::ChainSnapshot;
+use crate::mvcc::chain_snapshot::ChainSnapshot;
 use crate::mvcc::version::VersionEntry;
 use crate::storage::btree::{BTreePageStore, LeafPageImage};
 use crate::storage::buffer_pool::{LatchMode, LatchedPinnedPage, PageSize, PinnedPage};
@@ -170,6 +170,42 @@ impl BufferPoolPageStore {
                 Ok((LeafPageImage::owned(buf), None))
             }
         }
+    }
+
+    /// Copy a leaf page image from a shared reader guard, SKIPPING the chain
+    /// snapshot entirely.
+    ///
+    /// WHY: structural rebuild (checkpoint materialize) consumes `(key, value)`
+    /// pairs already collected via `visible_delta_entries`; its rebuild ops
+    /// parse only base + staged page bytes and discard the chain snapshot
+    /// `read_leaf` returns. Cloning resident chains per read is dead work that
+    /// made close O(n²) (measured 4.4s × (docs/4k)²). This is the image-only
+    /// counterpart to `snapshot_leaf` for those reads.
+    fn image_only_leaf(&self, guard: &SharedReaderPage<'_>) -> Result<LeafPageImage> {
+        match guard {
+            SharedReaderPage::Latched(p) => {
+                let _hold = LeafHoldScope::new(p.page_id());
+                LeafPageImage::shared(p.data_snapshot())
+            }
+            SharedReaderPage::Pinned(p) => {
+                let mut buf = Box::new([0u8; LEAF_SIZE]);
+                buf.copy_from_slice(p.data());
+                Ok(LeafPageImage::owned(buf))
+            }
+        }
+    }
+
+    /// Read a leaf page image WITHOUT snapshotting its resident MVCC chains.
+    ///
+    /// WHY: mirrors [`BTreePageStore::read_leaf`]'s pin/copy path for
+    /// `BufferPoolPageStore` but skips `snapshot_chains`. Structural rebuild
+    /// callers discard the chain snapshot
+    /// (`let (buf, _) = self.store.read_leaf(...)`), so cloning the resident
+    /// chains per read is pure dead work, O(n) per read × n reads, which made
+    /// close O(n²). See [`Self::image_only_leaf`].
+    pub(crate) fn read_leaf_image_only(&self, page: u32) -> Result<LeafPageImage> {
+        let guard = self.pin_shared_for_read(page, PageSize::Large32k)?;
+        self.image_only_leaf(&guard)
     }
 }
 

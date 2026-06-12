@@ -3,18 +3,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use parking_lot::{Condvar, Mutex as PlMutex};
+use parking_lot::Mutex as PlMutex;
 
 use crate::error::{EngineFatalReason, Error, Result};
-use crate::journal::log_file::{LogicalOpKind, LogicalTxnFrame};
 use crate::journal::ParsedLogicalFrames;
-use crate::mvcc::metrics::{
-    record_logical_txn_pass2_resolved_op, record_logical_txn_pass2_unresolved_op,
-};
 use crate::mvcc::timestamp::TimestampOracle;
 use crate::storage::btree_store::BufferPoolPageStore;
 use crate::storage::catalog::{open_with_fallback as catalog_open_with_fallback, Catalog};
@@ -28,7 +23,7 @@ use super::publish::build_published_catalog;
 use super::publish_sequencer::PublishSequencer;
 use super::recovery_apply::{
     apply_parsed_logical_frames, check_recovery_replay_pool_bound,
-    install_recovered_published_epoch,
+    install_recovered_published_epoch, validate_parsed_logical_frames_against_catalog,
 };
 use super::writer_registry::NsWriterRegistry;
 
@@ -52,138 +47,21 @@ use state_test_hooks::SharedStateTestHooks;
 // SharedState — fields shared by read path (no mutex) and writer (mutex held)
 // ---------------------------------------------------------------------------
 
-/// Engine-wide writer-admission gate used by checkpoint freeze windows.
-///
-/// The namespace writer registry remains per-collection. This gate sits
-/// before that namespace admission point so a checkpoint can close all new
-/// writer admission, wait for already-admitted writers to publish or abort,
-/// then run the mutation-free planning / freeze window without relying on
-/// metadata-write exclusion.
-pub(crate) struct CheckpointAdmissionGate {
-    inner: PlMutex<CheckpointAdmissionInner>,
-    cvar: Condvar,
-}
-
-#[derive(Default)]
-struct CheckpointAdmissionInner {
-    admits: u64,
-    releases: u64,
-    close_count: u32,
-    poisoned_reason: Option<EngineFatalReason>,
-}
-
-impl CheckpointAdmissionGate {
-    /// Construct an open checkpoint admission gate.
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: PlMutex::new(CheckpointAdmissionInner::default()),
-            cvar: Condvar::new(),
-        }
-    }
-
-    /// Close writer admission and wait until every admitted writer exits.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::WriterBusy`] when already-admitted writers do not
-    /// drain within `timeout`. Returns [`Error::EngineFatal`] when the live
-    /// engine is already poisoned.
-    pub(crate) fn close_and_drain_all(
-        self: &Arc<Self>,
-        timeout: Duration,
-    ) -> Result<CheckpointAdmissionGuard> {
-        let guard = CheckpointAdmissionGuard {
-            gate: Arc::clone(self),
-        };
-        let start = Instant::now();
-        let mut inner = self.inner.lock();
-        inner.close_count = inner.close_count.saturating_add(1);
-        loop {
-            if let Some(reason) = inner.poisoned_reason.clone() {
-                return Err(Error::EngineFatal { reason });
-            }
-            if inner.admits == inner.releases {
-                return Ok(guard);
-            }
-            let remaining = timeout.checked_sub(start.elapsed()).unwrap_or_default();
-            if remaining.is_zero() {
-                return Err(Error::WriterBusy);
-            }
-            let wait = self.cvar.wait_for(&mut inner, remaining);
-            if wait.timed_out() && inner.admits != inner.releases {
-                return Err(Error::WriterBusy);
-            }
-        }
-    }
-
-    /// Admit one writer unless a checkpoint has closed admission.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::EngineFatal`] when the live engine has been poisoned.
-    pub(crate) fn admit_writer(self: &Arc<Self>) -> Result<CheckpointWriterAdmission> {
-        let mut inner = self.inner.lock();
-        loop {
-            if let Some(reason) = inner.poisoned_reason.clone() {
-                return Err(Error::EngineFatal { reason });
-            }
-            if inner.close_count == 0 {
-                inner.admits = inner.admits.saturating_add(1);
-                return Ok(CheckpointWriterAdmission {
-                    gate: Arc::clone(self),
-                });
-            }
-            self.cvar.wait(&mut inner);
-        }
-    }
-
-    fn reopen(&self) {
-        let mut inner = self.inner.lock();
-        if inner.poisoned_reason.is_none() {
-            inner.close_count = inner.close_count.saturating_sub(1);
-            if inner.close_count == 0 {
-                self.cvar.notify_all();
-            }
-        }
-    }
-
-    fn poison(&self, reason: EngineFatalReason) {
-        let mut inner = self.inner.lock();
-        inner.close_count = inner.close_count.saturating_add(1);
-        if inner.poisoned_reason.is_none() {
-            inner.poisoned_reason = Some(reason);
-        }
-        self.cvar.notify_all();
-    }
-}
-
-/// RAII guard returned by [`CheckpointAdmissionGate::close_and_drain_all`].
-#[must_use = "CheckpointAdmissionGuard reopens checkpoint writer admission on drop"]
-pub(crate) struct CheckpointAdmissionGuard {
-    gate: Arc<CheckpointAdmissionGate>,
-}
-
-impl Drop for CheckpointAdmissionGuard {
-    fn drop(&mut self) {
-        self.gate.reopen();
-    }
-}
-
-/// Writer admission token released after the writer publishes or aborts.
-#[must_use = "dropping CheckpointWriterAdmission releases the admitted writer"]
-pub(crate) struct CheckpointWriterAdmission {
-    gate: Arc<CheckpointAdmissionGate>,
-}
-
-impl Drop for CheckpointWriterAdmission {
-    fn drop(&mut self) {
-        let mut inner = self.gate.inner.lock();
-        inner.releases = inner.releases.saturating_add(1);
-        if inner.admits == inner.releases {
-            self.gate.cvar.notify_all();
-        }
-    }
-}
+// The checkpoint writer-admission gate moved to `checkpoint_gate.rs`
+// (plan item R12). Re-exported here so every existing import/usage path
+// through `state` keeps resolving unchanged — callers reach the gate via
+// `SharedState.checkpoint_admission` and these re-exported type names.
+// `CheckpointAdmissionGate` is named directly below (field type +
+// constructor); the two guard tokens are returned by the gate's
+// `pub(crate)` methods and re-exported alongside it so the full gate
+// surface stays reachable through `state` for current and future callers.
+#[allow(
+    unused_imports,
+    reason = "guard/admission tokens flow through method return types; re-exported so the gate surface resolves through `state`"
+)]
+pub(crate) use super::checkpoint_gate::{
+    CheckpointAdmissionGate, CheckpointAdmissionGuard, CheckpointWriterAdmission,
+};
 
 /// State shared by the read path (no mutex) and the writer inside
 /// `Mutex<BpBackend>`.
@@ -358,6 +236,22 @@ impl SharedState {
         batch.store(self.new_btree_store())
     }
 
+    /// Create a structural writer-side page store with chain-free leaf reads.
+    ///
+    /// WHY: checkpoint materialize rebuilds the B+ tree from `(key, value)`
+    /// pairs already harvested via `visible_delta_entries`. The rebuild ops
+    /// (`insert` / `replace_existing` / `delete`) parse only base + staged page
+    /// bytes and discard the chain snapshot `read_leaf` returns. Cloning the
+    /// resident chains on every such read is pure dead work, O(n) per read × n
+    /// reads, which made close O(n²) (measured 4.4s × (docs/4k)²). This store
+    /// routes those reads through the image-only path.
+    pub(super) fn new_structural_store_chain_free<'a>(
+        &self,
+        batch: &'a mut StructuralPageBatch,
+    ) -> StructuralBatchStore<'a> {
+        batch.store(self.new_btree_store()).with_chain_free_reads()
+    }
+
     /// Poison the live engine after a post-durable unrecoverable
     /// failure. Preserves the first reason if called more than once;
     /// later attempts notify the sequencer but do not overwrite the
@@ -390,10 +284,15 @@ impl SharedState {
 /// 3. Returns the constructed `Error::EngineFatal { reason }` so the
 ///    caller can `?`-propagate without re-reading the poison state.
 ///
-/// Callers MUST NOT use this helper before the durable journal commit
-/// completes; pre-durable failures route through the cleanup matrix
-/// owned by US-026 / US-009 (mark Pending → Aborted, mark sequencer
-/// slot aborted, drop ticket).
+/// Ordinary pre-durable failures route through the cleanup matrix owned
+/// by US-026 / US-009 (mark Pending → Aborted, mark sequencer slot
+/// aborted, drop ticket) and MUST NOT use this helper — the engine can
+/// still abort cleanly. The one sanctioned pre-durable caller is the
+/// cleanup matrix itself when its Pending → Aborted flip FAILS
+/// (`cleanup_registered_pre_durable_failure`): the chain is wedged in
+/// `Pending`, and unwinding normally would let frontier passage surface
+/// the never-durable write as committed (a dirty read), so the only safe
+/// exit is this poison.
 pub(crate) fn poison_after_durable_commit(
     shared: &SharedState,
     reason: EngineFatalReason,
@@ -431,114 +330,6 @@ pub(crate) struct MetadataState {
     pub catalog: std::sync::Mutex<Catalog<BufferPoolPageStore>>,
 }
 
-/// Phase 2 §5.2 Pass 2 — validate `ParsedLogicalFrames` against the live
-/// catalog without mutating any durable state.
-///
-/// Per-op resolution taxonomy:
-///   - `PrimaryInsert|PrimaryUpdate|PrimaryDelete` → `ns_id` must resolve
-///     via `Catalog::find_collection_by_id`; a miss ticks the unresolved
-///     counter.
-///   - `SecondaryInsert|SecondaryDelete` → `index_id` must resolve via
-///     `Catalog::find_index_by_id`; a miss ticks the unresolved counter.
-///
-/// Per-frame invariant: op ordinals MUST be dense `0..op_count-1` with
-/// no gaps or duplicates. A violation is a Phase 2 invariant error
-/// (Pass 1 should have already enforced this via the decoder, so
-/// reaching this arm implies recovery-plus-catalog corruption).
-///
-/// Contract: the `&Catalog` receiver is the only durable-state access.
-/// No mutation of the catalog tree, buffer pool, journal, HLC oracle,
-/// or history store — the only observable side-effect is the Phase 2
-/// `logical_txn_pass2_{resolved,unresolved}_ops_total` counters.
-fn validate_parsed_logical_frames_against_catalog<S>(
-    catalog: &Catalog<S>,
-    parsed: &ParsedLogicalFrames,
-) -> Result<()>
-where
-    S: crate::storage::btree::BTreePageStore,
-{
-    for (_offset, frame) in &parsed.frames {
-        validate_frame_ordinals_dense(frame)?;
-        for op in &frame.ops {
-            match &op.kind {
-                LogicalOpKind::PrimaryInsert { ns_id, .. }
-                | LogicalOpKind::PrimaryUpdate { ns_id, .. }
-                | LogicalOpKind::PrimaryDelete { ns_id, .. } => {
-                    if catalog.find_collection_by_id(*ns_id)?.is_some() {
-                        record_logical_txn_pass2_resolved_op();
-                    } else {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(
-                            target: "mqlite",
-                            ns_id = *ns_id,
-                            commit_ts = ?frame.commit_ts,
-                            "Pass 2: unresolved ns_id (Phase 2 tolerance — log-and-proceed; \
-                             Phase 4 §8.13 hard-errors this)"
-                        );
-                        record_logical_txn_pass2_unresolved_op();
-                    }
-                }
-                LogicalOpKind::SecondaryInsert { index_id, .. }
-                | LogicalOpKind::SecondaryDelete { index_id, .. } => {
-                    if catalog.find_index_by_id(*index_id)?.is_some() {
-                        record_logical_txn_pass2_resolved_op();
-                    } else {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(
-                            target: "mqlite",
-                            index_id = *index_id,
-                            commit_ts = ?frame.commit_ts,
-                            "Pass 2: unresolved index_id (Phase 2 tolerance — \
-                             log-and-proceed; Phase 4 §8.13 hard-errors this)"
-                        );
-                        record_logical_txn_pass2_unresolved_op();
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn reject_unpaired_chain_commits(parsed: &ParsedLogicalFrames) -> Result<()> {
-    if let Some(candidate) = parsed.case_c_candidates.first() {
-        return Err(Error::Recovery {
-            detail: format!(
-                "chain_commit_offset={}: ChainCommit without matching \
-                 LogicalTxnFrame commit_ts={:?}",
-                candidate.chain_commit_offset, candidate.commit_ts
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// §3.4 invariant: op_ordinal values form a dense sequence
-/// `0..ops.len()-1` with no gaps and no duplicates. Pass 1 should
-/// already have enforced this via `LogicalTxnFrame::decode`; we re-check
-/// here because Pass 2 is the last gate before published-state open.
-fn validate_frame_ordinals_dense(frame: &LogicalTxnFrame) -> Result<()> {
-    let n = frame.ops.len();
-    let mut seen = vec![false; n];
-    for op in &frame.ops {
-        let ord = op.op_ordinal as usize;
-        if ord >= n {
-            return Err(Error::Internal(format!(
-                "Pass 2: op_ordinal {} out of range 0..{} (commit_ts {:?})",
-                op.op_ordinal, n, frame.commit_ts
-            )));
-        }
-        if seen[ord] {
-            return Err(Error::Internal(format!(
-                "Pass 2: duplicate op_ordinal {} (commit_ts {:?})",
-                op.op_ordinal, frame.commit_ts
-            )));
-        }
-        seen[ord] = true;
-    }
-    Ok(())
-}
-
 impl MetadataState {
     #[allow(
         clippy::expect_used,
@@ -550,13 +341,20 @@ impl MetadataState {
 
     /// Create the initial MetadataState + SharedState from an existing
     /// (or fresh) buffer pool handle.
+    ///
+    /// Open is split into named phases (plan item R12) that run in the same
+    /// order and propagate errors in the same order as before the split:
+    /// [`Self::open_catalog_validated`] (open + Pass-2 gates),
+    /// [`Self::recover_oracle_and_sequencer_floors`] (HLC + publish-seq
+    /// floors), [`Self::open_or_create_history_store`], assemble
+    /// `SharedState`, replay deltas, [`Self::persist_fresh_roots`], then
+    /// install the recovered published epoch.
     pub(super) fn new(
         handle: Arc<BufferPoolHandle>,
         catalog_root_page: u32,
         catalog_root_level: u8,
         smo_classification_retry_cap: u32,
     ) -> Result<(Self, Arc<SharedState>)> {
-        let store = BufferPoolPageStore::new(Arc::clone(&handle));
         let (
             backup_root,
             header_next_namespace_id,
@@ -572,73 +370,24 @@ impl MetadataState {
                 h.history_store_root_level,
             )
         })?;
-        // Phase 1 §10.7 — propagate the persisted `next_*` counters to the
-        // in-memory catalog. Fresh DB uses the defaults (1) from
-        // `Catalog::create`.
-        let (catalog, _) = catalog_open_with_fallback(
-            store,
+
+        // Phase A — open the catalog and run the Pass-2 post-open gates.
+        let (catalog, parsed_logical) = Self::open_catalog_validated(
+            &handle,
             catalog_root_page,
             catalog_root_level,
             backup_root,
-            catalog_root_level,
             header_next_namespace_id,
             header_next_index_id,
-            |_page| true,
         )?;
 
-        // Phase 2 §5.2 — Pass 2 post-open validation of logical frames.
-        // Runs exactly once immediately after `catalog_open_with_fallback`
-        // and before any user-visible state is published. Phase 2
-        // tolerance: unresolved ids are log-and-proceed. The validation
-        // pass itself does not mutate durable state.
-        let parsed_logical = handle.take_parsed_logical_frames();
-        reject_unpaired_chain_commits(&parsed_logical)?;
-        validate_parsed_logical_frames_against_catalog(&catalog, &parsed_logical)?;
-        check_recovery_replay_pool_bound(&handle, &catalog, &parsed_logical)?;
-        // T7 — journal-tail HLC oracle recovery: floor the oracle above
-        // every durable ChainCommit from the previous lifetime. Missing
-        // `successor()` (saturated `Ts::MAX`) is a hard error per plan.
-        let oracle = TimestampOracle::new();
-        let recovered_max_commit_ts = handle.recovered_max_commit_ts()?;
-        let recovered_max_publish_seq = handle.recovered_max_publish_seq()?;
-        let next_publish_seq = match recovered_max_publish_seq {
-            Some(seq) => seq.checked_add(1).ok_or_else(|| {
-                Error::Internal("recovered publish_seq floor overflows u64".into())
-            })?,
-            None => 1,
-        };
-        if let Some(max_ts) = recovered_max_commit_ts {
-            match max_ts.successor() {
-                Some(next) => oracle.set_min(next),
-                None => return Err(Error::TimestampExhausted),
-            }
-        }
-        // Phase 4 US-011 — on fresh DB, allocate an empty root and persist
-        // both the root page and level. On reopen, use the header-persisted
-        // `(root_page, root_level)` so history entries survive a restart.
-        let history_allocator = Arc::new(handle.allocator().clone());
+        // Phase B — recover the HLC oracle floor and publish-seq window.
+        let (oracle, recovered_max_commit_ts, next_publish_seq) =
+            Self::recover_oracle_and_sequencer_floors(&handle)?;
+
+        // Phase C — open or create the history store.
         let (history_store_inner, persisted_history_root, persisted_history_level) =
-            if history_root_page == 0 {
-                let (history, root_page) = HistoryStore::create_empty_root(
-                    BufferPoolPageStore::new_history(Arc::clone(&handle)),
-                )?;
-                (
-                    history.with_overflow_allocator(Arc::clone(&history_allocator)),
-                    root_page,
-                    0,
-                )
-            } else {
-                (
-                    HistoryStore::open(
-                        BufferPoolPageStore::new_history(Arc::clone(&handle)),
-                        history_root_page,
-                        history_root_level,
-                    )
-                    .with_overflow_allocator(Arc::clone(&history_allocator)),
-                    history_root_page,
-                    history_root_level,
-                )
-            };
+            Self::open_or_create_history_store(&handle, history_root_page, history_root_level)?;
 
         // Pre-replay epoch. Readers cannot reach this engine until open
         // returns; keeping both timestamps at Ts::MIN ensures a failed replay
@@ -669,13 +418,18 @@ impl MetadataState {
             checkpoint_admission: Arc::new(CheckpointAdmissionGate::new()),
             smo_classification_retry_cap,
             txn_counter: AtomicU64::new(1),
-            // §10.17.1 — start the DDL reservation counter at the live
-            // `PublishedEpoch.catalog_generation` (1 on fresh open). The
-            // first DDL `fetch_add(1) + 1` reserves a strictly larger
-            // generation. Reopen recovery bumps this to the recovered
-            // published value via `install_recovered_published_epoch`.
+            // DDL-reservation counter. It must start at or below the live
+            // published `catalog_generation` so the first DDL's
+            // `fetch_add(1) + 1` reserves a strictly larger generation than
+            // any reader has already cached; otherwise a stale-identity gate
+            // could miss a catalog change. Both a fresh open and a reopen
+            // start at 1: `install_recovered_published_epoch` republishes the
+            // recovered catalog with `catalog_generation` reset to 1 rather
+            // than restoring the pre-crash counter, so this seed stays in
+            // lockstep with it. (Generations are not persisted, so recovery
+            // cannot resume the old sequence — it restarts a fresh one.)
             next_catalog_gen: AtomicU64::new(1),
-            test_hooks: SharedStateTestHooks::default(),
+            test_hooks: SharedStateTestHooks::new(),
         });
         let weak_shared = Arc::downgrade(&shared);
         shared
@@ -691,11 +445,141 @@ impl MetadataState {
             catalog: std::sync::Mutex::new(catalog),
         };
         apply_parsed_logical_frames(&shared, &md, &parsed_logical)?;
-        // For a new database, persist the freshly-allocated catalog root
-        // AND the history-store root page to the file header immediately
-        // (will be written to disk on flush). Reopen case: header values
-        // already match; we still persist the history-store root if it
-        // was zero and just freshly created.
+
+        // Phase D — persist freshly-allocated roots to the file header.
+        Self::persist_fresh_roots(
+            &shared,
+            &md,
+            catalog_root_page,
+            history_root_page,
+            persisted_history_root,
+            persisted_history_level,
+        )?;
+        install_recovered_published_epoch(&shared, &md, recovered_max_commit_ts)?;
+        Ok((md, shared))
+    }
+
+    /// Phase A — open the catalog (with backup fallback) and run the Pass-2
+    /// post-open validation gates before any user-visible state publishes.
+    ///
+    /// Runs exactly once immediately after `catalog_open_with_fallback` and
+    /// before any user-visible state is published. Phase 2 tolerance:
+    /// unresolved ids are log-and-proceed. The validation pass itself does
+    /// not mutate durable state. Returns the opened catalog and the consumed
+    /// `ParsedLogicalFrames` for the later replay.
+    fn open_catalog_validated(
+        handle: &Arc<BufferPoolHandle>,
+        catalog_root_page: u32,
+        catalog_root_level: u8,
+        backup_root: u32,
+        header_next_namespace_id: i64,
+        header_next_index_id: i64,
+    ) -> Result<(Catalog<BufferPoolPageStore>, ParsedLogicalFrames)> {
+        let store = BufferPoolPageStore::new(Arc::clone(handle));
+        // Phase 1 §10.7 — propagate the persisted `next_*` counters to the
+        // in-memory catalog. Fresh DB uses the defaults (1) from
+        // `Catalog::create`.
+        let (catalog, _) = catalog_open_with_fallback(
+            store,
+            catalog_root_page,
+            catalog_root_level,
+            backup_root,
+            catalog_root_level,
+            header_next_namespace_id,
+            header_next_index_id,
+            |_page| true,
+        )?;
+
+        // Phase 2 §5.2 — Pass 2 post-open validation of logical frames.
+        // Recovery "case C" (an unpaired durable ChainCommit) is structurally
+        // impossible in the Phase 8 wire format — a CrudCommit record carries
+        // the logical and chain frames together — so no unpaired-chain
+        // rejection runs here. See the `ParsedLogicalFrames` doc comment in
+        // `journal/recovery.rs`.
+        let parsed_logical = handle.take_parsed_logical_frames();
+        validate_parsed_logical_frames_against_catalog(&catalog, &parsed_logical)?;
+        check_recovery_replay_pool_bound(handle, &catalog, &parsed_logical)?;
+        Ok((catalog, parsed_logical))
+    }
+
+    /// Phase B — recover the HLC oracle floor and the publish-seq window.
+    ///
+    /// T7 — journal-tail HLC oracle recovery: floor the oracle above every
+    /// durable ChainCommit from the previous lifetime. Missing `successor()`
+    /// (saturated `Ts::MAX`) is a hard error per plan. Returns the seeded
+    /// oracle, the recovered max commit ts, and the next publish-seq.
+    fn recover_oracle_and_sequencer_floors(
+        handle: &Arc<BufferPoolHandle>,
+    ) -> Result<(TimestampOracle, Option<crate::mvcc::Ts>, u64)> {
+        let oracle = TimestampOracle::new();
+        let recovered_max_commit_ts = handle.recovered_max_commit_ts()?;
+        let recovered_max_publish_seq = handle.recovered_max_publish_seq()?;
+        let next_publish_seq = match recovered_max_publish_seq {
+            Some(seq) => seq.checked_add(1).ok_or_else(|| {
+                Error::Internal("recovered publish_seq floor overflows u64".into())
+            })?,
+            None => 1,
+        };
+        if let Some(max_ts) = recovered_max_commit_ts {
+            match max_ts.successor() {
+                Some(next) => oracle.set_min(next),
+                None => return Err(Error::TimestampExhausted),
+            }
+        }
+        Ok((oracle, recovered_max_commit_ts, next_publish_seq))
+    }
+
+    /// Phase C — open the persisted history store or create a fresh root.
+    ///
+    /// Phase 4 US-011 — on fresh DB, allocate an empty root and persist both
+    /// the root page and level. On reopen, use the header-persisted
+    /// `(root_page, root_level)` so history entries survive a restart.
+    /// Returns the configured store plus the `(root_page, root_level)` to be
+    /// persisted by [`Self::persist_fresh_roots`].
+    fn open_or_create_history_store(
+        handle: &Arc<BufferPoolHandle>,
+        history_root_page: u32,
+        history_root_level: u8,
+    ) -> Result<(HistoryStore<BufferPoolPageStore>, u32, u8)> {
+        let history_allocator = Arc::new(handle.allocator().clone());
+        if history_root_page == 0 {
+            let (history, root_page) = HistoryStore::create_empty_root(
+                BufferPoolPageStore::new_history(Arc::clone(handle)),
+            )?;
+            Ok((
+                history.with_overflow_allocator(Arc::clone(&history_allocator)),
+                root_page,
+                0,
+            ))
+        } else {
+            Ok((
+                HistoryStore::open(
+                    BufferPoolPageStore::new_history(Arc::clone(handle)),
+                    history_root_page,
+                    history_root_level,
+                )
+                .with_overflow_allocator(Arc::clone(&history_allocator)),
+                history_root_page,
+                history_root_level,
+            ))
+        }
+    }
+
+    /// Phase D — persist freshly-allocated catalog/history roots to the file
+    /// header (written to disk on flush).
+    ///
+    /// For a new database, persist the freshly-allocated catalog root AND the
+    /// history-store root page to the file header immediately. Reopen case:
+    /// header values already match; we still persist the history-store root
+    /// if it was zero and just freshly created.
+    fn persist_fresh_roots(
+        shared: &SharedState,
+        md: &Self,
+        catalog_root_page: u32,
+        history_root_page: u32,
+        persisted_history_root: u32,
+        persisted_history_level: u8,
+    ) -> Result<()> {
         if catalog_root_page == 0 || history_root_page == 0 {
             let cat = md.catalog_lock();
             let root_page = cat.root_page();
@@ -713,8 +597,7 @@ impl MetadataState {
                 }
             })?;
         }
-        install_recovered_published_epoch(&shared, &md, recovered_max_commit_ts)?;
-        Ok((md, shared))
+        Ok(())
     }
 }
 

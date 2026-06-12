@@ -24,11 +24,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use mqlite::mvcc::{
+use mqlite::mvcc::metrics::{
     record_secondary_index_tombstone_hit, reset_secondary_index_tombstone_hits,
-    secondary_index_tombstone_hits_snapshot, ChainSnapshot, ReadView, Ts, VersionData,
-    VersionEntry, VersionState,
+    secondary_index_tombstone_hits_snapshot,
 };
+use mqlite::mvcc::{ChainSnapshot, ReadView, Ts, VersionData, VersionEntry, VersionState};
 
 // The tombstone counter is a process-global atomic. Tests in this file
 // run in parallel by default, so we serialize their counter probes with
@@ -112,7 +112,7 @@ fn tombstone_elision_ticks_counter() {
     ]);
 
     // Reader at ts>=200 sees the tombstone and elides the primary fetch.
-    let reader = ReadView::new(
+    let reader = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 300,
             logical: 0,
@@ -147,7 +147,7 @@ fn live_sec_entry_does_not_tick_counter() {
         false,
     )]);
 
-    let reader = ReadView::new(
+    let reader = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 150,
             logical: 0,
@@ -194,7 +194,7 @@ fn reader_below_tombstone_ts_sees_live_entry_and_no_tick() {
     ]);
 
     // Reader at ts between 100 and 200 sees the live entry, not the tombstone.
-    let reader = ReadView::new(
+    let reader = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 150,
             logical: 0,

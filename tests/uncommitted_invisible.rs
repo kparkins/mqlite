@@ -82,7 +82,7 @@ fn pending_write_is_invisible_to_concurrent_reader() {
     let snap = ChainSnapshot::new(&source, None);
 
     // Reader B with a distinct txn_id opens BEFORE the writer commits.
-    let reader_b = ReadView::new(
+    let reader_b = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 150,
             logical: 0,
@@ -115,7 +115,7 @@ fn commit_stamps_pending_and_later_reader_sees_new_value() {
     let snap = ChainSnapshot::new(&source, None);
 
     // Reader C opens at a later read_ts >= commit_ts.
-    let reader_c = ReadView::new(
+    let reader_c = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 250,
             logical: 0,
@@ -129,7 +129,7 @@ fn commit_stamps_pending_and_later_reader_sees_new_value() {
     assert_eq!(seen.start_ts, ts200);
 
     // A reader opened with a read_ts BEFORE the commit still sees v1.
-    let reader_old = ReadView::new(
+    let reader_old = ReadView::new_frontier_pinned_for_tests(
         Ts {
             physical_ms: 150,
             logical: 0,

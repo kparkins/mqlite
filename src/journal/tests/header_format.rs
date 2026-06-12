@@ -9,7 +9,7 @@
 )]
 mod tests {
     use crate::error::Error;
-    use crate::journal::log_file::{
+    use crate::journal::wire::{
         ChainCommitFrame, JournalHeader, FRAME_KIND_CHAIN_COMMIT, JOURNAL_FORMAT_VERSION,
         JOURNAL_HEADER_SIZE, RETIRED_PRE_RELEASE_JOURNAL_FORMAT_VERSIONS,
     };

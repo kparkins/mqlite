@@ -1,9 +1,12 @@
 use super::btree_ops::btree_collscan;
 use super::*;
+use crate::error::WriteConflictReason;
+use crate::keys::encode_key;
 use crate::mvcc::read_view::ReadView;
 use crate::storage::btree::BTree;
 use crate::storage::btree_store::BufferPoolPageStore;
 use bson::doc;
+use std::sync::atomic::Ordering;
 
 fn engine() -> PagedEngine {
     let (e, _io) = buffered_engine();
@@ -457,10 +460,29 @@ fn buffered_drop_namespace_frees_pages_for_reuse() {
             .with_header(|h| h.total_page_count)
             .unwrap()
     };
+    // The exact page set the drop must eventually return to the free list.
+    let expected_freed = {
+        let entry = e
+            .metadata_state
+            .catalog_lock()
+            .get_collection("mydb.users")
+            .unwrap()
+            .expect("collection entry before drop");
+        e.collect_tree_pages(entry.data_root_page, entry.data_root_level)
+            .unwrap()
+            .len() as u32
+    };
+    assert!(expected_freed > 0, "tree must own at least one page");
 
     e.drop_namespace("mydb.users").unwrap();
 
-    // Free page count should have increased (pages returned to free list).
+    // BUG-5: drop_namespace defers its physical 32k frees through the
+    // page-lifetime queue so a reader still pinned to the pre-drop epoch can
+    // never observe the pages reused mid-snapshot. The pages reach the free
+    // list once a checkpoint advances the lifetime fence and drains the
+    // queue.
+    e.checkpoint().unwrap();
+
     let free_after = {
         e.shared
             .handle
@@ -469,11 +491,13 @@ fn buffered_drop_namespace_frees_pages_for_reuse() {
             .unwrap()
     };
 
-    // After drop the free page count must be > 0 (at least the data leaf
-    // and _id-index leaf were reclaimed).
+    // After the post-drop checkpoint the free page count must cover the
+    // FULL retired tree (every leaf and internal the drop collected), not
+    // merely be non-zero — a partial release would silently leak pages.
     assert!(
-        free_after > 0,
-        "pages must be returned to free list after drop; total_before={total_before}, free_after={free_after}"
+        free_after >= expected_freed,
+        "all {expected_freed} retired tree pages must be returned to the free list \
+         after drop + checkpoint; total_before={total_before}, free_after={free_after}"
     );
 }
 
@@ -1006,7 +1030,7 @@ fn swmr_reader_sees_snapshot_isolation() {
             let store = BufferPoolPageStore::new(Arc::clone(&e_reader.shared.handle));
             let tree = BTree::open(store, ns_snap.data_root_page, ns_snap.data_root_level);
             let txn_id = e_reader.shared.txn_counter.fetch_add(1, Ordering::Relaxed);
-            let view = ReadView::open(
+            let view = ReadView::open_frontier_pinned_for_tests(
                 Arc::clone(e_reader.shared.handle.read_view_registry()),
                 publish_ts,
                 txn_id,

@@ -10,7 +10,7 @@ use std::path::Path;
 use bson::{doc, Bson};
 
 use crate::error::Result;
-use crate::journal::log_file::{
+use crate::journal::wire::{
     ChainCommitFrame, LogRecordDraft, LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire,
     LOGICAL_TXN_FORMAT_VERSION,
 };

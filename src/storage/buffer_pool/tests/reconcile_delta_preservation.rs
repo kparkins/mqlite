@@ -3,7 +3,7 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::mvcc::read_view::ReadViewRegistry;
+use crate::mvcc::registry::ReadViewRegistry;
 use crate::mvcc::{Ts, VersionData, VersionEntry, VersionState};
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::header::FileHeader;

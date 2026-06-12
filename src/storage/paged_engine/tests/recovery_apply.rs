@@ -8,7 +8,7 @@ use bson::Bson;
 use super::super::PagedEngine;
 use super::apply_parsed_logical_frames;
 use crate::client::Client;
-use crate::journal::log_file::{
+use crate::journal::wire::{
     ChainCommitFrame, LogRecordDraft, LogicalOp, LogicalOpKind, LogicalTxnFrame, OverflowRefWire,
     LOGICAL_TXN_FORMAT_VERSION,
 };

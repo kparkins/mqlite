@@ -5,8 +5,8 @@
   ## 1. Think Before Coding
 
   Before implementing:
-  - State assumptions explicitly. If anything is unclear or uncertain, stop and ask — name what's confusing.
-  - If multiple interpretations exist, present them — don't pick silently.
+  - State assumptions explicitly. If anything is unclear or uncertain, stop and ask; name what's confusing.
+  - If multiple interpretations exist, present them; don't pick silently.
   - If a simpler approach exists, say so. Push back when warranted.
 
   ## 2. Simplicity First
@@ -29,7 +29,7 @@
   - Don't "improve" adjacent code, comments, or formatting.
   - Don't refactor things that aren't broken.
   - Match existing style, even if you'd do it differently.
-  - Remove imports/variables/functions that YOUR changes orphaned. Leave pre-existing dead code alone — mention it instead of deleting it.
+  - Remove imports/variables/functions that YOUR changes orphaned. Leave pre-existing dead code alone; mention it instead of deleting it.
 
   ## 4. Goal-Driven Execution
 
@@ -56,9 +56,9 @@
   - SOLID principles; use design patterns (https://rust-unofficial.github.io/patterns/patterns/index.html) when appropriate
   - No leaky abstractions
   - Early returns/continues over deep nesting of the happy path
-  - No magic numbers — use named constants
+  - No magic numbers: use named constants
   - No emoji or unicode emoji substitutes (e.g. checkmarks, crosses) in code or output
-  - No secrets in code — `.env` only; ensure `.env` and test output dirs are in `.gitignore`
+  - No secrets in code: use `.env` only; ensure `.env` and test output dirs are in `.gitignore`
   - No logging of sensitive data (passwords, tokens, PII)
 
   ## Design

@@ -1,14 +1,14 @@
 //! Phase 5 US-010 structural-modification classification and latch planning.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result, WriteConflictReason};
-use crate::mvcc::{PrimaryOp, SecIndexOp};
+use crate::mvcc::transaction::{PrimaryOp, SecIndexOp};
 use crate::storage::btree::{
-    leaf_can_insert_value, leaf_needs_rebalance_after_delete, BTree, BTreePathStep,
-    OVERFLOW_THRESHOLD,
+    leaf_can_insert_value, leaf_needs_rebalance_after_delete, page_size_for_level, BTree,
+    BTreePathStep, OVERFLOW_THRESHOLD,
 };
-use crate::storage::buffer_pool::LatchedPinnedPage;
+use crate::storage::buffer_pool::{LatchedPinnedPage, PageSize};
 
 use super::state::SharedState;
 
@@ -146,8 +146,31 @@ pub(crate) fn classify_write(
     Ok(shape)
 }
 
+/// Result of one [`try_acquire_latches_once`] attempt.
+///
+/// Names the two non-error outcomes so the retry driver reads as a small
+/// state machine. A plain `enum` (the `Settled` payload is the latch set
+/// the caller already needed to build) keeps the attempt allocation-free
+/// beyond the latch set itself.
+enum LatchAttempt<'pool> {
+    /// Shared-latch classification held under exclusive latches: the
+    /// acquired latch set is final.
+    Settled(SmoLatchSet<'pool>),
+    /// Exclusive reclassification widened the required page set; the held
+    /// latches were dropped and the caller must re-plan under fresh
+    /// classification.
+    Reclassify,
+}
+
 /// Acquire the page-local latches required by `targets`, retrying bounded
 /// reclassification when shared-latch classification is stale.
+///
+/// Invariant: each iteration re-plans from scratch (`plan_targets` under a
+/// fresh shared latch), so a retry never reuses a stale path or page set.
+/// Forward progress is guaranteed by `smo_classification_retry_cap`:
+/// reclassification can only widen the page set finitely often before the
+/// cap converts the livelock into a `StructuralContention` write conflict
+/// that the writer can resolve by retrying its commit.
 pub(crate) fn acquire_smo_latches<'pool>(
     shared: &'pool SharedState,
     targets: &[SmoWriteTarget],
@@ -158,38 +181,60 @@ pub(crate) fn acquire_smo_latches<'pool>(
 
     let mut reclassifications = 0u32;
     loop {
-        let planned = plan_targets(shared, targets)?;
-        let required_pages = required_pages(&planned);
-        let pages = acquire_pages(shared, &required_pages)?;
-
-        if !paths_still_valid(shared, &planned)? {
-            return structural_contention();
-        }
-        #[cfg(any(test, feature = "test-hooks"))]
-        if super::smo_classification_observations::force_revalidation_failure_once() {
-            return structural_contention();
-        }
-
-        let exclusive_shapes = reclassify_exclusive(&pages, &planned)?;
-        let exclusive_pages = required_pages_for_shapes(&planned, &exclusive_shapes);
-        if exclusive_pages == required_pages {
-            return Ok(SmoLatchSet {
-                pages,
-                target_leaves: planned
-                    .iter()
-                    .filter_map(|plan| plan.path.last().map(|step| step.page_id))
-                    .collect(),
-            });
-        }
-
-        drop(pages);
-        reclassifications = reclassifications.saturating_add(1);
-        #[cfg(any(test, feature = "test-hooks"))]
-        super::smo_classification_observations::record_reclassification(reclassifications);
-        if reclassifications >= shared.smo_classification_retry_cap {
-            return structural_contention();
+        match try_acquire_latches_once(shared, targets)? {
+            LatchAttempt::Settled(latches) => return Ok(latches),
+            LatchAttempt::Reclassify => {
+                reclassifications = reclassifications.saturating_add(1);
+                #[cfg(any(test, feature = "test-hooks"))]
+                super::smo_classification_observations::record_reclassification(reclassifications);
+                if reclassifications >= shared.smo_classification_retry_cap {
+                    return structural_contention();
+                }
+                // Re-plan under a fresh shared latch on the next iteration.
+            }
         }
     }
+}
+
+/// One plan → latch → revalidate → reclassify attempt.
+///
+/// On `Reclassify` the held latches are already dropped. A stale path
+/// (`paths_still_valid` false) is a hard `StructuralContention` rather than
+/// a retry: the tree shape changed under us, so re-planning would race the
+/// same way.
+fn try_acquire_latches_once<'pool>(
+    shared: &'pool SharedState,
+    targets: &[SmoWriteTarget],
+) -> Result<LatchAttempt<'pool>> {
+    let planned = plan_targets(shared, targets)?;
+    let required_pages = required_pages(&planned);
+    let pages = acquire_pages(shared, &required_pages)?;
+
+    if !paths_still_valid(shared, &planned)? {
+        return structural_contention();
+    }
+    #[cfg(any(test, feature = "test-hooks"))]
+    if super::smo_classification_observations::force_revalidation_failure_once() {
+        return structural_contention();
+    }
+
+    let exclusive_shapes = reclassify_exclusive(&pages, &planned)?;
+    let exclusive_pages = required_pages_for_shapes(&planned, &exclusive_shapes);
+    if exclusive_pages != required_pages {
+        // Exclusive-latch classification disagrees with the shared-latch
+        // plan (e.g. a concurrent write turned a root-neutral leaf into a
+        // split). Drop everything and let the caller re-plan.
+        drop(pages);
+        return Ok(LatchAttempt::Reclassify);
+    }
+
+    Ok(LatchAttempt::Settled(SmoLatchSet {
+        pages,
+        target_leaves: planned
+            .iter()
+            .filter_map(|plan| plan.path.last().map(|step| step.page_id))
+            .collect(),
+    }))
 }
 
 fn plan_targets(shared: &SharedState, targets: &[SmoWriteTarget]) -> Result<Vec<PlannedWrite>> {
@@ -280,7 +325,7 @@ fn classify_leaf_bytes(
     }
 }
 
-fn required_pages(planned: &[PlannedWrite]) -> BTreeSet<u32> {
+fn required_pages(planned: &[PlannedWrite]) -> BTreeMap<u32, PageSize> {
     required_pages_for_shapes(
         planned,
         &planned
@@ -290,19 +335,49 @@ fn required_pages(planned: &[PlannedWrite]) -> BTreeSet<u32> {
     )
 }
 
-fn required_pages_for_shapes(planned: &[PlannedWrite], shapes: &[WriteShape]) -> BTreeSet<u32> {
-    let mut pages = BTreeSet::new();
+/// Compute the set of pages a write batch must hold under exclusive latch.
+///
+/// The rule splits on whether any planned write is structural (a split,
+/// merge, or overflow change — anything that is not `RootNeutral`):
+///
+/// - A purely root-neutral write only rewrites its own leaf, so it latches
+///   that single leaf.
+/// - As soon as one write is structural, every batched write latches its
+///   entire root-to-leaf path (the "spine"), not just the leaf.
+///
+/// Latching the whole spine is what makes a structural modification atomic
+/// against concurrent readers and writers. A split or merge does not stay on
+/// the leaf: it rewrites the parent's separator keys and child pointers, can
+/// propagate upward, and may move the root. A concurrent descent that latched
+/// only the leaf would read a parent whose pointers were mid-rewrite and could
+/// follow a stale or dangling child link to the wrong subtree — a lost or
+/// duplicated key. Holding every page from the root down freezes the exact
+/// portion of the tree the modification can touch, so no other operation can
+/// observe the spine in a half-rebalanced state. The pages are returned as an
+/// ordered `BTreeSet` so callers acquire them in a single deterministic page
+/// order, which is also what prevents two structural writers from deadlocking.
+fn required_pages_for_shapes(
+    planned: &[PlannedWrite],
+    shapes: &[WriteShape],
+) -> BTreeMap<u32, PageSize> {
+    // Keyed by page id so the acquire order stays deterministic (ascending
+    // page id) exactly as the prior `BTreeSet<u32>` ordering, while carrying
+    // each page's true allocator size from its path-step level.
+    let mut pages = BTreeMap::new();
     let any_structural = shapes.iter().any(|shape| !shape.is_root_neutral());
     for (plan, shape) in planned.iter().zip(shapes) {
         if any_structural {
             for step in &plan.path {
-                pages.insert(step.page_id);
+                pages.insert(step.page_id, page_size_for_level(step.level));
             }
         } else if let Some(leaf) = plan.path.last() {
-            pages.insert(leaf.page_id);
+            pages.insert(leaf.page_id, page_size_for_level(leaf.level));
         }
         if let WriteShape::UniqueSpansSibling { leaves } = shape {
-            pages.extend(leaves.iter().copied());
+            // Sibling leaves are level-0 leaves (32 KiB).
+            for leaf in leaves {
+                pages.insert(*leaf, PageSize::Large32k);
+            }
         }
     }
     pages
@@ -310,13 +385,17 @@ fn required_pages_for_shapes(planned: &[PlannedWrite], shapes: &[WriteShape]) ->
 
 fn acquire_pages<'pool>(
     shared: &'pool SharedState,
-    required_pages: &BTreeSet<u32>,
+    required_pages: &BTreeMap<u32, PageSize>,
 ) -> Result<Vec<LatchedPinnedPage<'pool>>> {
     let mut pages = Vec::with_capacity(required_pages.len());
-    for page_id in required_pages {
+    for (page_id, size) in required_pages {
         #[cfg(any(test, feature = "test-hooks"))]
         super::smo_classification_observations::record_exclusive_acquire(*page_id);
-        pages.push(shared.handle.pool().pin_for_write(*page_id)?);
+        // Pin at the path-known size — NOT via `pin_for_write`'s residency
+        // heuristic, which would load an evicted interior (4 KiB) page as a
+        // 32 KiB frame in the wrong partition (duplicate frame, latch excludes
+        // nothing). See `page_size_for_level`.
+        pages.push(shared.handle.pool().pin_for_write_sized(*page_id, *size)?);
     }
     Ok(pages)
 }
@@ -379,4 +458,98 @@ fn structural_contention<T>() -> Result<T> {
     Err(Error::WriteConflict {
         reason: WriteConflictReason::StructuralContention,
     })
+}
+
+#[cfg(test)]
+mod bugsuspect_tests {
+    //! Bug-suspect (rank ~3): the SMO latch planner must latch each required
+    //! page at its TRUE allocator size, not via `BufferPool::detect_page_size`,
+    //! which defaults a non-resident page to 32 KiB. Before the fix,
+    //! `required_pages_for_shapes` collapsed the planned path to a bare
+    //! `BTreeSet<u32>` and `acquire_pages` pinned every page with the residency
+    //! heuristic — so an interior (4 KiB) page evicted between plan and acquire
+    //! was loaded as a 32 KiB frame in the wrong partition (its exclusive latch
+    //! excluding nothing). The hazard of the heuristic itself is pinned in
+    //! `buffer_pool::tests::bugsuspect_detect_page_size_misclassification`.
+    //!
+    //! This test pins the fix: for a structural write over a 2-level tree, the
+    //! planned page set carries the interior page at `Small4k` and the leaf at
+    //! `Large32k`, so `acquire_pages` can pin each at its known size.
+
+    use super::*;
+
+    fn planned_two_level_split() -> PlannedWrite {
+        // Path: root interior at level 1 (page 5, 4 KiB) -> leaf at level 0
+        // (page 9, 32 KiB).
+        let path = vec![
+            BTreePathStep {
+                page_id: 5,
+                parent_page: None,
+                child_slot: None,
+                level: 1,
+            },
+            BTreePathStep {
+                page_id: 9,
+                parent_page: Some(5),
+                child_slot: Some(0),
+                level: 0,
+            },
+        ];
+        PlannedWrite {
+            target: SmoWriteTarget {
+                root_page: 5,
+                root_level: 1,
+                key: b"k".to_vec(),
+                op: SmoWriteOp::Insert {
+                    key: b"k".to_vec(),
+                    value_len: 8,
+                },
+                unique_prefix_range: None,
+            },
+            path,
+            // A structural shape forces the full spine (interior + leaf) into
+            // the required set.
+            shape: WriteShape::LeafSplit,
+        }
+    }
+
+    #[test]
+    fn required_pages_for_shapes_carries_interior_4k_size() {
+        let plan = planned_two_level_split();
+        let required = required_pages_for_shapes(
+            std::slice::from_ref(&plan),
+            std::slice::from_ref(&plan.shape),
+        );
+
+        assert_eq!(
+            required.get(&5),
+            Some(&PageSize::Small4k),
+            "interior path page (level 1) must be latched at its true 4 KiB \
+             size so an evicted interior page is not loaded into the 32 KiB \
+             partition"
+        );
+        assert_eq!(
+            required.get(&9),
+            Some(&PageSize::Large32k),
+            "leaf page (level 0) must be latched as 32 KiB"
+        );
+    }
+
+    #[test]
+    fn root_neutral_leaf_only_keeps_leaf_32k_size() {
+        let plan = PlannedWrite {
+            shape: WriteShape::RootNeutral,
+            ..planned_two_level_split()
+        };
+        let required = required_pages_for_shapes(
+            std::slice::from_ref(&plan),
+            std::slice::from_ref(&plan.shape),
+        );
+        // Root-neutral: only the leaf is latched, at 32 KiB.
+        assert_eq!(required.get(&9), Some(&PageSize::Large32k));
+        assert!(
+            !required.contains_key(&5),
+            "a root-neutral write must not latch the interior spine"
+        );
+    }
 }

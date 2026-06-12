@@ -6,7 +6,8 @@ use crate::mvcc::version::{OverflowRef, VersionData, VersionEntry, VersionState}
 use crate::storage::allocator::AllocatorHandle;
 use crate::storage::header::FileHeader;
 
-use super::{ChainSnapshot, ReadView};
+use super::ChainSnapshot;
+use crate::mvcc::read_view::ReadView;
 
 fn ts(physical_ms: u64) -> crate::mvcc::Ts {
     crate::mvcc::Ts {
@@ -42,7 +43,7 @@ fn test_chain_snapshot_visible_range_in_order() {
         b"k09", b"k02", b"k07", b"k00", b"k05", b"k01", b"k08", b"k03", b"k06", b"k04",
     ]);
     let snap = ChainSnapshot::new(&source, None);
-    let view = ReadView::new(ts(20), 99);
+    let view = ReadView::new_frontier_pinned_for_tests(ts(20), 99);
 
     let keys = snap
         .visible_range(Bound::Unbounded, Bound::Unbounded, &view)
@@ -70,7 +71,7 @@ fn test_chain_snapshot_visible_range_in_order() {
 fn test_chain_snapshot_visible_range_bounded() {
     let source = source_from_keys(&[b"a", b"b", b"c", b"d", b"e", b"f"]);
     let snap = ChainSnapshot::new(&source, None);
-    let view = ReadView::new(ts(20), 99);
+    let view = ReadView::new_frontier_pinned_for_tests(ts(20), 99);
 
     let included_start_excluded_end = snap
         .visible_range(

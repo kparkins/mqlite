@@ -41,10 +41,10 @@ use std::io::ErrorKind;
 
 match Client::open("myapp.mqlite") {
     Err(Error::Io(e)) if e.kind() == ErrorKind::PermissionDenied => {
-        eprintln!("Permission denied — check file ownership and mode");
+        eprintln!("Permission denied: check file ownership and mode");
     }
     Err(Error::Io(e)) if e.kind() == ErrorKind::NotFound => {
-        eprintln!("Parent directory does not exist — create it first");
+        eprintln!("Parent directory does not exist: create it first");
     }
     Err(Error::Io(e)) => eprintln!("I/O error: {e}"),
     Ok(client) => { /* use client.database("name") */ }
@@ -203,9 +203,9 @@ is truncated, or a page checksum is bad.
 Can also occur mid-operation if storage pages are corrupted.
 
 **Fields:**
-- `path` — path to the corrupt file
-- `detail` — human-readable description of the corruption
-- `recoverable` — `true` if the last checkpointed pages may still be readable
+- `path`: path to the corrupt file
+- `detail`: human-readable description of the corruption
+- `recoverable`: `true` if the last checkpointed pages may still be readable
 
 **Recovery options:**
 
@@ -239,10 +239,10 @@ match Client::open("myapp.mqlite") {
 A write operation failed because the filesystem has no space remaining.
 
 **Fields:**
-- `path` — path to the database file
-- `required_bytes` — bytes needed for the write
-- `available_bytes` — bytes currently available on the device
-- `suggestion` — human-readable remediation hint
+- `path`: path to the database file
+- `required_bytes`: bytes needed for the write
+- `available_bytes`: bytes currently available on the device
+- `suggestion`: human-readable remediation hint
 
 **Recovery:**
 
@@ -298,7 +298,7 @@ let col = client.database("test").collection::<bson::Document>("events");
 
 match col.drop_index("myindex") {
     Err(Error::CollectionNotFound { name }) => {
-        eprintln!("Collection '{name}' does not exist — skipping drop");
+        eprintln!("Collection '{name}' does not exist; skipping drop");
     }
     Ok(_) => {}
     Err(e) => return Err(e),
@@ -346,7 +346,7 @@ let col = client.database("test").collection::<bson::Document>("items");
 
 match col.find_one(doc! { "text": { "$text": { "$search": "hello" } } }) {
     Err(Error::UnsupportedOperator { operator }) => {
-        eprintln!("Operator '{operator}' is not supported — see COMPATIBILITY.md");
+        eprintln!("Operator '{operator}' is not supported; see COMPATIBILITY.md");
     }
     Ok(result) => { /* ... */ }
     Err(e) => return Err(e),
@@ -412,8 +412,8 @@ The document exceeds the 16,777,216 byte (16MB) BSON-serialized size limit.
 **MongoDB error code:** 10334
 
 **Fields:**
-- `size` — actual serialized size of the document in bytes
-- `max` — maximum allowed size (16,777,216)
+- `size`: actual serialized size of the document in bytes
+- `max`: maximum allowed size (16,777,216)
 
 **Recovery:** Split large documents into smaller ones, or store large payloads
 in separate files and reference them by path or ID.
@@ -443,7 +443,7 @@ message size, or uses an unsupported opcode.
 **MongoDB error code:** 48 (IllegalOperation)
 
 **Common causes:**
-- Client sent OP_COMPRESSED (opcode 2012) — mqlite does not support compression
+- Client sent OP_COMPRESSED (opcode 2012): mqlite does not support compression
 - Message header magic bytes are wrong (not a MongoDB message)
 - Message size field exceeds the 48MB OP_MSG limit
 
@@ -478,19 +478,19 @@ first-committer-wins MVCC engine; the caller decides whether to retry against
 a fresh `ReadView`. Distinct from `WriterBusy`, which signals lane contention
 with no logical conflict.
 
-**Field:** `reason: WriteConflictReason` — discriminant explaining why the
+**Field:** `reason: WriteConflictReason`: discriminant explaining why the
 conflict was raised:
-- `StaleSnapshot` — the writer's `ReadView` predates a concurrent committed
+- `StaleSnapshot`: the writer's `ReadView` predates a concurrent committed
   head on the same key.
-- `UpgradeRace` — two readers on the same page-local latch requested upgrade;
+- `UpgradeRace`: two readers on the same page-local latch requested upgrade;
   one loses. Retry is immediate and does not require a new `ReadView`.
-- `SameKeyConflict { key_preview }` — two writers installed deltas on the
+- `SameKeyConflict { key_preview }`: two writers installed deltas on the
   same primary key.
-- `CatalogGenerationChanged` — the captured catalog generation no longer
+- `CatalogGenerationChanged`: the captured catalog generation no longer
   matches the published epoch when the writer revalidated.
-- `StructuralContention` — multi-leaf install could not acquire all required
+- `StructuralContention`: multi-leaf install could not acquire all required
   exclusive page latches.
-- `UniqueConflict { key_prefix_preview }` — a unique-index install observed
+- `UniqueConflict { key_prefix_preview }`: a unique-index install observed
   another live entry whose prefix equals this writer's prefix.
 
 **Recovery:** open a new `ReadView` (or re-run the operation against the live
@@ -505,8 +505,8 @@ A caller supplied an invalid engine configuration value (e.g. via `OpenOptions`)
 **MongoDB error code:** 2 (BAD_VALUE)
 
 **Fields:**
-- `field: &'static str` — configuration field that failed validation
-- `detail: String` — human-readable reason
+- `field: &'static str`: configuration field that failed validation
+- `detail: String`: human-readable reason
 
 ---
 
@@ -517,8 +517,8 @@ this build supports. Typically means the database was created by an older or
 newer mqlite build.
 
 **Fields:**
-- `found: [u8; 4]` — magic bytes read from the journal
-- `expected: [u8; 4]` — magic bytes this build expects (`MQJL`)
+- `found: [u8; 4]`: magic bytes read from the journal
+- `expected: [u8; 4]`: magic bytes this build expects (`MQJL`)
 
 ---
 
@@ -560,7 +560,7 @@ barrier). The caller must open a new `ReadView` to continue reading.
 
 A shared-state mutex was poisoned by a panicking thread.
 
-**Field:** `component: &'static str` — name of the poisoned component
+**Field:** `component: &'static str`: name of the poisoned component
 (e.g. `"history_store"`).
 
 ---
@@ -570,8 +570,8 @@ A shared-state mutex was poisoned by a panicking thread.
 A catalog field could not be parsed from BSON.
 
 **Fields:**
-- `field: &'static str` — the BSON field name that failed to parse
-- `source: bson::de::Error` — underlying deserialization error (via `#[source]`)
+- `field: &'static str`: the BSON field name that failed to parse
+- `source: bson::de::Error`: underlying deserialization error (via `#[source]`)
 
 ---
 
@@ -591,7 +591,7 @@ operator requires (e.g. `$inc` on a string field).
 
 Open-time recovery found durable evidence that cannot be replayed safely.
 
-**Field:** `detail: String` — operator-facing recovery detail.
+**Field:** `detail: String`: operator-facing recovery detail.
 
 ---
 
@@ -610,8 +610,8 @@ Checkpoint frontier pressure is reported separately as
 `Error::CheckpointIncomplete`.
 
 **Field:** `reason: PoolExhaustedReason`:
-- `AllFramesPinned` — every frame in the target pool partition is pinned.
-- `DeltaBearingFrames` — every eviction candidate carries resident deltas
+- `AllFramesPinned`: every frame in the target pool partition is pinned.
+- `DeltaBearingFrames`: every eviction candidate carries resident deltas
   that cannot be dropped without first reconciling them.
 
 **Recovery:** close or expire long-lived readers/pins, wait for checkpoint
@@ -625,9 +625,9 @@ A checkpoint cannot advance the durable frontier without losing
 checkpoint-visible resident state.
 
 **Fields:**
-- `first_blocking_page: u32` — first dirty leaf that blocked checkpoint
+- `first_blocking_page: u32`: first dirty leaf that blocked checkpoint
   planning.
-- `reason: CheckpointIncompleteReason` — `FrameCoWRefused`,
+- `reason: CheckpointIncompleteReason`: `FrameCoWRefused`,
   `OverflowSpillNotWired`, `VisibleWinnerExceedsPageBudget`,
   `TombstonePredecessorPressure`, `PoolExhausted(PoolExhaustedReason)`,
   `HistoryDuplicateConflict`, `HistoryDuplicateCapExceeded`,
@@ -658,16 +658,22 @@ cannot be repaired, so the engine is poisoned, refuses new operations, and
 must be reopened.
 
 **Field:** `reason: EngineFatalReason`:
-- `PostReservationLogWriteFailure` — log writer failed after reserving a
+- `PostReservationLogWriteFailure`: log writer failed after reserving a
   byte-LSN range and before marking the record written.
-- `PostDurablePublishFailure` — failure during the ordinary CRUD `mark_ready`
+- `PostDurablePublishFailure`: failure during the ordinary CRUD `mark_ready`
   publish closure or its surrounding post-durable scope.
-- `PostDurablePendingFlipFailure` — failure flipping `VersionState::Pending`
+- `PostDurablePendingFlipFailure`: failure flipping `VersionState::Pending`
   to `Committed`.
-- `PostDurableDdlPublishFailure` — failure during a DDL publish closure
+- `PostDurableDdlPublishFailure`: failure during a DDL publish closure
   (create/drop index, drop namespace, create-index cleanup).
-- `CheckpointPostMutationFailure` — checkpoint failed after its mutation
+- `CheckpointPostMutationFailure`: checkpoint failed after its mutation
   phase began.
+- `PreDurableAbortFlipFailure`: a *pre-durable* commit cleanup could not flip
+  its resident `VersionState::Pending` heads to `Aborted`. The publish slot is
+  deliberately NOT aborted (advancing the frontier past an unflipped slot would
+  let foreign readers treat the Pending-below-frontier head as committed, a
+  dirty read); the engine poisons instead. The txn was never durable, so reopen
+  recovery discards it wholesale.
 
 **Recovery:** close the `Client` and reopen the database; recovery replays
 from the last durable checkpoint boundary.
@@ -686,13 +692,13 @@ fn handle_write(db: &mqlite::Database) -> mqlite::Result<()> {
     match col.insert_one(&doc! { "x": 1 }) {
         Ok(_) => {}
         Err(Error::WriterBusy) => {
-            eprintln!("Writer busy — retry with backoff");
+            eprintln!("Writer busy, retry with backoff");
         }
         Err(Error::DuplicateKey { detail }) => {
             eprintln!("Duplicate: {detail}");
         }
         Err(Error::DiskFull { required_bytes, .. }) => {
-            eprintln!("Disk full — need {required_bytes} more bytes");
+            eprintln!("Disk full, need {required_bytes} more bytes");
         }
         Err(e) => return Err(e),  // propagate other errors
     }
@@ -720,8 +726,8 @@ Drivers that inspect the `code` field of the error response will receive these v
 | 10334 | `DOCUMENT_TOO_LARGE` | `Error::DocumentTooLarge` |
 | 11000 | `DUPLICATE_KEY` | `Error::DuplicateKey` |
 
-All other variants — including `WriteConflict`, `WriterBusy`, `Io`, BSON
-serialization errors, and the engine/recovery variants — return `None` from
+All other variants (including `WriteConflict`, `WriterBusy`, `Io`, BSON
+serialization errors, and the engine/recovery variants) return `None` from
 `Error::code()` and surface as `INTERNAL_ERROR` (1) when emitted via the wire
 protocol's generic conversion path.
 

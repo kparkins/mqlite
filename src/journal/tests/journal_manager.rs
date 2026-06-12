@@ -12,7 +12,8 @@
 )]
 mod tests {
     use super::super::*;
-    use crate::journal::log_file::{PositionedLogFile, PositionedLogIo};
+    use crate::error::EngineFatalReason;
+    use crate::journal::log_manager::{PositionedLogFile, PositionedLogIo};
     use crate::storage::header::FileHeader;
     use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
     use std::io::{Read, Seek, SeekFrom};
@@ -179,7 +180,7 @@ mod tests {
 
     #[test]
     fn log_manager_reserve_does_not_mutate_record_metadata() {
-        use crate::journal::log_file::{LogRecord, LogRecordDraft};
+        use crate::journal::wire::{LogRecord, LogRecordDraft};
         use crate::mvcc::timestamp::Ts;
 
         let (_dir, manager) = make_log_manager(4096);
@@ -516,7 +517,7 @@ mod tests {
     #[test]
     fn logical_txn_encode_rejects_oversize_inline_fields() {
         use crate::error::Error;
-        use crate::journal::log_file::{
+        use crate::journal::wire::{
             LogicalOp, LogicalOpKind, LogicalTxnFrame, LOGICAL_TXN_FORMAT_VERSION,
             LOGICAL_TXN_MAX_KEY_BYTES,
         };
@@ -552,7 +553,7 @@ mod tests {
 
     #[test]
     fn chain_commit_decode_bounds_page_write_count_before_allocation() {
-        use crate::journal::log_file::ChainCommitFrame;
+        use crate::journal::wire::ChainCommitFrame;
         use crate::mvcc::timestamp::Ts;
 
         let frame = ChainCommitFrame {
@@ -692,7 +693,7 @@ mod tests {
     /// populated vec, second call returns an empty struct.
     #[test]
     fn take_parsed_logical_frames_returns_once() {
-        use crate::journal::log_file::{LogicalOp, LogicalOpKind, LogicalTxnFrame};
+        use crate::journal::wire::{LogicalOp, LogicalOpKind, LogicalTxnFrame};
         use crate::mvcc::timestamp::Ts;
 
         let (dir, db_path, mut main_file) = make_db_file();
@@ -711,7 +712,7 @@ mod tests {
                 logical: 1,
             },
             diagnostic_txn_id: 7,
-            format_version: crate::journal::log_file::LOGICAL_TXN_FORMAT_VERSION,
+            format_version: crate::journal::wire::LOGICAL_TXN_FORMAT_VERSION,
             flags: 0,
             ops: vec![LogicalOp {
                 op_ordinal: 0,
@@ -725,7 +726,7 @@ mod tests {
         };
         mgr.parsed_logical_frames
             .frames
-            .push((crate::journal::log_file::JOURNAL_HEADER_SIZE as u64, frame));
+            .push((crate::journal::wire::JOURNAL_HEADER_SIZE as u64, frame));
         mgr.parsed_logical_frames.seen_commit_ts.insert(Ts {
             physical_ms: 42,
             logical: 1,
@@ -821,7 +822,7 @@ mod crash_recovery_tests {
     use std::path::Path;
 
     use crate::error::{Error, Result};
-    use crate::journal::log_file::JournalPageSize;
+    use crate::journal::wire::JournalPageSize;
     use crate::journal::{write_page_to_main, CheckpointPoolKind, JournalManager};
     use crate::storage::header::FileHeader;
     use crate::storage::page::{PAGE_SIZE_INTERNAL, PAGE_SIZE_LEAF};
@@ -1282,7 +1283,7 @@ mod crash_recovery_tests {
     }
 
     mod log_record_codec_tests {
-        use crate::journal::log_file::{
+        use crate::journal::wire::{
             FinalizedLogRecord, LogRecord, LogRecordDraft, LogRecordFlags, LogRecordKind,
             LogRecordPayload, JOURNAL_FORMAT_VERSION, LOG_RECORD_COMMIT_TS_LOGICAL_OFFSET,
             LOG_RECORD_COMMIT_TS_PHYSICAL_OFFSET, LOG_RECORD_END_LSN_OFFSET,

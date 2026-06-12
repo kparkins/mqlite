@@ -487,6 +487,18 @@ pub enum EngineFatalReason {
     /// engine is poisoned; close and reopen to recover from the last
     /// durable checkpoint boundary.
     CheckpointPostMutationFailure,
+    /// A *pre-durable* commit cleanup could not flip its resident
+    /// `VersionState::Pending` heads to `Aborted`
+    /// (`flip_pending_to_aborted_for` failed: bounded-retry exhaustion under
+    /// chain contention or a pin failure). The commit was never durable, but
+    /// the leaked Pending heads remain resident; the publish slot must NOT be
+    /// aborted, because advancing the published frontier past an unflipped
+    /// slot would let foreign readers treat the Pending-below-frontier head as
+    /// committed (a dirty read of never-committed data). Poisoning instead is
+    /// safe: the txn is not durable, so reopen-recovery discards it wholesale,
+    /// the resident Pending heads die with the process, and no in-flight
+    /// reader ever sees the slot pass the frontier.
+    PreDurableAbortFlipFailure,
 }
 
 /// Why [`Error::CheckpointIncomplete`] blocked a checkpoint.

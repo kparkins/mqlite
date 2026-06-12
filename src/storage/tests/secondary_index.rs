@@ -54,7 +54,7 @@ where
 }
 
 fn read_view() -> ReadView {
-    ReadView::new(READ_TS, READER_TXN_ID)
+    ReadView::new_frontier_pinned_for_tests(READ_TS, READER_TXN_ID)
 }
 
 /// Drain a `WriteTxn`'s pending sec-index writes into `tree`, mirroring

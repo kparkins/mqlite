@@ -104,7 +104,7 @@ fn reader_step(
     let (view, snap) = {
         let guard = chains.lock().unwrap();
         let read_ts = ts(oracle.load(Ordering::Acquire));
-        let view = ReadView::open(Arc::clone(registry), read_ts, txn_id);
+        let view = ReadView::open_frontier_pinned_for_tests(Arc::clone(registry), read_ts, txn_id);
         let snap = ChainSnapshot::new(&guard, Some(Arc::clone(&view)));
         (view, snap)
     };
